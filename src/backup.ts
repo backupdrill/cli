@@ -7,6 +7,7 @@ import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
 import { Upload } from "@aws-sdk/lib-storage";
 import type { BackupConfig } from "./config.js";
 import type { Manifest, TableStat } from "./manifest.js";
+import { syncStorage } from "./storage.js";
 import { log } from "./log.js";
 
 const execFileAsync = promisify(execFile);
@@ -190,6 +191,26 @@ export async function runBackup(config: BackupConfig): Promise<Manifest> {
   const { bytes, sha256 } = await dumpToS3(config, s3, dumpKey, pgDumpBin);
   log.ok(`Database dumped (${(bytes / 1024 / 1024).toFixed(1)} MB, sha256 ${sha256.slice(0, 12)}…)`);
 
+  // Storage 文件同步(源配置存在才做;否则只备数据库)
+  let storageResult: Manifest["storage"] = null;
+  if (config.supabaseStorage) {
+    log.step("Syncing Storage files…");
+    const synced = await syncStorage(config.supabaseStorage, {
+      client: s3,
+      bucket: config.storage.bucket,
+      base, // syncStorage 内部会加 /storage/<bucket>/<key>
+    });
+    storageResult = {
+      fileCount: synced.fileCount,
+      totalBytes: synced.totalBytes,
+      files: synced.files,
+    };
+    log.ok(
+      `Storage synced (${synced.fileCount} files, ` +
+        `${(synced.totalBytes / 1024 / 1024).toFixed(1)} MB)`
+    );
+  }
+
   const manifest: Manifest = {
     tool: "backupdrill-cli",
     toolVersion: process.env.npm_package_version || "0.1.0",
@@ -204,7 +225,7 @@ export async function runBackup(config: BackupConfig): Promise<Manifest> {
       tables: db.tables,
     },
     dump: { key: dumpKey, format: "custom", bytes, sha256 },
-    storage: null, // Storage 文件同步为下一里程碑
+    storage: storageResult,
   };
 
   await s3.send(
