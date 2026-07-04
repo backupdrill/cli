@@ -3,6 +3,7 @@ import { Command } from "commander";
 import { loadConfig } from "./config.js";
 import { runBackup } from "./backup.js";
 import { runEstimate, type EgressPricing } from "./estimate.js";
+import { runDrill } from "./drill.js";
 import { log } from "./log.js";
 
 // Supabase egress 定价表(2026-07-04 核实,来源见 README「Egress & cost」)。
@@ -65,6 +66,53 @@ program
       );
       // stdout 输出机器可读结果,便于在 CI / GitHub Action 里消费
       process.stdout.write(JSON.stringify({ ok: true, manifest }) + "\n");
+    } catch (error) {
+      log.error((error as Error).message);
+      process.exitCode = 1;
+    }
+  });
+
+program
+  .command("drill")
+  .description(
+    "Restore a snapshot into an ephemeral Postgres and prove it comes back (needs Docker)"
+  )
+  .option("-c, --config <path>", "path to a JSON config file", "backupdrill.config.json")
+  .option("--snapshot <timestamp>", "which snapshot to drill (default: latest)")
+  .option("--bucket <name>", "bucket the backups live in")
+  .option("--endpoint <url>", "S3-compatible endpoint (for R2/B2)")
+  .option("--region <region>", "bucket region")
+  .option("--prefix <prefix>", "key prefix inside the bucket (default: backupdrill)")
+  .option("--project-name <name>", "project name used in the object key")
+  .action(async (opts) => {
+    try {
+      const config = await loadConfig({
+        configPath: opts.config,
+        overrides: {
+          projectName: opts.projectName,
+          // drill 只读桶,不连源库;给 databaseUrl 占位以通过校验
+          databaseUrl: "postgresql://unused",
+          storage: {
+            bucket: opts.bucket,
+            endpoint: opts.endpoint,
+            region: opts.region,
+            prefix: opts.prefix,
+          },
+        },
+      });
+      const report = await runDrill(config, { snapshot: opts.snapshot });
+      console.error("");
+      for (const c of report.checks) {
+        console.error(`  ${c.pass ? "✓" : "✗"} ${c.name} — ${c.detail}`);
+      }
+      console.error("");
+      log[report.pass ? "ok" : "error"](
+        `Drill ${report.pass ? "PASSED" : "FAILED"} — snapshot ${report.snapshot}, ` +
+          `${report.restoredTableCount} tables / ${report.restoredRowTotal.toLocaleString()} rows ` +
+          `restored in ${report.restoreSeconds}s`
+      );
+      process.stdout.write(JSON.stringify({ ok: report.pass, report }) + "\n");
+      if (!report.pass) process.exitCode = 1;
     } catch (error) {
       log.error((error as Error).message);
       process.exitCode = 1;
