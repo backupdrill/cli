@@ -2,7 +2,17 @@
 import { Command } from "commander";
 import { loadConfig } from "./config.js";
 import { runBackup } from "./backup.js";
+import { runEstimate, type EgressPricing } from "./estimate.js";
 import { log } from "./log.js";
+
+// Supabase egress 定价表(2026-07-04 核实,来源见 README「Egress & cost」)。
+// 备份流量 100% 未缓存,故用 uncached 单价 $0.09/GB;included 用 uncached 额度。
+// Free 硬上限(超额即限流,不计费);Pro/Team 由 Spend Cap 决定超额限流还是计费。
+const EGRESS_PRICING: Record<"free" | "pro" | "team", EgressPricing> = {
+  free: { planLabel: "Free", includedGb: 5, pricePerGb: 0.09, hardCap: true },
+  pro: { planLabel: "Pro", includedGb: 250, pricePerGb: 0.09, hardCap: false },
+  team: { planLabel: "Team", includedGb: 250, pricePerGb: 0.09, hardCap: false },
+};
 
 const program = new Command();
 
@@ -46,12 +56,42 @@ program
         },
       });
       const manifest = await runBackup(config);
+      const storageNote = manifest.storage
+        ? ` + ${manifest.storage.fileCount} Storage files`
+        : " (database only)";
       log.ok(
-        `Backup complete — ${manifest.database.tableCount} tables, ` +
-          `${(manifest.dump.bytes / 1024 / 1024).toFixed(1)} MB.`
+        `Backup complete — ${manifest.database.tableCount} tables` +
+          `${storageNote}.`
       );
       // stdout 输出机器可读结果,便于在 CI / GitHub Action 里消费
       process.stdout.write(JSON.stringify({ ok: true, manifest }) + "\n");
+    } catch (error) {
+      log.error((error as Error).message);
+      process.exitCode = 1;
+    }
+  });
+
+program
+  .command("estimate")
+  .description("Measure your DB + Storage size and project monthly Supabase egress cost")
+  .option("-c, --config <path>", "path to a JSON config file", "backupdrill.config.json")
+  .option("--database-url <url>", "Supabase Session Pooler connection string")
+  .option("--schema <name...>", "schema(s) to measure (default: public)")
+  .option("--plan <plan>", "your Supabase plan for the cost estimate: free | pro | team", "pro")
+  .action(async (opts) => {
+    try {
+      const config = await loadConfig({
+        configPath: opts.config,
+        overrides: {
+          databaseUrl: opts.databaseUrl,
+          schemas: opts.schema,
+          // estimate 不写数据,给目标桶占位以通过校验(仅用 databaseUrl + 源)
+          storage: { bucket: "estimate", accessKeyId: "estimate", secretAccessKey: "estimate" },
+        },
+      });
+      const pricing = EGRESS_PRICING[opts.plan as keyof typeof EGRESS_PRICING];
+      if (!pricing) throw new Error(`Unknown plan "${opts.plan}". Use free | pro | team.`);
+      await runEstimate(config, pricing);
     } catch (error) {
       log.error((error as Error).message);
       process.exitCode = 1;

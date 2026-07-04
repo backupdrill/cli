@@ -30,9 +30,17 @@ export interface Manifest {
     bytes: number;
     sha256: string;
   };
-  // 下一里程碑:Storage 文件同步后在此登记文件清单与校验和
+  // Storage 文件清单:每个文件的桶/键/大小/校验和(PRD US-2 要求"文件清单+校验和")
   storage: null | {
     fileCount: number;
     totalBytes: number;
+    files: StorageFile[];
   };
+}
+
+export interface StorageFile {
+  bucket: string;
+  key: string;
+  bytes: number;
+  sha256: string;
 }
