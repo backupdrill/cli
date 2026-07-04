@@ -14,7 +14,9 @@
   "scripts": {
     "build": "tsc",
     "dev": "node src/index.ts",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "pretest": "tsc",
+    "test": "node --test test/*.test.js"
   },
   "engines": {
     "node": ">=20"
