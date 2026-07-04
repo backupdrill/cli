@@ -4,6 +4,7 @@ import { loadConfig } from "./config.js";
 import { runBackup } from "./backup.js";
 import { runEstimate, type EgressPricing } from "./estimate.js";
 import { runDrill } from "./drill.js";
+import { runRestore } from "./restore.js";
 import { log } from "./log.js";
 
 // Supabase egress 定价表(2026-07-04 核实,来源见 README「Egress & cost」)。
@@ -84,6 +85,7 @@ program
   .option("--region <region>", "bucket region")
   .option("--prefix <prefix>", "key prefix inside the bucket (default: backupdrill)")
   .option("--project-name <name>", "project name used in the object key")
+  .option("--verify-all-files", "checksum every Storage file, not just a sample")
   .action(async (opts) => {
     try {
       const config = await loadConfig({
@@ -100,7 +102,10 @@ program
           },
         },
       });
-      const report = await runDrill(config, { snapshot: opts.snapshot });
+      const report = await runDrill(config, {
+        snapshot: opts.snapshot,
+        verifyAllFiles: opts.verifyAllFiles,
+      });
       console.error("");
       for (const c of report.checks) {
         console.error(`  ${c.pass ? "✓" : "✗"} ${c.name} — ${c.detail}`);
@@ -113,6 +118,50 @@ program
       );
       process.stdout.write(JSON.stringify({ ok: report.pass, report }) + "\n");
       if (!report.pass) process.exitCode = 1;
+    } catch (error) {
+      log.error((error as Error).message);
+      process.exitCode = 1;
+    }
+  });
+
+program
+  .command("restore")
+  .description("Recover a snapshot: restore the database into a target and pull Storage files down")
+  .option("-c, --config <path>", "path to a JSON config file", "backupdrill.config.json")
+  .option("--target-database-url <url>", "connection string to restore the database INTO")
+  .option("--storage-dir <path>", "local directory to write Storage files to")
+  .option("--snapshot <timestamp>", "which snapshot to restore (default: latest)")
+  .option("--bucket <name>", "bucket the backups live in")
+  .option("--endpoint <url>", "S3-compatible endpoint (for R2/B2)")
+  .option("--region <region>", "bucket region")
+  .option("--prefix <prefix>", "key prefix inside the bucket (default: backupdrill)")
+  .option("--project-name <name>", "project name used in the object key")
+  .action(async (opts) => {
+    try {
+      const config = await loadConfig({
+        configPath: opts.config,
+        overrides: {
+          projectName: opts.projectName,
+          databaseUrl: "postgresql://unused", // restore 读桶,不连源库
+          storage: {
+            bucket: opts.bucket,
+            endpoint: opts.endpoint,
+            region: opts.region,
+            prefix: opts.prefix,
+          },
+        },
+      });
+      const result = await runRestore(config, {
+        targetDatabaseUrl: opts.targetDatabaseUrl,
+        storageDir: opts.storageDir,
+        snapshot: opts.snapshot,
+      });
+      log.ok(
+        `Restore complete — snapshot ${result.snapshot}: ` +
+          `database ${result.restoredToDatabase ? "restored" : "skipped"}, ` +
+          `${result.storageFilesWritten} Storage files written` +
+          (result.storageDir ? ` to ${result.storageDir}` : "")
+      );
     } catch (error) {
       log.error((error as Error).message);
       process.exitCode = 1;

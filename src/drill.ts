@@ -1,23 +1,25 @@
 import { execFile, spawn } from "node:child_process";
-import { createHash } from "node:crypto";
-import { createWriteStream } from "node:fs";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
-import { pipeline } from "node:stream/promises";
-import { Transform, type Readable } from "node:stream";
 import { Client } from "pg";
-import {
-  S3Client,
-  ListObjectsV2Command,
-  GetObjectCommand,
-} from "@aws-sdk/client-s3";
+import { S3Client } from "@aws-sdk/client-s3";
 import type { BackupConfig } from "./config.js";
 import type { Manifest } from "./manifest.js";
+import {
+  targetClient,
+  resolveSnapshot,
+  getObjectText,
+  downloadToFile,
+  hashObject,
+} from "./snapshots.js";
 import { log } from "./log.js";
 
 const execFileAsync = promisify(execFile);
+
+// Storage 校验默认抽样上限(避免每次演练重下全部文件产生大量 egress);超限如实记录
+const STORAGE_SAMPLE_CAP = 100;
 
 export interface DrillCheck {
   name: string;
@@ -32,82 +34,6 @@ export interface DrillReport {
   restoreSeconds: number;
   restoredTableCount: number;
   restoredRowTotal: number;
-}
-
-function targetClient(config: BackupConfig): S3Client {
-  return new S3Client({
-    region: config.storage.region,
-    endpoint: config.storage.endpoint,
-    forcePathStyle: config.storage.forcePathStyle,
-    credentials: {
-      accessKeyId: config.storage.accessKeyId,
-      secretAccessKey: config.storage.secretAccessKey,
-    },
-  });
-}
-
-/** 找出要演练的快照:显式指定,否则取字典序最大(时间戳格式天然可排序)。 */
-async function resolveSnapshot(
-  s3: S3Client,
-  config: BackupConfig,
-  explicit?: string
-): Promise<string> {
-  const root = `${config.storage.prefix}/${config.projectName}/`;
-  if (explicit) return `${root}${explicit}`;
-
-  const prefixes: string[] = [];
-  let token: string | undefined;
-  do {
-    const res = await s3.send(
-      new ListObjectsV2Command({
-        Bucket: config.storage.bucket,
-        Prefix: root,
-        Delimiter: "/",
-        ContinuationToken: token,
-      })
-    );
-    for (const cp of res.CommonPrefixes ?? []) {
-      if (cp.Prefix) prefixes.push(cp.Prefix);
-    }
-    token = res.IsTruncated ? res.NextContinuationToken : undefined;
-  } while (token);
-
-  if (!prefixes.length) {
-    throw new Error(
-      `No snapshots found under s3://${config.storage.bucket}/${root}. ` +
-        "Run a backup first."
-    );
-  }
-  prefixes.sort();
-  return prefixes[prefixes.length - 1];
-}
-
-async function getObjectText(
-  s3: S3Client,
-  bucket: string,
-  key: string
-): Promise<string> {
-  const res = await s3.send(new GetObjectCommand({ Bucket: bucket, Key: key }));
-  return res.Body!.transformToString();
-}
-
-/** 下载 dump 到临时文件,顺带算 sha256(验证读回的归档没被损坏)。 */
-async function downloadDump(
-  s3: S3Client,
-  bucket: string,
-  key: string,
-  dest: string
-): Promise<string> {
-  const res = await s3.send(new GetObjectCommand({ Bucket: bucket, Key: key }));
-  const hash = createHash("sha256");
-  const hasher = new Transform({
-    transform(chunk: Buffer, _enc, cb) {
-      hash.update(chunk);
-      cb(null, chunk);
-    },
-  });
-  await pipeline(res.Body as Readable, hasher, createWriteStream(dest));
-  return hash.digest("hex");
 }
 
 // ── 临时 Postgres 容器编排 ──────────────────────────────────────────
@@ -273,6 +199,43 @@ async function verifyRestored(
   }
 }
 
+/**
+ * Storage 完整性校验:从备份桶重新读回文件、比对 manifest 里记录的 sha256,
+ * 证明备份的文件副本真实存在且未损坏。文件多时抽样(默认上限),避免大量 egress。
+ */
+async function verifyStorage(
+  s3: S3Client,
+  config: BackupConfig,
+  manifest: Manifest,
+  verifyAll: boolean
+): Promise<DrillCheck> {
+  const files = manifest.storage!.files;
+  const sample = verifyAll ? files : files.slice(0, STORAGE_SAMPLE_CAP);
+  // 备份写入时的键:<snapshot base>/storage/<bucket>/<key>,base 从 dump.key 反推
+  const base = manifest.dump.key.replace(/\/dump\.pgcustom$/, "");
+  const mismatches: string[] = [];
+  for (const f of sample) {
+    const objectKey = `${base}/storage/${f.bucket}/${f.key}`;
+    try {
+      const { sha256 } = await hashObject(s3, config.storage.bucket, objectKey);
+      if (sha256 !== f.sha256) mismatches.push(`${f.bucket}/${f.key}`);
+    } catch {
+      mismatches.push(`${f.bucket}/${f.key} (unreadable)`);
+    }
+  }
+  const scope = verifyAll
+    ? `all ${files.length}`
+    : `${sample.length}/${files.length} sampled`;
+  return {
+    name: "storage file integrity",
+    pass: mismatches.length === 0,
+    detail:
+      mismatches.length === 0
+        ? `${scope} files match their manifest checksums`
+        : `${mismatches.length} of ${scope} failed: ${mismatches.slice(0, 5).join(", ")}`,
+  };
+}
+
 // ── 主流程 ──────────────────────────────────────────────────────────
 
 /**
@@ -312,10 +275,10 @@ export async function drillDump(
   }
 }
 
-/** 演练一份快照:从桶里下载→drillDump→报告。 */
+/** 演练一份快照:从桶里下载→drillDump(含 Storage 校验)→报告。 */
 export async function runDrill(
   config: BackupConfig,
-  opts: { snapshot?: string } = {}
+  opts: { snapshot?: string; verifyAllFiles?: boolean } = {}
 ): Promise<DrillReport> {
   const s3 = targetClient(config);
   const snapshotPrefix = await resolveSnapshot(s3, config, opts.snapshot);
@@ -330,21 +293,32 @@ export async function runDrill(
   const dumpPath = join(workdir, "dump.pgcustom");
   try {
     log.step("Downloading dump…");
-    const sha = await downloadDump(
+    const { sha256: sha } = await downloadToFile(
       s3,
       config.storage.bucket,
       manifest.dump.key,
       dumpPath
     );
-    const integrity: DrillCheck = {
-      name: "archive integrity",
-      pass: sha === manifest.dump.sha256,
-      detail:
-        sha === manifest.dump.sha256
-          ? `sha256 matches (${sha.slice(0, 12)}…)`
-          : `sha256 MISMATCH — got ${sha.slice(0, 12)}…, manifest ${manifest.dump.sha256.slice(0, 12)}…`,
-    };
-    return await drillDump(dumpPath, manifest, snapshot, [integrity]);
+    const preChecks: DrillCheck[] = [
+      {
+        name: "archive integrity",
+        pass: sha === manifest.dump.sha256,
+        detail:
+          sha === manifest.dump.sha256
+            ? `sha256 matches (${sha.slice(0, 12)}…)`
+            : `sha256 MISMATCH — got ${sha.slice(0, 12)}…, manifest ${manifest.dump.sha256.slice(0, 12)}…`,
+      },
+    ];
+
+    // Storage 文件完整性(备份含 Storage 时才校验)
+    if (manifest.storage && manifest.storage.files.length) {
+      log.step("Verifying Storage files…");
+      preChecks.push(
+        await verifyStorage(s3, config, manifest, opts.verifyAllFiles ?? false)
+      );
+    }
+
+    return await drillDump(dumpPath, manifest, snapshot, preChecks);
   } finally {
     await rm(workdir, { recursive: true, force: true }).catch(() => {});
   }

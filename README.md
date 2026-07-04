@@ -115,7 +115,24 @@ backupdrill estimate --plan pro   # measures your DB + Storage, prints the proje
   └── manifest.json              # schemas, tables, row counts, file list, sizes + sha256
 ```
 
-Restore later with:
+## Restoring & drilling
+
+Prove a backup is restorable, without touching anything real — `drill` restores the latest snapshot into a throwaway Postgres (needs Docker) and checks it:
+
+```bash
+backupdrill drill                    # latest snapshot; add --snapshot <timestamp> to pick one
+backupdrill drill --verify-all-files # also checksum every Storage file, not just a sample
+```
+
+When you actually need to recover, `restore` puts the database back into a target you name and pulls the Storage files down to a local folder:
+
+```bash
+backupdrill restore \
+  --target-database-url "postgresql://…/postgres" \
+  --storage-dir ./recovered
+```
+
+Or restore the dump by hand:
 
 ```bash
 pg_restore --clean --if-exists --no-owner --dbname "<target-connection-string>" dump.pgcustom
@@ -139,8 +156,9 @@ Before switching to a **daily** schedule, read the egress-cost section above —
 - [x] **Storage file sync** (the files Supabase restores leave behind)
 - [x] `estimate` — project your monthly Supabase egress cost before you schedule
 - [x] `drill` — restore a snapshot into an ephemeral Postgres and prove it comes back
+- [x] Storage-file integrity check inside the drill (checksums, sampled by default)
+- [x] `restore` — recover a snapshot into a target DB + pull Storage files down
 - [x] GitHub Action wrapper
-- [ ] Storage-file restore verification in the drill
 
 For scheduling, automated restore drills, and alerting, use the hosted service at [backupdrill.com](https://backupdrill.com).
 
