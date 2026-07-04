@@ -121,13 +121,26 @@ Restore later with:
 pg_restore --clean --if-exists --no-owner --dbname "<target-connection-string>" dump.pgcustom
 ```
 
+## GitHub Action / scheduled backups
+
+Want this running on a schedule without paying for a server? Run it in GitHub Actions.
+
+1. Copy [`.github/workflows/scheduled-backup.yml`](.github/workflows/scheduled-backup.yml) from this repo into **your own** repo at the same path. It runs daily and can also be triggered by hand from the Actions tab. The workflow installs `postgresql-client-17` from the PGDG apt repo (so `pg_dump`'s major version matches Supabase) and points the CLI at it via `BACKUPDRILL_PG_DUMP`.
+2. Add these repo secrets (Settings → Secrets and variables → Actions):
+   - **Required:** `BACKUPDRILL_DATABASE_URL`, `BACKUPDRILL_S3_BUCKET`, `BACKUPDRILL_S3_ACCESS_KEY_ID`, `BACKUPDRILL_S3_SECRET_ACCESS_KEY`
+   - **Optional (destination):** `BACKUPDRILL_S3_ENDPOINT` (for R2/B2), `BACKUPDRILL_S3_REGION`, `BACKUPDRILL_PROJECT_NAME`
+   - **Optional (Storage files):** set all four of `BACKUPDRILL_SUPABASE_STORAGE_ENDPOINT`, `BACKUPDRILL_SUPABASE_STORAGE_REGION`, `BACKUPDRILL_SUPABASE_STORAGE_ACCESS_KEY_ID`, `BACKUPDRILL_SUPABASE_STORAGE_SECRET_ACCESS_KEY` to also back up Storage files; leave them unset to back up the database only.
+
+Before switching to a **daily** schedule, read the egress-cost section above — every run is egress on your Supabase bill.
+
 ## Roadmap
 
 - [x] Database backup → your bucket, with checksummed manifest
 - [x] **Storage file sync** (the files Supabase restores leave behind)
 - [x] `estimate` — project your monthly Supabase egress cost before you schedule
-- [ ] `restore` helper command + restore verification
-- [ ] GitHub Action wrapper
+- [x] `drill` — restore a snapshot into an ephemeral Postgres and prove it comes back
+- [x] GitHub Action wrapper
+- [ ] Storage-file restore verification in the drill
 
 For scheduling, automated restore drills, and alerting, use the hosted service at [backupdrill.com](https://backupdrill.com).
 
