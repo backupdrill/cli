@@ -142,7 +142,7 @@ pg_restore --clean --if-exists --no-owner --dbname "<target-connection-string>" 
 
 Want this running on a schedule without paying for a server? Run it in GitHub Actions.
 
-1. Copy [`.github/workflows/scheduled-backup.yml`](.github/workflows/scheduled-backup.yml) from this repo into **your own** repo at the same path. It runs daily and can also be triggered by hand from the Actions tab. The workflow installs `postgresql-client-17` from the PGDG apt repo (so `pg_dump`'s major version matches Supabase) and points the CLI at it via `BACKUPDRILL_PG_DUMP`.
+1. Copy [`examples/scheduled-backup.yml`](examples/scheduled-backup.yml) into **your own** repo at `.github/workflows/scheduled-backup.yml`. (It lives under `examples/` here so GitHub doesn't try to run it in this repo — it's a template.) It runs daily and can also be triggered by hand from the Actions tab. The workflow installs `postgresql-client-17` from the PGDG apt repo (so `pg_dump`'s major version matches Supabase) and points the CLI at it via `BACKUPDRILL_PG_DUMP`.
 2. Add these repo secrets (Settings → Secrets and variables → Actions):
    - **Required:** `BACKUPDRILL_DATABASE_URL`, `BACKUPDRILL_S3_BUCKET`, `BACKUPDRILL_S3_ACCESS_KEY_ID`, `BACKUPDRILL_S3_SECRET_ACCESS_KEY`
    - **Optional (destination):** `BACKUPDRILL_S3_ENDPOINT` (for R2/B2), `BACKUPDRILL_S3_REGION`, `BACKUPDRILL_PROJECT_NAME`
