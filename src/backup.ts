@@ -17,13 +17,27 @@ function majorOf(serverVersionNum: number): number {
   return Math.floor(serverVersionNum / 10000);
 }
 
+/**
+ * Parse the major version out of `pg_dump --version` output.
+ *
+ * MUST tolerate a trailing vendor suffix: Homebrew/macOS prints `pg_dump (PostgreSQL) 17.2`, but
+ * Debian/PGDG (what the deployed worker image uses) prints
+ * `pg_dump (PostgreSQL) 17.10 (Debian 17.10-1.pgdg120+1)`. Anchoring the match to end-of-string
+ * therefore breaks in production while passing on a dev Mac. Anchor on the `(PostgreSQL)` marker
+ * instead, falling back to the first dotted version token for non-standard builds.
+ */
+export function parsePgDumpMajor(raw: string): number | null {
+  const match = raw.match(/\(PostgreSQL\)\s+(\d+)/) ?? raw.match(/(\d+)(?:\.\d+)+/);
+  return match ? Number(match[1]) : null;
+}
+
 async function pgDumpVersion(bin: string): Promise<{ raw: string; major: number }> {
   try {
     const { stdout } = await execFileAsync(bin, ["--version"]);
-    const raw = stdout.trim(); // "pg_dump (PostgreSQL) 17.2"
-    const match = raw.match(/(\d+)(?:\.\d+)?\s*$/);
-    if (!match) throw new Error(`Unrecognized pg_dump version string: ${raw}`);
-    return { raw, major: Number(match[1]) };
+    const raw = stdout.trim();
+    const major = parsePgDumpMajor(raw);
+    if (major === null) throw new Error(`Unrecognized pg_dump version string: ${raw}`);
+    return { raw, major };
   } catch (error) {
     const err = error as NodeJS.ErrnoException;
     if (err.code === "ENOENT") {
