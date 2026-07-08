@@ -53,17 +53,20 @@ Copy `backupdrill.config.example.json` → `backupdrill.config.json` (it's gitig
 backupdrill backup --config backupdrill.config.json
 ```
 
-## Get the connection string & a least-privilege role
+## Get the connection string
 
-Use the **Session Pooler** string from your Supabase dashboard (Project Settings → Database → Connection string → Session pooler).
+Use the **Session Pooler** string from your Supabase dashboard (Project Settings → Database → Connection string → Session pooler). The default `postgres` user works as-is — it owns your tables, so `pg_dump` passes row-level security.
 
-For backups you only need read access. Create a dedicated read-only role and use it instead of the `postgres` superuser:
+**Least-privilege role (advanced, usually not viable on Supabase):** `pg_dump` needs `select` on *sequences* too, and it **errors on any RLS-enabled table the role can't bypass** — and most Supabase tables have RLS on, while `bypassrls` can't be granted without superuser. Only use a dedicated role if your schema has no RLS tables:
 
 ```sql
-create role backup_reader with login password 'a-strong-password';
+-- replace <generate-a-strong-password> before running
+create role backup_reader with login password '<generate-a-strong-password>';
 grant usage on schema public to backup_reader;
 grant select on all tables in schema public to backup_reader;
+grant select on all sequences in schema public to backup_reader;
 alter default privileges in schema public grant select on tables to backup_reader;
+alter default privileges in schema public grant select on sequences to backup_reader;
 ```
 
 ## Backing up Storage files too
