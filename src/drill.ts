@@ -132,13 +132,31 @@ export function classifyPostDataErrors(stderr: string): PostDataResult {
   let supabaseSkipped = 0;
   const failures: string[] = [];
   for (const block of blocks) {
-    if (SUPABASE_MANAGED_ERROR.test(block)) {
+    // 只对 ERROR 原因行分类,不看 "Command was:" 之后的语句文本——否则一个恰好
+    // 引用 auth.uid 的用户对象因"损坏/语法错误"失败时,会被误判成预期跳过。
+    const cause = block.split(/Command was:/i)[0];
+    if (SUPABASE_MANAGED_ERROR.test(cause)) {
       supabaseSkipped += 1;
     } else {
       failures.push(block.replace(/\s+/g, " ").trim().slice(0, 200));
     }
   }
   return { supabaseSkipped, failures };
+}
+
+/**
+ * post-data 第二遍的最终裁决:分类之外,非零退出却没解析到任何错误块(被信号杀死、
+ * 归档器致命错误等)绝不能谎报"全部恢复"——记为通用失败。
+ */
+export function postDataResult(code: number | null, stderr: string): PostDataResult {
+  const result = classifyPostDataErrors(stderr);
+  if (code !== 0 && result.supabaseSkipped === 0 && result.failures.length === 0) {
+    result.failures.push(
+      `pg_restore post-data exited with ${code === null ? "a signal" : `code ${code}`}: ` +
+        (stderr.trim().replace(/\s+/g, " ").slice(0, 200) || "(no stderr)")
+    );
+  }
+  return result;
 }
 
 /**
@@ -169,7 +187,7 @@ async function pgRestore(dumpPath: string, connString: string): Promise<PostData
   }
 
   const second = await spawnPgRestore(pgRestoreBin, ["--section=post-data", ...common]);
-  return classifyPostDataErrors(second.stderr);
+  return postDataResult(second.code, second.stderr);
 }
 
 // ── 校验 ────────────────────────────────────────────────────────────
