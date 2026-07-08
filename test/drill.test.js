@@ -6,7 +6,7 @@ import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { drillDump, classifyPostDataErrors } from "../dist/drill.js";
+import { drillDump, classifyPostDataErrors, postDataResult } from "../dist/drill.js";
 
 const x = promisify(execFile);
 const pgDump = process.env.BACKUPDRILL_PG_DUMP || "pg_dump";
@@ -130,4 +130,32 @@ test("classifyPostDataErrors: clean stderr → nothing skipped, nothing failed",
   const r = classifyPostDataErrors("");
   assert.equal(r.supabaseSkipped, 0);
   assert.equal(r.failures.length, 0);
+});
+
+// 回归(xreview):Command 提到 auth.uid 但真实错误是别的 → 必须判失败,不许误跳过
+test("classifyPostDataErrors: auth.uid in Command but unrelated error → failure", () => {
+  const stderr = [
+    "pg_restore: error: could not execute query: ERROR:  syntax error at or near \"USING\"",
+    "Command was: CREATE POLICY p ON public.demo USING (auth.uid() = id);",
+  ].join("\n");
+  const r = classifyPostDataErrors(stderr);
+  assert.equal(r.supabaseSkipped, 0, "unrelated error must not be classified as a skip");
+  assert.equal(r.failures.length, 1);
+});
+
+// 回归(xreview):post-data 非零退出且无可解析错误块 → 通用失败,不许谎报"全部恢复"
+test("postDataResult: nonzero exit with no parsed blocks → generic failure", () => {
+  const killed = postDataResult(null, "");
+  assert.equal(killed.failures.length, 1);
+  assert.match(killed.failures[0], /signal/);
+  const archiverFatal = postDataResult(1, "pg_restore: [archiver] out of memory");
+  assert.equal(archiverFatal.failures.length, 1);
+  assert.match(archiverFatal.failures[0], /code 1/);
+  // 正常情形:退出 1 但错误已全部归类为 Supabase 跳过 → 不额外报失败
+  const explained = postDataResult(
+    1,
+    'pg_restore: error: could not execute query: ERROR:  role "authenticated" does not exist\nCommand was: CREATE POLICY x;'
+  );
+  assert.equal(explained.failures.length, 0);
+  assert.equal(explained.supabaseSkipped, 1);
 });
