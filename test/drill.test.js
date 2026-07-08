@@ -6,7 +6,7 @@ import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { drillDump } from "../dist/drill.js";
+import { drillDump, classifyPostDataErrors } from "../dist/drill.js";
 
 const x = promisify(execFile);
 const pgDump = process.env.BACKUPDRILL_PG_DUMP || "pg_dump";
@@ -41,7 +41,9 @@ test(
       const port = portOut.trim().split(":").pop().trim();
       for (let i = 0; i < 60; i++) {
         try {
-          await x("docker", ["exec", id, "pg_isready", "-U", "postgres", "-q"]);
+          // -h 强制 TCP:与引擎同一个坑——镜像初始化阶段的临时服务只听 socket,
+          // 默认检查会在"临时停/正式起"窗口前误报就绪(VPS 上真实复现过)
+          await x("docker", ["exec", id, "pg_isready", "-h", "127.0.0.1", "-U", "postgres", "-q"]);
           break;
         } catch {
           await new Promise((r) => setTimeout(r, 500));
@@ -49,7 +51,11 @@ test(
       }
       await x("docker", [
         "exec", id, "psql", "-U", "postgres", "-c",
-        "create table demo(id int primary key, v text); insert into demo select g, 'row'||g from generate_series(1,100) g;",
+        // PK = 用户自己的 post-data(必须恢复成功);authenticated 角色 + policy 模拟
+        // Supabase 库的托管接线(演练沙箱没有该角色 → 必须被归类为预期跳过,而非失败)
+        "create table demo(id int primary key, v text); insert into demo select g, 'row'||g from generate_series(1,100) g; " +
+        "create role authenticated nologin; alter table demo enable row level security; " +
+        "create policy demo_read on demo for select to authenticated using (true);",
       ]);
       const conn = `postgresql://postgres:seed@127.0.0.1:${port}/postgres`;
       await x(pgDump, [
@@ -80,6 +86,11 @@ test(
     assert.equal(good.pass, true, "good backup should pass");
     assert.equal(good.restoredRowTotal, 100);
     assert.equal(good.restoredTableCount, 1);
+    // post-data 语义:用户的 PK 恢复成功,Supabase 式 policy(TO authenticated)被
+    // 归类为沙箱预期跳过——两边都不许把演练翻成失败,也不许假装没跳过
+    const pd = good.checks.find((c) => c.name === "post-data objects");
+    assert.ok(pd?.pass, "user post-data objects (PK) must restore");
+    assert.match(pd.detail, /Supabase-managed/, "the policy skip must be reported");
 
     // 3. FAIL:manifest 谎报一张 dump 里没有的表,演练必须抓到
     const tampered = {
@@ -98,3 +109,25 @@ test(
     );
   }
 );
+
+// 纯单测(无需 Docker):post-data 错误分类——Supabase 托管失败 vs 用户对象失败
+test("classifyPostDataErrors: supabase-managed vs user failures", () => {
+  const stderr = [
+    'pg_restore: error: could not execute query: ERROR:  role "authenticated" does not exist',
+    "Command was: CREATE POLICY demo_read ON public.demo FOR SELECT TO authenticated;",
+    'pg_restore: error: could not execute query: ERROR:  schema "auth" does not exist',
+    "Command was: ALTER TABLE accounts ADD CONSTRAINT fk FOREIGN KEY (user_id) REFERENCES auth.users(id);",
+    "pg_restore: error: could not execute query: ERROR:  syntax error at or near \"BROKEN\"",
+    "Command was: CREATE INDEX broken_idx ON public.demo (BROKEN);",
+  ].join("\n");
+  const r = classifyPostDataErrors(stderr);
+  assert.equal(r.supabaseSkipped, 2, "auth-schema + authenticated-role failures are expected skips");
+  assert.equal(r.failures.length, 1, "the user's broken index is a real failure");
+  assert.match(r.failures[0], /broken_idx/);
+});
+
+test("classifyPostDataErrors: clean stderr → nothing skipped, nothing failed", () => {
+  const r = classifyPostDataErrors("");
+  assert.equal(r.supabaseSkipped, 0);
+  assert.equal(r.failures.length, 0);
+});

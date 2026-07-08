@@ -100,45 +100,76 @@ async function startEphemeralPostgres(major: number): Promise<Ephemeral> {
   }
 }
 
-async function pgRestore(dumpPath: string, connString: string): Promise<void> {
+/** post-data 第二遍恢复的结果:用户对象失败 vs Supabase 托管对象的沙箱预期跳过。 */
+interface PostDataResult {
+  supabaseSkipped: number;
+  failures: string[];
+}
+
+function spawnPgRestore(
+  bin: string,
+  args: string[]
+): Promise<{ code: number | null; stderr: string }> {
+  return new Promise((resolve, reject) => {
+    const proc = spawn(bin, args, { stdio: ["ignore", "ignore", "pipe"] });
+    let stderr = "";
+    proc.stderr.on("data", (d: Buffer) => (stderr += d.toString()));
+    proc.on("error", reject);
+    proc.on("close", (code) => resolve({ code, stderr }));
+  });
+}
+
+// 演练沙箱是裸 Postgres,Supabase 托管的 schema/角色必然缺席。post-data 里
+// 引用它们的失败是"环境预期",不是备份坏了;其余失败才是演练要抓的。
+const SUPABASE_MANAGED_ERROR =
+  /schema "(auth|storage|realtime|vault|extensions|graphql[a-z_]*)" does not exist|role "(authenticated|anon|service_role|supabase_[a-z_]+)" does not exist|\bauth\.uid\b|\bauth\.jwt\b/i;
+
+/** 把 pg_restore 的 stderr 拆成单个错误块并分类(Supabase 托管 vs 用户对象)。 */
+export function classifyPostDataErrors(stderr: string): PostDataResult {
+  const blocks = stderr
+    .split(/(?=pg_restore: error:)/)
+    .filter((b) => /pg_restore: error:/.test(b));
+  let supabaseSkipped = 0;
+  const failures: string[] = [];
+  for (const block of blocks) {
+    if (SUPABASE_MANAGED_ERROR.test(block)) {
+      supabaseSkipped += 1;
+    } else {
+      failures.push(block.replace(/\s+/g, " ").trim().slice(0, 200));
+    }
+  }
+  return { supabaseSkipped, failures };
+}
+
+/**
+ * 两遍恢复(真实首演炸出的设计):
+ * 1. pre-data+data —— 表结构 + 数据。任何错误都是硬失败:数据回不来 = 演练失败。
+ * 2. post-data —— 用户自己的索引/约束/触发器**必须**恢复成功(它们是"备份完整"的
+ *    一部分,一刀切跳过会让坏备份漏网);只有引用 Supabase 托管对象的失败
+ *    (policy TO authenticated、FK → auth.users)才归类为沙箱预期,记入报告而非失败。
+ */
+async function pgRestore(dumpPath: string, connString: string): Promise<PostDataResult> {
   const pgRestoreBin =
     process.env.BACKUPDRILL_PG_RESTORE ||
     (process.env.BACKUPDRILL_PG_DUMP
       ? process.env.BACKUPDRILL_PG_DUMP.replace(/pg_dump$/, "pg_restore")
       : "pg_restore");
-  await new Promise<void>((resolve, reject) => {
-    const proc = spawn(
-      pgRestoreBin,
-      [
-        "--clean",
-        "--if-exists",
-        "--no-owner",
-        "--no-privileges",
-        // 只恢复表结构 + 数据,跳过 post-data(索引/FK 约束/RLS policy/触发器)。
-        // Supabase 库的 post-data 必然引用 Supabase 托管的对象(policy 的
-        // TO authenticated、FK 指向 auth.users),在裸 Postgres 容器里不可能存在,
-        // 逐条必炸(真实首个演练即撞上)。演练的主张是"数据能回来并对上 manifest"
-        // (表数 + 逐表行数 + 校验和),这由 pre-data+data 完整承载。
-        // 已知局限:视图体若引用 auth.*(pre-data、创建即校验)仍会失败;
-        // 后续如需支持,方案是容器内预置 auth schema 桩。
-        "--section=pre-data",
-        "--section=data",
-        "--dbname",
-        connString,
-        dumpPath,
-      ],
-      { stdio: ["ignore", "ignore", "pipe"] }
-    );
-    let stderr = "";
-    proc.stderr.on("data", (d: Buffer) => (stderr += d.toString()));
-    proc.on("error", reject);
-    proc.on("close", (code) =>
-      // pg_restore 对无害告警会返回非 0;仅在明确 error 时判失败
-      code === 0 || !/error:/i.test(stderr)
-        ? resolve()
-        : reject(new Error(`pg_restore failed: ${stderr.trim()}`))
-    );
-  });
+  const common = ["--no-owner", "--no-privileges", "--dbname", connString, dumpPath];
+
+  const first = await spawnPgRestore(pgRestoreBin, [
+    "--clean",
+    "--if-exists",
+    "--section=pre-data",
+    "--section=data",
+    ...common,
+  ]);
+  // pg_restore 对无害告警会返回非 0;仅在明确 error 时判失败
+  if (first.code !== 0 && /error:/i.test(first.stderr)) {
+    throw new Error(`pg_restore failed: ${first.stderr.trim()}`);
+  }
+
+  const second = await spawnPgRestore(pgRestoreBin, ["--section=post-data", ...common]);
+  return classifyPostDataErrors(second.stderr);
 }
 
 // ── 校验 ────────────────────────────────────────────────────────────
@@ -269,9 +300,21 @@ export async function drillDump(
   try {
     const started = Date.now();
     log.step("Restoring into ephemeral Postgres…");
-    await pgRestore(dumpPath, pg.connString);
+    const postData = await pgRestore(dumpPath, pg.connString);
     const restoreSeconds = Math.round((Date.now() - started) / 100) / 10;
     checks.push({ name: "pg_restore", pass: true, detail: `completed in ${restoreSeconds}s` });
+    // 用户自己的 post-data 对象(索引/约束/触发器)必须全部恢复;Supabase 托管对象
+    // 的沙箱预期跳过如实写进报告(演练不假装它们恢复了)。
+    checks.push({
+      name: "post-data objects",
+      pass: postData.failures.length === 0,
+      detail:
+        postData.failures.length > 0
+          ? `${postData.failures.length} failed: ${postData.failures[0]}`
+          : postData.supabaseSkipped > 0
+            ? `user objects restored; ${postData.supabaseSkipped} Supabase-managed object(s) skipped (auth schema/roles do not exist in the drill sandbox)`
+            : "all post-data objects restored",
+    });
 
     const verify = await verifyRestored(pg.connString, manifest);
     checks.push(...verify.checks);
