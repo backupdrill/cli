@@ -71,13 +71,19 @@ async function startEphemeralPostgres(major: number): Promise<Ephemeral> {
     const port = portOut.stdout.trim().split(":").pop()!.trim();
     const connString = `postgresql://postgres:drill@127.0.0.1:${port}/postgres`;
 
-    // 等就绪(容器内 pg_isready),最多 ~30s
+    // 等就绪(容器内 pg_isready),最多 ~30s。
+    // 必须 -h 127.0.0.1 强制走 TCP:官方镜像 initdb 阶段先起一个只听 unix socket 的临时
+    // 服务跑初始化,默认(socket)检查在该阶段就通过,pg_restore 随后连 TCP 正撞上
+    // 临时服务停止/正式服务重启的窗口 → "server closed the connection unexpectedly"。
+    // 阶段一不听 TCP,所以 TCP 检查首次通过 = 正式服务已就绪。
     for (let i = 0; i < 60; i++) {
       try {
         await execFileAsync("docker", [
           "exec",
           containerId,
           "pg_isready",
+          "-h",
+          "127.0.0.1",
           "-U",
           "postgres",
           "-q",
@@ -108,6 +114,15 @@ async function pgRestore(dumpPath: string, connString: string): Promise<void> {
         "--if-exists",
         "--no-owner",
         "--no-privileges",
+        // 只恢复表结构 + 数据,跳过 post-data(索引/FK 约束/RLS policy/触发器)。
+        // Supabase 库的 post-data 必然引用 Supabase 托管的对象(policy 的
+        // TO authenticated、FK 指向 auth.users),在裸 Postgres 容器里不可能存在,
+        // 逐条必炸(真实首个演练即撞上)。演练的主张是"数据能回来并对上 manifest"
+        // (表数 + 逐表行数 + 校验和),这由 pre-data+data 完整承载。
+        // 已知局限:视图体若引用 auth.*(pre-data、创建即校验)仍会失败;
+        // 后续如需支持,方案是容器内预置 auth schema 桩。
+        "--section=pre-data",
+        "--section=data",
         "--dbname",
         connString,
         dumpPath,
