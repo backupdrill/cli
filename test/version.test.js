@@ -11,6 +11,8 @@ const CASES = [
   ["Debian / PGDG (prod)", "pg_dump (PostgreSQL) 17.10 (Debian 17.10-1.pgdg120+1)", 17],
   ["Ubuntu suffix", "pg_dump (PostgreSQL) 16.4 (Ubuntu 16.4-1.pgdg22.04+1)", 16],
   ["no suffix, older major", "pg_dump (PostgreSQL) 15.8", 15],
+  // fallback 分支:没有 "(PostgreSQL)" 标记的非常规构建,取第一个带点的版本号
+  ["non-standard build (fallback path)", "pg_dump 17.10 custom-build", 17],
 ];
 
 for (const [label, raw, expected] of CASES) {
