@@ -6,7 +6,7 @@ import { Client } from "pg";
 import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
 import { Upload } from "@aws-sdk/lib-storage";
 import type { BackupConfig } from "./config.js";
-import type { Manifest, TableStat } from "./manifest.js";
+import type { ExtensionInfo, Manifest, TableStat } from "./manifest.js";
 import { syncStorage } from "./storage.js";
 import { log } from "./log.js";
 import { TOOL_VERSION } from "./version.js";
@@ -55,6 +55,7 @@ interface DbFacts {
   serverVersion: string;
   serverVersionNum: number;
   tables: TableStat[];
+  extensions: ExtensionInfo[];
 }
 
 async function inspectDatabase(
@@ -90,6 +91,15 @@ async function inspectDatabase(
         order by 1, 2`,
       [schemas]
     );
+    // 非内置扩展清单(排除必装的 plpgsql):--schema 转储不含 CREATE EXTENSION,
+    // 演练沙箱要靠它在恢复前把扩展类型(如 vector)装回来
+    const extensions = await client.query<ExtensionInfo>(
+      `select e.extname as name, e.extversion as version, n.nspname as schema
+         from pg_extension e
+         join pg_namespace n on n.oid = e.extnamespace
+        where e.extname <> 'plpgsql'
+        order by e.extname`
+    );
     return {
       serverVersion: version.rows[0].server_version,
       serverVersionNum: Number(versionNum.rows[0].server_version_num),
@@ -98,6 +108,7 @@ async function inspectDatabase(
         name: r.name,
         estimatedRows: Number(r.estimated_rows),
       })),
+      extensions: extensions.rows,
     };
   } finally {
     await client.end();
@@ -249,6 +260,7 @@ export async function runBackup(config: BackupConfig): Promise<Manifest> {
       tableCount: db.tables.length,
       estimatedRowTotal: db.tables.reduce((n, t) => n + t.estimatedRows, 0),
       tables: db.tables,
+      extensions: db.extensions,
     },
     dump: { key: dumpKey, format: "custom", bytes, sha256 },
     storage: storageResult,

@@ -126,6 +126,72 @@ test(
   }
 );
 
+test(
+  "drill: restores a backup with pgvector columns (extension manifest → pgvector sandbox image)",
+  { skip: canRun ? false : "requires Docker + pg_dump" },
+  async () => {
+    // 源库按 Supabase 惯例把 pgvector 装在 "extensions" schema:dump 里的列类型是
+    // 限定名 extensions.vector(3),沙箱必须先建同名 schema 并把扩展装进去才解析得到。
+    // 曾经的硬崩回归:--schema=public 转储不含 CREATE EXTENSION,alpine 沙箱又没有
+    // pgvector,含 vector 列的库演练必然裸报 "pg_restore failed"。
+    const { stdout: idOut } = await x("docker", [
+      "run", "-d", "--rm", "-e", "POSTGRES_PASSWORD=seed",
+      "-p", "127.0.0.1:0:5432", "pgvector/pgvector:pg17",
+    ]);
+    const id = idOut.trim();
+    const dumpPath = join(tmpdir(), `bd-test-vec-${id.slice(0, 8)}.pgcustom`);
+    let sha, bytes;
+    try {
+      const { stdout: portOut } = await x("docker", ["port", id, "5432/tcp"]);
+      const port = portOut.trim().split(":").pop().trim();
+      for (let i = 0; i < 60; i++) {
+        try {
+          await x("docker", ["exec", id, "pg_isready", "-h", "127.0.0.1", "-U", "postgres", "-q"]);
+          break;
+        } catch {
+          await new Promise((r) => setTimeout(r, 500));
+        }
+      }
+      await x("docker", [
+        "exec", id, "psql", "-U", "postgres", "-c",
+        "create schema extensions; create extension vector schema extensions; " +
+        "create table items(id int primary key, embedding extensions.vector(3)); " +
+        "insert into items values (1,'[1,2,3]'),(2,'[4,5,6]');",
+      ]);
+      const conn = `postgresql://postgres:seed@127.0.0.1:${port}/postgres`;
+      await x(pgDump, [
+        "--format=custom", "--no-owner", "--no-privileges", "--schema=public",
+        "--dbname", conn, "-f", dumpPath,
+      ]);
+      const buf = readFileSync(dumpPath);
+      bytes = buf.length;
+      sha = createHash("sha256").update(buf).digest("hex");
+    } finally {
+      await x("docker", ["rm", "-f", id]).catch(() => {});
+    }
+
+    const manifest = {
+      tool: "backupdrill-cli", toolVersion: "test", createdAt: "2026-07-04T00:00:00.000Z",
+      projectName: "test",
+      database: {
+        serverVersion: "17.4", pgDumpVersion: "test", schemas: ["public"],
+        tableCount: 1, estimatedRowTotal: 2,
+        tables: [{ schema: "public", name: "items", estimatedRows: 2 }],
+        extensions: [{ name: "vector", version: "0.8.5", schema: "extensions" }],
+      },
+      dump: { key: "seed/dump.pgcustom", format: "custom", bytes, sha256: sha },
+      storage: null,
+    };
+
+    const report = await drillDump(dumpPath, manifest, "vector");
+    assert.equal(report.pass, true, "vector-column backup should drill PASS");
+    assert.equal(report.restoredRowTotal, 2);
+    const ext = report.checks.find((c) => c.name === "sandbox extensions");
+    assert.ok(ext?.pass, "extension pre-install must be reported");
+    assert.match(ext.detail, /vector/);
+  }
+);
+
 // 纯单测(无需 Docker):post-data 错误分类——Supabase 托管失败 vs 用户对象失败
 test("classifyPostDataErrors: supabase-managed vs user failures", () => {
   const stderr = [

@@ -18,7 +18,7 @@ export type {
   StorageConfig,
   SupabaseStorageConfig,
 } from "./config.js";
-export type { Manifest, StorageFile, TableStat } from "./manifest.js";
+export type { ExtensionInfo, Manifest, StorageFile, TableStat } from "./manifest.js";
 export type { DrillReport, DrillCheck } from "./drill.js";
 export type { RestoreResult } from "./restore.js";
 export type { EgressPricing, EgressProjection } from "./estimate.js";
