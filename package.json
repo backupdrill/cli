@@ -1,6 +1,6 @@
 {
   "name": "backupdrill",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Open-source CLI to back up a Supabase project — Postgres database and Storage files — to your own S3/R2/B2 bucket, with a checksummed manifest.",
   "type": "module",
   "bin": {
@@ -33,17 +33,27 @@
   },
   "keywords": [
     "supabase",
+    "supabase-backup",
     "backup",
+    "database-backup",
     "postgres",
+    "postgresql",
     "pg_dump",
+    "restore",
     "s3",
+    "cloudflare-r2",
+    "backblaze-b2",
     "disaster-recovery"
   ],
   "license": "MIT",
+  "author": "BackupDrill <support@backupdrill.com> (https://backupdrill.com)",
   "homepage": "https://backupdrill.com",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/backupdrill/cli.git"
+  },
+  "bugs": {
+    "url": "https://github.com/backupdrill/cli/issues"
   },
   "dependencies": {
     "@aws-sdk/client-s3": "^3.658.0",
