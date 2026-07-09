@@ -22,7 +22,7 @@ const program = new Command();
 program
   .name("backupdrill")
   .description(
-    "Back up a Supabase project — Postgres database (and, soon, Storage files) — " +
+    "Back up a Supabase project — Postgres database and Storage files — " +
       "to your own S3/R2/B2 bucket, with a checksummed manifest.\n\n" +
       "Want scheduling, restore drills, and alerts? → https://backupdrill.com"
   )

@@ -1,10 +1,10 @@
 # backupdrill
 
-Open-source CLI to back up a **Supabase** project to **your own** S3/R2/B2 bucket — the Postgres database now, Storage files next — with a checksummed `manifest.json` so you can prove what was captured.
+Open-source CLI to back up a **Supabase** project to **your own** S3/R2/B2 bucket — the Postgres database **and** Storage files, together — with a checksummed `manifest.json` so you can prove what was captured.
 
 Backups stream through the CLI on your machine (or your CI) straight to your bucket. **Your data never touches our servers, because there are none — this is just a CLI.**
 
-> Want this on a schedule, with **restore drills that prove your backup actually restores**, plus Storage-file backup and alerts? That's the hosted service → **[backupdrill.com](https://backupdrill.com)**. This CLI is the DIY layer; the cloud adds scheduling, drills, alerting, and reports on top.
+> Want this on a schedule, with **restore drills that prove your backup actually restores**, plus alerts and reports? That's the hosted service → **[backupdrill.com](https://backupdrill.com)**. This CLI is the DIY layer; the cloud adds scheduling, drills, alerting, and reports on top.
 
 ## Why
 
