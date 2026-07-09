@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { createHash } from "node:crypto";
-import { readFileSync } from "node:fs";
+import { readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { drillDump, classifyPostDataErrors, postDataResult } from "../dist/drill.js";
@@ -189,6 +189,41 @@ test(
     const ext = report.checks.find((c) => c.name === "sandbox extensions");
     assert.ok(ext?.pass, "extension pre-install must be reported");
     assert.match(ext.detail, /vector/);
+  }
+);
+
+// 回归(adversarial review):沙箱装不上扩展 + 与扩展无关的硬失败(损坏的归档)
+// → 必须抛原始错误;不许归因沙箱,更不许断言"备份没事"
+test(
+  "drill: corrupt archive with unavailable extensions throws the original error",
+  { skip: canRun ? false : "requires Docker + pg_dump" },
+  async () => {
+    const dumpPath = join(tmpdir(), `bd-test-corrupt-${Date.now()}.pgcustom`);
+    writeFileSync(dumpPath, "this is not a pg_dump custom archive");
+    const manifest = {
+      tool: "backupdrill-cli", toolVersion: "test", createdAt: "2026-07-04T00:00:00.000Z",
+      projectName: "test",
+      database: {
+        serverVersion: "17.4", pgDumpVersion: "test", schemas: ["public"],
+        tableCount: 0, estimatedRowTotal: 0, tables: [],
+        // alpine 沙箱必然装不上的托管扩展 → unavailable 非空,复现误归因前提
+        extensions: [{ name: "pg_graphql", version: "1.5.11", schema: "graphql" }],
+      },
+      dump: { key: "seed/dump.pgcustom", format: "custom", bytes: 36, sha256: "irrelevant" },
+      storage: null,
+    };
+    await assert.rejects(
+      () => drillDump(dumpPath, manifest, "corrupt"),
+      (err) => {
+        assert.match(err.message, /pg_restore failed/, "the original hard failure must surface");
+        assert.doesNotMatch(
+          err.message,
+          /likely because|sandbox/i,
+          "an extension-unrelated failure must not be attributed to the sandbox"
+        );
+        return true;
+      }
+    );
   }
 );
 
