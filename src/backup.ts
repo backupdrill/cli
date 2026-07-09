@@ -70,16 +70,24 @@ async function inspectDatabase(
     const versionNum = await client.query<{ server_version_num: string }>(
       "show server_version_num"
     );
-    // 只统计将被 dump 的 schema,manifest 才与转储内容一致
+    // 只统计将被 dump 的 schema,manifest 才与转储内容一致。
+    // 口径 = pg_class relkind in ('r','p','m'):普通表 + 分区父表 + 物化视图,
+    // 与 pg_dump 实际转储的关系集合一致,且必须与 drill 校验端(verifyRestored)
+    // 用同一查询——两端口径不同曾导致含 matview 的库演练必然误报 FAIL。
+    // 行数估算仍取 n_live_tup(planner 统计);分区父表本身不存行,天然为 0。
     const tables = await client.query<{
       schema: string;
       name: string;
       estimated_rows: string;
     }>(
-      `select schemaname as schema, relname as name, n_live_tup as estimated_rows
-         from pg_stat_user_tables
-        where schemaname = any($1::text[])
-        order by schemaname, relname`,
+      `select n.nspname as schema, c.relname as name,
+              coalesce(s.n_live_tup, 0) as estimated_rows
+         from pg_class c
+         join pg_namespace n on n.oid = c.relnamespace
+         left join pg_stat_all_tables s on s.relid = c.oid
+        where c.relkind in ('r', 'p', 'm')
+          and n.nspname = any($1::text[])
+        order by 1, 2`,
       [schemas]
     );
     return {
