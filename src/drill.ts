@@ -133,8 +133,9 @@ async function installExtensions(
     for (const ext of extensions) {
       try {
         await client.query(`create schema if not exists ${quoteIdent(ext.schema)}`);
+        // CASCADE 自动带上依赖扩展,免受 manifest 里的安装顺序摆布
         await client.query(
-          `create extension if not exists ${quoteIdent(ext.name)} schema ${quoteIdent(ext.schema)}`
+          `create extension if not exists ${quoteIdent(ext.name)} schema ${quoteIdent(ext.schema)} cascade`
         );
       } catch {
         unavailable.push(ext.name);
