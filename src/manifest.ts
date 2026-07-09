@@ -13,6 +13,18 @@ export interface TableStat {
   estimatedRows: number;
 }
 
+/**
+ * 源库安装的非内置扩展(pg_extension,排除必装的 plpgsql)。
+ * --schema=public 的转储不含 CREATE EXTENSION,但表定义会引用扩展类型
+ * (如 extensions.vector)——沙箱恢复前必须按这份清单把扩展装进**同名 schema**,
+ * dump 里的限定名才解析得到(Supabase 惯例装在 "extensions" schema)。
+ */
+export interface ExtensionInfo {
+  name: string;
+  version: string;
+  schema: string;
+}
+
 export interface Manifest {
   tool: "backupdrill-cli";
   toolVersion: string;
@@ -25,6 +37,8 @@ export interface Manifest {
     tableCount: number;
     estimatedRowTotal: number;
     tables: TableStat[];
+    // 可选 = 向后兼容:0.1.1 及更早的 manifest 没有这个字段,演练行为保持原样
+    extensions?: ExtensionInfo[];
   };
   dump: {
     key: string; // 桶内对象键

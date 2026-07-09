@@ -6,7 +6,7 @@ import { promisify } from "node:util";
 import { Client } from "pg";
 import { S3Client } from "@aws-sdk/client-s3";
 import type { BackupConfig } from "./config.js";
-import type { Manifest } from "./manifest.js";
+import type { ExtensionInfo, Manifest } from "./manifest.js";
 import {
   targetClient,
   resolveSnapshot,
@@ -44,8 +44,18 @@ interface Ephemeral {
   connString: string;
 }
 
-async function startEphemeralPostgres(major: number): Promise<Ephemeral> {
-  const image = `postgres:${major}-alpine`;
+/**
+ * 沙箱镜像选择:alpine 镜像只带 contrib 扩展,装不了 pgvector——含 vector 列的
+ * 备份在裸镜像里恢复必然硬崩("type vector does not exist")。manifest 记录了
+ * vector 时换用 pgvector 官方镜像(同 major),其余维持轻量 alpine。
+ */
+function sandboxImage(manifest: Manifest): string {
+  const major = parseInt(manifest.database.serverVersion, 10);
+  const hasVector = (manifest.database.extensions ?? []).some((e) => e.name === "vector");
+  return hasVector ? `pgvector/pgvector:pg${major}` : `postgres:${major}-alpine`;
+}
+
+async function startEphemeralPostgres(image: string): Promise<Ephemeral> {
   log.step(`Starting ephemeral ${image}…`);
   const { stdout } = await execFileAsync("docker", [
     "run",
@@ -98,6 +108,42 @@ async function startEphemeralPostgres(major: number): Promise<Ephemeral> {
     await execFileAsync("docker", ["rm", "-f", containerId]).catch(() => {});
     throw error;
   }
+}
+
+function quoteIdent(name: string): string {
+  return `"${name.replace(/"/g, '""')}"`;
+}
+
+/**
+ * 恢复前把 manifest 记录的扩展装进沙箱(--schema 转储不含 CREATE EXTENSION)。
+ * 必须装进与源库相同的 schema:dump 里的类型是限定名(如 extensions.vector)。
+ * 装不上的扩展如实收集返回,**不在这里失败**——Supabase 项目普遍装着沙箱镜像
+ * 没有的托管扩展(pg_graphql、supabase_vault…),public 转储通常并不引用它们;
+ * 只有恢复真的因此失败时才升级为分类错误(见 drillDump)。
+ */
+async function installExtensions(
+  connString: string,
+  extensions: ExtensionInfo[]
+): Promise<string[]> {
+  if (!extensions.length) return [];
+  const client = new Client({ connectionString: connString });
+  await client.connect();
+  const unavailable: string[] = [];
+  try {
+    for (const ext of extensions) {
+      try {
+        await client.query(`create schema if not exists ${quoteIdent(ext.schema)}`);
+        await client.query(
+          `create extension if not exists ${quoteIdent(ext.name)} schema ${quoteIdent(ext.schema)}`
+        );
+      } catch {
+        unavailable.push(ext.name);
+      }
+    }
+  } finally {
+    await client.end();
+  }
+  return unavailable;
 }
 
 /** post-data 第二遍恢复的结果:用户对象失败 vs Supabase 托管对象的沙箱预期跳过。 */
@@ -345,12 +391,41 @@ export async function drillDump(
   preChecks: DrillCheck[] = []
 ): Promise<DrillReport> {
   const checks: DrillCheck[] = [...preChecks];
-  const major = parseInt(manifest.database.serverVersion, 10);
-  const pg = await startEphemeralPostgres(major);
+  const pg = await startEphemeralPostgres(sandboxImage(manifest));
   try {
+    // 旧 manifest(≤0.1.1)没有 extensions 字段 → 不装任何扩展,行为与从前一致
+    const extensions = manifest.database.extensions ?? [];
+    const unavailable = await installExtensions(pg.connString, extensions);
+    if (extensions.length) {
+      // 装不上 ≠ 演练失败:扩展本体不在 public 转储里,没丢任何已备份的数据;
+      // 若恢复真的需要它,下面的 pgRestore 会失败并给出分类错误
+      checks.push({
+        name: "sandbox extensions",
+        pass: true,
+        detail: unavailable.length
+          ? `installed ${extensions.length - unavailable.length}/${extensions.length}; ` +
+            `sandbox image cannot install: ${unavailable.join(", ")}`
+          : `installed ${extensions.map((e) => e.name).join(", ")}`,
+      });
+    }
+
     const started = Date.now();
     log.step("Restoring into ephemeral Postgres…");
-    const postData = await pgRestore(dumpPath, pg.connString);
+    let postData: PostDataResult;
+    try {
+      postData = await pgRestore(dumpPath, pg.connString);
+    } catch (error) {
+      // 沙箱装不上扩展 + 恢复失败 → 明确归因到沙箱环境,不伪装成备份损坏。
+      // 原始错误全文保留:失败也可能另有原因,不许掩盖
+      if (unavailable.length) {
+        throw new Error(
+          `sandbox missing extension(s) ${unavailable.join(", ")} — the drill sandbox ` +
+            `image cannot install them, so the restore failed there; the backup itself ` +
+            `is fine. Original error: ${(error as Error).message}`
+        );
+      }
+      throw error;
+    }
     const restoreSeconds = Math.round((Date.now() - started) / 100) / 10;
     checks.push({ name: "pg_restore", pass: true, detail: `completed in ${restoreSeconds}s` });
     // 用户自己的 post-data 对象(索引/约束/触发器)必须全部恢复;Supabase 托管对象
