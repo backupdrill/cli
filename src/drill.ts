@@ -200,23 +200,49 @@ async function verifyRestored(
   await client.connect();
   try {
     const schemas = manifest.database.schemas;
-    const tablesRes = await client.query<{ schema: string; name: string }>(
-      `select schemaname as schema, tablename as name
-         from pg_tables where schemaname = any($1::text[])`,
+    // 口径必须与 manifest 统计端(backup.ts inspectDatabase)完全一致:
+    // pg_class relkind in ('r','p','m')。此前这里用 pg_tables(不含 matview),
+    // manifest 用 pg_stat_user_tables(含 matview)——任何有 matview 的库
+    // 演练必然误报"表数不符 + 缺表"。
+    const tablesRes = await client.query<{
+      schema: string;
+      name: string;
+      kind: string;
+      populated: boolean;
+    }>(
+      `select n.nspname as schema, c.relname as name,
+              c.relkind as kind, c.relispopulated as populated
+         from pg_class c
+         join pg_namespace n on n.oid = c.relnamespace
+        where c.relkind in ('r', 'p', 'm')
+          and n.nspname = any($1::text[])
+        order by 1, 2`,
       [schemas]
     );
     const restoredTables = tablesRes.rows;
 
     // 逐表精确计数(演练要证明数据真回来了,估算值不够)
     const counts = new Map<string, number>();
+    const unpopulatedMatviews = new Set<string>();
     let rowTotal = 0;
     for (const t of restoredTables) {
+      const key = `${t.schema}.${t.name}`;
+      // 未填充的 matview 无法 count(*)(Postgres 直接报错)。它要么备份时就没数据
+      // (dump 里本来就没有 REFRESH),要么 REFRESH 在 post-data 阶段失败——后者已由
+      // post-data 检查如实记录,这里按 0 行处理即可。
+      if (t.kind === "m" && !t.populated) {
+        counts.set(key, 0);
+        unpopulatedMatviews.add(key);
+        continue;
+      }
       const c = await client.query<{ n: string }>(
         `select count(*)::bigint as n from "${t.schema}"."${t.name}"`
       );
       const n = Number(c.rows[0].n);
-      counts.set(`${t.schema}.${t.name}`, n);
-      rowTotal += n;
+      counts.set(key, n);
+      // 分区父表的 count(*) 是子分区行的总和,子分区又各自计一次;
+      // rowTotal 只累计叶子关系,避免翻倍。
+      if (t.kind !== "p") rowTotal += n;
     }
 
     const checks: DrillCheck[] = [];
@@ -242,9 +268,15 @@ async function verifyRestored(
           : `missing: ${missing.map((t) => `${t.schema}.${t.name}`).join(", ")}`,
     });
 
-    // 3. 备份时有数据的表,还原后不能是空的(最阴险的"备了半个库"故障)
+    // 3. 备份时有数据的表,还原后不能是空的(最阴险的"备了半个库"故障)。
+    // 未填充的 matview 豁免:REFRESH 失败已由 post-data 检查裁决(用户对象失败
+    // = 演练失败,Supabase 托管依赖 = 预期跳过),这里再报一次会把环境预期
+    // 误标成备份损坏。
     const emptied = manifest.database.tables.filter(
-      (t) => t.estimatedRows > 0 && (counts.get(`${t.schema}.${t.name}`) ?? 0) === 0
+      (t) =>
+        t.estimatedRows > 0 &&
+        !unpopulatedMatviews.has(`${t.schema}.${t.name}`) &&
+        (counts.get(`${t.schema}.${t.name}`) ?? 0) === 0
     );
     checks.push({
       name: "populated tables came back",

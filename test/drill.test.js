@@ -55,7 +55,14 @@ test(
         // Supabase 库的托管接线(演练沙箱没有该角色 → 必须被归类为预期跳过,而非失败)
         "create table demo(id int primary key, v text); insert into demo select g, 'row'||g from generate_series(1,100) g; " +
         "create role authenticated nologin; alter table demo enable row level security; " +
-        "create policy demo_read on demo for select to authenticated using (true);",
+        "create policy demo_read on demo for select to authenticated using (true); " +
+        // matview + 分区表 = 曾经的必然 FAIL 回归:manifest 统计端含它们而校验端不含,
+        // 表数不符 + 误报缺表。修复后两端同口径,这个组合必须 PASS。
+        "create materialized view demo_mv as select id, v from demo where id <= 10; " +
+        "create table parted(id int not null, v text) partition by range(id); " +
+        "create table parted_a partition of parted for values from (0) to (50); " +
+        "create table parted_b partition of parted for values from (50) to (200); " +
+        "insert into parted select g, 'p'||g from generate_series(1,100) g;",
       ]);
       const conn = `postgresql://postgres:seed@127.0.0.1:${port}/postgres`;
       await x(pgDump, [
@@ -69,23 +76,32 @@ test(
       await x("docker", ["rm", "-f", id]).catch(() => {});
     }
 
+    // 注意:故意不带 extensions 字段 = 0.1.1 及更早的旧 manifest,行为必须不变
     const manifest = {
       tool: "backupdrill-cli", toolVersion: "test", createdAt: "2026-07-04T00:00:00.000Z",
       projectName: "test",
       database: {
         serverVersion: "17.4", pgDumpVersion: "test", schemas: ["public"],
-        tableCount: 1, estimatedRowTotal: 100,
-        tables: [{ schema: "public", name: "demo", estimatedRows: 100 }],
+        // 口径 = 普通表 + matview + 分区父表 + 分区子表(与备份统计端一致);
+        // 分区父表不存行(estimatedRows 0),行数落在子分区上(1..49 / 50..100)
+        tableCount: 5, estimatedRowTotal: 210,
+        tables: [
+          { schema: "public", name: "demo", estimatedRows: 100 },
+          { schema: "public", name: "demo_mv", estimatedRows: 10 },
+          { schema: "public", name: "parted", estimatedRows: 0 },
+          { schema: "public", name: "parted_a", estimatedRows: 49 },
+          { schema: "public", name: "parted_b", estimatedRows: 51 },
+        ],
       },
       dump: { key: "seed/dump.pgcustom", format: "custom", bytes, sha256: sha },
       storage: null,
     };
 
-    // 2. PASS:好备份应通过,且恢复出 100 行 / 1 表
+    // 2. PASS:好备份应通过;行数 = demo 100 + matview 10 + 分区叶子 100(父表不重复计)
     const good = await drillDump(dumpPath, manifest, "good");
     assert.equal(good.pass, true, "good backup should pass");
-    assert.equal(good.restoredRowTotal, 100);
-    assert.equal(good.restoredTableCount, 1);
+    assert.equal(good.restoredRowTotal, 210);
+    assert.equal(good.restoredTableCount, 5);
     // post-data 语义:用户的 PK 恢复成功,Supabase 式 policy(TO authenticated)被
     // 归类为沙箱预期跳过——两边都不许把演练翻成失败,也不许假装没跳过
     const pd = good.checks.find((c) => c.name === "post-data objects");
@@ -97,7 +113,7 @@ test(
       ...manifest,
       database: {
         ...manifest.database,
-        tableCount: 2,
+        tableCount: manifest.database.tableCount + 1,
         tables: [...manifest.database.tables, { schema: "public", name: "ghost", estimatedRows: 5 }],
       },
     };

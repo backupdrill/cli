@@ -3,10 +3,12 @@
  * 云版演练靠它做校验(表数量、行数对比、体积异常告警);开源侧至少让用户能核对
  * "这次到底备了什么、有多大、校验和是多少"。
  */
+// "表"的口径 = pg_class relkind in ('r','p','m'):普通表 + 分区父表 + 物化视图。
+// 备份统计端与演练校验端必须共用这一口径,否则含 matview/分区的库会误报。
 export interface TableStat {
   schema: string;
   name: string;
-  // 来自 pg_stat_user_tables.n_live_tup:是估算值(planner 统计),不是精确 count(*)。
+  // 来自 n_live_tup:是估算值(planner 统计),不是精确 count(*);分区父表恒为 0。
   // 对"体积/行数骤降"这类异常检测足够;需要精确值时云版会在演练里重新计数。
   estimatedRows: number;
 }
