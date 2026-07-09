@@ -165,6 +165,12 @@ function spawnPgRestore(
   });
 }
 
+// 只有这些特征说明恢复失败源于沙箱缺扩展(限定类型/schema 解析不到、扩展装不上)。
+// 真实 Supabase 项目的 manifest 几乎必然含沙箱装不上的托管扩展(pg_graphql 等),
+// 若不按特征过滤,任何硬失败(归档损坏、OOM…)都会被误归因到沙箱。
+const MISSING_EXTENSION_ERROR =
+  /type "[^"]+" does not exist|schema "[^"]+" does not exist|extension "[^"]+" is not available/i;
+
 // 演练沙箱是裸 Postgres,Supabase 托管的 schema/角色必然缺席。post-data 里
 // 引用它们的失败是"环境预期",不是备份坏了;其余失败才是演练要抓的。
 const SUPABASE_MANAGED_ERROR =
@@ -415,13 +421,13 @@ export async function drillDump(
     try {
       postData = await pgRestore(dumpPath, pg.connString);
     } catch (error) {
-      // 沙箱装不上扩展 + 恢复失败 → 明确归因到沙箱环境,不伪装成备份损坏。
-      // 原始错误全文保留:失败也可能另有原因,不许掩盖
-      if (unavailable.length) {
+      // 沙箱装不上扩展 + 错误特征命中"缺类型/schema/扩展" → 假设式归因到沙箱环境
+      // (不对备份健康下断言);其余失败与扩展无关,必须原样抛出
+      const message = (error as Error).message;
+      if (unavailable.length && MISSING_EXTENSION_ERROR.test(message)) {
         throw new Error(
-          `sandbox missing extension(s) ${unavailable.join(", ")} — the drill sandbox ` +
-            `image cannot install them, so the restore failed there; the backup itself ` +
-            `is fine. Original error: ${(error as Error).message}`
+          `restore failed; likely because the drill sandbox cannot install ` +
+            `extension(s) ${unavailable.join(", ")}. Original error: ${message}`
         );
       }
       throw error;
@@ -482,16 +488,27 @@ export async function runDrill(
       manifest.dump.key,
       dumpPath
     );
+    const integrityPass = sha === manifest.dump.sha256;
     const preChecks: DrillCheck[] = [
       {
         name: "archive integrity",
-        pass: sha === manifest.dump.sha256,
-        detail:
-          sha === manifest.dump.sha256
-            ? `sha256 matches (${sha.slice(0, 12)}…)`
-            : `sha256 MISMATCH — got ${sha.slice(0, 12)}…, manifest ${manifest.dump.sha256.slice(0, 12)}…`,
+        pass: integrityPass,
+        detail: integrityPass
+          ? `sha256 matches (${sha.slice(0, 12)}…)`
+          : `sha256 MISMATCH — got ${sha.slice(0, 12)}…, manifest ${manifest.dump.sha256.slice(0, 12)}…`,
       },
     ];
+    // 归档校验和不符 = 演练已经 FAIL,继续恢复只会产生误导性失败;短路如实报告
+    if (!integrityPass) {
+      return {
+        snapshot,
+        pass: false,
+        checks: preChecks,
+        restoreSeconds: 0,
+        restoredTableCount: 0,
+        restoredRowTotal: 0,
+      };
+    }
 
     // Storage 文件完整性(备份含 Storage 时才校验)
     if (manifest.storage && manifest.storage.files.length) {
