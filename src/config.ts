@@ -92,6 +92,15 @@ async function fromFile(path: string): Promise<RawConfig> {
   }
 }
 
+// spread 里显式的 undefined 会覆盖前一层的值(CLI 未传的 flag 正是 undefined),
+// 合并前必须剔除,否则 env/配置文件里的 storage 配置会被整体清空。
+function definedOnly<T extends object>(obj: T | undefined): Partial<T> {
+  if (!obj) return {};
+  return Object.fromEntries(
+    Object.entries(obj).filter(([, value]) => value !== undefined)
+  ) as Partial<T>;
+}
+
 /** 合并优先级:显式 flag > 环境变量 > 配置文件。 */
 export async function loadConfig(opts: {
   configPath: string;
@@ -107,14 +116,14 @@ export async function loadConfig(opts: {
   const schemas =
     o.schemas ?? env.schemas ?? file.schemas ?? ["public"];
   const storage: Partial<StorageConfig> = {
-    ...file.storage,
-    ...env.storage,
-    ...o.storage,
+    ...definedOnly(file.storage),
+    ...definedOnly(env.storage),
+    ...definedOnly(o.storage),
   };
   const src: Partial<SupabaseStorageConfig> = {
-    ...file.supabaseStorage,
-    ...env.supabaseStorage,
-    ...o.supabaseStorage,
+    ...definedOnly(file.supabaseStorage),
+    ...definedOnly(env.supabaseStorage),
+    ...definedOnly(o.supabaseStorage),
   };
 
   const missing: string[] = [];
