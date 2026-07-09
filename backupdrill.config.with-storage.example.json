@@ -10,5 +10,11 @@
     "secretAccessKey": "PUT-IN-ENV-OR-HERE",
     "prefix": "backupdrill",
     "forcePathStyle": true
+  },
+  "supabaseStorage": {
+    "endpoint": "https://<ref>.storage.supabase.co/storage/v1/s3",
+    "region": "<project-region>",
+    "accessKeyId": "PUT-IN-ENV-OR-HERE",
+    "secretAccessKey": "PUT-IN-ENV-OR-HERE"
   }
 }
