@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import { Transform, type Readable } from "node:stream";
+import { pipeline } from "node:stream/promises";
 import {
   S3Client,
   ListBucketsCommand,
@@ -101,16 +102,25 @@ export async function syncStorage(
           cb(null, chunk);
         },
       });
-      body.pipe(meter);
-
-      await new Upload({
+      // pipeline(而非裸 pipe)才会传播源流错误;否则 Supabase 侧读取中断时
+      // meter 永不 end,Upload.done() 永久挂起。两侧任一失败都终止另一侧。
+      const copy = pipeline(body, meter);
+      const upload = new Upload({
         client: target.client,
         params: {
           Bucket: target.bucket,
           Key: `${target.base}/storage/${bucket}/${obj.key}`,
           Body: meter,
         },
-      }).done();
+      });
+      try {
+        await Promise.all([copy, upload.done()]);
+      } catch (error) {
+        meter.destroy();
+        body.destroy();
+        await upload.abort().catch(() => {});
+        throw error;
+      }
 
       files.push({ bucket, key: obj.key, bytes, sha256: hash.digest("hex") });
       totalBytes += bytes;

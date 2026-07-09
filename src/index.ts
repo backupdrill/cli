@@ -6,6 +6,7 @@ import { runEstimate, type EgressPricing } from "./estimate.js";
 import { runDrill } from "./drill.js";
 import { runRestore } from "./restore.js";
 import { log } from "./log.js";
+import { TOOL_VERSION } from "./version.js";
 
 // Supabase egress 定价表(2026-07-04 核实,来源见 README「Egress & cost」)。
 // 备份流量 100% 未缓存,故用 uncached 单价 $0.09/GB;included 用 uncached 额度。
@@ -25,7 +26,7 @@ program
       "to your own S3/R2/B2 bucket, with a checksummed manifest.\n\n" +
       "Want scheduling, restore drills, and alerts? → https://backupdrill.com"
   )
-  .version(process.env.npm_package_version || "0.1.0");
+  .version(TOOL_VERSION);
 
 program
   .command("backup")

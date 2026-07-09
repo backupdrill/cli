@@ -9,6 +9,7 @@ import type { BackupConfig } from "./config.js";
 import type { Manifest, TableStat } from "./manifest.js";
 import { syncStorage } from "./storage.js";
 import { log } from "./log.js";
+import { TOOL_VERSION } from "./version.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -152,15 +153,18 @@ async function dumpToS3(
   });
   const uploadDone = upload.done();
 
-  // 正确性以 pg_dump 退出码为准:dump 失败则中止上传,绝不把半截转储当成功
+  // 失败双向联动:dump 失败要中止上传(绝不把半截转储当成功);上传失败也必须
+  // 杀掉 pg_dump —— 否则上传侧停止消费后,背压会让 pg_dump 永远阻塞在 stdout
+  // 写入上,调用方(worker 的串行队列)随之永久挂起。Promise.all 会订阅两侧,
+  // 先失败的一方抛出后,另一方稍后的 rejection 也已被视为 handled。
   try {
-    await dumpDone;
+    await Promise.all([dumpDone, uploadDone]);
   } catch (error) {
-    meter.destroy(error as Error);
+    dump.kill("SIGKILL");
+    meter.destroy();
     await upload.abort().catch(() => {});
     throw error;
   }
-  await uploadDone;
 
   return { bytes, sha256: hash.digest("hex") };
 }
@@ -227,7 +231,7 @@ export async function runBackup(config: BackupConfig): Promise<Manifest> {
 
   const manifest: Manifest = {
     tool: "backupdrill-cli",
-    toolVersion: process.env.npm_package_version || "0.1.0",
+    toolVersion: TOOL_VERSION,
     createdAt: new Date().toISOString(),
     projectName: config.projectName,
     database: {
