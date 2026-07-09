@@ -45,9 +45,26 @@ export BACKUPDRILL_S3_SECRET_ACCESS_KEY="…"
 backupdrill backup
 ```
 
+All recognized variables:
+
+| Variable | Purpose | Default |
+|---|---|---|
+| `BACKUPDRILL_DATABASE_URL` | Source connection string (falls back to `DATABASE_URL`) | — (required) |
+| `BACKUPDRILL_PROJECT_NAME` | Readable name used in object keys and the manifest | `supabase` |
+| `BACKUPDRILL_SCHEMAS` | Comma-separated schemas to dump | `public` |
+| `BACKUPDRILL_S3_ENDPOINT` | S3-compatible endpoint (R2/B2/self-hosted; omit for AWS S3) | — |
+| `BACKUPDRILL_S3_REGION` | Destination bucket region | `auto` |
+| `BACKUPDRILL_S3_BUCKET` | Destination bucket | — (required) |
+| `BACKUPDRILL_S3_ACCESS_KEY_ID`, `BACKUPDRILL_S3_SECRET_ACCESS_KEY` | Destination credentials | — (required) |
+| `BACKUPDRILL_S3_PREFIX` | Key prefix inside the bucket | `backupdrill` |
+| `BACKUPDRILL_S3_FORCE_PATH_STYLE` | `true`/`false` — path-style addressing (R2/MinIO) | `true` when an endpoint is set |
+| `BACKUPDRILL_SUPABASE_STORAGE_*` | Storage-file source (endpoint/region/keys/buckets) — see [Backing up Storage files](#backing-up-storage-files-too) | — |
+| `BACKUPDRILL_PG_DUMP` | Path to the `pg_dump` binary to use | `pg_dump` on `PATH` |
+| `BACKUPDRILL_PG_RESTORE` | Path to `pg_restore` (used by `drill` and `restore`) | next to `BACKUPDRILL_PG_DUMP`, else `pg_restore` on `PATH` |
+
 ### Config file
 
-Copy `backupdrill.config.example.json` → `backupdrill.config.json` (it's gitignored) and fill it in. Keep secrets in env vars even when using a file.
+Copy `backupdrill.config.example.json` → `backupdrill.config.json` (it's gitignored) and fill it in. Keep secrets in env vars even when using a file. To also back up Storage files, start from `backupdrill.config.with-storage.example.json` instead — only copy the `supabaseStorage` block once you actually have S3 access keys for your project's Storage.
 
 ```bash
 backupdrill backup --config backupdrill.config.json
@@ -75,7 +92,7 @@ Supabase's own database restore only brings back `storage.objects` **metadata** 
 
 1. Dashboard → Project → **Storage → Settings → S3 Access Keys** → enable the S3 connection and generate an **Access Key ID + Secret Access Key** (these bypass RLS; keep them server-side).
 2. Copy the **endpoint** and **region** from the same page.
-3. Provide them (env shown; config-file keys are `supabaseStorage.*`):
+3. Provide them (env shown; config-file keys are `supabaseStorage.*` — see `backupdrill.config.with-storage.example.json`):
 
 ```bash
 export BACKUPDRILL_SUPABASE_STORAGE_ENDPOINT="https://<ref>.storage.supabase.co/storage/v1/s3"
@@ -120,12 +137,14 @@ backupdrill estimate --plan pro   # measures your DB + Storage, prints the proje
 
 ## Restoring & drilling
 
-Prove a backup is restorable, without touching anything real — `drill` restores the latest snapshot into a throwaway Postgres (needs Docker) and checks it:
+Prove a backup is restorable, without touching anything real — `drill` restores the latest snapshot into a throwaway Postgres and checks it. It needs **Docker** (for the throwaway Postgres) and **`pg_restore`** (same major-version rule as `pg_dump`; set `BACKUPDRILL_PG_RESTORE` if it's not on your `PATH`):
 
 ```bash
 backupdrill drill                    # latest snapshot; add --snapshot <timestamp> to pick one
 backupdrill drill --verify-all-files # also checksum every Storage file, not just a sample
 ```
+
+Backups record your installed Postgres extensions in the manifest, and the drill pre-installs them in the sandbox before restoring — including switching to a pgvector-enabled sandbox image when your database uses `vector` columns.
 
 When you actually need to recover, `restore` puts the database back into a target you name and pulls the Storage files down to a local folder:
 

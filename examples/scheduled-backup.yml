@@ -9,7 +9,9 @@
 # REQUIRED SECRETS (database backup)
 #   BACKUPDRILL_DATABASE_URL          Supabase Session Pooler connection string
 #                                     (Project Settings → Database → Session pooler).
-#                                     Use a read-only role — see the README.
+#                                     The default postgres user works as-is; a
+#                                     read-only role usually fails under RLS —
+#                                     see the README's connection-string section.
 #   BACKUPDRILL_S3_BUCKET             Destination bucket you own (S3 / R2 / B2).
 #   BACKUPDRILL_S3_ACCESS_KEY_ID      Credentials for that destination bucket.
 #   BACKUPDRILL_S3_SECRET_ACCESS_KEY
