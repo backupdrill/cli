@@ -14,6 +14,7 @@ import {
   getObjectText,
   downloadToFile,
 } from "./snapshots.js";
+import { resolvePgRestoreBin } from "./pgbin.js";
 import { log } from "./log.js";
 
 export interface RestoreResult {
@@ -24,11 +25,7 @@ export interface RestoreResult {
 }
 
 function pgRestore(dumpPath: string, targetUrl: string): Promise<void> {
-  const bin =
-    process.env.BACKUPDRILL_PG_RESTORE ||
-    (process.env.BACKUPDRILL_PG_DUMP
-      ? process.env.BACKUPDRILL_PG_DUMP.replace(/pg_dump$/, "pg_restore")
-      : "pg_restore");
+  const bin = resolvePgRestoreBin();
   return new Promise((resolve, reject) => {
     const proc = spawn(
       bin,
