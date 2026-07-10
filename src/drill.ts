@@ -397,7 +397,7 @@ async function verifyStorage(
     detail:
       mismatches.length === 0
         ? `${scope} match their manifest checksums`
-        : `${mismatches.length} of ${scope} failed: ${mismatches.slice(0, 5).join(", ")}`,
+        : `${mismatches.length} failed in ${scope}: ${mismatches.slice(0, 5).join(", ")}`,
   };
 }
 
