@@ -6,7 +6,12 @@ import { createHash } from "node:crypto";
 import { readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { drillDump, classifyPostDataErrors, postDataResult } from "../dist/drill.js";
+import {
+  drillDump,
+  classifyPostDataErrors,
+  postDataResult,
+  sampleStorageFiles,
+} from "../dist/drill.js";
 
 const x = promisify(execFile);
 const pgDump = process.env.BACKUPDRILL_PG_DUMP || "pg_dump";
@@ -258,6 +263,36 @@ test("classifyPostDataErrors: auth.uid in Command but unrelated error → failur
   const r = classifyPostDataErrors(stderr);
   assert.equal(r.supabaseSkipped, 0, "unrelated error must not be classified as a skip");
   assert.equal(r.failures.length, 1);
+});
+
+// 回归:Storage 抽样必须随机——此前恒取 manifest 顺序前 N 个,超过上限的项目里
+// 排序靠后的文件永远不被校验。场景:250 个文件、上限 100。
+test("sampleStorageFiles: caps at n, no duplicates, and varies between drills", () => {
+  const files = Array.from({ length: 250 }, (_, i) => ({ bucket: "b", key: `file-${i}` }));
+
+  const first = sampleStorageFiles(files, 100);
+  assert.equal(first.length, 100, "sample size must equal the cap");
+  assert.equal(
+    new Set(first.map((f) => f.key)).size,
+    100,
+    "sampling must be without replacement (no duplicates)"
+  );
+  const source = new Set(files);
+  assert.ok(first.every((f) => source.has(f)), "every sampled entry must come from the input");
+
+  // 两次演练样本可不同:两次独立均匀抽样撞出同一个 100/250 子集的概率是
+  // 1/C(250,100) ≈ 10^-72,统计上不可能 flaky;只有退化回"确定性取前 N"才会相等。
+  const second = sampleStorageFiles(files, 100);
+  const asSetKey = (s) => s.map((f) => f.key).sort().join(",");
+  assert.notEqual(
+    asSetKey(first),
+    asSetKey(second),
+    "two drills must be able to sample different subsets"
+  );
+
+  // 文件数 ≤ 上限:全量校验,原样返回(不洗牌、不复制)
+  const small = files.slice(0, 100);
+  assert.equal(sampleStorageFiles(small, 100), small);
 });
 
 // 回归(xreview):post-data 非零退出且无可解析错误块 → 通用失败,不许谎报"全部恢复"

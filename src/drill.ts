@@ -22,6 +22,23 @@ const execFileAsync = promisify(execFile);
 // Storage 校验默认抽样上限(避免每次演练重下全部文件产生大量 egress);超限如实记录
 const STORAGE_SAMPLE_CAP = 100;
 
+/**
+ * 无放回随机抽样:部分 Fisher-Yates,只洗出前 n 位(O(n) 次交换,不必全 shuffle)。
+ * 此前恒取 manifest 顺序的前 CAP 个 → 超过 CAP 的项目里排序靠后的文件永远不被校验;
+ * 随机抽样让每次演练覆盖不同子集,损坏的文件长期必然被抽中。
+ * 随机源用 Math.random 足够:演练是一次性进程,无可复现性要求——校验失败的文件名
+ * 会原样列进报告,定位问题不依赖重放同一批样本。
+ */
+export function sampleStorageFiles<T>(files: T[], n: number): T[] {
+  if (files.length <= n) return files;
+  const pool = [...files];
+  for (let i = 0; i < n; i++) {
+    const j = i + Math.floor(Math.random() * (pool.length - i));
+    [pool[i], pool[j]] = [pool[j], pool[i]];
+  }
+  return pool.slice(0, n);
+}
+
 export interface DrillCheck {
   name: string;
   pass: boolean;
@@ -356,7 +373,7 @@ async function verifyStorage(
   verifyAll: boolean
 ): Promise<DrillCheck> {
   const files = manifest.storage!.files;
-  const sample = verifyAll ? files : files.slice(0, STORAGE_SAMPLE_CAP);
+  const sample = verifyAll ? files : sampleStorageFiles(files, STORAGE_SAMPLE_CAP);
   // 备份写入时的键:<snapshot base>/storage/<bucket>/<key>,base 从 dump.key 反推
   const base = manifest.dump.key.replace(/\/dump\.pgcustom$/, "");
   const mismatches: string[] = [];
@@ -369,15 +386,17 @@ async function verifyStorage(
       mismatches.push(`${f.bucket}/${f.key} (unreadable)`);
     }
   }
-  const scope = verifyAll
-    ? `all ${files.length}`
-    : `${sample.length}/${files.length} sampled`;
+  // 抽样时如实说明这是随机样本(N of M);全量(--verify-all-files 或文件数 ≤ 上限)说 all
+  const scope =
+    sample.length === files.length
+      ? `all ${files.length} files`
+      : `random sample of ${sample.length} of ${files.length} files`;
   return {
     name: "storage file integrity",
     pass: mismatches.length === 0,
     detail:
       mismatches.length === 0
-        ? `${scope} files match their manifest checksums`
+        ? `${scope} match their manifest checksums`
         : `${mismatches.length} of ${scope} failed: ${mismatches.slice(0, 5).join(", ")}`,
   };
 }
