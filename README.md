@@ -9,7 +9,7 @@ Backups stream through the CLI on your machine (or your CI) straight to your buc
 ## Why
 
 - Supabase's own database restore only brings back `storage.objects` **metadata**, not your actual Storage files.
-- Pro-plan backups keep 7 days and can't be pulled into your own infrastructure; PITR is $100/mo per project.
+- Pro-plan backups keep 7 days and can't be pulled into your own infrastructure; PITR is $100/month per project.
 - A `pg_dump` you've never restored is a guess.
 
 This CLI gets your database into a bucket **you** control, with a manifest you can check.
@@ -106,19 +106,19 @@ With those set, `backupdrill backup` also copies every Storage file into your bu
 
 ## Egress & cost — read this before scheduling daily backups
 
-A backup pulls data **out** of Supabase, which counts as **egress on your Supabase bill**. Verified rates (2026-07-04, [egress docs](https://supabase.com/docs/guides/platform/manage-your-usage/egress) + [pricing](https://supabase.com/pricing)):
+A backup pulls data **out** of Supabase, which counts as **egress on your Supabase bill**. Verified rates (2026-07-10, [egress docs](https://supabase.com/docs/guides/platform/manage-your-usage/egress) + [pricing](https://supabase.com/pricing)):
 
 - Backup traffic (pg_dump + first-time file downloads) is **uncached egress: $0.09/GB** above your plan's included allowance.
 - Included uncached egress: **Free 5 GB · Pro 250 GB · Team 250 GB** per month.
 - **Spend Cap is ON by default (Pro/Team).** If a backup pushes you past the quota, Supabase **throttles your whole project's egress** for the rest of the month and the backup fails — turn Spend Cap OFF to be billed the overage instead.
-- **Free is a hard cap:** exceed 5 GB and the project is restricted (never billed). A large daily backup can't complete on Free.
+- **Free never bills overage.** Exceeding the included 5 GB/month starts Supabase's Fair Use process: a notification to your billing email, then a grace period, then egress restrictions if usage stays over (the restriction clears at the next billing cycle or when you upgrade). Sustained large backups are not viable on Free.
 
 Rough cost (Pro, Spend Cap OFF, backups = your only egress):
 
 | DB + Storage | Weekly | Daily |
 |---|---|---|
-| 10 GB | $0/mo (within 250 GB) | ~$4.50/mo |
-| 50 GB | ~$0/mo | **~$112/mo** ⚠ |
+| 10 GB | $0/month (within 250 GB) | ~$4.50/month |
+| 50 GB | ~$0/month | **~$112/month** ⚠ |
 
 Cost scales with **size × frequency**. Run `backupdrill estimate` to project it for *your* project, and prefer weekly (or a smaller scope) once your data is large. The compressed dump is smaller than raw DB size, so real DB egress is below the `estimate` upper bound; Storage egress is exact.
 
