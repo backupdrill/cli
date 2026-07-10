@@ -4,7 +4,7 @@ import { measureStorage } from "./storage.js";
 import { log } from "./log.js";
 
 /**
- * Supabase egress 定价(2026-07-04 经核实,来源见 README「Egress & cost」)。
+ * Supabase egress 定价(2026-07-10 经核实,来源见 README「Egress & cost」)。
  * 单价 = 超出计划包含额度后的每 GB 价;included = 各计划每月包含的 egress。
  * 备份 = 把数据拉出 Supabase = egress,计入用户账单。这是 PRD §4.3 的上线否决项:
  * 让用户"我们帮你算过账"而不是收到意外账单。
@@ -13,7 +13,8 @@ export interface EgressPricing {
   pricePerGb: number; // 超额单价 $/GB(uncached)
   includedGb: number; // 该计划每月包含的 uncached egress 额度 GB
   planLabel: string;
-  // Free = 硬上限:超额直接限流不计费(备份会失败);Pro/Team 视 Spend Cap 而定
+  // Free = 永不计费:超额走 Fair Use 流程(通知 → 宽限期 → 限制),持续超额跑不通;
+  // Pro/Team 视 Spend Cap 而定。字段名沿用 hardCap,语义是"超额不可计费、只会被限"
   hardCap: boolean;
 }
 
@@ -111,11 +112,11 @@ export async function runEstimate(
       `then $${pricing.pricePerGb}/GB`
   );
   console.error("");
-  console.error("  Frequency   Runs/mo   Monthly egress   Overage   Est. cost/mo");
-  console.error("  ─────────   ───────   ──────────────   ───────   ────────────");
+  console.error("  Frequency   Runs/month   Monthly egress   Overage   Est. cost/month");
+  console.error("  ─────────   ──────────   ──────────────   ───────   ───────────────");
   for (const r of projection.rows) {
     console.error(
-      `  ${r.frequency.padEnd(9)}   ${String(r.runsPerMonth).padStart(7)}   ` +
+      `  ${r.frequency.padEnd(9)}   ${String(r.runsPerMonth).padStart(10)}   ` +
         `${(r.monthlyEgressGb + " GB").padStart(14)}   ` +
         `${(r.overageGb + " GB").padStart(7)}   ` +
         `$${r.monthlyCost.toFixed(2)}`
@@ -133,12 +134,14 @@ export async function runEstimate(
   const weekly = projection.rows.find((r) => r.frequency === "weekly");
   console.error("");
   if (pricing.hardCap) {
-    // Free:超额=限流,备份直接失败,daily 大库根本跑不完
+    // Free:超额不计费,走 Fair Use 通知 → 宽限期 → 限制;持续超额的大备份在 Free 跑不通
     if (daily && daily.overageGb > 0) {
       log.warn(
-        `${pricing.planLabel} egress is a HARD CAP (${pricing.includedGb} GB). ` +
-          `Daily backups (~${daily.monthlyEgressGb} GB/mo) will blow the cap and ` +
-          `get your project throttled — the backup itself will fail. ` +
+        `${pricing.planLabel} plan egress is never billed, but exceeding the included ` +
+          `${pricing.includedGb} GB/month starts Supabase's Fair Use process: a ` +
+          `notification, then a grace period, then egress restrictions. Daily backups ` +
+          `(~${daily.monthlyEgressGb} GB/month) would keep you permanently over the ` +
+          `line — sustained large backups are not viable on Free. ` +
           `Use weekly at most, or upgrade to Pro.`
       );
     }
@@ -154,9 +157,9 @@ export async function runEstimate(
     const worst = daily?.monthlyCost ?? 0;
     if (worst >= SUBSCRIPTION_FLOOR_USD) {
       log.warn(
-        `At daily frequency the egress overage alone (~$${worst.toFixed(0)}/mo) is ` +
+        `At daily frequency the egress overage alone (~$${worst.toFixed(0)}/month) is ` +
           `in the range of a paid backup subscription. Consider weekly ` +
-          `(~$${(weekly?.monthlyCost ?? 0).toFixed(0)}/mo overage) or a smaller scope.`
+          `(~$${(weekly?.monthlyCost ?? 0).toFixed(0)}/month overage) or a smaller scope.`
       );
     }
   }

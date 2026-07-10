@@ -8,9 +8,10 @@ import { runRestore } from "./restore.js";
 import { log } from "./log.js";
 import { TOOL_VERSION } from "./version.js";
 
-// Supabase egress 定价表(2026-07-04 核实,来源见 README「Egress & cost」)。
+// Supabase egress 定价表(2026-07-10 核实,来源见 README「Egress & cost」)。
 // 备份流量 100% 未缓存,故用 uncached 单价 $0.09/GB;included 用 uncached 额度。
-// Free 硬上限(超额即限流,不计费);Pro/Team 由 Spend Cap 决定超额限流还是计费。
+// Free 永不计费:超额走 Fair Use 流程(通知 → 宽限期 → 限制),持续大备份不可行;
+// Pro/Team 由 Spend Cap 决定超额限流还是计费。
 const EGRESS_PRICING: Record<"free" | "pro" | "team", EgressPricing> = {
   free: { planLabel: "Free", includedGb: 5, pricePerGb: 0.09, hardCap: true },
   pro: { planLabel: "Pro", includedGb: 250, pricePerGb: 0.09, hardCap: false },
