@@ -6,7 +6,7 @@ Backups stream through the CLI on your machine (or your CI) straight to your buc
 
 > Want this on a schedule, with **restore drills that prove your backup actually restores**, plus alerts and reports? That's the hosted service → **[backupdrill.com](https://backupdrill.com)**. This CLI is the DIY layer; the cloud adds scheduling, drills, alerting, and reports on top.
 
-🎥 Prefer watching? [Where do your backups actually go — explained in 80 seconds](https://backupdrill.com/guides/test-supabase-backup-restore#explainer-video).
+🎥 Prefer watching? [Where do your backups actually go — explained in about a minute](https://backupdrill.com/guides/test-supabase-backup-restore#explainer-video).
 
 ## Why
 
