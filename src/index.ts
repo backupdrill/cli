@@ -88,6 +88,12 @@ program
   .option("--prefix <prefix>", "key prefix inside the bucket (default: backupdrill)")
   .option("--project-name <name>", "project name used in the object key")
   .option("--verify-all-files", "checksum every Storage file, not just a sample")
+  .option(
+    "--check-cmd <command>",
+    "after structural checks pass, run your own smoke test against the restored sandbox " +
+      "(connection string in BACKUPDRILL_SANDBOX_URL; exit 0 = pass, reported as 'app checks')"
+  )
+  .option("--keep", "if the drill fails, keep the sandbox container running for inspection")
   .action(async (opts) => {
     try {
       const config = await loadConfig({
@@ -107,6 +113,8 @@ program
       const report = await runDrill(config, {
         snapshot: opts.snapshot,
         verifyAllFiles: opts.verifyAllFiles,
+        appCheckCommand: opts.checkCmd,
+        keepSandboxOnFailure: opts.keep,
       });
       console.error("");
       for (const c of report.checks) {

@@ -148,6 +148,16 @@ backupdrill drill --verify-all-files # also checksum every Storage file, not jus
 
 Backups record your installed Postgres extensions in the manifest, and the drill pre-installs them in the sandbox before restoring — including switching to a pgvector-enabled sandbox image when your database uses `vector` columns.
 
+### Run your own checks against the restored copy
+
+The drill's structural checks (tables, rows, checksums) can't know what "working" means for *your* app — RLS behavior and business workflows only have answers in your code. `--check-cmd` hands you the restored sandbox before it's destroyed:
+
+```bash
+backupdrill drill --check-cmd "npm run smoke"   # BACKUPDRILL_SANDBOX_URL points at the restored copy
+```
+
+Your command runs after all structural checks pass, with `BACKUPDRILL_SANDBOX_URL` set to the sandbox's connection string. Exit 0 means pass; the result shows up in the report as an `app checks` line, and a non-zero exit fails the drill (the report keeps structural and app-level failures clearly separate). Entirely optional — without the flag, nothing changes and the report has no `app checks` line. There's a 10-minute timeout, and `--keep` leaves the sandbox container running when a drill fails so you can inspect it (`docker rm -f <id>` when done).
+
 When you actually need to recover, `restore` puts the database back into a target you name and pulls the Storage files down to a local folder:
 
 ```bash
