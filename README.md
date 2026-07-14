@@ -150,13 +150,15 @@ Backups record your installed Postgres extensions in the manifest, and the drill
 
 ### Run your own checks against the restored copy
 
-The drill's structural checks (tables, rows, checksums) can't know what "working" means for *your* app — RLS behavior and business workflows only have answers in your code. `--check-cmd` hands you the restored sandbox before it's destroyed:
+The drill's structural checks (tables, rows, checksums) can't know what "working" means for *your* app — business invariants only have answers in your code. `--check-cmd` hands you the restored sandbox before it's destroyed:
 
 ```bash
 backupdrill drill --check-cmd "npm run smoke"   # BACKUPDRILL_SANDBOX_URL points at the restored copy
 ```
 
-Your command runs after all structural checks pass, with `BACKUPDRILL_SANDBOX_URL` set to the sandbox's connection string. Exit 0 means pass; the result shows up in the report as an `app checks` line, and a non-zero exit fails the drill (the report keeps structural and app-level failures clearly separate). Entirely optional — without the flag, nothing changes and the report has no `app checks` line. There's a 10-minute timeout, and `--keep` leaves the sandbox container running when a drill fails so you can inspect it (`docker rm -f <id>` when done).
+Your command runs after all structural checks pass, with `BACKUPDRILL_SANDBOX_URL` set to the sandbox's connection string. Exit 0 means pass; the result shows up in the report as an `app checks` line, and a non-zero exit fails the drill (the report keeps structural and app-level failures clearly separate). Entirely optional — without the flag, nothing changes and the report has no `app checks` line. There's a 10-minute timeout (the whole process tree is killed), and `--keep` leaves the sandbox container running when a drill fails so you can inspect it — the report JSON then includes a `keptSandbox` object with the container id and connection string (`docker rm -f <id>` when done).
+
+**What this can and cannot verify, honestly:** `BACKUPDRILL_SANDBOX_URL` connects as the sandbox **superuser**, and superusers bypass row-level security — plus policies referencing Supabase-managed roles (`authenticated`, `anon`) are skipped during restore, since those roles don't exist outside the platform. So use `--check-cmd` for data and business invariants ("orders reference existing users", "the row count I care about is sane"). It is **not** an RLS behavior test — verifying RLS takes an authenticated client stack with real JWTs, which no restore sandbox can fake generically.
 
 When you actually need to recover, `restore` puts the database back into a target you name and pulls the Storage files down to a local folder:
 
