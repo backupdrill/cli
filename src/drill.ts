@@ -401,6 +401,62 @@ async function verifyStorage(
   };
 }
 
+// ── 应用自检钩子(语义层)────────────────────────────────────────────
+
+// 挂死的 smoke test 不能永远挡住沙箱销毁;10 分钟对"冒烟"级检查绰绰有余
+export const APP_CHECK_TIMEOUT_MS = 10 * 60 * 1000;
+
+/**
+ * 语义层钩子:结构检查全绿后、销毁沙箱前,把沙箱连接串经 BACKUPDRILL_SANDBOX_URL
+ * 交给用户命令执行(RLS 行为、业务流可用性——判据只存在于应用侧,引擎不解释
+ * 命令输出,只裁决退出码:0 = pass)。
+ * 子进程输出定向到 stderr:stdout 是 CLI 的机器可读 JSON 通道,不能被污染。
+ * 红线:托管 worker 绝不能把用户输入传到这里(任意代码执行);此钩子只属于
+ * 用户在自己机器上运行的 CLI(见 PRD §1.4 演练后应用自检钩子)。
+ */
+export function runAppCheck(
+  command: string,
+  connString: string,
+  timeoutMs = APP_CHECK_TIMEOUT_MS
+): Promise<DrillCheck> {
+  const started = Date.now();
+  return new Promise((resolve) => {
+    const proc = spawn(command, {
+      shell: true,
+      stdio: ["ignore", 2, 2],
+      env: { ...process.env, BACKUPDRILL_SANDBOX_URL: connString },
+      timeout: timeoutMs,
+      killSignal: "SIGKILL",
+    });
+    proc.on("error", (error) => {
+      resolve({
+        name: "app checks",
+        pass: false,
+        detail: `command failed to start: ${error.message}`,
+      });
+    });
+    proc.on("close", (code, signal) => {
+      const seconds = Math.round((Date.now() - started) / 100) / 10;
+      if (signal) {
+        resolve({
+          name: "app checks",
+          pass: false,
+          detail: `terminated by ${signal} after ${seconds}s (timeout ${timeoutMs / 1000}s)`,
+        });
+        return;
+      }
+      resolve({
+        name: "app checks",
+        pass: code === 0,
+        detail:
+          code === 0
+            ? `command exited 0 in ${seconds}s`
+            : `command exited ${code} after ${seconds}s`,
+      });
+    });
+  });
+}
+
 // ── 主流程 ──────────────────────────────────────────────────────────
 
 /**
@@ -411,10 +467,12 @@ export async function drillDump(
   dumpPath: string,
   manifest: Manifest,
   snapshot: string,
-  preChecks: DrillCheck[] = []
+  preChecks: DrillCheck[] = [],
+  opts: { appCheckCommand?: string; keepSandboxOnFailure?: boolean } = {}
 ): Promise<DrillReport> {
   const checks: DrillCheck[] = [...preChecks];
   const pg = await startEphemeralPostgres(sandboxImage(manifest));
+  let pass = false; // 异常路径视为失败,供 finally 决定 --keep 是否保留沙箱
   try {
     // 旧 manifest(≤0.1.1)没有 extensions 字段 → 不装任何扩展,行为与从前一致
     const extensions = manifest.database.extensions ?? [];
@@ -467,24 +525,46 @@ export async function drillDump(
     const verify = await verifyRestored(pg.connString, manifest);
     checks.push(...verify.checks);
 
+    // 语义层钩子:只在结构层全绿时才跑——结构已失败时再跑应用检查,只会把
+    // 一次失败报成两层失败,误导排查方向。没配置则不跑、报告里不出现该行。
+    if (opts.appCheckCommand && checks.every((c) => c.pass)) {
+      log.step("Running app checks…");
+      checks.push(await runAppCheck(opts.appCheckCommand, pg.connString));
+    }
+
+    pass = checks.every((c) => c.pass);
     return {
       snapshot,
-      pass: checks.every((c) => c.pass),
+      pass,
       checks,
       restoreSeconds,
       restoredTableCount: verify.tableCount,
       restoredRowTotal: verify.rowTotal,
     };
   } finally {
-    log.step("Tearing down ephemeral Postgres…");
-    await execFileAsync("docker", ["rm", "-f", pg.containerId]).catch(() => {});
+    if (opts.keepSandboxOnFailure && !pass) {
+      // --rm 容器不 docker rm 就一直活着;用户排查完 stop/rm 时 --rm 自动清理
+      log.warn(
+        `--keep: sandbox left running for inspection — ${pg.connString} ` +
+          `(remove with: docker rm -f ${pg.containerId.slice(0, 12)})`
+      );
+    } else {
+      log.step("Tearing down ephemeral Postgres…");
+      await execFileAsync("docker", ["rm", "-f", pg.containerId]).catch(() => {});
+    }
   }
 }
 
 /** 演练一份快照:从桶里下载→drillDump(含 Storage 校验)→报告。 */
 export async function runDrill(
   config: BackupConfig,
-  opts: { snapshot?: string; verifyAllFiles?: boolean } = {}
+  opts: {
+    snapshot?: string;
+    verifyAllFiles?: boolean;
+    /** CLI 专用。红线:托管 worker 绝不能传入(在 worker 上执行用户命令 = RCE)。 */
+    appCheckCommand?: string;
+    keepSandboxOnFailure?: boolean;
+  } = {}
 ): Promise<DrillReport> {
   const s3 = targetClient(config);
   const snapshotPrefix = await resolveSnapshot(s3, config, opts.snapshot);
@@ -535,7 +615,10 @@ export async function runDrill(
       );
     }
 
-    return await drillDump(dumpPath, manifest, snapshot, preChecks);
+    return await drillDump(dumpPath, manifest, snapshot, preChecks, {
+      appCheckCommand: opts.appCheckCommand,
+      keepSandboxOnFailure: opts.keepSandboxOnFailure,
+    });
   } finally {
     await rm(workdir, { recursive: true, force: true }).catch(() => {});
   }

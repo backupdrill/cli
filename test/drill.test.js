@@ -128,6 +128,35 @@ test(
       bad.checks.some((c) => c.name === "no missing tables" && !c.pass),
       "the 'no missing tables' check should fail"
     );
+
+    // 4. 应用自检钩子:命令拿到 BACKUPDRILL_SANDBOX_URL 并真连沙箱查数——
+    //    证明钩子跑在销毁之前、拿到的是活库
+    const hooked = await drillDump(dumpPath, manifest, "hooked", [], {
+      appCheckCommand:
+        `node -e "const {Client}=require('pg');` +
+        `const c=new Client({connectionString:process.env.BACKUPDRILL_SANDBOX_URL});` +
+        `c.connect().then(()=>c.query('select count(*) n from demo')).then(r=>` +
+        `process.exit(Number(r.rows[0].n)===100?0:1)).catch(()=>process.exit(2))"`,
+    });
+    assert.equal(hooked.pass, true, "app check querying the live sandbox should pass");
+    assert.ok(
+      hooked.checks.find((c) => c.name === "app checks")?.pass,
+      "app checks row must be present and passing"
+    );
+
+    // 5. 语义层失败 → 演练整体失败,但结构层各检查仍然全绿(报告必须区分两层)
+    const semanticFail = await drillDump(dumpPath, manifest, "semfail", [], {
+      appCheckCommand: `node -e "process.exit(1)"`,
+    });
+    assert.equal(semanticFail.pass, false, "semantic failure fails the drill");
+    assert.ok(
+      semanticFail.checks.filter((c) => c.name !== "app checks").every((c) => c.pass),
+      "structural checks must all still pass"
+    );
+
+    // 6. 默认关闭红线:未配置时报告里不出现 app checks 行
+    assert.ok(!good.checks.some((c) => c.name === "app checks"));
+    assert.ok(!bad.checks.some((c) => c.name === "app checks"));
   }
 );
 
@@ -310,4 +339,40 @@ test("postDataResult: nonzero exit with no parsed blocks → generic failure", (
   );
   assert.equal(explained.failures.length, 0);
   assert.equal(explained.supabaseSkipped, 1);
+});
+
+// ── 应用自检钩子(语义层,无需 Docker)─────────────────────────────
+
+const { runAppCheck } = await import("../dist/drill.js");
+
+test("runAppCheck: exit 0 passes and receives BACKUPDRILL_SANDBOX_URL", async () => {
+  const check = await runAppCheck(
+    `node -e "process.exit(process.env.BACKUPDRILL_SANDBOX_URL === 'postgresql://sandbox' ? 0 : 1)"`,
+    "postgresql://sandbox"
+  );
+  assert.equal(check.name, "app checks");
+  assert.equal(check.pass, true);
+  assert.match(check.detail, /exited 0/);
+});
+
+test("runAppCheck: nonzero exit fails with the code in the detail", async () => {
+  const check = await runAppCheck(`node -e "process.exit(3)"`, "postgresql://sandbox");
+  assert.equal(check.pass, false);
+  assert.match(check.detail, /exited 3/);
+});
+
+test("runAppCheck: hung command is killed at the timeout and fails", async () => {
+  const check = await runAppCheck(
+    `node -e "setTimeout(() => {}, 30000)"`,
+    "postgresql://sandbox",
+    500
+  );
+  assert.equal(check.pass, false);
+  assert.match(check.detail, /terminated by SIGKILL/);
+});
+
+test("runAppCheck: unlaunchable command fails instead of throwing", async () => {
+  // shell 存在但命令不存在 → 非零退出;两种平台行为(error 事件/非零码)都算 fail
+  const check = await runAppCheck("definitely-not-a-real-command-xyz", "postgresql://sandbox");
+  assert.equal(check.pass, false);
 });
