@@ -1,6 +1,6 @@
 {
   "name": "backupdrill",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Open-source CLI to back up a Supabase project — Postgres database and Storage files — to your own S3/R2/B2 bucket, with a checksummed manifest.",
   "type": "module",
   "bin": {

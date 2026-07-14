@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { createHash } from "node:crypto";
-import { readFileSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -154,9 +154,23 @@ test(
       "structural checks must all still pass"
     );
 
-    // 6. 默认关闭红线:未配置时报告里不出现 app checks 行
+    // 6. 默认关闭红线:未配置时报告里不出现 app checks 行,也没有 keptSandbox
     assert.ok(!good.checks.some((c) => c.name === "app checks"));
     assert.ok(!bad.checks.some((c) => c.name === "app checks"));
+    assert.equal(good.keptSandbox, undefined);
+    assert.equal(bad.keptSandbox, undefined, "failed drill without --keep must not keep the sandbox");
+
+    // 7. --keep 生命周期(xreview 回归):失败保留沙箱且报告可脚本消费;排查完能删
+    const kept = await drillDump(dumpPath, tampered, "kept", [], {
+      keepSandboxOnFailure: true,
+    });
+    assert.equal(kept.pass, false);
+    assert.ok(kept.keptSandbox, "failed drill with --keep must expose the kept sandbox");
+    const { stdout: running } = await x("docker", [
+      "inspect", "-f", "{{.State.Running}}", kept.keptSandbox.containerId,
+    ]);
+    assert.equal(running.trim(), "true", "kept sandbox container must still be running");
+    await x("docker", ["rm", "-f", kept.keptSandbox.containerId]);
   }
 );
 
@@ -368,11 +382,39 @@ test("runAppCheck: hung command is killed at the timeout and fails", async () =>
     500
   );
   assert.equal(check.pass, false);
-  assert.match(check.detail, /terminated by SIGKILL/);
+  assert.match(check.detail, /timed out .* process tree killed/);
 });
 
 test("runAppCheck: unlaunchable command fails instead of throwing", async () => {
   // shell 存在但命令不存在 → 非零退出;两种平台行为(error 事件/非零码)都算 fail
   const check = await runAppCheck("definitely-not-a-real-command-xyz", "postgresql://sandbox");
   assert.equal(check.pass, false);
+});
+
+// ── xreview 回归:进程树击杀 / 空命令拒绝 ─────────────────────────
+
+test("runAppCheck: timeout kills the whole process tree, not just the shell", async () => {
+  const marker = join(tmpdir(), `bd-grandchild-${Date.now()}.marker`);
+  // 孙进程(后台子 shell)2 秒后落盘;500ms 超时若只杀 shell,marker 仍会出现
+  const check = await runAppCheck(
+    `(sleep 2 && touch "${marker}") & sleep 30`,
+    "postgresql://sandbox",
+    500
+  );
+  assert.equal(check.pass, false);
+  assert.match(check.detail, /timed out .* process tree killed/);
+  await new Promise((r) => setTimeout(r, 2600));
+  assert.equal(
+    existsSync(marker),
+    false,
+    "grandchild survived the timeout — process tree was not killed"
+  );
+});
+
+test("drillDump: empty --check-cmd is rejected before the sandbox starts", async () => {
+  await assert.rejects(
+    // manifest/dumpPath 无所谓:空命令必须在起 Docker 之前就被拒绝
+    () => drillDump("/nonexistent", {}, "x", [], { appCheckCommand: "   " }),
+    /--check-cmd is empty/
+  );
 });

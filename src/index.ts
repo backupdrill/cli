@@ -91,11 +91,19 @@ program
   .option(
     "--check-cmd <command>",
     "after structural checks pass, run your own smoke test against the restored sandbox " +
-      "(connection string in BACKUPDRILL_SANDBOX_URL; exit 0 = pass, reported as 'app checks')"
+      "(connection string in BACKUPDRILL_SANDBOX_URL; exit 0 = pass, reported as 'app checks'). " +
+      "Note: connects as the sandbox superuser, so RLS policies are NOT enforced — " +
+      "verify data and business invariants here, not RLS behavior"
   )
   .option("--keep", "if the drill fails, keep the sandbox container running for inspection")
   .action(async (opts) => {
     try {
+      if (opts.checkCmd !== undefined && !String(opts.checkCmd).trim()) {
+        throw new Error(
+          "--check-cmd is empty (did an env var fail to expand?) — refusing to run a drill " +
+            "that would report a check that never executes"
+        );
+      }
       const config = await loadConfig({
         configPath: opts.config,
         overrides: {

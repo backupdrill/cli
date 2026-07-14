@@ -52,6 +52,8 @@ export interface DrillReport {
   restoreSeconds: number;
   restoredTableCount: number;
   restoredRowTotal: number;
+  /** --keep 且演练失败时:被保留的沙箱(供排查/脚本消费);其余情况不存在 */
+  keptSandbox?: { containerId: string; connString: string };
 }
 
 // ── 临时 Postgres 容器编排 ──────────────────────────────────────────
@@ -425,10 +427,21 @@ export function runAppCheck(
       shell: true,
       stdio: ["ignore", 2, 2],
       env: { ...process.env, BACKUPDRILL_SANDBOX_URL: connString },
-      timeout: timeoutMs,
-      killSignal: "SIGKILL",
+      // 独立进程组:超时必须杀整棵进程树。只杀 shell 的话,npm/测试运行器这类
+      // 孙进程会在沙箱销毁后继续跑(xreview 抓出的资源泄漏)。
+      detached: true,
     });
+    let timedOut = false;
+    const timer = setTimeout(() => {
+      timedOut = true;
+      try {
+        process.kill(-proc.pid!, "SIGKILL"); // 负 pid = 杀整个进程组
+      } catch {
+        proc.kill("SIGKILL");
+      }
+    }, timeoutMs);
     proc.on("error", (error) => {
+      clearTimeout(timer);
       resolve({
         name: "app checks",
         pass: false,
@@ -436,12 +449,21 @@ export function runAppCheck(
       });
     });
     proc.on("close", (code, signal) => {
+      clearTimeout(timer);
       const seconds = Math.round((Date.now() - started) / 100) / 10;
+      if (timedOut) {
+        resolve({
+          name: "app checks",
+          pass: false,
+          detail: `timed out after ${timeoutMs / 1000}s — process tree killed`,
+        });
+        return;
+      }
       if (signal) {
         resolve({
           name: "app checks",
           pass: false,
-          detail: `terminated by ${signal} after ${seconds}s (timeout ${timeoutMs / 1000}s)`,
+          detail: `terminated by ${signal} after ${seconds}s`,
         });
         return;
       }
@@ -470,6 +492,15 @@ export async function drillDump(
   preChecks: DrillCheck[] = [],
   opts: { appCheckCommand?: string; keepSandboxOnFailure?: boolean } = {}
 ): Promise<DrillReport> {
+  // 空/纯空白命令 = 危险的假配置(CI 里变量没展开的典型形态):跑了会以 exit 0
+  // 假通过,忽略会让用户以为检查在跑。拒绝,且要在起沙箱之前拒绝。
+  const appCheckCommand = opts.appCheckCommand?.trim();
+  if (opts.appCheckCommand !== undefined && !appCheckCommand) {
+    throw new Error(
+      "--check-cmd is empty (did an env var fail to expand?) — refusing to report a check that would never run"
+    );
+  }
+
   const checks: DrillCheck[] = [...preChecks];
   const pg = await startEphemeralPostgres(sandboxImage(manifest));
   let pass = false; // 异常路径视为失败,供 finally 决定 --keep 是否保留沙箱
@@ -527,13 +558,13 @@ export async function drillDump(
 
     // 语义层钩子:只在结构层全绿时才跑——结构已失败时再跑应用检查,只会把
     // 一次失败报成两层失败,误导排查方向。没配置则不跑、报告里不出现该行。
-    if (opts.appCheckCommand && checks.every((c) => c.pass)) {
+    if (appCheckCommand && checks.every((c) => c.pass)) {
       log.step("Running app checks…");
-      checks.push(await runAppCheck(opts.appCheckCommand, pg.connString));
+      checks.push(await runAppCheck(appCheckCommand, pg.connString));
     }
 
     pass = checks.every((c) => c.pass);
-    return {
+    const report: DrillReport = {
       snapshot,
       pass,
       checks,
@@ -541,6 +572,11 @@ export async function drillDump(
       restoredTableCount: verify.tableCount,
       restoredRowTotal: verify.rowTotal,
     };
+    if (opts.keepSandboxOnFailure && !pass) {
+      // 写进报告让 --keep 可被脚本消费(拿连接串排查),不只靠人眼看日志
+      report.keptSandbox = { containerId: pg.containerId, connString: pg.connString };
+    }
+    return report;
   } finally {
     if (opts.keepSandboxOnFailure && !pass) {
       // --rm 容器不 docker rm 就一直活着;用户排查完 stop/rm 时 --rm 自动清理
