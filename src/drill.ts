@@ -410,8 +410,9 @@ export const APP_CHECK_TIMEOUT_MS = 10 * 60 * 1000;
 
 /**
  * 语义层钩子:结构检查全绿后、销毁沙箱前,把沙箱连接串经 BACKUPDRILL_SANDBOX_URL
- * 交给用户命令执行(RLS 行为、业务流可用性——判据只存在于应用侧,引擎不解释
- * 命令输出,只裁决退出码:0 = pass)。
+ * 交给用户命令执行,校验数据/业务不变量(判据只存在于应用侧,引擎不解释命令输出,
+ * 只裁决退出码:0 = pass)。注意这不是 RLS 行为测试:连接身份是沙箱超级用户
+ * (绕过 RLS),且引用 Supabase 托管角色的策略在恢复时已被归类跳过。
  * 子进程输出定向到 stderr:stdout 是 CLI 的机器可读 JSON 通道,不能被污染。
  * 红线:托管 worker 绝不能把用户输入传到这里(任意代码执行);此钩子只属于
  * 用户在自己机器上运行的 CLI(见 PRD §1.4 演练后应用自检钩子)。
@@ -577,6 +578,14 @@ export async function drillDump(
       report.keptSandbox = { containerId: pg.containerId, connString: pg.connString };
     }
     return report;
+  } catch (error) {
+    // 异常路径(恢复/校验抛出)没有报告对象可挂 keptSandbox;把沙箱坐标并入
+    // 错误信息,让脚本和人都拿得到被保留容器的清理线索
+    if (opts.keepSandboxOnFailure) {
+      (error as Error).message +=
+        ` [sandbox kept: ${pg.connString} — remove with: docker rm -f ${pg.containerId.slice(0, 12)}]`;
+    }
+    throw error;
   } finally {
     if (opts.keepSandboxOnFailure && !pass) {
       // --rm 容器不 docker rm 就一直活着;用户排查完 stop/rm 时 --rm 自动清理

@@ -166,11 +166,30 @@ test(
     });
     assert.equal(kept.pass, false);
     assert.ok(kept.keptSandbox, "failed drill with --keep must expose the kept sandbox");
-    const { stdout: running } = await x("docker", [
-      "inspect", "-f", "{{.State.Running}}", kept.keptSandbox.containerId,
-    ]);
-    assert.equal(running.trim(), "true", "kept sandbox container must still be running");
-    await x("docker", ["rm", "-f", kept.keptSandbox.containerId]);
+    try {
+      const { stdout: running } = await x("docker", [
+        "inspect", "-f", "{{.State.Running}}", kept.keptSandbox.containerId,
+      ]);
+      assert.equal(running.trim(), "true", "kept sandbox container must still be running");
+    } finally {
+      // 断言失败也不能把容器留在机器上(xreview:测试自身不许泄漏沙箱)
+      await x("docker", ["rm", "-f", kept.keptSandbox.containerId]).catch(() => {});
+    }
+
+    // 8. 异常路径 + --keep:恢复抛出时报告不存在,沙箱坐标必须并入错误信息
+    const garbagePath = join(tmpdir(), `bd-garbage-${Date.now()}.pgcustom`);
+    writeFileSync(garbagePath, "not a pg dump");
+    let thrown;
+    try {
+      await drillDump(garbagePath, manifest, "boom", [], { keepSandboxOnFailure: true });
+      assert.fail("garbage dump must throw");
+    } catch (e) {
+      thrown = e;
+    }
+    assert.match(thrown.message, /sandbox kept: postgresql:/);
+    const keptId = thrown.message.match(/docker rm -f ([0-9a-f]+)/)?.[1];
+    assert.ok(keptId, "error message must carry the container id");
+    await x("docker", ["rm", "-f", keptId]).catch(() => {});
   }
 );
 
