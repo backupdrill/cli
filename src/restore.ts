@@ -25,6 +25,28 @@ export interface RestoreResult {
   storageDir?: string;
 }
 
+/**
+ * pg_restore 的成败判定:退出码非 0(或被 signal 杀死,code=null)一律失败。
+ * 旧判定"非零但 stderr 没有 error: 字样就算成功"是假成功缺陷(增补 PRD §5.2.3/D4):
+ * signal kill、非英文 locale 的报错、写盘中断都不会带 "error:" 文本,却都意味着
+ * 恢复出来的库是残缺的——对备份工具,静默的假成功比失败糟糕得多。
+ * 可忽略错误的豁免只存在于 drill 的分段分类(classifyPostDataErrors);
+ * 一把梭的 restore 在统一引擎(R1)落地前不享受任何豁免。
+ */
+export function pgRestoreOutcome(
+  code: number | null,
+  stderr: string
+): { ok: true } | { ok: false; message: string } {
+  if (code === 0) return { ok: true };
+  const detail = stderr.trim();
+  return {
+    ok: false,
+    message:
+      `pg_restore exited with ${code === null ? "a signal" : `code ${code}`}` +
+      (detail ? `: ${detail}` : " and produced no error output"),
+  };
+}
+
 function pgRestore(dumpPath: string, targetUrl: string): Promise<void> {
   const bin = resolvePgRestoreBin();
   return new Promise((resolve, reject) => {
@@ -36,11 +58,10 @@ function pgRestore(dumpPath: string, targetUrl: string): Promise<void> {
     let stderr = "";
     proc.stderr.on("data", (d: Buffer) => (stderr += d.toString()));
     proc.on("error", reject);
-    proc.on("close", (code) =>
-      code === 0 || !/error:/i.test(stderr)
-        ? resolve()
-        : reject(new Error(`pg_restore failed: ${stderr.trim()}`))
-    );
+    proc.on("close", (code) => {
+      const outcome = pgRestoreOutcome(code, stderr);
+      outcome.ok ? resolve() : reject(new Error(outcome.message));
+    });
   });
 }
 
