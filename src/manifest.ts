@@ -25,7 +25,20 @@ export interface ExtensionInfo {
   schema: string;
 }
 
+/**
+ * manifest.json 的格式版本。**这是留在客户桶里、可能躺很多年的持久产物**——将来改结构时,
+ * 读取端要靠它分支判断,而不是去猜 toolVersion。
+ *
+ * 约定:
+ *  - 缺失该字段的 manifest = 版本 1(1.0 之前写出的旧快照)
+ *  - 读取端遇到**更高**的版本必须明确报错,而不是按旧结构硬解析出错误结果
+ *    ——对备份工具来说,"旧程序静默误读新归档"是最不能接受的失败方式。
+ */
+export const MANIFEST_SCHEMA_VERSION = 1;
+
 export interface Manifest {
+  // 旧快照(1.0 之前)没有此字段 → 语义上等同 1
+  schemaVersion?: number;
   tool: "backupdrill-cli";
   toolVersion: string;
   createdAt: string; // ISO8601
@@ -59,4 +72,27 @@ export interface StorageFile {
   key: string;
   bytes: number;
   sha256: string;
+}
+
+
+/**
+ * 解析桶里的 manifest.json,并做**向前兼容**校验:比本程序更新的格式一律拒绝,
+ * 明确告诉用户升级,绝不按旧结构硬解析(那会静默产出错误的演练/恢复结果)。
+ */
+export function parseManifest(json: string): Manifest {
+  let parsed: Manifest;
+  try {
+    parsed = JSON.parse(json) as Manifest;
+  } catch (error) {
+    throw new Error(`manifest.json is not valid JSON: ${(error as Error).message}`);
+  }
+  const version = parsed.schemaVersion ?? 1; // 缺失 = 1.0 之前的旧快照
+  if (!Number.isFinite(version) || version > MANIFEST_SCHEMA_VERSION) {
+    throw new Error(
+      `This snapshot's manifest uses schema version ${String(parsed.schemaVersion)}, but this ` +
+        `BackupDrill understands up to ${MANIFEST_SCHEMA_VERSION}. Upgrade the CLI ` +
+        `(npm i -g backupdrill@latest) to read it.`
+    );
+  }
+  return parsed;
 }

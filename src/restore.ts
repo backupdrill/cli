@@ -7,6 +7,7 @@ import { pipeline } from "node:stream/promises";
 import { type Readable } from "node:stream";
 import { GetObjectCommand } from "@aws-sdk/client-s3";
 import type { BackupConfig } from "./config.js";
+import { parseManifest } from "./manifest.js";
 import type { Manifest } from "./manifest.js";
 import {
   targetClient,
@@ -58,9 +59,9 @@ export async function runRestore(
   const s3 = targetClient(config);
   const snapshotPrefix = await resolveSnapshot(s3, config, opts.snapshot);
   const snapshot = snapshotPrefix.replace(/\/$/, "").split("/").pop()!;
-  const manifest = JSON.parse(
+  const manifest = parseManifest(
     await getObjectText(s3, config.storage.bucket, `${snapshotPrefix}manifest.json`)
-  ) as Manifest;
+  );
   const base = manifest.dump.key.replace(/\/dump\.pgcustom$/, "");
 
   const result: RestoreResult = {

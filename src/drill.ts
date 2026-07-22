@@ -6,6 +6,7 @@ import { promisify } from "node:util";
 import { Client } from "pg";
 import { S3Client } from "@aws-sdk/client-s3";
 import type { BackupConfig } from "./config.js";
+import { parseManifest } from "./manifest.js";
 import type { ExtensionInfo, Manifest } from "./manifest.js";
 import {
   targetClient,
@@ -616,9 +617,9 @@ export async function runDrill(
   const snapshot = snapshotPrefix.replace(/\/$/, "").split("/").pop()!;
   log.step(`Drilling snapshot ${snapshot}`);
 
-  const manifest = JSON.parse(
+  const manifest = parseManifest(
     await getObjectText(s3, config.storage.bucket, `${snapshotPrefix}manifest.json`)
-  ) as Manifest;
+  );
 
   const workdir = await mkdtemp(join(tmpdir(), "backupdrill-"));
   const dumpPath = join(workdir, "dump.pgcustom");
