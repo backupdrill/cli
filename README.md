@@ -198,6 +198,23 @@ Before switching to a **daily** schedule, read the egress-cost section above —
 
 For scheduling, automated restore drills, and alerting, use the hosted service at [backupdrill.com](https://backupdrill.com).
 
+## Versioning & stability
+
+`backupdrill` follows [semantic versioning](https://semver.org/). From **1.0.0** onwards the
+following is the stable public surface — breaking it requires a major version bump:
+
+- the commands (`backup`, `drill`, `restore`, `estimate`) and their flags
+- the `BACKUPDRILL_*` environment variables and the config-file keys
+- the layout written to your bucket, and the shape of `manifest.json`
+
+`manifest.json` carries a `schemaVersion` so the format can evolve safely. A snapshot written by
+a newer release is **refused with a clear message** rather than parsed on a best-effort basis —
+for a backup tool, silently misreading an archive is the worst possible failure. Snapshots taken
+before 1.0 have no `schemaVersion` and are treated as version 1, so older backups stay readable.
+
+The package's **JavaScript exports are internal** to the hosted BackupDrill product and are not
+covered by this promise; they may change in any release. Use the CLI if you need a stable contract.
+
 ## License
 
 MIT

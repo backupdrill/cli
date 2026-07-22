@@ -6,6 +6,7 @@ import { Client } from "pg";
 import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
 import { Upload } from "@aws-sdk/lib-storage";
 import type { BackupConfig } from "./config.js";
+import { MANIFEST_SCHEMA_VERSION } from "./manifest.js";
 import type { ExtensionInfo, Manifest, TableStat } from "./manifest.js";
 import { syncStorage } from "./storage.js";
 import { log } from "./log.js";
@@ -254,6 +255,7 @@ export async function runBackup(config: BackupConfig): Promise<Manifest> {
   }
 
   const manifest: Manifest = {
+    schemaVersion: MANIFEST_SCHEMA_VERSION,
     tool: "backupdrill-cli",
     toolVersion: TOOL_VERSION,
     createdAt: new Date().toISOString(),
