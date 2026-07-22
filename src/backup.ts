@@ -10,6 +10,7 @@ import type { ExtensionInfo, Manifest, TableStat } from "./manifest.js";
 import { syncStorage } from "./storage.js";
 import { log } from "./log.js";
 import { TOOL_VERSION } from "./version.js";
+import { pgConnectOptions, dumpUrlFor } from "./supabase-ca.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -62,7 +63,9 @@ async function inspectDatabase(
   databaseUrl: string,
   schemas: string[]
 ): Promise<DbFacts> {
-  const client = new Client({ connectionString: databaseUrl });
+  // Supabase 主机 → 用打包的根 CA 做 verify-full(pooler 证书自签、不在系统信任库);
+  // 非 Supabase(本 CLI 不限制目标)→ 保持默认,别把开源用户挡在门外
+  const client = new Client(pgConnectOptions(databaseUrl));
   await client.connect();
   try {
     const version = await client.query<{ server_version: string }>(
@@ -133,6 +136,8 @@ async function dumpToS3(
   });
 
   const schemaArgs = config.schemas.map((s) => `--schema=${s}`);
+  // pg_dump(libpq):Supabase 主机才改写成 sslmode=verify-full + sslrootcert=<打包CA临时文件>
+  const dumpDbUrl = dumpUrlFor(config.databaseUrl);
   const dump = spawn(
     pgDumpBin,
     [
@@ -141,7 +146,7 @@ async function dumpToS3(
       "--no-privileges",
       ...schemaArgs,
       "--dbname",
-      config.databaseUrl,
+      dumpDbUrl,
     ],
     { stdio: ["ignore", "pipe", "pipe"] }
   );
