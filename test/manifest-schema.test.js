@@ -84,3 +84,41 @@ test("storage.buckets 条目无 name → malformed", () => {
   };
   assert.throws(() => parseManifest(JSON.stringify(bad)), /malformed: storage\.buckets\[\]/);
 });
+
+// ---- 复审第 2 轮:根检查前置、版本整数关、v2 属性类型 ----
+
+test("根不是对象(null/数字)→ malformed,不是裸 TypeError", () => {
+  assert.throws(() => parseManifest("null"), /malformed: root is not an object/);
+  assert.throws(() => parseManifest("42"), /malformed: root is not an object/);
+});
+
+test("schemaVersion 0 / 负数 / 小数 / 字符串 → malformed,不得混过版本闸门", () => {
+  for (const v of [0, -1, 1.5, "2"]) {
+    assert.throws(
+      () => parseManifest(JSON.stringify({ ...base, schemaVersion: v })),
+      /malformed: schemaVersion/,
+      `schemaVersion ${JSON.stringify(v)} should be rejected`
+    );
+  }
+});
+
+test("v2 属性错型(public 是字符串、contentType 是数字)→ malformed", () => {
+  const badBucket = {
+    ...base,
+    schemaVersion: 2,
+    storage: {
+      buckets: [{ name: "b", public: "false", fileSizeLimit: null, allowedMimeTypes: null }],
+      fileCount: 0, totalBytes: 0, files: [],
+    },
+  };
+  assert.throws(() => parseManifest(JSON.stringify(badBucket)), /malformed: storage\.buckets\[\]\.public/);
+  const badFile = {
+    ...base,
+    schemaVersion: 2,
+    storage: {
+      fileCount: 1, totalBytes: 1,
+      files: [{ bucket: "b", key: "k", bytes: 1, sha256: "x", contentType: 5 }],
+    },
+  };
+  assert.throws(() => parseManifest(JSON.stringify(badFile)), /malformed: storage\.files\[\]\.contentType/);
+});

@@ -122,8 +122,12 @@ function malformed(what: string): never {
  * 校验面 = 恢复代码真正会解引用的路径,新增可选字段不在此列——它们缺失是合法的 v1 形态)。
  * 半截上传、被篡改或非本工具写的 JSON 要在这里被拦下,而不是在 pg_restore 中途炸开。
  */
+/** 可选字段:缺席合法(v1 形态),在场就必须是期望类型——错型值会驱动恢复端做错事。 */
+function optionalString(value: unknown, what: string): void {
+  if (value !== undefined && typeof value !== "string") malformed(what);
+}
+
 function assertManifestShape(m: Manifest): void {
-  if (typeof m !== "object" || m === null) malformed("root is not an object");
   const d = m.dump as unknown;
   if (typeof d !== "object" || d === null) malformed("dump section missing");
   const dump = m.dump;
@@ -132,21 +136,45 @@ function assertManifestShape(m: Manifest): void {
   if (typeof dump.bytes !== "number") malformed("dump.bytes");
   if (typeof m.database !== "object" || m.database === null) malformed("database section missing");
   if (!Array.isArray(m.database.schemas)) malformed("database.schemas");
+  if (typeof m.database.tableCount !== "number") malformed("database.tableCount");
   if (!Array.isArray(m.database.tables)) malformed("database.tables");
   for (const t of m.database.tables) {
     if (typeof t?.schema !== "string" || typeof t?.name !== "string") malformed("database.tables[]");
   }
   if (m.storage !== null && m.storage !== undefined) {
     if (typeof m.storage !== "object") malformed("storage section");
+    if (typeof m.storage.fileCount !== "number" || typeof m.storage.totalBytes !== "number") {
+      malformed("storage.fileCount/totalBytes");
+    }
     if (!Array.isArray(m.storage.files)) malformed("storage.files");
     for (const f of m.storage.files) {
       if (typeof f?.bucket !== "string" || typeof f?.key !== "string") malformed("storage.files[]");
       if (typeof f.bytes !== "number" || typeof f.sha256 !== "string") malformed("storage.files[]");
+      optionalString(f.contentType, "storage.files[].contentType");
+      optionalString(f.cacheControl, "storage.files[].cacheControl");
+      optionalString(f.contentEncoding, "storage.files[].contentEncoding");
+      optionalString(f.lastModified, "storage.files[].lastModified");
+      if (f.metadata !== undefined && (typeof f.metadata !== "object" || f.metadata === null || Array.isArray(f.metadata))) {
+        malformed("storage.files[].metadata");
+      }
     }
     if (m.storage.buckets !== undefined) {
       if (!Array.isArray(m.storage.buckets)) malformed("storage.buckets");
       for (const b of m.storage.buckets) {
         if (typeof b?.name !== "string" || !b.name) malformed("storage.buckets[]");
+        if (b.public !== null && b.public !== undefined && typeof b.public !== "boolean") {
+          malformed("storage.buckets[].public");
+        }
+        if (b.fileSizeLimit !== null && b.fileSizeLimit !== undefined && typeof b.fileSizeLimit !== "number") {
+          malformed("storage.buckets[].fileSizeLimit");
+        }
+        if (
+          b.allowedMimeTypes !== null &&
+          b.allowedMimeTypes !== undefined &&
+          !(Array.isArray(b.allowedMimeTypes) && b.allowedMimeTypes.every((v) => typeof v === "string"))
+        ) {
+          malformed("storage.buckets[].allowedMimeTypes");
+        }
       }
     }
   }
@@ -164,8 +192,17 @@ export function parseManifest(json: string): Manifest {
   } catch (error) {
     throw new Error(`manifest.json is not valid JSON: ${(error as Error).message}`);
   }
-  const version = parsed.schemaVersion ?? 1; // 缺失 = 1.0 之前的旧快照
-  if (!Number.isFinite(version) || version > MANIFEST_SCHEMA_VERSION) {
+  // 根检查必须先于一切属性访问:JSON 里合法的 null/数字/字符串会把裸 TypeError 抛给用户
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+    malformed("root is not an object");
+  }
+  // 版本字段:缺失 = 1.0 之前的旧快照;在场必须是 ≥1 的整数——0/负数/小数/字符串
+  // 都不是本工具写过的值,按坏 manifest 拒绝,不得混过前向兼容闸门
+  const version = parsed.schemaVersion ?? 1;
+  if (typeof version !== "number" || !Number.isInteger(version) || version < 1) {
+    malformed(`schemaVersion ${JSON.stringify(parsed.schemaVersion)}`);
+  }
+  if (version > MANIFEST_SCHEMA_VERSION) {
     throw new Error(
       `This snapshot's manifest uses schema version ${String(parsed.schemaVersion)}, but this ` +
         `BackupDrill understands up to ${MANIFEST_SCHEMA_VERSION}. Upgrade the CLI ` +
