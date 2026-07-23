@@ -80,7 +80,7 @@ export async function measureStorage(
 export async function syncStorage(
   cfg: SupabaseStorageConfig,
   target: { client: S3Client; bucket: string; base: string }
-): Promise<{ fileCount: number; totalBytes: number; files: StorageFile[] }> {
+): Promise<{ fileCount: number; totalBytes: number; files: StorageFile[]; buckets: string[] }> {
   const src = sourceClient(cfg);
   const buckets = await resolveBuckets(src, cfg.buckets);
   const files: StorageFile[] = [];
@@ -128,5 +128,6 @@ export async function syncStorage(
     log.step(`  ${bucket}: ${files.filter((f) => f.bucket === bucket).length} files`);
   }
 
-  return { fileCount: files.length, totalBytes, files };
+  // buckets 含空 bucket(files 推不出来)——manifest v2 的 bucket 属性采集要按它查
+  return { fileCount: files.length, totalBytes, files, buckets };
 }

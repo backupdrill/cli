@@ -11,6 +11,26 @@ export interface TableStat {
   // 来自 n_live_tup:是估算值(planner 统计),不是精确 count(*);分区父表恒为 0。
   // 对"体积/行数骤降"这类异常检测足够;需要精确值时云版会在演练里重新计数。
   estimatedRows: number;
+  // ---- 以下为验证升级包预留字段(恢复闭环 PRD §5.1.2 / §0.1 D3):随 v2 一并定稿
+  // 以免二次升版,但本期不生成。只存聚合结果,绝不落抽样行原始值或 PII。
+  primaryKeyColumns?: string[];
+  exactRows?: number;
+  sampleHash?: string;
+  sampleAlgorithm?: string;
+  freshnessColumn?: string;
+  freshnessValue?: string;
+}
+
+/**
+ * 源 bucket 的可恢复属性(v2,读自源库 storage.buckets——S3 兼容端点拿不到这些)。
+ * 值为 null = 源端就没设置;字段整体缺失 = 当次备份没捕获到(如 storage schema 无读权限),
+ * 恢复端遇缺失须如实标 "not captured",不得猜测(PRD §5.1.3)。
+ */
+export interface BucketAttrs {
+  name: string;
+  public: boolean | null;
+  fileSizeLimit: number | null;
+  allowedMimeTypes: string[] | null;
 }
 
 /**
@@ -33,8 +53,14 @@ export interface ExtensionInfo {
  *  - 缺失该字段的 manifest = 版本 1(1.0 之前写出的旧快照)
  *  - 读取端遇到**更高**的版本必须明确报错,而不是按旧结构硬解析出错误结果
  *    ——对备份工具来说,"旧程序静默误读新归档"是最不能接受的失败方式。
+ *
+ * 版本史:
+ *  - 1:初始格式。
+ *  - 2(恢复闭环 PRD §5.1):storage 增加 buckets 属性清单(public/大小/MIME 限制),
+ *    files 增加 contentType/cacheControl/metadata 等恢复所需元数据;tables 预留
+ *    验证升级字段(本期不生成)。全部为**可加字段**——v2 读取端兼容 v1 快照。
  */
-export const MANIFEST_SCHEMA_VERSION = 1;
+export const MANIFEST_SCHEMA_VERSION = 2;
 
 export interface Manifest {
   // 旧快照(1.0 之前)没有此字段 → 语义上等同 1
@@ -61,6 +87,8 @@ export interface Manifest {
   };
   // Storage 文件清单:每个文件的桶/键/大小/校验和(PRD US-2 要求"文件清单+校验和")
   storage: null | {
+    // v2:恢复端重建 bucket 用(含空 bucket)。v1 快照无此字段 → 恢复端标 not captured
+    buckets?: BucketAttrs[];
     fileCount: number;
     totalBytes: number;
     files: StorageFile[];
@@ -72,6 +100,14 @@ export interface StorageFile {
   key: string;
   bytes: number;
   sha256: string;
+  // ---- v2:恢复文件访问行为所需的非秘密元数据(读自源库 storage.objects,
+  // 与文件拷贝分属两次读取,极端并发写下可能有漂移)。缺失 = 未捕获,恢复端不猜测。
+  contentType?: string;
+  cacheControl?: string;
+  // 用户自定义 metadata(storage.objects.user_metadata)。恢复经 x-metadata 头回写
+  // (spike 1 已验证可保真);只存原样 JSON,不解释内容。
+  metadata?: Record<string, unknown>;
+  lastModified?: string;
 }
 
 

@@ -7,8 +7,9 @@ import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
 import { Upload } from "@aws-sdk/lib-storage";
 import type { BackupConfig } from "./config.js";
 import { MANIFEST_SCHEMA_VERSION } from "./manifest.js";
-import type { ExtensionInfo, Manifest, TableStat } from "./manifest.js";
+import type { BucketAttrs, ExtensionInfo, Manifest, TableStat } from "./manifest.js";
 import { syncStorage } from "./storage.js";
+import { inspectStorageCatalog, mergeFileMetadata } from "./storage-catalog.js";
 import { log } from "./log.js";
 import { TOOL_VERSION } from "./version.js";
 import { pgConnectOptions, dumpUrlFor } from "./supabase-ca.js";
@@ -243,10 +244,26 @@ export async function runBackup(config: BackupConfig): Promise<Manifest> {
       bucket: config.storage.bucket,
       base, // syncStorage 内部会加 /storage/<bucket>/<key>
     });
+    // v2 目录采集(bucket 属性 + 每文件元数据),通道 = 已有的只读库连接。
+    // 失败只降级不报错:storage schema 读不到(如收紧的 backup_reader 角色)时,
+    // manifest 回到 v1 信息量,恢复端把缺失如实标 not captured(PRD §5.1.3)。
+    let files = synced.files;
+    let bucketAttrs: BucketAttrs[] | undefined;
+    try {
+      const catalog = await inspectStorageCatalog(config.databaseUrl, synced.buckets);
+      bucketAttrs = catalog.buckets;
+      files = mergeFileMetadata(synced.files, catalog.fileMeta);
+    } catch (error) {
+      log.warn(
+        `Storage catalog not captured (${(error as Error).message}); ` +
+          `bucket attributes and file metadata will be absent from this manifest.`
+      );
+    }
     storageResult = {
+      ...(bucketAttrs ? { buckets: bucketAttrs } : {}),
       fileCount: synced.fileCount,
       totalBytes: synced.totalBytes,
-      files: synced.files,
+      files,
     };
     log.ok(
       `Storage synced (${synced.fileCount} files, ` +
