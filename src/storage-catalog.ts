@@ -15,6 +15,7 @@ export interface FileMeta {
 }
 
 interface BucketRow {
+  id: string;
   name: string;
   public: boolean | null;
   file_size_limit: string | number | null;
@@ -49,20 +50,31 @@ export function catalogFromRows(
   bucketRows: BucketRow[],
   objectRows: ObjectRow[]
 ): { buckets: BucketAttrs[]; fileMeta: Map<string, FileMeta> } {
-  const returned = new Set(bucketRows.map((r) => r.name));
-  const missing = requestedBuckets.filter((name) => !returned.has(name));
+  // 请求标识来自 S3 层(ListBuckets),优先按 buckets.id 匹配——storage.objects.bucket_id
+  // 外键指向 buckets.id,且 id 与 name 允许不同;只按 name 匹配会让 id≠name 的 bucket
+  // 静默丢光元数据。id 无中则退 name 匹配。
+  const matched = new Map<string, BucketRow>();
+  const missing: string[] = [];
+  for (const req of requestedBuckets) {
+    const row =
+      bucketRows.find((r) => r.id === req) ?? bucketRows.find((r) => r.name === req);
+    if (row) matched.set(req, row);
+    else missing.push(req);
+  }
   if (missing.length) {
     throw new Error(
       `storage.buckets returned no row for: ${missing.join(", ")} ` +
         `(RLS filtering or concurrent deletion) — refusing a partial bucket capture`
     );
   }
-  const buckets = bucketRows.map((r) => ({
-    name: r.name,
+  // manifest 里的 name = 快照对象布局用的标识(S3 层名),恢复端按它重建;属性取自匹配行
+  const buckets = [...matched].map(([req, r]) => ({
+    name: req,
     public: r.public,
     fileSizeLimit: r.file_size_limit === null ? null : Number(r.file_size_limit),
     allowedMimeTypes: r.allowed_mime_types,
   }));
+  const idToRequested = new Map([...matched].map(([req, r]) => [r.id, req]));
   const fileMeta = new Map<string, FileMeta>();
   for (const r of objectRows) {
     const meta: FileMeta = {};
@@ -74,7 +86,8 @@ export function catalogFromRows(
       meta.lastModified =
         r.updated_at instanceof Date ? r.updated_at.toISOString() : String(r.updated_at);
     }
-    fileMeta.set(fileMetaKey(r.bucket_id, r.name), meta);
+    // 对象行按 bucket_id(=buckets.id)回映到请求标识,与 files[].bucket 的口径对齐
+    fileMeta.set(fileMetaKey(idToRequested.get(r.bucket_id) ?? r.bucket_id, r.name), meta);
   }
   return { buckets, fileMeta };
 }
@@ -107,10 +120,12 @@ export async function inspectStorageCatalog(
   await client.connect();
   try {
     const bucketRows = await client.query<BucketRow>(
-      `select name, public, file_size_limit, allowed_mime_types
-         from storage.buckets where name = any($1::text[]) order by name`,
+      `select id, name, public, file_size_limit, allowed_mime_types
+         from storage.buckets where id = any($1::text[]) or name = any($1::text[])
+        order by name`,
       [bucketNames]
     );
+    // objects.bucket_id 外键指向 buckets.id(不是 name)——经子查询把两种请求标识都覆盖
     const objectRows = await client.query<ObjectRow>(
       `select bucket_id, name,
               metadata->>'mimetype' as mimetype,
@@ -118,7 +133,10 @@ export async function inspectStorageCatalog(
               metadata->>'contentEncoding' as content_encoding,
               user_metadata,
               updated_at
-         from storage.objects where bucket_id = any($1::text[])`,
+         from storage.objects
+        where bucket_id in (
+          select id from storage.buckets where id = any($1::text[]) or name = any($1::text[])
+        )`,
       [bucketNames]
     );
     return catalogFromRows(bucketNames, bucketRows.rows, objectRows.rows);
