@@ -35,3 +35,52 @@ test("更新格式的 manifest 必须明确拒绝,而不是硬解析", () => {
 test("坏 JSON 报可读错误,不是裸 SyntaxError", () => {
   assert.throws(() => parseManifest("{not json"), /manifest\.json is not valid JSON/);
 });
+
+// ---- 结构校验(v2 评审 Blocker:纯 cast 会让坏 manifest 在 pg_restore 中途才炸)----
+
+test("v2 带 buckets 与文件元数据的 storage 正常解析", () => {
+  const m = parseManifest(
+    JSON.stringify({
+      ...base,
+      schemaVersion: 2,
+      storage: {
+        buckets: [{ name: "avatars", public: false, fileSizeLimit: null, allowedMimeTypes: null }],
+        fileCount: 1,
+        totalBytes: 3,
+        files: [
+          {
+            bucket: "avatars",
+            key: "a.png",
+            bytes: 3,
+            sha256: "x",
+            contentType: "image/png",
+            metadata: { origin: "app" },
+          },
+        ],
+      },
+    })
+  );
+  assert.equal(m.storage.buckets[0].name, "avatars");
+});
+
+test("dump 段缺 sha256 → malformed,不得放行到恢复/演练", () => {
+  const bad = { ...base, dump: { key: "k", format: "custom", bytes: 1 } };
+  assert.throws(() => parseManifest(JSON.stringify(bad)), /malformed: dump\.sha256/);
+});
+
+test("storage.files 条目缺校验和 → malformed", () => {
+  const bad = {
+    ...base,
+    storage: { fileCount: 1, totalBytes: 1, files: [{ bucket: "b", key: "k", bytes: 1 }] },
+  };
+  assert.throws(() => parseManifest(JSON.stringify(bad)), /malformed: storage\.files\[\]/);
+});
+
+test("storage.buckets 条目无 name → malformed", () => {
+  const bad = {
+    ...base,
+    schemaVersion: 2,
+    storage: { buckets: [{ public: true }], fileCount: 0, totalBytes: 0, files: [] },
+  };
+  assert.throws(() => parseManifest(JSON.stringify(bad)), /malformed: storage\.buckets\[\]/);
+});

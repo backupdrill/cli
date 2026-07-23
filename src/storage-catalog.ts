@@ -9,6 +9,7 @@ import { pgConnectOptions } from "./supabase-ca.js";
 export interface FileMeta {
   contentType?: string;
   cacheControl?: string;
+  contentEncoding?: string;
   metadata?: Record<string, unknown>;
   lastModified?: string;
 }
@@ -25,6 +26,7 @@ interface ObjectRow {
   name: string;
   mimetype: string | null;
   cache_control: string | null;
+  content_encoding: string | null;
   user_metadata: Record<string, unknown> | null;
   updated_at: Date | string | null;
 }
@@ -37,11 +39,24 @@ export function fileMetaKey(bucket: string, key: string): string {
 /**
  * 行 → manifest 形状的纯映射。null 原样保留(= 源端未设置);
  * user_metadata 为空对象时省略字段——{} 没有恢复价值,只会撑大 manifest。
+ *
+ * 完整性关口:查询结果必须覆盖每一个请求的 bucket。storage.buckets 上的 RLS
+ * 或并发删除会**静默**少返回行——把不完整清单写进 manifest,恢复端就会漏建 bucket
+ * 还以为自己全知。缺任何一个 → 抛错,由调用方整体降级为"未捕获"。
  */
 export function catalogFromRows(
+  requestedBuckets: string[],
   bucketRows: BucketRow[],
   objectRows: ObjectRow[]
 ): { buckets: BucketAttrs[]; fileMeta: Map<string, FileMeta> } {
+  const returned = new Set(bucketRows.map((r) => r.name));
+  const missing = requestedBuckets.filter((name) => !returned.has(name));
+  if (missing.length) {
+    throw new Error(
+      `storage.buckets returned no row for: ${missing.join(", ")} ` +
+        `(RLS filtering or concurrent deletion) — refusing a partial bucket capture`
+    );
+  }
   const buckets = bucketRows.map((r) => ({
     name: r.name,
     public: r.public,
@@ -53,6 +68,7 @@ export function catalogFromRows(
     const meta: FileMeta = {};
     if (r.mimetype) meta.contentType = r.mimetype;
     if (r.cache_control) meta.cacheControl = r.cache_control;
+    if (r.content_encoding) meta.contentEncoding = r.content_encoding;
     if (r.user_metadata && Object.keys(r.user_metadata).length) meta.metadata = r.user_metadata;
     if (r.updated_at) {
       meta.lastModified =
@@ -99,12 +115,13 @@ export async function inspectStorageCatalog(
       `select bucket_id, name,
               metadata->>'mimetype' as mimetype,
               metadata->>'cacheControl' as cache_control,
+              metadata->>'contentEncoding' as content_encoding,
               user_metadata,
               updated_at
          from storage.objects where bucket_id = any($1::text[])`,
       [bucketNames]
     );
-    return catalogFromRows(bucketRows.rows, objectRows.rows);
+    return catalogFromRows(bucketNames, bucketRows.rows, objectRows.rows);
   } finally {
     await client.end();
   }
