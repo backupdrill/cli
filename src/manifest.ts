@@ -104,6 +104,7 @@ export interface StorageFile {
   // 与文件拷贝分属两次读取,极端并发写下可能有漂移)。缺失 = 未捕获,恢复端不猜测。
   contentType?: string;
   cacheControl?: string;
+  contentEncoding?: string;
   // 用户自定义 metadata(storage.objects.user_metadata)。恢复经 x-metadata 头回写
   // (spike 1 已验证可保真);只存原样 JSON,不解释内容。
   metadata?: Record<string, unknown>;
@@ -111,9 +112,50 @@ export interface StorageFile {
 }
 
 
+/** 结构断言失败时的统一出错口径:说清哪个字段坏了,让"桶里的 manifest 被篡改/截断"可定位。 */
+function malformed(what: string): never {
+  throw new Error(`manifest.json is malformed: ${what}`);
+}
+
+/**
+ * 演练/恢复实际依赖的字段做结构校验(手写而非 JSON Schema 依赖:CLI 保持零校验库依赖,
+ * 校验面 = 恢复代码真正会解引用的路径,新增可选字段不在此列——它们缺失是合法的 v1 形态)。
+ * 半截上传、被篡改或非本工具写的 JSON 要在这里被拦下,而不是在 pg_restore 中途炸开。
+ */
+function assertManifestShape(m: Manifest): void {
+  if (typeof m !== "object" || m === null) malformed("root is not an object");
+  const d = m.dump as unknown;
+  if (typeof d !== "object" || d === null) malformed("dump section missing");
+  const dump = m.dump;
+  if (typeof dump.key !== "string" || !dump.key) malformed("dump.key");
+  if (typeof dump.sha256 !== "string" || !dump.sha256) malformed("dump.sha256");
+  if (typeof dump.bytes !== "number") malformed("dump.bytes");
+  if (typeof m.database !== "object" || m.database === null) malformed("database section missing");
+  if (!Array.isArray(m.database.schemas)) malformed("database.schemas");
+  if (!Array.isArray(m.database.tables)) malformed("database.tables");
+  for (const t of m.database.tables) {
+    if (typeof t?.schema !== "string" || typeof t?.name !== "string") malformed("database.tables[]");
+  }
+  if (m.storage !== null && m.storage !== undefined) {
+    if (typeof m.storage !== "object") malformed("storage section");
+    if (!Array.isArray(m.storage.files)) malformed("storage.files");
+    for (const f of m.storage.files) {
+      if (typeof f?.bucket !== "string" || typeof f?.key !== "string") malformed("storage.files[]");
+      if (typeof f.bytes !== "number" || typeof f.sha256 !== "string") malformed("storage.files[]");
+    }
+    if (m.storage.buckets !== undefined) {
+      if (!Array.isArray(m.storage.buckets)) malformed("storage.buckets");
+      for (const b of m.storage.buckets) {
+        if (typeof b?.name !== "string" || !b.name) malformed("storage.buckets[]");
+      }
+    }
+  }
+}
+
 /**
  * 解析桶里的 manifest.json,并做**向前兼容**校验:比本程序更新的格式一律拒绝,
  * 明确告诉用户升级,绝不按旧结构硬解析(那会静默产出错误的演练/恢复结果)。
+ * 版本关之后再做结构校验(assertManifestShape)——两类失败要给出不同的处置指引。
  */
 export function parseManifest(json: string): Manifest {
   let parsed: Manifest;
@@ -130,5 +172,6 @@ export function parseManifest(json: string): Manifest {
         `(npm i -g backupdrill@latest) to read it.`
     );
   }
+  assertManifestShape(parsed);
   return parsed;
 }

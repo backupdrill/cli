@@ -12,12 +12,14 @@ const bucketRows = [
   { name: "avatars", public: false, file_size_limit: "1048576", allowed_mime_types: ["image/png"] },
   { name: "public-assets", public: true, file_size_limit: null, allowed_mime_types: null },
 ];
+const allBuckets = ["avatars", "public-assets"];
 const objectRows = [
   {
     bucket_id: "avatars",
     name: "u1/pic.png",
     mimetype: "image/png",
     cache_control: "max-age=3600",
+    content_encoding: null,
     user_metadata: { origin: "app" },
     updated_at: new Date("2026-07-23T00:00:00Z"),
   },
@@ -26,21 +28,41 @@ const objectRows = [
     name: "u2/pic.png",
     mimetype: null,
     cache_control: null,
+    content_encoding: null,
     user_metadata: {},
+    updated_at: null,
+  },
+  {
+    bucket_id: "public-assets",
+    name: "bundle.js.gz",
+    mimetype: "application/javascript",
+    cache_control: null,
+    content_encoding: "gzip",
+    // user_metadata 是原样 JSON,值可以嵌套——恢复经 x-metadata 头整体回写,不拍平
+    user_metadata: { build: { commit: "abc", pipeline: 7 } },
     updated_at: null,
   },
 ];
 
 test("bucket 属性:null 原样保留(= 源端未设置,不是猜测值);limit 归一为 number", () => {
-  const { buckets } = catalogFromRows(bucketRows, []);
+  const { buckets } = catalogFromRows(allBuckets, bucketRows, []);
   assert.deepEqual(buckets, [
     { name: "avatars", public: false, fileSizeLimit: 1048576, allowedMimeTypes: ["image/png"] },
     { name: "public-assets", public: true, fileSizeLimit: null, allowedMimeTypes: null },
   ]);
 });
 
+test("完整性关口:任一请求的 bucket 没有返回行(RLS 静默过滤/并发删除)→ 整体拒绝", () => {
+  assert.throws(
+    () => catalogFromRows(["avatars", "public-assets", "invisible"], bucketRows, []),
+    /no row for: invisible.*partial bucket capture/s
+  );
+  // 零行(权限全无)同样拒绝,不得把"看不见"当成"没有"
+  assert.throws(() => catalogFromRows(["avatars"], [], []), /no row for: avatars/);
+});
+
 test("文件元数据:有值才落字段;空 user_metadata 省略;Date 序列化为 ISO", () => {
-  const { fileMeta } = catalogFromRows([], objectRows);
+  const { fileMeta } = catalogFromRows(allBuckets, bucketRows, objectRows);
   assert.deepEqual(fileMeta.get(fileMetaKey("avatars", "u1/pic.png")), {
     contentType: "image/png",
     cacheControl: "max-age=3600",
@@ -50,8 +72,17 @@ test("文件元数据:有值才落字段;空 user_metadata 省略;Date 序列化
   assert.deepEqual(fileMeta.get(fileMetaKey("avatars", "u2/pic.png")), {});
 });
 
+test("contentEncoding 捕获;嵌套 user_metadata 原样保留", () => {
+  const { fileMeta } = catalogFromRows(allBuckets, bucketRows, objectRows);
+  assert.deepEqual(fileMeta.get(fileMetaKey("public-assets", "bundle.js.gz")), {
+    contentType: "application/javascript",
+    contentEncoding: "gzip",
+    metadata: { build: { commit: "abc", pipeline: 7 } },
+  });
+});
+
 test("合并:命中的文件带上元数据,DB 查不到的文件保持原样(未捕获≠编造)", () => {
-  const { fileMeta } = catalogFromRows([], objectRows);
+  const { fileMeta } = catalogFromRows(allBuckets, bucketRows, objectRows);
   const files = [
     { bucket: "avatars", key: "u1/pic.png", bytes: 10, sha256: "a" },
     { bucket: "avatars", key: "ghost.png", bytes: 20, sha256: "b" },
