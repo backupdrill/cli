@@ -94,3 +94,9 @@ test("pg_restore 版本口径跟随归档写入工具:dump 工具比服务端新
   const doc = renderRecoveryDoc(manifest, ctx); // server 17.6, pg_dump 18.4
   assert.ok(doc.includes("restore with pg_restore 18 or newer"), "须按 max(dump 工具, 服务端) 指引");
 });
+
+test("手动 pg_restore 命令经 PGPASSWORD:URL 无密码、密码不进 argv", () => {
+  const doc = renderRecoveryDoc(manifest, ctx);
+  assert.ok(doc.includes('export PGPASSWORD="<target-database-password>"'));
+  assert.ok(doc.includes('postgresql://postgres.<target-ref>@<target-pooler-host>:5432/postgres'));
+});

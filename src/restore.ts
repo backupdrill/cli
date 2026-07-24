@@ -28,7 +28,31 @@ import {
   type StorageRestoreTarget,
 } from "./storage-restore.js";
 import { pgConnectOptions } from "./supabase-ca.js";
+import { resolvePgRestoreBin } from "./pgbin.js";
+import { parsePgDumpMajor } from "./backup.js";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
 import { log } from "./log.js";
+
+const execFileAsync = promisify(execFile);
+
+/** 本地 pg_restore 主版本(拿不到 → null,由引擎自己的报错兜底)。 */
+async function localPgRestoreMajor(): Promise<number | null> {
+  try {
+    const { stdout } = await execFileAsync(resolvePgRestoreBin(), ["--version"]);
+    return parsePgDumpMajor(stdout.trim());
+  } catch {
+    return null;
+  }
+}
+
+/** 归档可读性要求:pg_restore 必须 ≥ max(写入工具版本, 源服务端版本)——格式跟随写入工具。 */
+export function requiredRestoreToolMajor(manifest: Manifest): number {
+  return Math.max(
+    parsePgDumpMajor(manifest.database.pgDumpVersion) ?? 0,
+    parseInt(manifest.database.serverVersion, 10) || 0
+  );
+}
 
 export interface RestoreResult {
   snapshot: string;
@@ -71,7 +95,11 @@ export function sameDatabaseTarget(a: string, b: string): boolean {
     const ua = new URL(a);
     const ub = new URL(b);
     if (!ua.hostname || !ub.hostname) return false;
-    return ua.hostname === ub.hostname && ua.username === ub.username;
+    // 用户名按驱动语义(解码后)比较,与 projectRefOf 同一口径
+    return (
+      ua.hostname === ub.hostname &&
+      decodeURIComponent(ua.username) === decodeURIComponent(ub.username)
+    );
   } catch {
     return false;
   }
@@ -170,7 +198,7 @@ export function assertConfirmedTarget(
   // 两个入口都给了且指向不同项目 → 直接硬错,和确认无关
   if (dbRef && apiRef && dbRef !== apiRef) {
     throw new Error(
-      `--target-database-url points at project "${dbRef}" but --target-supabase-url at "${apiRef}" — ` +
+      `the target database URL points at project "${dbRef}" but --target-supabase-url at "${apiRef}" — ` +
         `these are different projects; fix one of them.`
     );
   }
@@ -303,6 +331,14 @@ async function dryRunPreflight(
       } else {
         log.ok(`postgres version: target ${targetMajor} ≥ source ${sourceMajor}`);
       }
+      const toolMajor = await localPgRestoreMajor();
+      const requiredMajor = requiredRestoreToolMajor(manifest);
+      if (toolMajor !== null && toolMajor < requiredMajor) {
+        blockers.push(`local pg_restore v${toolMajor} < archive requirement v${requiredMajor}`);
+        log.error(`pg_restore tool: local v${toolMajor} cannot read a v${requiredMajor} archive`);
+      } else if (toolMajor !== null) {
+        log.ok(`pg_restore tool: local v${toolMajor} ≥ archive requirement v${requiredMajor}`);
+      }
       const extensions = db.extensions ?? [];
       if (extensions.length) {
         const available = await client.query<{ name: string }>(
@@ -363,6 +399,8 @@ export async function runRestore(
     targetServiceRoleKey?: string;
     confirmTarget?: string;
     dryRun?: boolean;
+    /** 源身份不可考(v1 快照 + 无配置)时的显式风险认知——没有它一律拒绝写入 */
+    acknowledgeUnverifiedSource?: boolean;
     snapshot?: string;
     storageDir?: string;
   }
@@ -409,6 +447,17 @@ export async function runRestore(
       );
     }
   }
+  // 源身份完全不可考(v1 老快照 + 纯 flag 恢复)时不 fail-open(评审第 10 轮):
+  // 同源阻断没有比对对象 = 目标填成源也拦不住。要么给原始配置,要么显式认知风险。
+  const sourceIdentityKnown = config.databaseUrl !== NO_SOURCE_DATABASE || sourceRefs.size > 0;
+  if ((opts.targetDatabaseUrl || storageTarget) && !sourceIdentityKnown && !opts.acknowledgeUnverifiedSource) {
+    throw new Error(
+      "source identity cannot be verified: this snapshot predates the manifest source-ref record " +
+        "and no source config is available, so same-source protection has nothing to compare against. " +
+        "Restore with the original backup config (-c backupdrill.config.json), or pass " +
+        "--acknowledge-unverified-source after double-checking the target is NOT the original project."
+    );
+  }
 
   const result: RestoreResult = {
     snapshot,
@@ -442,7 +491,7 @@ export async function runRestore(
       ) {
         throw new Error(
           "target database resolves to the same host and user as the backup source — " +
-            "restoring onto the source project is blocked. Point --target-database-url " +
+            "restoring onto the source project is blocked. Point BACKUPDRILL_TARGET_DATABASE_URL " +
             "at a fresh Supabase project."
         );
       }
@@ -469,6 +518,18 @@ export async function runRestore(
           `target PostgreSQL (${Number.isFinite(targetMajor) ? targetMajor : "undeterminable"}) is older ` +
             `than the source (${sourceMajor}) — pg_restore would fail or partially restore. ` +
             `Create the target on PostgreSQL ${sourceMajor} or newer.`
+        );
+      }
+
+      // 本地工具闸(评审第 10 轮):dump 归档格式跟随写入工具版本,老 pg_restore
+      // 读不了新归档——不查的话会先装完扩展再在恢复中途才炸
+      const toolMajor = await localPgRestoreMajor();
+      const requiredMajor = requiredRestoreToolMajor(manifest);
+      if (toolMajor !== null && toolMajor < requiredMajor) {
+        throw new Error(
+          `local pg_restore is v${toolMajor} but this archive needs v${requiredMajor}+ ` +
+            `(archive format follows the writing tool). Install postgresql client ${requiredMajor}+ ` +
+            `and/or point BACKUPDRILL_PG_RESTORE at it.`
         );
       }
 
@@ -519,7 +580,7 @@ export async function runRestore(
           `${verified.rowTotal.toLocaleString()} rows)`
       );
     } else {
-      log.warn("No --target-database-url given; skipping database restore.");
+      log.warn("No database target (--database + BACKUPDRILL_TARGET_DATABASE_URL); skipping database restore.");
     }
 
     // 2a. Storage → 目标项目回传(P0-D:给了目标 Storage 凭据时)

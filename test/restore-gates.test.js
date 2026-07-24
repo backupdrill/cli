@@ -8,7 +8,7 @@ import {
   sourceProjectRefs,
   NO_SOURCE_DATABASE,
 } from "../dist/restore.js";
-import { bucketsToRestore, reconcileFiles, standardUploadBlocker } from "../dist/storage-restore.js";
+import { bucketsToRestore, reconcileFiles, tusThresholdBytes, STANDARD_UPLOAD_LIMIT_BYTES } from "../dist/storage-restore.js";
 
 const REF = "abcdefghij0123456789";
 const POOLER = `postgresql://postgres.${REF}:pw@aws-0-us-east-1.pooler.supabase.com:5432/postgres`;
@@ -122,9 +122,18 @@ test("sourceProjectRefs:manifest 自记的源 ref 是纯 flag 恢复的最后防
   assert.deepEqual([...withManifest], [REF]);
 });
 
-test("标准上传 5GB 上限:超限 = 诚实单文件失败(不假装传上,不整体中断)", () => {
-  assert.equal(standardUploadBlocker(5 * 1024 ** 3), null);
-  const blocked = standardUploadBlocker(6 * 1024 ** 3);
-  assert.match(blocked, /5 GB standard-upload limit/);
-  assert.match(blocked, /RECOVERY\.md/);
+test("TUS 阈值:默认 = 5GB 标准上传上限;env 可压低供活体验证小文件走 TUS 路径", () => {
+  delete process.env.BACKUPDRILL_TUS_THRESHOLD;
+  assert.equal(tusThresholdBytes(), STANDARD_UPLOAD_LIMIT_BYTES);
+  process.env.BACKUPDRILL_TUS_THRESHOLD = "1";
+  assert.equal(tusThresholdBytes(), 1);
+  delete process.env.BACKUPDRILL_TUS_THRESHOLD;
+});
+
+test("projectRefOf:百分号编码的用户名按驱动语义解码后判定(编码不得绕过身份检查)", async () => {
+  const { projectRefOf } = await import("../dist/restore.js");
+  assert.equal(
+    projectRefOf(`postgresql://postgres%2E${REF}:pw@aws-0-us-east-1.pooler.supabase.com:5432/postgres`),
+    REF
+  );
 });

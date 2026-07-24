@@ -183,6 +183,11 @@ program
   )
   .option("--confirm-target <ref>", "type the TARGET project ref to confirm writing to it")
   .option("--dry-run", "run every read-only preflight check and write nothing")
+  .option(
+    "--acknowledge-unverified-source",
+    "proceed although the source identity cannot be verified (legacy snapshot without config) — " +
+      "same-source protection is inert; double-check the target first"
+  )
   .option("--storage-dir <path>", "local directory to write Storage files to (when not uploading)")
   .option("--snapshot <timestamp>", "which snapshot to restore (default: latest)")
   .option("--bucket <name>", "bucket the backups live in")
@@ -215,19 +220,20 @@ program
       }
       // 凭据形态(决策 D6,2.0 起):env 或隐藏式交互输入,绝不经 argv。
       // --database 只表达意图,秘密自身不上命令行
-      // 只有显式 --database 才读连接串(评审第 9 轮):环境变量残留 + storage-only
-      // 意图,绝不能演变成一次意外的数据库恢复
+      // 秘密只随各自的意图旗标读取(评审第 9/10 轮):环境变量残留不能把 storage-only
+      // 变成意外的数据库恢复,也不能把无 Storage 目标的运行拖进凭据配对检查;
+      // 空串按缺失处理(误 export 空值不许静默吞掉一个显式请求)
       let targetDatabaseUrl: string | undefined;
       if (opts.database) {
         targetDatabaseUrl =
-          process.env.BACKUPDRILL_TARGET_DATABASE_URL ??
+          process.env.BACKUPDRILL_TARGET_DATABASE_URL?.trim() ||
           (await promptSecret("Target database connection string (BACKUPDRILL_TARGET_DATABASE_URL)"));
       }
-      let targetServiceRoleKey = process.env.BACKUPDRILL_TARGET_SERVICE_ROLE_KEY;
-      if (opts.targetSupabaseUrl && !targetServiceRoleKey) {
-        targetServiceRoleKey = await promptSecret(
-          "Target service-role key (BACKUPDRILL_TARGET_SERVICE_ROLE_KEY)"
-        );
+      let targetServiceRoleKey: string | undefined;
+      if (opts.targetSupabaseUrl) {
+        targetServiceRoleKey =
+          process.env.BACKUPDRILL_TARGET_SERVICE_ROLE_KEY?.trim() ||
+          (await promptSecret("Target service-role key (BACKUPDRILL_TARGET_SERVICE_ROLE_KEY)"));
       }
       const result = await runRestore(config, {
         targetDatabaseUrl,
@@ -235,6 +241,7 @@ program
         targetServiceRoleKey,
         confirmTarget: opts.confirmTarget,
         dryRun: opts.dryRun,
+        acknowledgeUnverifiedSource: opts.acknowledgeUnverifiedSource,
         storageDir: opts.storageDir,
         snapshot: opts.snapshot,
       });
@@ -246,6 +253,8 @@ program
       const storageProblems =
         (result.storageSummary?.filesFailed.length ?? 0) +
         (result.storageSummary?.checksumSample.mismatched.length ?? 0) +
+        // 属性漂移进裁决(评审第 10 轮):访问行为与快照不一致不算干净恢复
+        (result.storageSummary?.bucketAttrDrift.length ?? 0) +
         (rec ? rec.missing.length + rec.sizeMismatched.length : 0);
       const summary =
         `snapshot ${result.snapshot}: ` +

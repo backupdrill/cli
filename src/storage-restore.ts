@@ -144,50 +144,158 @@ async function ensureBucket(
   // 与 manifest 漂移时,恢复出的访问行为是错的——如实警告(不强改:可能是用户有意)
   if (res.status === 409 || /already exists|Duplicate/i.test(text)) {
     summary.bucketsExisting.push(name);
+    // 既有桶必须可验证(评审第 10 轮):读不到属性 = 不知道自己在往什么可见性的
+    // 桶里传文件,直接拒绝——尤其"manifest 说私有、既有桶是公开"会静默暴露数据
+    const info = await storageApi(target, "GET", `/bucket/${encodeURIComponent(name)}`, {}, summary);
+    if (!info.ok) {
+      throw new Error(
+        `existing bucket "${name}" attributes are unreadable (HTTP ${info.status}) — ` +
+          `refusing to upload into an unverifiable bucket`
+      );
+    }
+    const existing = (await info.json()) as {
+      public: boolean | null;
+      file_size_limit: number | null;
+      allowed_mime_types: string[] | null;
+    };
     if (attrs) {
-      const info = await storageApi(target, "GET", `/bucket/${encodeURIComponent(name)}`, {}, summary);
-      if (info.ok) {
-        const existing = (await info.json()) as {
-          public: boolean | null;
-          file_size_limit: number | null;
-          allowed_mime_types: string[] | null;
-        };
-        const drift: string[] = [];
-        if (attrs.public !== null && attrs.public !== undefined && existing.public !== attrs.public)
-          drift.push(`public ${existing.public} ≠ manifest ${attrs.public}`);
-        if (
-          attrs.fileSizeLimit !== null &&
-          attrs.fileSizeLimit !== undefined &&
-          Number(existing.file_size_limit) !== attrs.fileSizeLimit
-        )
-          drift.push(`file_size_limit ${existing.file_size_limit} ≠ manifest ${attrs.fileSizeLimit}`);
-        if (
-          attrs.allowedMimeTypes !== null &&
-          attrs.allowedMimeTypes !== undefined &&
-          JSON.stringify(existing.allowed_mime_types ?? null) !== JSON.stringify(attrs.allowedMimeTypes)
-        )
-          drift.push(
-            `allowed_mime_types ${JSON.stringify(existing.allowed_mime_types)} ≠ manifest ${JSON.stringify(attrs.allowedMimeTypes)}`
-          );
-        if (drift.length) summary.bucketAttrDrift.push(`${name}: ${drift.join("; ")}`);
+      // public 是安全属性:漂移 = 硬失败(私有文件进公开桶是数据暴露,不是"配置口味")
+      if (attrs.public !== null && attrs.public !== undefined && existing.public !== attrs.public) {
+        throw new Error(
+          `existing bucket "${name}" is ${existing.public ? "PUBLIC" : "private"} but the snapshot ` +
+            `recorded it as ${attrs.public ? "public" : "PRIVATE"} — fix the bucket's visibility ` +
+            `(or restore into a fresh project) before uploading files into it`
+        );
       }
+      const drift: string[] = [];
+      if (
+        attrs.fileSizeLimit !== null &&
+        attrs.fileSizeLimit !== undefined &&
+        Number(existing.file_size_limit) !== attrs.fileSizeLimit
+      )
+        drift.push(`file_size_limit ${existing.file_size_limit} ≠ manifest ${attrs.fileSizeLimit}`);
+      if (
+        attrs.allowedMimeTypes !== null &&
+        attrs.allowedMimeTypes !== undefined &&
+        JSON.stringify(existing.allowed_mime_types ?? null) !== JSON.stringify(attrs.allowedMimeTypes)
+      )
+        drift.push(
+          `allowed_mime_types ${JSON.stringify(existing.allowed_mime_types)} ≠ manifest ${JSON.stringify(attrs.allowedMimeTypes)}`
+        );
+      if (drift.length) summary.bucketAttrDrift.push(`${name}: ${drift.join("; ")}`);
+    } else if (existing.public) {
+      // manifest 无属性(v1 快照)而既有桶是公开的:文件将变为公开可读——必须醒目
+      summary.bucketAttrDrift.push(
+        `${name}: existing bucket is PUBLIC and the snapshot has no recorded attributes — uploaded files will be publicly readable`
+      );
     }
     return;
   }
   throw new Error(`create bucket "${name}" failed: HTTP ${res.status} ${text.slice(0, 160)}`);
 }
 
-// Supabase 标准上传的官方上限;超限文件需要 TUS 断点续传——按 PRD §6.5 的触发门
-// (首个 >10–20GB Storage 真实客户)再立项,此前**诚实单文件失败**,绝不假装传上了
+// Supabase 标准上传的官方上限;超过则走 TUS 断点续传(PRD §5.4.2 大文件要求)
 export const STANDARD_UPLOAD_LIMIT_BYTES = 5 * 1024 * 1024 * 1024;
+// Supabase TUS 约定块大小:除末块外必须恰为 6MB
+const TUS_CHUNK_BYTES = 6 * 1024 * 1024;
 
-/** 超限判定(纯函数,可测):返回失败原因或 null。 */
-export function standardUploadBlocker(bytes: number): string | null {
-  if (bytes <= STANDARD_UPLOAD_LIMIT_BYTES) return null;
-  return (
-    `file exceeds Supabase's 5 GB standard-upload limit (${(bytes / 1024 ** 3).toFixed(1)} GB); ` +
-    `resumable TUS upload is not implemented yet — restore this file manually (see RECOVERY.md storage layout)`
-  );
+/** TUS 启用阈值:默认 = 标准上传上限;测试/验证经 env 压低,让小文件也走 TUS 路径。 */
+export function tusThresholdBytes(): number {
+  const env = Number(process.env.BACKUPDRILL_TUS_THRESHOLD ?? "");
+  return Number.isFinite(env) && env > 0 ? env : STANDARD_UPLOAD_LIMIT_BYTES;
+}
+
+async function collectBody(body: unknown): Promise<Buffer> {
+  const chunks: Buffer[] = [];
+  for await (const chunk of body as AsyncIterable<Buffer>) chunks.push(Buffer.from(chunk));
+  return Buffer.concat(chunks);
+}
+
+/**
+ * TUS 断点续传上传(Supabase resumable 端点):创建 → 按 6MB 块 PATCH,块数据经
+ * S3 Range 读取(可重取);offset 不符/瞬时失败 → HEAD 重新对准后续传。
+ * 每块独立有界重试,整文件不从零重来——这正是它存在的意义。
+ */
+async function uploadViaTus(
+  source: { s3: S3Client; bucket: string; base: string },
+  target: StorageRestoreTarget,
+  file: StorageFile,
+  summary: StorageRestoreSummary
+): Promise<void> {
+  const b64 = (s: string) => Buffer.from(s).toString("base64");
+  const metaParts = [`bucketName ${b64(file.bucket)}`, `objectName ${b64(file.key)}`];
+  if (file.contentType) metaParts.push(`contentType ${b64(file.contentType)}`);
+  if (file.cacheControl) metaParts.push(`cacheControl ${b64(file.cacheControl)}`);
+  if (file.metadata) metaParts.push(`metadata ${b64(JSON.stringify(file.metadata))}`);
+
+  const create = await fetch(`${target.supabaseUrl}/storage/v1/upload/resumable`, {
+    method: "POST",
+    headers: {
+      ...storageHeaders(target.serviceRoleKey),
+      "Tus-Resumable": "1.0.0",
+      "Upload-Length": String(file.bytes),
+      "x-upsert": "true",
+      "Upload-Metadata": metaParts.join(","),
+    },
+    signal: AbortSignal.timeout(API_TIMEOUT_MS),
+  });
+  if (create.status !== 201) {
+    throw new Error(`TUS creation failed: HTTP ${create.status} ${(await create.text()).slice(0, 160)}`);
+  }
+  const location = create.headers.get("location");
+  if (!location) throw new Error("TUS creation returned no Location header");
+  const uploadUrl = new URL(location, target.supabaseUrl).toString();
+
+  let offset = 0;
+  let failures = 0;
+  while (offset < file.bytes) {
+    const end = Math.min(offset + TUS_CHUNK_BYTES, file.bytes) - 1;
+    const got = await source.s3.send(
+      new GetObjectCommand({
+        Bucket: source.bucket,
+        Key: `${source.base}/storage/${file.bucket}/${file.key}`,
+        Range: `bytes=${offset}-${end}`,
+      })
+    );
+    const chunk = await collectBody(got.Body);
+    let res: Response | null = null;
+    try {
+      res = await fetch(uploadUrl, {
+        method: "PATCH",
+        headers: {
+          ...storageHeaders(target.serviceRoleKey),
+          "Tus-Resumable": "1.0.0",
+          "Upload-Offset": String(offset),
+          "Content-Type": "application/offset+octet-stream",
+        },
+        body: new Uint8Array(chunk),
+        signal: AbortSignal.timeout(UPLOAD_TIMEOUT_MS),
+      });
+    } catch (error) {
+      res = null; // 超时/网络错:走 HEAD 重对准
+      if (++failures > MAX_ATTEMPTS) throw error;
+    }
+    if (res && (res.status === 204 || res.status === 200)) {
+      offset = Number(res.headers.get("upload-offset") ?? offset + chunk.length);
+      continue;
+    }
+    if (res && !isRetryable(res.status) && res.status !== 409) {
+      throw new Error(`TUS chunk failed: HTTP ${res.status} ${(await res.text()).slice(0, 160)}`);
+    }
+    if (++failures > MAX_ATTEMPTS) {
+      throw new Error(`TUS upload gave up after ${MAX_ATTEMPTS} chunk failures at offset ${offset}`);
+    }
+    // 断点续传的核心:HEAD 问服务端"你收到哪了",从那里继续,不从零重来
+    const head = await fetch(uploadUrl, {
+      method: "HEAD",
+      headers: { ...storageHeaders(target.serviceRoleKey), "Tus-Resumable": "1.0.0" },
+      signal: AbortSignal.timeout(API_TIMEOUT_MS),
+    });
+    const serverOffset = Number(head.headers.get("upload-offset") ?? Number.NaN);
+    if (Number.isFinite(serverOffset)) offset = serverOffset;
+    summary.retries += 1;
+    await new Promise((r) => setTimeout(r, 1000 * failures * failures));
+  }
 }
 
 async function uploadFile(
@@ -196,8 +304,10 @@ async function uploadFile(
   file: StorageFile,
   summary: StorageRestoreSummary
 ): Promise<void> {
-  const blocked = standardUploadBlocker(file.bytes);
-  if (blocked) throw new Error(blocked);
+  // 大文件走 TUS:标准上传 5GB 封顶且整文件重试;TUS 分块可续传(PRD §5.4.2)
+  if (file.bytes > tusThresholdBytes()) {
+    return uploadViaTus(source, target, file, summary);
+  }
   const headers: Record<string, string> = {
     "x-upsert": "true", // 幂等重传(spike 1:同 key upsert 成功且对象 Id 不变)
     "Content-Length": String(file.bytes), // 流式体 + 显式长度,不整文件驻留内存
@@ -326,6 +436,26 @@ export function reconcileFiles(
   };
 }
 
+/** 从目标下载单个文件并重算 sha256;读不到/不符时返回原因,匹配返回 null。 */
+async function hashMismatchOnTarget(
+  target: StorageRestoreTarget,
+  file: StorageFile,
+  counters: { retries: number }
+): Promise<string | null> {
+  const encodedKey = file.key.split("/").map(encodeURIComponent).join("/");
+  const res = await storageApi(
+    target,
+    "GET",
+    `/object/${encodeURIComponent(file.bucket)}/${encodedKey}`,
+    { timeoutMs: UPLOAD_TIMEOUT_MS },
+    counters
+  );
+  if (!res.ok) return `unreadable: HTTP ${res.status}`;
+  const hash = createHash("sha256");
+  for await (const chunk of res.body as unknown as AsyncIterable<Uint8Array>) hash.update(chunk);
+  return hash.digest("hex") === file.sha256 ? null : "sha256 mismatch";
+}
+
 /** 从目标下载抽样文件并重算 sha256(证明目标上的字节 = manifest 承诺的字节)。 */
 async function sampleChecksums(
   target: StorageRestoreTarget,
@@ -335,21 +465,8 @@ async function sampleChecksums(
   const sample = sampleStorageFiles(files, CHECKSUM_SAMPLE_CAP);
   const mismatched: string[] = [];
   for (const file of sample) {
-    const encodedKey = file.key.split("/").map(encodeURIComponent).join("/");
-    const res = await storageApi(
-      target,
-      "GET",
-      `/object/${encodeURIComponent(file.bucket)}/${encodedKey}`,
-      { timeoutMs: UPLOAD_TIMEOUT_MS },
-      counters
-    );
-    if (!res.ok) {
-      mismatched.push(`${file.bucket}/${file.key} (unreadable: HTTP ${res.status})`);
-      continue;
-    }
-    const hash = createHash("sha256");
-    for await (const chunk of res.body as unknown as AsyncIterable<Uint8Array>) hash.update(chunk);
-    if (hash.digest("hex") !== file.sha256) mismatched.push(`${file.bucket}/${file.key}`);
+    const mismatch = await hashMismatchOnTarget(target, file, counters);
+    if (mismatch) mismatched.push(`${file.bucket}/${file.key} (${mismatch})`);
   }
   return { checked: sample.length, mismatched };
 }
@@ -420,6 +537,30 @@ export async function restoreStorage(
   for (const bucket of buckets) {
     actualByBucket.set(bucket.name, await walkTargetObjects(target, bucket.name, summary));
   }
+
+  // 超时误报重裁(评审第 10 轮):上传"失败"但目标上尺寸吻合的文件(响应超时时
+  // 服务端其实已成功)→ 重哈希裁决;字节确证一致才改判成功,幂等重试的契约成立
+  if (summary.filesFailed.length) {
+    const reclassified: string[] = [];
+    for (const failed of [...summary.filesFailed]) {
+      const file = files.find((f) => `${f.bucket}/${f.key}` === failed.file);
+      const sizeOnTarget = file && actualByBucket.get(file.bucket)?.get(file.key);
+      if (!file || sizeOnTarget !== file.bytes) continue;
+      const mismatch = await hashMismatchOnTarget(target, file, summary);
+      if (mismatch === null) {
+        summary.filesFailed = summary.filesFailed.filter((x) => x !== failed);
+        summary.filesUploaded += 1;
+        summary.bytesUploaded += file.bytes;
+        reclassified.push(failed.file);
+      }
+    }
+    if (reclassified.length) {
+      log.ok(
+        `${reclassified.length} timed-out upload(s) verified byte-identical on target — reclassified as success`
+      );
+    }
+  }
+
   summary.reconcile = reconcileFiles(files, actualByBucket);
 
   if (files.length && summary.filesFailed.length < files.length) {
