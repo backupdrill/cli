@@ -289,6 +289,25 @@ export async function runBackup(config: BackupConfig): Promise<Manifest> {
     storage: storageResult,
   };
 
+  // RECOVERY.md(PRD §5.9.2.1)先于 manifest 落桶:manifest 是快照的"完成标记"
+  // (演练/恢复按它找快照)——先写手册再写标记,"快照完成"就蕴含"手册在场";
+  // 手册写失败 = 备份失败(同桶同权限,与 manifest 自身的写入风险一致)。
+  await s3.send(
+    new PutObjectCommand({
+      Bucket: config.storage.bucket,
+      Key: `${base}/RECOVERY.md`,
+      Body: renderRecoveryDoc(manifest, {
+        snapshot: timestamp,
+        bucket: config.storage.bucket,
+        endpoint: config.storage.endpoint,
+        prefix: config.storage.prefix,
+        projectName: config.projectName,
+      }),
+      ContentType: "text/markdown",
+    })
+  );
+  log.ok(`Recovery runbook written → s3://${config.storage.bucket}/${base}/RECOVERY.md`);
+
   await s3.send(
     new PutObjectCommand({
       Bucket: config.storage.bucket,
@@ -298,29 +317,6 @@ export async function runBackup(config: BackupConfig): Promise<Manifest> {
     })
   );
   log.ok(`Manifest written → s3://${config.storage.bucket}/${base}/manifest.json`);
-
-  // RECOVERY.md(PRD §5.9.2.1):自包含恢复手册随快照落桶——BackupDrill 全线消失时,
-  // 用户凭桶里这份文件 + 标准 pg 工具就能恢复。写入失败只警告不失败:手册是导览,
-  // 快照本体(dump+manifest)此时已经安全落桶。
-  try {
-    await s3.send(
-      new PutObjectCommand({
-        Bucket: config.storage.bucket,
-        Key: `${base}/RECOVERY.md`,
-        Body: renderRecoveryDoc(manifest, {
-          snapshot: timestamp,
-          bucket: config.storage.bucket,
-          endpoint: config.storage.endpoint,
-          prefix: config.storage.prefix,
-          projectName: config.projectName,
-        }),
-        ContentType: "text/markdown",
-      })
-    );
-    log.ok(`Recovery runbook written → s3://${config.storage.bucket}/${base}/RECOVERY.md`);
-  } catch (error) {
-    log.warn(`Recovery runbook not written (${(error as Error).message}); snapshot itself is complete.`);
-  }
 
   return manifest;
 }

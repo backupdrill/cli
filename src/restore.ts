@@ -99,6 +99,73 @@ export function refFromSupabaseUrl(supabaseUrl: string): string | null {
 }
 
 /**
+ * 目标 Storage URL 的严格校验:必须是 https 且恰为 <ref>.supabase.co 源(无路径/查询)。
+ * service-role key 会作为请求头发往这个地址——校验必须发生在**第一次 fetch 之前**,
+ * 否则任意主机(或明文 http)都能收到 key(评审第 8 轮)。返回规范化 origin。
+ */
+export function validateStorageTargetOrigin(supabaseUrl: string): string {
+  let url: URL;
+  try {
+    url = new URL(supabaseUrl);
+  } catch {
+    throw new Error(`--target-supabase-url is not a valid URL: ${supabaseUrl}`);
+  }
+  const ref = url.hostname.match(/^([a-z0-9]{16,})\.supabase\.co$/);
+  if (url.protocol !== "https:" || !ref || (url.pathname !== "/" && url.pathname !== "") || url.search) {
+    throw new Error(
+      `--target-supabase-url must be exactly https://<project-ref>.supabase.co — got "${supabaseUrl}". ` +
+        `The service-role key is only ever sent to a verified Supabase project origin.`
+    );
+  }
+  return url.origin;
+}
+
+/**
+ * 拒绝连接串里的 host/hostaddr 查询覆盖:node-pg 与 libpq 都会让 ?host= 改写实际
+ * 连接目标——身份判定(ref/主机)看的是 authority,写入却发生在别处,确认门与
+ * 同源阻断都会被绕过(评审第 8 轮)。恢复目标不接受这种形态,直说。
+ */
+export function assertNoHostOverride(connString: string): void {
+  try {
+    const params = new URL(connString).searchParams;
+    for (const key of params.keys()) {
+      if (/^host(addr)?$/i.test(key)) {
+        throw new Error(
+          `target connection string carries a ?${key}= override — the effective server would differ ` +
+            `from the URL authority that identity checks inspect. Use a plain connection string.`
+        );
+      }
+    }
+  } catch (error) {
+    if ((error as Error).message.includes("override")) throw error;
+    // URL 解析不了的连接串走不到这里的调用方(pg 会自己报错),放行
+  }
+}
+
+/**
+ * 备份配置能导出的全部源项目 ref:数据库连接串 + Storage 读取端点
+ * (https://<ref>.storage.supabase.co/...)。storage-only 恢复没有目标库连接串,
+ * 同源阻断必须同样覆盖"目标 Storage = 源项目"的组合(评审第 8 轮)。
+ */
+export function sourceProjectRefs(config: BackupConfig): Set<string> {
+  const refs = new Set<string>();
+  if (config.databaseUrl !== NO_SOURCE_DATABASE) {
+    const ref = projectRefOf(config.databaseUrl);
+    if (ref) refs.add(ref);
+  }
+  const endpoint = config.supabaseStorage?.endpoint;
+  if (endpoint) {
+    try {
+      const match = new URL(endpoint).hostname.match(/^([a-z0-9]{16,})\.(?:storage\.)?supabase\.co$/);
+      if (match) refs.add(match[1]);
+    } catch {
+      /* 端点不可解析:无 ref 可提取 */
+    }
+  }
+  return refs;
+}
+
+/**
  * 正式执行的确认门(PRD §5.3.3):用户必须键入目标 project ref(或非 Supabase 目标的
  * 主机名)与实际连接目标一致。误把生产源当目标是恢复流程里代价最不对称的失误,
  * 这道门要求人把目标身份亲手打一遍。
@@ -165,7 +232,9 @@ async function assertEmptyTarget(targetUrl: string, schemas: string[]): Promise<
       throw new Error(
         `target schema(s) ${schemas.join(", ")} contain ${objectCount} existing object(s) — ` +
           `restore only writes into an empty target. Create a fresh Supabase project ` +
-          `(or empty these schemas) and retry.`
+          `(or empty these schemas) and retry. If a previous run already restored the ` +
+          `database and only Storage was interrupted, re-run WITHOUT the database target ` +
+          `to retry Storage alone.`
       );
     }
   } finally {
@@ -199,6 +268,17 @@ async function dryRunPreflight(
   log.warn(
     "not covered: Auth users/sessions, secret values, Edge Functions, most platform settings"
   );
+
+  // 双目标一致性(dry-run 也要查,不能绿灯放行到正式执行才拒):库与 Storage
+  // 两个入口指向不同项目 = 配置错了一个
+  const dbRef = targetUrl ? projectRefOf(targetUrl) : null;
+  const apiRef = storageTarget ? refFromSupabaseUrl(storageTarget.supabaseUrl) : null;
+  if (dbRef && apiRef && dbRef !== apiRef) {
+    blockers.push(`database URL targets "${dbRef}" but Storage URL targets "${apiRef}"`);
+    log.error(`target consistency: database → ${dbRef}, storage → ${apiRef} — different projects`);
+  } else if (dbRef || apiRef) {
+    log.ok(`target project: ${dbRef ?? apiRef}`);
+  }
 
   if (targetUrl) {
     if (config.databaseUrl !== NO_SOURCE_DATABASE && sameDatabaseTarget(config.databaseUrl, targetUrl)) {
@@ -305,13 +385,32 @@ export async function runRestore(
   );
   const base = manifest.dump.key.replace(/\/dump\.pgcustom$/, "");
 
+  // Storage 目标构造即校验(https + 恰为 <ref>.supabase.co):service key 只发往
+  // 已验证的 Supabase 项目源;目标库连接串拒绝 host 覆盖(身份判定=实际写入目标)
   const storageTarget: StorageRestoreTarget | null =
     opts.targetSupabaseUrl && opts.targetServiceRoleKey
       ? {
-          supabaseUrl: opts.targetSupabaseUrl.replace(/\/+$/, ""),
+          supabaseUrl: validateStorageTargetOrigin(opts.targetSupabaseUrl),
           serviceRoleKey: opts.targetServiceRoleKey,
         }
       : null;
+  if (opts.targetDatabaseUrl) assertNoHostOverride(opts.targetDatabaseUrl);
+
+  // 同源阻断(统一收口):目标(库或 Storage)的 ref 命中任何源项目 ref → 拒绝。
+  // 覆盖 storage-only 组合:目标 Storage = 备份读取源的项目时,upsert 会改写源。
+  const sourceRefs = sourceProjectRefs(config);
+  const targetRefs = [
+    opts.targetDatabaseUrl ? projectRefOf(opts.targetDatabaseUrl) : null,
+    opts.targetSupabaseUrl ? refFromSupabaseUrl(opts.targetSupabaseUrl) : null,
+  ].filter((r): r is string => r !== null);
+  for (const ref of targetRefs) {
+    if (sourceRefs.has(ref)) {
+      throw new Error(
+        `target project "${ref}" is the backup SOURCE — restoring onto the source is blocked. ` +
+          `Point the restore at a fresh Supabase project.`
+      );
+    }
+  }
 
   const result: RestoreResult = {
     snapshot,
@@ -352,6 +451,28 @@ export async function runRestore(
 
       log.step("Checking target is empty…");
       await assertEmptyTarget(targetUrl, manifest.database.schemas);
+
+      // 版本预检不只属于 dry-run:跳过 dry-run 直接执行时,目标比源旧照样会
+      // 半途炸掉或部分恢复(评审第 8 轮)——写入前必须拦住
+      const versionClient = new Client(pgConnectOptions(targetUrl));
+      await versionClient.connect();
+      let targetMajor: number;
+      try {
+        const res = await versionClient.query<{ v: string }>(
+          "select current_setting('server_version') as v"
+        );
+        targetMajor = parseInt(res.rows[0].v, 10);
+      } finally {
+        await versionClient.end();
+      }
+      const sourceMajor = parseInt(manifest.database.serverVersion, 10);
+      if (!Number.isFinite(targetMajor) || targetMajor < sourceMajor) {
+        throw new Error(
+          `target PostgreSQL (${Number.isFinite(targetMajor) ? targetMajor : "undeterminable"}) is older ` +
+            `than the source (${sourceMajor}) — pg_restore would fail or partially restore. ` +
+            `Create the target on PostgreSQL ${sourceMajor} or newer.`
+        );
+      }
 
       log.step("Downloading dump…");
       const dumpPath = join(workdir, "dump.pgcustom");
@@ -408,8 +529,7 @@ export async function runRestore(
       const summary = await restoreStorage(
         { s3, bucket: config.storage.bucket, base },
         storageTarget,
-        manifest,
-        { targetDatabaseUrl: opts.targetDatabaseUrl }
+        manifest
       );
       result.storageSummary = summary;
       result.storageFilesWritten = summary.filesUploaded;
@@ -430,14 +550,17 @@ export async function runRestore(
       if (summary.filesFailed.length > 5) {
         log.warn(`…and ${summary.filesFailed.length - 5} more file failure(s)`);
       }
-      if (summary.reconcile) {
-        (summary.reconcile.matches ? log.ok : log.warn)(
-          `reconcile: target catalog has ${summary.reconcile.targetCount} file(s), ` +
-            `${(summary.reconcile.targetBytes / 1024 / 1024).toFixed(1)} MB`
-        );
-      } else {
-        log.warn("reconcile skipped: no target database URL to count storage.objects with");
+      for (const drift of summary.bucketAttrDrift) {
+        log.warn(`bucket attribute drift: ${drift}`);
       }
+      if (summary.retries) log.warn(`transient failures retried: ${summary.retries}`);
+      const rec = summary.reconcile;
+      (rec.matches ? log.ok : log.error)(
+        `reconcile: ${rec.verified}/${manifest.storage.files.length} file(s) present with matching size` +
+          (rec.missing.length ? `; MISSING: ${rec.missing.slice(0, 5).join(", ")}` : "") +
+          (rec.sizeMismatched.length ? `; SIZE MISMATCH: ${rec.sizeMismatched.slice(0, 5).join(", ")}` : "") +
+          (rec.extras ? `; ${rec.extras} extra object(s) on target not in this snapshot` : "")
+      );
       if (summary.checksumSample.checked) {
         (summary.checksumSample.mismatched.length === 0 ? log.ok : log.error)(
           `checksum sample: ${summary.checksumSample.checked} file(s) re-hashed from target` +

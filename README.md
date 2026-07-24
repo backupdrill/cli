@@ -160,13 +160,19 @@ Your command runs after all structural checks pass, with `BACKUPDRILL_SANDBOX_UR
 
 **What this can and cannot verify, honestly:** `BACKUPDRILL_SANDBOX_URL` connects as the sandbox **superuser**, and superusers bypass row-level security — plus policies referencing Supabase-managed roles (`authenticated`, `anon`) are skipped during restore, since those roles don't exist outside the platform. So use `--check-cmd` for data and business invariants ("orders reference existing users", "the row count I care about is sane"). It is **not** an RLS behavior test — verifying RLS takes an authenticated client stack with real JWTs, which no restore sandbox can fake generically.
 
-When you actually need to recover, `restore` puts the database back into a target you name and pulls the Storage files down to a local folder:
+When you actually need to recover, `restore` puts the database back into a fresh
+target project (through the same engine the drills use, with verification) and
+uploads the Storage files back — start with `--dry-run`, then confirm by typing
+the target's project ref:
 
 ```bash
-backupdrill restore \
-  --target-database-url "postgresql://…/postgres" \
-  --storage-dir ./recovered
+export BACKUPDRILL_TARGET_DATABASE_URL="postgresql://…/postgres"   # or let the hidden prompt ask
+export BACKUPDRILL_TARGET_SERVICE_ROLE_KEY="…"                     # only for Storage upload
+backupdrill restore --database --target-supabase-url https://<ref>.supabase.co --dry-run
+backupdrill restore --database --target-supabase-url https://<ref>.supabase.co --confirm-target <ref>
 ```
+
+Prefer files on disk instead? Skip the Storage target and pass `--storage-dir ./recovered`.
 
 Or restore the dump by hand — into an **empty** database, without `--clean`:
 
@@ -179,6 +185,21 @@ schema silently wipes Supabase's default grants for `anon`/`authenticated` (the 
 carries no ACLs), leaving the restored API returning 401s. One error is expected and
 harmless: `schema "public" already exists` — the target always has it. The
 `backupdrill restore` command above handles all of this (plus verification) for you.
+
+## 2.0 migration — `restore` flags changed
+
+Restore now refuses to take credentials on the command line (argv is visible to
+every process on the machine):
+
+- `--target-database-url <url>` was **removed**. Set `BACKUPDRILL_TARGET_DATABASE_URL`
+  (or let the hidden prompt ask) and pass `--database` to say you want the
+  database restored.
+- Writing to a target now requires `--confirm-target <target-ref>` — type the
+  target project's ref to confirm. Run `--dry-run` first to preview every check.
+- The service-role key for Storage upload comes from
+  `BACKUPDRILL_TARGET_SERVICE_ROLE_KEY` (or the hidden prompt), never a flag.
+
+`backup`, `drill` and `estimate` are unchanged.
 
 ## GitHub Action / scheduled backups
 

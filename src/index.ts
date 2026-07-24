@@ -4,7 +4,29 @@ import { loadConfig } from "./config.js";
 import { runBackup } from "./backup.js";
 import { runEstimate, type EgressPricing } from "./estimate.js";
 import { runDrill } from "./drill.js";
+import { createInterface } from "node:readline/promises";
+import { Writable } from "node:stream";
 import { runRestore, NO_SOURCE_DATABASE } from "./restore.js";
+
+/** 隐藏式秘密输入(PRD §5.3.1):终端不回显;无 TTY(CI/脚本)时明确要求走环境变量。 */
+async function promptSecret(label: string): Promise<string> {
+  if (!process.stdin.isTTY) {
+    throw new Error(
+      `${label} is required — set the environment variable (no TTY available for a prompt).`
+    );
+  }
+  const muted = new Writable({ write: (_chunk, _enc, cb) => cb() });
+  const rl = createInterface({ input: process.stdin, output: muted, terminal: true });
+  process.stderr.write(`${label} (hidden): `);
+  try {
+    const value = (await rl.question("")).trim();
+    process.stderr.write("\n");
+    if (!value) throw new Error(`${label} was empty.`);
+    return value;
+  } finally {
+    rl.close();
+  }
+}
 import { log } from "./log.js";
 import { TOOL_VERSION } from "./version.js";
 
@@ -150,13 +172,14 @@ program
   )
   .option("-c, --config <path>", "path to a JSON config file", "backupdrill.config.json")
   .option(
-    "--target-database-url <url>",
-    "connection string to restore the database INTO (prefer env BACKUPDRILL_TARGET_DATABASE_URL — flags land in shell history)"
+    "--database",
+    "restore the database — connection string via env BACKUPDRILL_TARGET_DATABASE_URL or a hidden prompt " +
+      "(2.0: the credential-bearing --target-database-url flag was removed; argv is visible to every process)"
   )
   .option(
     "--target-supabase-url <url>",
     "target project URL (https://<ref>.supabase.co) to upload Storage files into; " +
-      "requires env BACKUPDRILL_TARGET_SERVICE_ROLE_KEY"
+      "service-role key via env BACKUPDRILL_TARGET_SERVICE_ROLE_KEY or a hidden prompt"
   )
   .option("--confirm-target <ref>", "type the TARGET project ref to confirm writing to it")
   .option("--dry-run", "run every read-only preflight check and write nothing")
@@ -190,15 +213,18 @@ program
           overrides: { ...overrides, databaseUrl: NO_SOURCE_DATABASE },
         });
       }
-      // 凭据形态(决策 D6):连接串优先环境变量;service-role key 只收环境变量,
-      // 不提供 flag——argv 对 ps/shell history 全程可见
-      const targetDatabaseUrl =
-        opts.targetDatabaseUrl ?? process.env.BACKUPDRILL_TARGET_DATABASE_URL;
-      const targetServiceRoleKey = process.env.BACKUPDRILL_TARGET_SERVICE_ROLE_KEY;
+      // 凭据形态(决策 D6,2.0 起):env 或隐藏式交互输入,绝不经 argv。
+      // --database 只表达意图,秘密自身不上命令行
+      let targetDatabaseUrl = process.env.BACKUPDRILL_TARGET_DATABASE_URL;
+      if (opts.database && !targetDatabaseUrl) {
+        targetDatabaseUrl = await promptSecret(
+          "Target database connection string (BACKUPDRILL_TARGET_DATABASE_URL)"
+        );
+      }
+      let targetServiceRoleKey = process.env.BACKUPDRILL_TARGET_SERVICE_ROLE_KEY;
       if (opts.targetSupabaseUrl && !targetServiceRoleKey) {
-        throw new Error(
-          "--target-supabase-url needs the service-role key via env BACKUPDRILL_TARGET_SERVICE_ROLE_KEY " +
-            "(no flag on purpose: argv is visible to every process on the machine)."
+        targetServiceRoleKey = await promptSecret(
+          "Target service-role key (BACKUPDRILL_TARGET_SERVICE_ROLE_KEY)"
         );
       }
       const result = await runRestore(config, {
@@ -210,12 +236,15 @@ program
         storageDir: opts.storageDir,
         snapshot: opts.snapshot,
       });
+      // stdout = 机器可读通道(人读日志全在 stderr):完整结构化结果供脚本/报告消费
+      console.log(JSON.stringify(result));
       if (result.dryRun) return; // 预检自行打印结论;走到这里 = 零 blocker
       const failedChecks = (result.databaseChecks ?? []).filter((c) => !c.pass);
+      const rec = result.storageSummary?.reconcile;
       const storageProblems =
         (result.storageSummary?.filesFailed.length ?? 0) +
         (result.storageSummary?.checksumSample.mismatched.length ?? 0) +
-        (result.storageSummary && result.storageSummary.reconcile && !result.storageSummary.reconcile.matches ? 1 : 0);
+        (rec ? rec.missing.length + rec.sizeMismatched.length : 0);
       const summary =
         `snapshot ${result.snapshot}: ` +
         `database ${result.restoredToDatabase ? "restored" : "skipped"}, ` +

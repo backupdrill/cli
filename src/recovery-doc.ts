@@ -38,14 +38,19 @@ export function renderRecoveryDoc(manifest: Manifest, ctx: RecoveryDocContext): 
         .join("\n")
     : "-- (this snapshot records no extensions)";
 
+  // 2.0 形态:凭据只经环境变量(argv 对全机器可见);写入需要键入目标 ref 确认
   const cliRestoreCommand = [
+    `export BACKUPDRILL_TARGET_DATABASE_URL="<target-session-pooler-url>"`,
+    `export BACKUPDRILL_TARGET_SERVICE_ROLE_KEY="<target-service-role-key>"`,
     `backupdrill restore \\`,
     `  --snapshot ${ctx.snapshot} \\`,
     `  --bucket ${ctx.bucket} \\`,
     ...(ctx.endpoint ? [`  --endpoint ${ctx.endpoint} \\`] : []),
     `  --prefix ${ctx.prefix} \\`,
     `  --project-name ${ctx.projectName} \\`,
-    `  --target-database-url "<target-session-pooler-url>"`,
+    `  --database \\`,
+    `  --target-supabase-url https://<target-ref>.supabase.co \\`,
+    `  --confirm-target <target-ref>`,
   ].join("\n");
 
   return `# BackupDrill recovery runbook — ${ctx.projectName} @ ${ctx.snapshot}
@@ -119,9 +124,11 @@ npm install -g backupdrill
 ${cliRestoreCommand}
 \`\`\`
 
+Add \`--dry-run\` first to preview every check without writing anything.
 The CLI verifies the archive checksum, refuses non-empty targets, installs the
 extensions, restores through the same engine the weekly drills use, verifies
-table counts and row presence afterwards, and downloads Storage files locally.
+table counts and row presence afterwards, then rebuilds buckets, uploads the
+Storage files back and reconciles every one against the target.
 
 More: https://backupdrill.com/docs/restore
 `;
