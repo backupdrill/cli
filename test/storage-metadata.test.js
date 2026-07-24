@@ -30,3 +30,15 @@ test("头缺席就不落字段(= 未捕获,不猜测);空 Metadata 省略", () =
   assert.deepEqual(fileMetadataFromS3({ Metadata: {} }), {});
   assert.deepEqual(fileMetadataFromS3({ ContentType: "text/plain" }), { contentType: "text/plain" });
 });
+
+test("MissingMeta > 0:服务端自认头集残缺 → 整个 metadata 字段省略(不写自知残缺的数据)", () => {
+  assert.deepEqual(
+    fileMetadataFromS3({ Metadata: { origin: "app" }, MissingMeta: 1 }),
+    {}
+  );
+  // MissingMeta 为 0 时正常捕获
+  assert.deepEqual(
+    fileMetadataFromS3({ Metadata: { origin: "app" }, MissingMeta: 0 }),
+    { metadata: { origin: "app" } }
+  );
+});

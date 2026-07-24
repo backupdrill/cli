@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { mkdtemp, mkdir, rm } from "node:fs/promises";
+import { mkdtemp, mkdir, rm, readdir } from "node:fs/promises";
 import { createWriteStream } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname, resolve, sep } from "node:path";
@@ -109,6 +109,14 @@ export async function runRestore(
     // 2. Storage 文件 → 本地目录
     if (manifest.storage && manifest.storage.files.length) {
       const outDir = opts.storageDir ?? join(process.cwd(), `restored-storage-${snapshot}`);
+      // 输出目录必须是新的/空的:路径锚定检查是词法层面的,防不住目录里**已有**的
+      // 符号链接把写入引到别处;保证目录从空开始 = 所有子路径都由本进程创建,无链接可循
+      await mkdir(outDir, { recursive: true });
+      if ((await readdir(outDir)).length > 0) {
+        throw new Error(
+          `storage output directory is not empty: ${outDir} — restore only writes into a fresh directory`
+        );
+      }
       log.step(`Downloading ${manifest.storage.files.length} Storage files → ${outDir}`);
       for (const f of manifest.storage.files) {
         const dest = join(outDir, f.bucket, f.key);

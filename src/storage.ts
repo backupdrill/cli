@@ -73,7 +73,11 @@ export function fileMetadataFromS3(got: GetObjectCommandOutput): {
   if (got.ContentType) meta.contentType = got.ContentType;
   if (got.CacheControl) meta.cacheControl = got.CacheControl;
   if (got.ContentEncoding) meta.contentEncoding = got.ContentEncoding;
-  if (got.Metadata && Object.keys(got.Metadata).length) meta.metadata = got.Metadata;
+  // MissingMeta > 0 = 服务端明确声明有元数据条目没能放进 x-amz-meta 头(非法头名等)。
+  // 记一份自知残缺的 metadata 违反"未捕获就不写"原则 → 整个字段省略,如实缺席。
+  if (got.Metadata && Object.keys(got.Metadata).length && !(got.MissingMeta && got.MissingMeta > 0)) {
+    meta.metadata = got.Metadata;
+  }
   if (got.LastModified) meta.lastModified = got.LastModified.toISOString();
   return meta;
 }
