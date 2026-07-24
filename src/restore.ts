@@ -2,7 +2,7 @@ import { spawn } from "node:child_process";
 import { mkdtemp, mkdir, rm } from "node:fs/promises";
 import { createWriteStream } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, dirname } from "node:path";
+import { join, dirname, resolve, sep } from "node:path";
 import { pipeline } from "node:stream/promises";
 import { type Readable } from "node:stream";
 import { GetObjectCommand } from "@aws-sdk/client-s3";
@@ -112,6 +112,11 @@ export async function runRestore(
       log.step(`Downloading ${manifest.storage.files.length} Storage files → ${outDir}`);
       for (const f of manifest.storage.files) {
         const dest = join(outDir, f.bucket, f.key);
+        // 纵深防御:parseManifest 已拒绝穿越段,这里仍锚定最终路径必须落在 outDir 内
+        // ——两道防线独立失效才会发生"篡改的 manifest 写穿输出目录"
+        if (!resolve(dest).startsWith(resolve(outDir) + sep)) {
+          throw new Error(`unsafe storage path escapes output directory: ${f.bucket}/${f.key}`);
+        }
         await mkdir(dirname(dest), { recursive: true });
         const res = await s3.send(
           new GetObjectCommand({

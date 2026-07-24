@@ -138,6 +138,11 @@ function assertManifestShape(m: Manifest): void {
   if (!Array.isArray(m.database.schemas)) malformed("database.schemas");
   if (typeof m.database.tableCount !== "number") malformed("database.tableCount");
   if (!Array.isArray(m.database.tables)) malformed("database.tables");
+  // 写入端恒有 tableCount === tables.length;不相等 = tables 数组被截断/篡改,
+  // 逐表检查会静默缩水而表数检查还显得正常
+  if (m.database.tableCount !== m.database.tables.length) {
+    malformed("database.tableCount does not match tables.length");
+  }
   for (const t of m.database.tables) {
     if (typeof t?.schema !== "string" || typeof t?.name !== "string") malformed("database.tables[]");
     // estimatedRows 缺失/错型会让演练的"备份时非空的表恢复后不为空"检查静默失效
@@ -155,9 +160,28 @@ function assertManifestShape(m: Manifest): void {
       malformed("storage.fileCount/totalBytes");
     }
     if (!Array.isArray(m.storage.files)) malformed("storage.files");
+    // 聚合数与清单对账:files 被截断而 fileCount 完好时,Storage 验证会静默缩水
+    if (m.storage.fileCount !== m.storage.files.length) {
+      malformed("storage.fileCount does not match files.length");
+    }
+    const byteSum = m.storage.files.reduce((n, f) => n + (typeof f?.bytes === "number" ? f.bytes : 0), 0);
+    if (m.storage.totalBytes !== byteSum) malformed("storage.totalBytes does not match files");
     for (const f of m.storage.files) {
       if (typeof f?.bucket !== "string" || typeof f?.key !== "string") malformed("storage.files[]");
       if (typeof f.bytes !== "number" || typeof f.sha256 !== "string") malformed("storage.files[]");
+      // 路径穿越防线:bucket/key 会被拼进本地写路径(restore)与目标上传路径。
+      // manifest 是"从桶里来的数据"——被篡改时不得升级成任意文件写。
+      if (!f.bucket || f.bucket.includes("/") || f.bucket.includes("\\") || f.bucket.includes("\0") || f.bucket === "." || f.bucket === "..") {
+        malformed("storage.files[].bucket (unsafe path segment)");
+      }
+      if (
+        !f.key ||
+        f.key.includes("\\") ||
+        f.key.includes("\0") ||
+        f.key.split("/").some((seg) => seg === "" || seg === "." || seg === "..")
+      ) {
+        malformed("storage.files[].key (unsafe path segment)");
+      }
       optionalString(f.contentType, "storage.files[].contentType");
       optionalString(f.cacheControl, "storage.files[].cacheControl");
       optionalString(f.contentEncoding, "storage.files[].contentEncoding");
@@ -204,9 +228,9 @@ export function parseManifest(json: string): Manifest {
   if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
     malformed("root is not an object");
   }
-  // 版本字段:缺失 = 1.0 之前的旧快照;在场必须是 ≥1 的整数——0/负数/小数/字符串
+  // 版本字段:**属性缺席**才算 1.0 之前的旧快照;显式 null/0/负数/小数/字符串
   // 都不是本工具写过的值,按坏 manifest 拒绝,不得混过前向兼容闸门
-  const version = parsed.schemaVersion ?? 1;
+  const version = "schemaVersion" in parsed ? parsed.schemaVersion : 1;
   if (typeof version !== "number" || !Number.isInteger(version) || version < 1) {
     malformed(`schemaVersion ${JSON.stringify(parsed.schemaVersion)}`);
   }
