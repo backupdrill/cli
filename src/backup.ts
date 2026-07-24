@@ -254,7 +254,7 @@ export async function runBackup(config: BackupConfig): Promise<Manifest> {
     } catch (error) {
       log.warn(
         `Bucket attributes not captured (${(error as Error).message}); ` +
-          `restore will rebuild buckets with default settings.`
+          `this manifest will record them as absent — restore will say so instead of guessing.`
       );
     }
     storageResult = {
