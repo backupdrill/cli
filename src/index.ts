@@ -215,11 +215,13 @@ program
       }
       // 凭据形态(决策 D6,2.0 起):env 或隐藏式交互输入,绝不经 argv。
       // --database 只表达意图,秘密自身不上命令行
-      let targetDatabaseUrl = process.env.BACKUPDRILL_TARGET_DATABASE_URL;
-      if (opts.database && !targetDatabaseUrl) {
-        targetDatabaseUrl = await promptSecret(
-          "Target database connection string (BACKUPDRILL_TARGET_DATABASE_URL)"
-        );
+      // 只有显式 --database 才读连接串(评审第 9 轮):环境变量残留 + storage-only
+      // 意图,绝不能演变成一次意外的数据库恢复
+      let targetDatabaseUrl: string | undefined;
+      if (opts.database) {
+        targetDatabaseUrl =
+          process.env.BACKUPDRILL_TARGET_DATABASE_URL ??
+          (await promptSecret("Target database connection string (BACKUPDRILL_TARGET_DATABASE_URL)"));
       }
       let targetServiceRoleKey = process.env.BACKUPDRILL_TARGET_SERVICE_ROLE_KEY;
       if (opts.targetSupabaseUrl && !targetServiceRoleKey) {

@@ -15,7 +15,12 @@ import {
   getObjectText,
   downloadToFile,
 } from "./snapshots.js";
-import { restoreDatabaseArtifact, installExtensions } from "./restore-engine.js";
+import {
+  restoreDatabaseArtifact,
+  installExtensions,
+  projectRefOf,
+  refFromStorageEndpoint,
+} from "./restore-engine.js";
 import { verifyRestored, type DrillCheck } from "./drill.js";
 import {
   restoreStorage,
@@ -49,23 +54,8 @@ export interface RestoreResult {
  */
 export const NO_SOURCE_DATABASE = "postgresql://unused";
 
-/**
- * 从连接串提取 Supabase 项目 ref(纯函数):直连主机 `db.<ref>.supabase.co` 或
- * pooler 用户名 `postgres.<ref>`。两种形态指向同一租户——只比 host/user 会漏掉
- * "源填直连、目标填 pooler"的同项目组合(评审第 7 轮)。非 Supabase 形态返回 null。
- */
-export function projectRefOf(connString: string): string | null {
-  try {
-    const url = new URL(connString);
-    const direct = url.hostname.match(/^db\.([a-z0-9]{16,})\.supabase\.co$/);
-    if (direct) return direct[1];
-    const pooled = url.username.match(/^postgres\.([a-z0-9]{16,})$/);
-    if (pooled) return pooled[1];
-    return null;
-  } catch {
-    return null;
-  }
-}
+// projectRefOf 上移到引擎层(备份端写 manifest.sourceProjectRef 也要用);此处转出口
+export { projectRefOf } from "./restore-engine.js";
 
 /**
  * 两个连接串是否指向同一数据库租户(纯函数,可测)。
@@ -129,10 +119,11 @@ export function assertNoHostOverride(connString: string): void {
   try {
     const params = new URL(connString).searchParams;
     for (const key of params.keys()) {
-      if (/^host(addr)?$/i.test(key)) {
+      // user 同样是身份构件:pooler 的租户在用户名里,?user= 覆盖 = 换项目(评审第 9 轮)
+      if (/^(host|hostaddr|user)$/i.test(key)) {
         throw new Error(
-          `target connection string carries a ?${key}= override — the effective server would differ ` +
-            `from the URL authority that identity checks inspect. Use a plain connection string.`
+          `target connection string carries a ?${key}= override — the effective server/identity would ` +
+            `differ from the URL authority that identity checks inspect. Use a plain connection string.`
         );
       }
     }
@@ -147,7 +138,7 @@ export function assertNoHostOverride(connString: string): void {
  * (https://<ref>.storage.supabase.co/...)。storage-only 恢复没有目标库连接串,
  * 同源阻断必须同样覆盖"目标 Storage = 源项目"的组合(评审第 8 轮)。
  */
-export function sourceProjectRefs(config: BackupConfig): Set<string> {
+export function sourceProjectRefs(config: BackupConfig, manifest?: Manifest): Set<string> {
   const refs = new Set<string>();
   if (config.databaseUrl !== NO_SOURCE_DATABASE) {
     const ref = projectRefOf(config.databaseUrl);
@@ -155,13 +146,12 @@ export function sourceProjectRefs(config: BackupConfig): Set<string> {
   }
   const endpoint = config.supabaseStorage?.endpoint;
   if (endpoint) {
-    try {
-      const match = new URL(endpoint).hostname.match(/^([a-z0-9]{16,})\.(?:storage\.)?supabase\.co$/);
-      if (match) refs.add(match[1]);
-    } catch {
-      /* 端点不可解析:无 ref 可提取 */
-    }
+    const ref = refFromStorageEndpoint(endpoint);
+    if (ref) refs.add(ref);
   }
+  // manifest 自记的源 ref(评审第 9 轮):纯 flag 恢复没有 config 可比对,
+  // 快照自己就是最后一道源身份来源
+  if (manifest?.sourceProjectRef) refs.add(manifest.sourceProjectRef);
   return refs;
 }
 
@@ -387,6 +377,14 @@ export async function runRestore(
 
   // Storage 目标构造即校验(https + 恰为 <ref>.supabase.co):service key 只发往
   // 已验证的 Supabase 项目源;目标库连接串拒绝 host 覆盖(身份判定=实际写入目标)
+  // 两个字段必须成对:只给其一时静默退回"本地下载"会让库级调用方把受保护文件
+  // 写进 worker 本地目录还以为回传成功了(评审第 9 轮)
+  if (!!opts.targetSupabaseUrl !== !!opts.targetServiceRoleKey) {
+    throw new Error(
+      "targetSupabaseUrl and targetServiceRoleKey must be provided together — " +
+        "refusing to silently fall back to a local download."
+    );
+  }
   const storageTarget: StorageRestoreTarget | null =
     opts.targetSupabaseUrl && opts.targetServiceRoleKey
       ? {
@@ -398,7 +396,7 @@ export async function runRestore(
 
   // 同源阻断(统一收口):目标(库或 Storage)的 ref 命中任何源项目 ref → 拒绝。
   // 覆盖 storage-only 组合:目标 Storage = 备份读取源的项目时,upsert 会改写源。
-  const sourceRefs = sourceProjectRefs(config);
+  const sourceRefs = sourceProjectRefs(config, manifest);
   const targetRefs = [
     opts.targetDatabaseUrl ? projectRefOf(opts.targetDatabaseUrl) : null,
     opts.targetSupabaseUrl ? refFromSupabaseUrl(opts.targetSupabaseUrl) : null,

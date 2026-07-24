@@ -13,6 +13,7 @@ export interface RecoveryDocContext {
   snapshot: string; // 快照时间戳目录名
   bucket: string;
   endpoint?: string; // S3 兼容端点(R2/B2 需要;AWS 可省)
+  region?: string; // 无原始配置可依时,签名区域错了 AWS/B2 直接失败
   prefix: string;
   projectName: string;
 }
@@ -21,12 +22,27 @@ function quoteSqlIdent(name: string): string {
   return `"${name.replace(/"/g, '""')}"`;
 }
 
+/** POSIX 安全的 shell 值引用:项目名/前缀里合法的空格与元字符不得拆散或改写命令。 */
+function shellQuote(value: string): string {
+  return /^[A-Za-z0-9._/:@=-]+$/.test(value) ? value : `'${value.replace(/'/g, `'\\''`)}'`;
+}
+
 export function renderRecoveryDoc(manifest: Manifest, ctx: RecoveryDocContext): string {
   const base = manifest.dump.key.replace(/\/dump\.pgcustom$/, "");
   const db = manifest.database;
   const extensions = db.extensions ?? [];
   const storage = manifest.storage;
   const mb = (bytes: number) => (bytes / 1024 / 1024).toFixed(1);
+  // 归档格式跟随 dump 工具版本(允许比服务端新):pg_restore 必须 ≥ 两者较大值,
+  // 只按服务端版本指引会让 PG17 的 pg_restore 读不了 PG18 pg_dump 写的归档。
+  // 解析口径与 backup.ts parsePgDumpMajor 一致(不 import:backup → recovery-doc 会成环)
+  const dumpToolMajor =
+    db.pgDumpVersion.match(/\(PostgreSQL\)\s+(\d+)/)?.[1] ??
+    db.pgDumpVersion.match(/(\d+)(?:\.\d+)+/)?.[1];
+  const requiredRestoreMajor = Math.max(
+    Number(dumpToolMajor ?? 0),
+    parseInt(db.serverVersion, 10) || 0
+  );
 
   const extensionSql = extensions.length
     ? extensions
@@ -38,18 +54,20 @@ export function renderRecoveryDoc(manifest: Manifest, ctx: RecoveryDocContext): 
         .join("\n")
     : "-- (this snapshot records no extensions)";
 
-  // 2.0 形态:凭据只经环境变量(argv 对全机器可见);写入需要键入目标 ref 确认
+  // 2.0 形态:凭据只经环境变量(argv 对全机器可见);写入需要键入目标 ref 确认。
+  // DB-only 快照不出现 Storage 凭据与旗标——不为用不上的能力索要宽权限 key
   const cliRestoreCommand = [
     `export BACKUPDRILL_TARGET_DATABASE_URL="<target-session-pooler-url>"`,
-    `export BACKUPDRILL_TARGET_SERVICE_ROLE_KEY="<target-service-role-key>"`,
+    ...(storage ? [`export BACKUPDRILL_TARGET_SERVICE_ROLE_KEY="<target-service-role-key>"`] : []),
     `backupdrill restore \\`,
-    `  --snapshot ${ctx.snapshot} \\`,
-    `  --bucket ${ctx.bucket} \\`,
-    ...(ctx.endpoint ? [`  --endpoint ${ctx.endpoint} \\`] : []),
-    `  --prefix ${ctx.prefix} \\`,
-    `  --project-name ${ctx.projectName} \\`,
+    `  --snapshot ${shellQuote(ctx.snapshot)} \\`,
+    `  --bucket ${shellQuote(ctx.bucket)} \\`,
+    ...(ctx.endpoint ? [`  --endpoint ${shellQuote(ctx.endpoint)} \\`] : []),
+    ...(ctx.region ? [`  --region ${shellQuote(ctx.region)} \\`] : []),
+    `  --prefix ${shellQuote(ctx.prefix)} \\`,
+    `  --project-name ${shellQuote(ctx.projectName)} \\`,
     `  --database \\`,
-    `  --target-supabase-url https://<target-ref>.supabase.co \\`,
+    ...(storage ? [`  --target-supabase-url https://<target-ref>.supabase.co \\`] : []),
     `  --confirm-target <target-ref>`,
   ].join("\n");
 
@@ -64,7 +82,7 @@ works with standard PostgreSQL tools against this bucket alone.
 - **Database dump**: \`${manifest.dump.key}\`
   (pg_dump custom format, ${mb(manifest.dump.bytes)} MB, sha256 \`${manifest.dump.sha256}\`)
   - schemas: ${db.schemas.join(", ")} — ${db.tableCount} tables, ~${db.estimatedRowTotal.toLocaleString("en-US")} rows at backup time
-  - source PostgreSQL ${db.serverVersion}; restore with pg_restore of the same or newer major
+  - source PostgreSQL ${db.serverVersion}, archive written by ${db.pgDumpVersion} — restore with pg_restore ${requiredRestoreMajor} or newer (the archive format follows the dump tool, not the server)
 ${
   extensions.length
     ? `  - extensions required: ${extensions.map((e) => `${e.name} (schema "${e.schema}")`).join(", ")}`

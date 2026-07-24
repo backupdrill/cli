@@ -11,6 +11,7 @@ import type { BucketAttrs, ExtensionInfo, Manifest, TableStat } from "./manifest
 import { syncStorage } from "./storage.js";
 import { inspectBucketAttrs } from "./storage-catalog.js";
 import { renderRecoveryDoc } from "./recovery-doc.js";
+import { projectRefOf, refFromStorageEndpoint } from "./restore-engine.js";
 import { log } from "./log.js";
 import { TOOL_VERSION } from "./version.js";
 import { pgConnectOptions, dumpUrlFor } from "./supabase-ca.js";
@@ -270,12 +271,19 @@ export async function runBackup(config: BackupConfig): Promise<Manifest> {
     );
   }
 
+  // 非秘密源 ref 随快照自记(评审第 9 轮):纯 flag 恢复没有 config 可比对时,
+  // 同源阻断以它为最后防线
+  const sourceProjectRef =
+    projectRefOf(config.databaseUrl) ??
+    (config.supabaseStorage ? refFromStorageEndpoint(config.supabaseStorage.endpoint) : null);
+
   const manifest: Manifest = {
     schemaVersion: MANIFEST_SCHEMA_VERSION,
     tool: "backupdrill-cli",
     toolVersion: TOOL_VERSION,
     createdAt: new Date().toISOString(),
     projectName: config.projectName,
+    ...(sourceProjectRef ? { sourceProjectRef } : {}),
     database: {
       serverVersion: db.serverVersion,
       pgDumpVersion: pgd.raw,
@@ -300,6 +308,7 @@ export async function runBackup(config: BackupConfig): Promise<Manifest> {
         snapshot: timestamp,
         bucket: config.storage.bucket,
         endpoint: config.storage.endpoint,
+        region: config.storage.region,
         prefix: config.storage.prefix,
         projectName: config.projectName,
       }),

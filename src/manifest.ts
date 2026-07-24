@@ -70,6 +70,9 @@ export interface Manifest {
   toolVersion: string;
   createdAt: string; // ISO8601
   projectName: string;
+  // 非秘密的源项目 ref(可导出时)。恢复端同源阻断的**最后防线**:纯 flag 驱动的
+  // 恢复(无 config、无环境)没有别的源身份可比对——快照自己得记得自己来自哪
+  sourceProjectRef?: string;
   database: {
     serverVersion: string;
     pgDumpVersion: string;
@@ -130,6 +133,7 @@ function optionalString(value: unknown, what: string): void {
 }
 
 function assertManifestShape(m: Manifest): void {
+  optionalString(m.sourceProjectRef, "sourceProjectRef");
   const d = m.dump as unknown;
   if (typeof d !== "object" || d === null) malformed("dump section missing");
   const dump = m.dump;

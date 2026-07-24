@@ -34,6 +34,7 @@ const ctx = {
   snapshot: "2026-07-25T00-00-00-000Z",
   bucket: "my-backups",
   endpoint: "https://acct.r2.cloudflarestorage.com",
+  region: "auto",
   prefix: "backupdrill",
   projectName: "demo",
 };
@@ -74,4 +75,22 @@ test("DB-only 快照与无端点(AWS)形态:对应行如实变化", () => {
   );
   assert.ok(dbOnly.includes("database-only snapshot"));
   assert.ok(!dbOnly.includes("--endpoint"), "无端点时 CLI 命令不带 --endpoint");
+});
+
+test("命令带 region;含空格的项目名被安全引用(不拆参、不改写命令)", () => {
+  const doc = renderRecoveryDoc(manifest, { ...ctx, projectName: "My Cool App; rm -rf /" });
+  assert.ok(doc.includes("--region auto"));
+  assert.ok(doc.includes("--project-name 'My Cool App; rm -rf /'"), "空格与元字符必须单引号包裹");
+});
+
+test("DB-only 快照:不索要 service-role key、不出现 Storage 旗标", () => {
+  const doc = renderRecoveryDoc({ ...manifest, storage: null }, ctx);
+  assert.ok(!doc.includes("BACKUPDRILL_TARGET_SERVICE_ROLE_KEY"));
+  assert.ok(!doc.includes("--target-supabase-url"));
+  assert.ok(doc.includes("--database"));
+});
+
+test("pg_restore 版本口径跟随归档写入工具:dump 工具比服务端新时取较大值", () => {
+  const doc = renderRecoveryDoc(manifest, ctx); // server 17.6, pg_dump 18.4
+  assert.ok(doc.includes("restore with pg_restore 18 or newer"), "须按 max(dump 工具, 服务端) 指引");
 });

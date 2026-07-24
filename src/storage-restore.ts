@@ -161,6 +161,14 @@ async function ensureBucket(
           Number(existing.file_size_limit) !== attrs.fileSizeLimit
         )
           drift.push(`file_size_limit ${existing.file_size_limit} ≠ manifest ${attrs.fileSizeLimit}`);
+        if (
+          attrs.allowedMimeTypes !== null &&
+          attrs.allowedMimeTypes !== undefined &&
+          JSON.stringify(existing.allowed_mime_types ?? null) !== JSON.stringify(attrs.allowedMimeTypes)
+        )
+          drift.push(
+            `allowed_mime_types ${JSON.stringify(existing.allowed_mime_types)} ≠ manifest ${JSON.stringify(attrs.allowedMimeTypes)}`
+          );
         if (drift.length) summary.bucketAttrDrift.push(`${name}: ${drift.join("; ")}`);
       }
     }
@@ -169,18 +177,36 @@ async function ensureBucket(
   throw new Error(`create bucket "${name}" failed: HTTP ${res.status} ${text.slice(0, 160)}`);
 }
 
+// Supabase 标准上传的官方上限;超限文件需要 TUS 断点续传——按 PRD §6.5 的触发门
+// (首个 >10–20GB Storage 真实客户)再立项,此前**诚实单文件失败**,绝不假装传上了
+export const STANDARD_UPLOAD_LIMIT_BYTES = 5 * 1024 * 1024 * 1024;
+
+/** 超限判定(纯函数,可测):返回失败原因或 null。 */
+export function standardUploadBlocker(bytes: number): string | null {
+  if (bytes <= STANDARD_UPLOAD_LIMIT_BYTES) return null;
+  return (
+    `file exceeds Supabase's 5 GB standard-upload limit (${(bytes / 1024 ** 3).toFixed(1)} GB); ` +
+    `resumable TUS upload is not implemented yet — restore this file manually (see RECOVERY.md storage layout)`
+  );
+}
+
 async function uploadFile(
   source: { s3: S3Client; bucket: string; base: string },
   target: StorageRestoreTarget,
   file: StorageFile,
   summary: StorageRestoreSummary
 ): Promise<void> {
+  const blocked = standardUploadBlocker(file.bytes);
+  if (blocked) throw new Error(blocked);
   const headers: Record<string, string> = {
     "x-upsert": "true", // 幂等重传(spike 1:同 key upsert 成功且对象 Id 不变)
     "Content-Length": String(file.bytes), // 流式体 + 显式长度,不整文件驻留内存
   };
   if (file.contentType) headers["Content-Type"] = file.contentType;
   if (file.cacheControl) headers["Cache-Control"] = file.cacheControl;
+  // 尽力回传:当前 Supabase 不把该头落进目录(R0 补充实证),但发送无害且服务端
+  // 一旦支持即自动保真;字段本身在 manifest/报告里是如实在场的
+  if (file.contentEncoding) headers["Content-Encoding"] = file.contentEncoding;
   if (file.metadata) {
     headers["x-metadata"] = Buffer.from(JSON.stringify(file.metadata)).toString("base64");
   }
