@@ -144,10 +144,23 @@ program
 
 program
   .command("restore")
-  .description("Recover a snapshot: restore the database into a target and pull Storage files down")
+  .description(
+    "Recover a snapshot into a FRESH Supabase project: database via the drill-grade engine, " +
+      "Storage files uploaded back (or downloaded locally). Start with --dry-run."
+  )
   .option("-c, --config <path>", "path to a JSON config file", "backupdrill.config.json")
-  .option("--target-database-url <url>", "connection string to restore the database INTO")
-  .option("--storage-dir <path>", "local directory to write Storage files to")
+  .option(
+    "--target-database-url <url>",
+    "connection string to restore the database INTO (prefer env BACKUPDRILL_TARGET_DATABASE_URL — flags land in shell history)"
+  )
+  .option(
+    "--target-supabase-url <url>",
+    "target project URL (https://<ref>.supabase.co) to upload Storage files into; " +
+      "requires env BACKUPDRILL_TARGET_SERVICE_ROLE_KEY"
+  )
+  .option("--confirm-target <ref>", "type the TARGET project ref to confirm writing to it")
+  .option("--dry-run", "run every read-only preflight check and write nothing")
+  .option("--storage-dir <path>", "local directory to write Storage files to (when not uploading)")
   .option("--snapshot <timestamp>", "which snapshot to restore (default: latest)")
   .option("--bucket <name>", "bucket the backups live in")
   .option("--endpoint <url>", "S3-compatible endpoint (for R2/B2)")
@@ -177,20 +190,41 @@ program
           overrides: { ...overrides, databaseUrl: NO_SOURCE_DATABASE },
         });
       }
+      // 凭据形态(决策 D6):连接串优先环境变量;service-role key 只收环境变量,
+      // 不提供 flag——argv 对 ps/shell history 全程可见
+      const targetDatabaseUrl =
+        opts.targetDatabaseUrl ?? process.env.BACKUPDRILL_TARGET_DATABASE_URL;
+      const targetServiceRoleKey = process.env.BACKUPDRILL_TARGET_SERVICE_ROLE_KEY;
+      if (opts.targetSupabaseUrl && !targetServiceRoleKey) {
+        throw new Error(
+          "--target-supabase-url needs the service-role key via env BACKUPDRILL_TARGET_SERVICE_ROLE_KEY " +
+            "(no flag on purpose: argv is visible to every process on the machine)."
+        );
+      }
       const result = await runRestore(config, {
-        targetDatabaseUrl: opts.targetDatabaseUrl,
+        targetDatabaseUrl,
+        targetSupabaseUrl: opts.targetSupabaseUrl,
+        targetServiceRoleKey,
+        confirmTarget: opts.confirmTarget,
+        dryRun: opts.dryRun,
         storageDir: opts.storageDir,
         snapshot: opts.snapshot,
       });
+      if (result.dryRun) return; // 预检自行打印结论;走到这里 = 零 blocker
       const failedChecks = (result.databaseChecks ?? []).filter((c) => !c.pass);
+      const storageProblems =
+        (result.storageSummary?.filesFailed.length ?? 0) +
+        (result.storageSummary?.checksumSample.mismatched.length ?? 0) +
+        (result.storageSummary && result.storageSummary.reconcile && !result.storageSummary.reconcile.matches ? 1 : 0);
       const summary =
         `snapshot ${result.snapshot}: ` +
         `database ${result.restoredToDatabase ? "restored" : "skipped"}, ` +
-        `${result.storageFilesWritten} Storage files written` +
+        `${result.storageFilesWritten} Storage files ${result.storageSummary ? "uploaded to target" : "written"}` +
         (result.storageDir ? ` to ${result.storageDir}` : "");
-      if (failedChecks.length) {
+      if (failedChecks.length || storageProblems) {
         log.error(
-          `Restore finished with ${failedChecks.length} FAILED verification check(s) — ${summary}`
+          `Restore finished with issues (${failedChecks.length} failed check(s), ` +
+            `${storageProblems} storage problem(s)) — ${summary}`
         );
         process.exitCode = 1;
       } else {
