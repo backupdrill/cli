@@ -44,6 +44,10 @@ test("手册与 manifest 一致:对象键、校验和、扩展、快照坐标全
   assert.ok(doc.includes(manifest.dump.sha256), "归档校验和(供 shasum 对照)");
   assert.ok(doc.includes('create extension if not exists "pg_trgm" schema "extensions" cascade;'), "扩展预装 SQL");
   assert.ok(doc.includes("--snapshot 2026-07-25T00-00-00-000Z"), "CLI 命令带快照坐标");
+  assert.ok(doc.includes("--confirm-target <target-ref>"), "命令含确认门(2.0 必填)");
+  assert.ok(doc.includes("--database"), "命令用意图旗标而非凭据 flag");
+  assert.ok(!doc.includes("--target-database-url"), "凭据 flag 已移除,手册不得再教");
+  assert.ok(doc.includes('export BACKUPDRILL_TARGET_DATABASE_URL="<target-session-pooler-url>"'), "凭据走环境变量占位");
   assert.ok(doc.includes("--endpoint https://acct.r2.cloudflarestorage.com"), "CLI 命令带端点");
   assert.ok(doc.includes("storage/<bucket>/<key>"), "Storage 布局说明");
 });
