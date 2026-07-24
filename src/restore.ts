@@ -1,4 +1,3 @@
-import { spawn } from "node:child_process";
 import { mkdtemp, mkdir, rm, readdir } from "node:fs/promises";
 import { createWriteStream } from "node:fs";
 import { tmpdir } from "node:os";
@@ -6,68 +5,88 @@ import { join, dirname, resolve, sep } from "node:path";
 import { pipeline } from "node:stream/promises";
 import { type Readable } from "node:stream";
 import { GetObjectCommand } from "@aws-sdk/client-s3";
+import { Client } from "pg";
 import type { BackupConfig } from "./config.js";
 import { parseManifest } from "./manifest.js";
-import type { Manifest } from "./manifest.js";
 import {
   targetClient,
   resolveSnapshot,
   getObjectText,
   downloadToFile,
 } from "./snapshots.js";
-import { resolvePgRestoreBin } from "./pgbin.js";
+import { restoreDatabaseArtifact, installExtensions } from "./restore-engine.js";
+import { verifyRestored, type DrillCheck } from "./drill.js";
+import { pgConnectOptions } from "./supabase-ca.js";
 import { log } from "./log.js";
 
 export interface RestoreResult {
   snapshot: string;
   restoredToDatabase: boolean;
+  /** 表级验证结果(与演练同一套 verifyRestored);未恢复数据库时不存在 */
+  databaseChecks?: DrillCheck[];
   storageFilesWritten: number;
   storageDir?: string;
 }
 
 /**
- * pg_restore 的成败判定:退出码非 0(或被 signal 杀死,code=null)一律失败。
- * 旧判定"非零但 stderr 没有 error: 字样就算成功"是假成功缺陷(增补 PRD §5.2.3/D4):
- * signal kill、非英文 locale 的报错、写盘中断都不会带 "error:" 文本,却都意味着
- * 恢复出来的库是残缺的——对备份工具,静默的假成功比失败糟糕得多。
- * 可忽略错误的豁免只存在于 drill 的分段分类(classifyPostDataErrors);
- * 一把梭的 restore 在统一引擎(R1)落地前不享受任何豁免。
+ * restore 无源库配置时的占位连接串(纯 flag 驱动、没有 backupdrill.config.json 的场景)。
+ * 同源阻断门对它不生效——没有可比对的源;有真实源配置时阻断门照常工作。
  */
-export function pgRestoreOutcome(
-  code: number | null,
-  stderr: string
-): { ok: true } | { ok: false; message: string } {
-  if (code === 0) return { ok: true };
-  const detail = stderr.trim();
-  return {
-    ok: false,
-    message:
-      `pg_restore exited with ${code === null ? "a signal" : `code ${code}`}` +
-      (detail ? `: ${detail}` : " and produced no error output"),
-  };
-}
+export const NO_SOURCE_DATABASE = "postgresql://unused";
 
-function pgRestore(dumpPath: string, targetUrl: string): Promise<void> {
-  const bin = resolvePgRestoreBin();
-  return new Promise((resolve, reject) => {
-    const proc = spawn(
-      bin,
-      ["--clean", "--if-exists", "--no-owner", "--no-privileges", "--dbname", targetUrl, dumpPath],
-      { stdio: ["ignore", "ignore", "pipe"] }
-    );
-    let stderr = "";
-    proc.stderr.on("data", (d: Buffer) => (stderr += d.toString()));
-    proc.on("error", reject);
-    proc.on("close", (code) => {
-      const outcome = pgRestoreOutcome(code, stderr);
-      outcome.ok ? resolve() : reject(new Error(outcome.message));
-    });
-  });
+/**
+ * 两个连接串是否指向同一数据库租户(纯函数,可测)。
+ * 只比 host 不够:Supabase Session Pooler 的主机是区域级共享的
+ * (aws-0-us-east-1.pooler.supabase.com 对同区所有项目相同),租户身份在
+ * 用户名里(postgres.<ref>)——host 与 user 都相同才判同一目标。
+ * 任一解析失败 → false(pg 侧会给出自己的连接错误,这里不误伤)。
+ */
+export function sameDatabaseTarget(a: string, b: string): boolean {
+  try {
+    const ua = new URL(a);
+    const ub = new URL(b);
+    if (!ua.hostname || !ub.hostname) return false;
+    return ua.hostname === ub.hostname && ua.username === ub.username;
+  } catch {
+    return false;
+  }
 }
 
 /**
- * 把一份快照恢复出来:数据库还原进 --target-database-url;Storage 文件下载到本地目录
- * (拿回文件后你可以按需回传到新 Supabase 项目)。这是 US-5 恢复向导的 DIY 版本。
+ * 空目标门(PRD §5.3.3 / 决策 D5):目标 schema 里存在任何用户关系即拒绝写入。
+ * "空"的定义来自 R0 spike:不是"schema 不存在"(Supabase 恒有 public),而是
+ * schema 内零用户对象。关系之外的对象(函数、类型)不在此清单——它们冲突时会被
+ * 引擎如实报为失败,此门是防误覆盖的闸,不是完备性证明。
+ */
+async function assertEmptyTarget(targetUrl: string, schemas: string[]): Promise<void> {
+  const client = new Client(pgConnectOptions(targetUrl));
+  await client.connect();
+  try {
+    const res = await client.query<{ n: string }>(
+      `select count(*)::bigint as n
+         from pg_class c
+         join pg_namespace n on n.oid = c.relnamespace
+        where n.nspname = any($1::text[])
+          and c.relkind in ('r', 'p', 'm', 'v', 'S', 'f')`,
+      [schemas]
+    );
+    const objectCount = Number(res.rows[0].n);
+    if (objectCount > 0) {
+      throw new Error(
+        `target schema(s) ${schemas.join(", ")} contain ${objectCount} existing object(s) — ` +
+          `restore only writes into an empty target. Create a fresh Supabase project ` +
+          `(or empty these schemas) and retry.`
+      );
+    }
+  } finally {
+    await client.end();
+  }
+}
+
+/**
+ * 把一份快照恢复出来:数据库经统一引擎还原进 --target-database-url(与演练同一条
+ * pg_restore 路径与错误分类),恢复后跑同一套表级验证;Storage 文件下载到本地目录
+ * (回传到新 Supabase 项目的自动化是 P0-D,未到)。这是 US-5 恢复向导的 CLI 形态。
  */
 export async function runRestore(
   config: BackupConfig,
@@ -93,15 +112,70 @@ export async function runRestore(
 
   const workdir = await mkdtemp(join(tmpdir(), "backupdrill-restore-"));
   try {
-    // 1. 数据库
+    // 1. 数据库(写入前依次过安全门:同源阻断 → 空目标 → 归档校验 → 扩展预装)
     if (opts.targetDatabaseUrl) {
+      const targetUrl = opts.targetDatabaseUrl;
+      // 同源阻断(PRD §9.3):恢复绝不写回备份的源库。误把生产源当目标是
+      // 恢复流程里代价最不对称的失误。
+      if (
+        config.databaseUrl !== NO_SOURCE_DATABASE &&
+        sameDatabaseTarget(config.databaseUrl, targetUrl)
+      ) {
+        throw new Error(
+          "target database resolves to the same host and user as the backup source — " +
+            "restoring onto the source project is blocked. Point --target-database-url " +
+            "at a fresh Supabase project."
+        );
+      }
+
+      log.step("Checking target is empty…");
+      await assertEmptyTarget(targetUrl, manifest.database.schemas);
+
       log.step("Downloading dump…");
       const dumpPath = join(workdir, "dump.pgcustom");
-      await downloadToFile(s3, config.storage.bucket, manifest.dump.key, dumpPath);
+      const { sha256 } = await downloadToFile(s3, config.storage.bucket, manifest.dump.key, dumpPath);
+      // 归档完整性是恢复的前提:哈希不符还继续,只会把"备份坏了"变成一堆误导性
+      // 恢复错误(演练侧同一裁决:integrity FAIL 即短路)
+      if (sha256 !== manifest.dump.sha256) {
+        throw new Error(
+          `archive integrity check failed: downloaded sha256 ${sha256.slice(0, 12)}… ` +
+            `does not match manifest ${manifest.dump.sha256.slice(0, 12)}… — refusing to restore a corrupted dump`
+        );
+      }
+
+      // 扩展预装:沙箱装不上只能记录(环境局限),真实目标装不上必须阻断——
+      // 用户在 dashboard 一键可开,恢复残缺副本则要人工收拾(引擎头注的裁决分工)
+      const extensions = manifest.database.extensions ?? [];
+      if (extensions.length) {
+        log.step(`Installing ${extensions.length} extension(s) on target…`);
+        const unavailable = await installExtensions(targetUrl, extensions);
+        if (unavailable.length) {
+          throw new Error(
+            `target cannot install extension(s): ${unavailable.join(", ")} — enable them in ` +
+              `the Supabase dashboard (Database → Extensions) and retry.`
+          );
+        }
+      }
+
       log.step("Restoring database into target…");
-      await pgRestore(dumpPath, opts.targetDatabaseUrl);
+      const engine = await restoreDatabaseArtifact({ dumpPath, connString: targetUrl, target: "supabase" });
+      if (!engine.ok) {
+        const failures = [...engine.preData.failures, ...engine.postData.failures];
+        throw new Error(`database restore failed: ${failures.join(" | ")}`);
+      }
       result.restoredToDatabase = true;
-      log.ok(`Database restored (${manifest.database.tableCount} tables)`);
+
+      // 与演练同一套表级验证:两条路径对同一快照必须同一结论(PRD §5.2 验收)
+      log.step("Verifying restored tables…");
+      const verified = await verifyRestored(targetUrl, manifest);
+      result.databaseChecks = verified.checks;
+      for (const check of verified.checks) {
+        (check.pass ? log.ok : log.warn)(`${check.name}: ${check.detail}`);
+      }
+      log.ok(
+        `Database restored (${verified.tableCount} tables, ` +
+          `${verified.rowTotal.toLocaleString()} rows)`
+      );
     } else {
       log.warn("No --target-database-url given; skipping database restore.");
     }
