@@ -26,7 +26,9 @@ export function projectRefOf(connString: string): string | null {
     const url = new URL(connString);
     const direct = url.hostname.match(/^db\.([a-z0-9]{16,})\.supabase\.co$/);
     if (direct) return direct[1];
-    const pooled = url.username.match(/^postgres\.([a-z0-9]{16,})$/);
+    // 用户名必须先解码再匹配:URL 解析器保留百分号编码,而 pg/libpq 会解码——
+    // postgres%2Eref 在驱动眼里就是 postgres.ref,不解码 = 身份判定可被编码绕过
+    const pooled = decodeURIComponent(url.username).match(/^postgres\.([a-z0-9]{16,})$/);
     if (pooled) return pooled[1];
     return null;
   } catch {

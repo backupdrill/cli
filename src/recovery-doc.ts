@@ -117,11 +117,13 @@ ${extensionSql}
 shasum -a 256 dump.pgcustom   # must print ${manifest.dump.sha256}
 \`\`\`
 
-4. Restore — **without \`--clean\`**, into the empty target:
+4. Restore — **without \`--clean\`**, into the empty target. Keep the password out
+   of the URL and out of shell history via \`PGPASSWORD\`:
 
 \`\`\`bash
+export PGPASSWORD="<target-database-password>"
 pg_restore --no-owner --no-privileges \\
-  --dbname "<target-session-pooler-url>" dump.pgcustom
+  --dbname "postgresql://postgres.<target-ref>@<target-pooler-host>:5432/postgres" dump.pgcustom
 \`\`\`
 
 One error is expected and harmless: \`schema "public" already exists\` (the
