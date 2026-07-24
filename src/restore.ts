@@ -8,6 +8,7 @@ import { GetObjectCommand } from "@aws-sdk/client-s3";
 import { Client } from "pg";
 import type { BackupConfig } from "./config.js";
 import { parseManifest } from "./manifest.js";
+import type { Manifest } from "./manifest.js";
 import {
   targetClient,
   resolveSnapshot,
@@ -16,11 +17,18 @@ import {
 } from "./snapshots.js";
 import { restoreDatabaseArtifact, installExtensions } from "./restore-engine.js";
 import { verifyRestored, type DrillCheck } from "./drill.js";
+import {
+  restoreStorage,
+  type StorageRestoreSummary,
+  type StorageRestoreTarget,
+} from "./storage-restore.js";
 import { pgConnectOptions } from "./supabase-ca.js";
 import { log } from "./log.js";
 
 export interface RestoreResult {
   snapshot: string;
+  /** dry-run:只做只读预检,未发生任何写入 */
+  dryRun?: boolean;
   restoredToDatabase: boolean;
   /** 表级验证结果(与演练同一套 verifyRestored);未恢复数据库时不存在 */
   databaseChecks?: DrillCheck[];
@@ -29,6 +37,8 @@ export interface RestoreResult {
    * 不能只看 restoredToDatabase——"恢复完成"与"恢复通过验证"是两个事实。
    */
   databaseVerified?: boolean;
+  /** Storage 回传摘要(提供了目标 Storage 凭据时);本地下载模式不存在 */
+  storageSummary?: StorageRestoreSummary;
   storageFilesWritten: number;
   storageDir?: string;
 }
@@ -78,6 +88,57 @@ export function sameDatabaseTarget(a: string, b: string): boolean {
 }
 
 /**
+ * 从目标 Project URL(https://<ref>.supabase.co)提取 ref。 */
+export function refFromSupabaseUrl(supabaseUrl: string): string | null {
+  try {
+    const match = new URL(supabaseUrl).hostname.match(/^([a-z0-9]{16,})\.supabase\.co$/);
+    return match ? match[1] : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * 正式执行的确认门(PRD §5.3.3):用户必须键入目标 project ref(或非 Supabase 目标的
+ * 主机名)与实际连接目标一致。误把生产源当目标是恢复流程里代价最不对称的失误,
+ * 这道门要求人把目标身份亲手打一遍。
+ */
+export function assertConfirmedTarget(
+  confirmTarget: string | undefined,
+  targetDatabaseUrl?: string,
+  targetSupabaseUrl?: string
+): void {
+  const dbRef = targetDatabaseUrl ? projectRefOf(targetDatabaseUrl) : null;
+  const apiRef = targetSupabaseUrl ? refFromSupabaseUrl(targetSupabaseUrl) : null;
+  // 两个入口都给了且指向不同项目 → 直接硬错,和确认无关
+  if (dbRef && apiRef && dbRef !== apiRef) {
+    throw new Error(
+      `--target-database-url points at project "${dbRef}" but --target-supabase-url at "${apiRef}" — ` +
+        `these are different projects; fix one of them.`
+    );
+  }
+  let expected = dbRef ?? apiRef;
+  if (!expected && targetDatabaseUrl) {
+    try {
+      expected = new URL(targetDatabaseUrl).hostname || null;
+    } catch {
+      expected = null;
+    }
+  }
+  if (!expected) {
+    throw new Error(
+      "cannot derive the target's identity from the given URLs — refusing to write without a confirmable target."
+    );
+  }
+  if (confirmTarget !== expected) {
+    throw new Error(
+      `restore writes to target "${expected}" — confirm by re-running with --confirm-target ${expected} ` +
+        `(use --dry-run first to preview all checks without writing).`
+    );
+  }
+}
+
+/**
  * 空目标门(PRD §5.3.3 / 决策 D5):目标 schema 里存在任何用户对象即拒绝写入。
  * "空"的定义来自 R0 spike:不是"schema 不存在"(Supabase 恒有 public),而是
  * schema 内零用户对象——关系、函数/过程、独立类型(enum/domain/range/composite)
@@ -113,14 +174,125 @@ async function assertEmptyTarget(targetUrl: string, schemas: string[]): Promise<
 }
 
 /**
- * 把一份快照恢复出来:数据库经统一引擎还原进 --target-database-url(与演练同一条
- * pg_restore 路径与错误分类),恢复后跑同一套表级验证;Storage 文件下载到本地目录
- * (回传到新 Supabase 项目的自动化是 P0-D,未到)。这是 US-5 恢复向导的 CLI 形态。
+ * dry-run 只读预检(PRD §5.3.2):零写入,把正式执行会撞的墙全部提前撞一遍。
+ * 逐项打印,任何 blocker 汇总后抛出(退出码非零 = "现在执行不会成功")。
+ */
+async function dryRunPreflight(
+  config: BackupConfig,
+  manifest: Manifest,
+  targetUrl: string | undefined,
+  storageTarget: StorageRestoreTarget | null
+): Promise<void> {
+  const blockers: string[] = [];
+  const db = manifest.database;
+  const mb = (n: number) => (n / 1024 / 1024).toFixed(1);
+  log.ok(
+    `coverage: schemas ${db.schemas.join(", ")} — ${db.tableCount} tables, ` +
+      `~${db.estimatedRowTotal.toLocaleString()} rows, dump ${mb(manifest.dump.bytes)} MB`
+  );
+  log.ok(
+    manifest.storage
+      ? `storage: ${manifest.storage.fileCount} files, ${mb(manifest.storage.totalBytes)} MB` +
+          (manifest.storage.buckets ? `, ${manifest.storage.buckets.length} bucket(s) with attributes` : ", bucket attributes not captured")
+      : "storage: none (database-only snapshot)"
+  );
+  log.warn(
+    "not covered: Auth users/sessions, secret values, Edge Functions, most platform settings"
+  );
+
+  if (targetUrl) {
+    if (config.databaseUrl !== NO_SOURCE_DATABASE && sameDatabaseTarget(config.databaseUrl, targetUrl)) {
+      blockers.push("target database is the backup SOURCE (same project)");
+      log.error("target identity: SAME AS SOURCE — would be blocked");
+    } else {
+      log.ok("target identity: distinct from source");
+    }
+    try {
+      await assertEmptyTarget(targetUrl, db.schemas);
+      log.ok(`target schemas (${db.schemas.join(", ")}) are empty`);
+    } catch (error) {
+      blockers.push((error as Error).message);
+      log.error(`empty-target check: ${(error as Error).message}`);
+    }
+    const client = new Client(pgConnectOptions(targetUrl));
+    await client.connect();
+    try {
+      // SHOW 的结果列名是 server_version;用 current_setting 显式起别名,
+      // 否则取错列得 NaN,而 NaN < x 恒 false = 版本降级永远查不出来
+      const version = await client.query<{ v: string }>(
+        "select current_setting('server_version') as v"
+      );
+      const targetMajor = parseInt(version.rows[0].v, 10);
+      const sourceMajor = parseInt(db.serverVersion, 10);
+      if (!Number.isFinite(targetMajor)) {
+        blockers.push(`cannot determine target PostgreSQL version (got "${version.rows[0].v}")`);
+        log.error("postgres version: undeterminable — refusing to guess");
+      } else if (targetMajor < sourceMajor) {
+        blockers.push(`target PostgreSQL ${targetMajor} < source ${sourceMajor}`);
+        log.error(`postgres version: target ${targetMajor} < source ${sourceMajor} — would fail`);
+      } else {
+        log.ok(`postgres version: target ${targetMajor} ≥ source ${sourceMajor}`);
+      }
+      const extensions = db.extensions ?? [];
+      if (extensions.length) {
+        const available = await client.query<{ name: string }>(
+          `select name from pg_available_extensions where name = any($1::text[])`,
+          [extensions.map((e) => e.name)]
+        );
+        const availableNames = new Set(available.rows.map((r) => r.name));
+        const missing = extensions.filter((e) => !availableNames.has(e.name)).map((e) => e.name);
+        if (missing.length) {
+          blockers.push(`extensions unavailable on target: ${missing.join(", ")}`);
+          log.error(`extensions: ${missing.join(", ")} unavailable — enable in dashboard first`);
+        } else {
+          log.ok(`extensions: all ${extensions.length} available on target`);
+        }
+      }
+    } finally {
+      await client.end();
+    }
+  } else {
+    log.warn("no target database URL — database restore would be skipped");
+  }
+
+  if (storageTarget) {
+    const res = await fetch(`${storageTarget.supabaseUrl}/storage/v1/bucket`, {
+      headers: {
+        Authorization: `Bearer ${storageTarget.serviceRoleKey}`,
+        apikey: storageTarget.serviceRoleKey,
+      },
+    });
+    if (res.ok) {
+      log.ok("target Storage API reachable (service key accepted)");
+    } else {
+      blockers.push(`target Storage API returned HTTP ${res.status}`);
+      log.error(`target Storage API: HTTP ${res.status} — check the URL and service-role key`);
+    }
+  } else if (manifest.storage) {
+    log.warn("no Storage target credentials — files would be downloaded locally, not uploaded");
+  }
+
+  if (blockers.length) {
+    throw new Error(
+      `dry run found ${blockers.length} blocker(s):\n  - ${blockers.join("\n  - ")}`
+    );
+  }
+  log.ok("dry run passed — nothing was written; re-run with --confirm-target to execute");
+}
+
+/**
+ * 把一份快照恢复出来:数据库经统一引擎还原进目标(与演练同一条 pg_restore 路径与
+ * 错误分类),恢复后跑同一套表级验证;Storage 提供目标凭据时回传+对账(P0-D),
+ * 否则下载到本地目录。这是 US-5 恢复向导的 CLI 形态。
  */
 export async function runRestore(
   config: BackupConfig,
   opts: {
     targetDatabaseUrl?: string;
+    targetSupabaseUrl?: string;
+    targetServiceRoleKey?: string;
+    confirmTarget?: string;
+    dryRun?: boolean;
     snapshot?: string;
     storageDir?: string;
   }
@@ -133,11 +305,32 @@ export async function runRestore(
   );
   const base = manifest.dump.key.replace(/\/dump\.pgcustom$/, "");
 
+  const storageTarget: StorageRestoreTarget | null =
+    opts.targetSupabaseUrl && opts.targetServiceRoleKey
+      ? {
+          supabaseUrl: opts.targetSupabaseUrl.replace(/\/+$/, ""),
+          serviceRoleKey: opts.targetServiceRoleKey,
+        }
+      : null;
+
   const result: RestoreResult = {
     snapshot,
     restoredToDatabase: false,
     storageFilesWritten: 0,
   };
+
+  // dry-run:只读预检后直接返回,零写入(PRD §5.3.2)
+  if (opts.dryRun) {
+    log.step(`Dry run for snapshot ${snapshot} — nothing will be written`);
+    await dryRunPreflight(config, manifest, opts.targetDatabaseUrl, storageTarget);
+    result.dryRun = true;
+    return result;
+  }
+
+  // 正式执行的确认门(PRD §5.3.3):任何目标写入(库或 Storage)之前
+  if (opts.targetDatabaseUrl || storageTarget) {
+    assertConfirmedTarget(opts.confirmTarget, opts.targetDatabaseUrl, opts.targetSupabaseUrl);
+  }
 
   const workdir = await mkdtemp(join(tmpdir(), "backupdrill-restore-"));
   try {
@@ -210,8 +403,51 @@ export async function runRestore(
       log.warn("No --target-database-url given; skipping database restore.");
     }
 
-    // 2. Storage 文件 → 本地目录
-    if (manifest.storage && manifest.storage.files.length) {
+    // 2a. Storage → 目标项目回传(P0-D:给了目标 Storage 凭据时)
+    if (manifest.storage && storageTarget) {
+      const summary = await restoreStorage(
+        { s3, bucket: config.storage.bucket, base },
+        storageTarget,
+        manifest,
+        { targetDatabaseUrl: opts.targetDatabaseUrl }
+      );
+      result.storageSummary = summary;
+      result.storageFilesWritten = summary.filesUploaded;
+      log.ok(
+        `Storage restored: ${summary.filesUploaded}/${manifest.storage.files.length} files ` +
+          `(${(summary.bytesUploaded / 1024 / 1024).toFixed(1)} MB), ` +
+          `buckets created ${summary.bucketsCreated.length} / existing ${summary.bucketsExisting.length}`
+      );
+      if (summary.bucketsWithoutAttrs.length) {
+        log.warn(
+          `bucket attributes not captured for: ${summary.bucketsWithoutAttrs.join(", ")} — ` +
+            `created with defaults; review public/size/MIME settings by hand`
+        );
+      }
+      for (const failed of summary.filesFailed.slice(0, 5)) {
+        log.warn(`file failed: ${failed.file} — ${failed.reason}`);
+      }
+      if (summary.filesFailed.length > 5) {
+        log.warn(`…and ${summary.filesFailed.length - 5} more file failure(s)`);
+      }
+      if (summary.reconcile) {
+        (summary.reconcile.matches ? log.ok : log.warn)(
+          `reconcile: target catalog has ${summary.reconcile.targetCount} file(s), ` +
+            `${(summary.reconcile.targetBytes / 1024 / 1024).toFixed(1)} MB`
+        );
+      } else {
+        log.warn("reconcile skipped: no target database URL to count storage.objects with");
+      }
+      if (summary.checksumSample.checked) {
+        (summary.checksumSample.mismatched.length === 0 ? log.ok : log.error)(
+          `checksum sample: ${summary.checksumSample.checked} file(s) re-hashed from target` +
+            (summary.checksumSample.mismatched.length
+              ? `, MISMATCH: ${summary.checksumSample.mismatched.join(", ")}`
+              : ", all match")
+        );
+      }
+      log.warn(summary.ownerNote);
+    } else if (manifest.storage && manifest.storage.files.length) {
       const outDir = opts.storageDir ?? join(process.cwd(), `restored-storage-${snapshot}`);
       // 输出目录必须是新的/空的:路径锚定检查是词法层面的,防不住目录里**已有**的
       // 符号链接把写入引到别处;保证目录从空开始 = 所有子路径都由本进程创建,无链接可循
