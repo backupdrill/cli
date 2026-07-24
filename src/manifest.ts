@@ -145,6 +145,10 @@ function assertManifestShape(m: Manifest): void {
   if (typeof m.database.serverVersion !== "string" || !(parseInt(m.database.serverVersion, 10) > 0)) {
     malformed("database.serverVersion");
   }
+  // 恢复端的工具版本闸要解析它(requiredRestoreToolMajor)——错型值不能到那才炸
+  if (typeof m.database.pgDumpVersion !== "string" || !m.database.pgDumpVersion) {
+    malformed("database.pgDumpVersion");
+  }
   if (!Array.isArray(m.database.schemas) || m.database.schemas.some((s) => typeof s !== "string" || !s)) {
     malformed("database.schemas");
   }

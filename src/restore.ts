@@ -333,10 +333,13 @@ async function dryRunPreflight(
       }
       const toolMajor = await localPgRestoreMajor();
       const requiredMajor = requiredRestoreToolMajor(manifest);
-      if (toolMajor !== null && toolMajor < requiredMajor) {
+      if (toolMajor === null) {
+        blockers.push("local pg_restore missing or version unparseable");
+        log.error("pg_restore tool: not found / version unparseable — set BACKUPDRILL_PG_RESTORE");
+      } else if (toolMajor < requiredMajor) {
         blockers.push(`local pg_restore v${toolMajor} < archive requirement v${requiredMajor}`);
         log.error(`pg_restore tool: local v${toolMajor} cannot read a v${requiredMajor} archive`);
-      } else if (toolMajor !== null) {
+      } else {
         log.ok(`pg_restore tool: local v${toolMajor} ≥ archive requirement v${requiredMajor}`);
       }
       const extensions = db.extensions ?? [];
@@ -525,7 +528,15 @@ export async function runRestore(
       // 读不了新归档——不查的话会先装完扩展再在恢复中途才炸
       const toolMajor = await localPgRestoreMajor();
       const requiredMajor = requiredRestoreToolMajor(manifest);
-      if (toolMajor !== null && toolMajor < requiredMajor) {
+      // 查不到版本(pg_restore 缺失/输出不可解析)= fail-closed:不能先装扩展改了目标,
+      // 才发现根本没有可用的恢复工具(评审第 11 轮)
+      if (toolMajor === null) {
+        throw new Error(
+          `cannot determine the local pg_restore version — install postgresql client ${requiredMajor}+ ` +
+            `and/or point BACKUPDRILL_PG_RESTORE at it before restoring.`
+        );
+      }
+      if (toolMajor < requiredMajor) {
         throw new Error(
           `local pg_restore is v${toolMajor} but this archive needs v${requiredMajor}+ ` +
             `(archive format follows the writing tool). Install postgresql client ${requiredMajor}+ ` +
@@ -593,8 +604,11 @@ export async function runRestore(
       result.storageSummary = summary;
       result.storageFilesWritten = summary.filesUploaded;
       log.ok(
-        `Storage restored: ${summary.filesUploaded}/${manifest.storage.files.length} files ` +
-          `(${(summary.bytesUploaded / 1024 / 1024).toFixed(1)} MB), ` +
+        `Storage restored: ${summary.filesUploaded}/${manifest.storage.files.length} files uploaded` +
+          (summary.filesSkippedIdentical
+            ? `, ${summary.filesSkippedIdentical} already present (identical size)`
+            : "") +
+          ` (${(summary.bytesUploaded / 1024 / 1024).toFixed(1)} MB), ` +
           `buckets created ${summary.bucketsCreated.length} / existing ${summary.bucketsExisting.length}`
       );
       if (summary.bucketsWithoutAttrs.length) {

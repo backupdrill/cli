@@ -1,7 +1,8 @@
 // Storage 真实回传(恢复闭环 PRD §5.4):bucket 重建 → 文件上传 → 逐键对账 → 抽样校验和。
 // 通道 = 目标项目 Storage HTTP API + service-role key(R0 spike 1 实证:bucket 三属性
-// 与 contentType/cacheControl/x-metadata 全保真;x-upsert 幂等重传,PRD §5.3.4 明文
-// 许可;InvalidKey 是单文件失败不中断)。对账用 list API 递归遍历目标(不依赖目标 DB
+// 与 contentType/cacheControl/x-metadata 全保真;InvalidKey 是单文件失败不中断)。
+// 重试幂等 = 上传前预检目标对象:同 key 同尺寸跳过、尺寸不同拒绝覆盖——不用 x-upsert,
+// 静默覆盖在任何路径都不可能发生(评审第 11 轮)。对账用 list API 递归遍历目标(不依赖目标 DB
 // 凭据,storage-only 恢复也有完整对账),**逐 bucket/key 比对 + 尺寸核对**——聚合数的
 // >= 比较会被多余对象掩蔽缺失(评审第 8 轮)。
 import { createHash } from "node:crypto";
@@ -42,6 +43,8 @@ export interface StorageRestoreSummary {
   bucketAttrDrift: string[];
   filesUploaded: number;
   bytesUploaded: number;
+  /** 目标已有同 key 同尺寸对象而跳过的数量(重试残留;字节级抽样校验覆盖) */
+  filesSkippedIdentical: number;
   filesFailed: { file: string; reason: string }[];
   /** 429/5xx/超时后的成功重试次数(可观测性:PRD §10.3) */
   retries: number;
@@ -177,7 +180,8 @@ async function ensureBucket(
       if (
         attrs.allowedMimeTypes !== null &&
         attrs.allowedMimeTypes !== undefined &&
-        JSON.stringify(existing.allowed_mime_types ?? null) !== JSON.stringify(attrs.allowedMimeTypes)
+        JSON.stringify([...(existing.allowed_mime_types ?? [])].sort()) !==
+          JSON.stringify([...attrs.allowedMimeTypes].sort())
       )
         drift.push(
           `allowed_mime_types ${JSON.stringify(existing.allowed_mime_types)} ≠ manifest ${JSON.stringify(attrs.allowedMimeTypes)}`
@@ -199,10 +203,13 @@ export const STANDARD_UPLOAD_LIMIT_BYTES = 5 * 1024 * 1024 * 1024;
 // Supabase TUS 约定块大小:除末块外必须恰为 6MB
 const TUS_CHUNK_BYTES = 6 * 1024 * 1024;
 
-/** TUS 启用阈值:默认 = 标准上传上限;测试/验证经 env 压低,让小文件也走 TUS 路径。 */
+/**
+ * TUS 启用阈值:默认 = 6MB(Supabase 官方对 resumable 的建议线)——大文件从零重传
+ * 的标准上传既脆弱又贵;env 可覆盖(验证时压低,特殊网络环境可调高)。
+ */
 export function tusThresholdBytes(): number {
   const env = Number(process.env.BACKUPDRILL_TUS_THRESHOLD ?? "");
-  return Number.isFinite(env) && env > 0 ? env : STANDARD_UPLOAD_LIMIT_BYTES;
+  return Number.isFinite(env) && env > 0 ? env : TUS_CHUNK_BYTES;
 }
 
 async function collectBody(body: unknown): Promise<Buffer> {
@@ -234,7 +241,6 @@ async function uploadViaTus(
       ...storageHeaders(target.serviceRoleKey),
       "Tus-Resumable": "1.0.0",
       "Upload-Length": String(file.bytes),
-      "x-upsert": "true",
       "Upload-Metadata": metaParts.join(","),
     },
     signal: AbortSignal.timeout(API_TIMEOUT_MS),
@@ -245,9 +251,16 @@ async function uploadViaTus(
   const location = create.headers.get("location");
   if (!location) throw new Error("TUS creation returned no Location header");
   const uploadUrl = new URL(location, target.supabaseUrl).toString();
+  // Location 可能是任意绝对 URL,而后续 PATCH/HEAD 会带 service key——凭据只许发往
+  // 已验证的目标源(与 validateStorageTargetOrigin 同一约束)
+  if (new URL(uploadUrl).origin !== target.supabaseUrl) {
+    throw new Error(
+      `TUS Location resolved outside the verified target origin (${new URL(uploadUrl).origin}) — refusing to send credentials there`
+    );
+  }
 
   let offset = 0;
-  let failures = 0;
+  let chunkAttempts = 0; // 每前进一步清零:重试预算属于"当前卡住的位置",不是整个文件
   while (offset < file.bytes) {
     const end = Math.min(offset + TUS_CHUNK_BYTES, file.bytes) - 1;
     const got = await source.s3.send(
@@ -271,19 +284,23 @@ async function uploadViaTus(
         body: new Uint8Array(chunk),
         signal: AbortSignal.timeout(UPLOAD_TIMEOUT_MS),
       });
-    } catch (error) {
-      res = null; // 超时/网络错:走 HEAD 重对准
-      if (++failures > MAX_ATTEMPTS) throw error;
+    } catch {
+      res = null; // 超时/网络错:统一走下方的重试/对准路径,只计一次失败
     }
     if (res && (res.status === 204 || res.status === 200)) {
-      offset = Number(res.headers.get("upload-offset") ?? offset + chunk.length);
+      const newOffset = Number(res.headers.get("upload-offset") ?? offset + chunk.length);
+      if (newOffset > offset) {
+        offset = newOffset;
+        chunkAttempts = 0;
+      }
       continue;
     }
     if (res && !isRetryable(res.status) && res.status !== 409) {
       throw new Error(`TUS chunk failed: HTTP ${res.status} ${(await res.text()).slice(0, 160)}`);
     }
-    if (++failures > MAX_ATTEMPTS) {
-      throw new Error(`TUS upload gave up after ${MAX_ATTEMPTS} chunk failures at offset ${offset}`);
+    chunkAttempts += 1;
+    if (chunkAttempts >= MAX_ATTEMPTS) {
+      throw new Error(`TUS upload gave up after ${MAX_ATTEMPTS} attempts at offset ${offset}`);
     }
     // 断点续传的核心:HEAD 问服务端"你收到哪了",从那里继续,不从零重来
     const head = await fetch(uploadUrl, {
@@ -292,9 +309,12 @@ async function uploadViaTus(
       signal: AbortSignal.timeout(API_TIMEOUT_MS),
     });
     const serverOffset = Number(head.headers.get("upload-offset") ?? Number.NaN);
-    if (Number.isFinite(serverOffset)) offset = serverOffset;
+    if (Number.isFinite(serverOffset) && serverOffset > offset) {
+      offset = serverOffset;
+      chunkAttempts = 0; // 服务端有进展 = 没卡住
+    }
     summary.retries += 1;
-    await new Promise((r) => setTimeout(r, 1000 * failures * failures));
+    await new Promise((r) => setTimeout(r, 1000 * chunkAttempts * chunkAttempts));
   }
 }
 
@@ -308,8 +328,9 @@ async function uploadFile(
   if (file.bytes > tusThresholdBytes()) {
     return uploadViaTus(source, target, file, summary);
   }
+  // 不用 x-upsert(评审第 11 轮):目标既有对象的处置在上传前已裁决(同尺寸跳过/
+  // 冲突拒绝),此处冲突只剩并发竞态 → 409 如实失败,绝不静默覆盖
   const headers: Record<string, string> = {
-    "x-upsert": "true", // 幂等重传(spike 1:同 key upsert 成功且对象 Id 不变)
     "Content-Length": String(file.bytes), // 流式体 + 显式长度,不整文件驻留内存
   };
   if (file.contentType) headers["Content-Type"] = file.contentType;
@@ -476,12 +497,26 @@ async function uploadAll(
   source: { s3: S3Client; bucket: string; base: string },
   target: StorageRestoreTarget,
   files: StorageFile[],
+  preexisting: Map<string, Map<string, number>>,
   summary: StorageRestoreSummary
 ): Promise<void> {
   let next = 0;
   const workers = Array.from({ length: Math.min(UPLOAD_CONCURRENCY, files.length) }, async () => {
     while (next < files.length) {
       const file = files[next++];
+      const existingSize = preexisting.get(file.bucket)?.get(file.key);
+      if (existingSize !== undefined) {
+        if (existingSize === file.bytes) {
+          // 重试残留:同 key 同尺寸跳过;字节级正确性由抽样校验覆盖
+          summary.filesSkippedIdentical += 1;
+        } else {
+          summary.filesFailed.push({
+            file: `${file.bucket}/${file.key}`,
+            reason: `target already has a conflicting object (size ${existingSize} ≠ manifest ${file.bytes}) — refusing to overwrite`,
+          });
+        }
+        continue;
+      }
       try {
         await uploadFile(source, target, file, summary);
         summary.filesUploaded += 1;
@@ -514,6 +549,7 @@ export async function restoreStorage(
     bucketAttrDrift: [],
     filesUploaded: 0,
     bytesUploaded: 0,
+    filesSkippedIdentical: 0,
     filesFailed: [],
     retries: 0,
     reconcile: { verified: 0, missing: [], sizeMismatched: [], extras: 0, matches: false },
@@ -528,9 +564,21 @@ export async function restoreStorage(
     await ensureBucket(target, manifest, bucket.name, summary);
   }
 
+  // 上传前预检目标对象(评审第 11 轮):新建桶必空;既有桶列一遍,让"跳过/拒绝"
+  // 的裁决发生在任何写入之前
+  const preexisting = new Map<string, Map<string, number>>();
+  for (const bucket of buckets) {
+    preexisting.set(
+      bucket.name,
+      summary.bucketsExisting.includes(bucket.name)
+        ? await walkTargetObjects(target, bucket.name, summary)
+        : new Map()
+    );
+  }
+
   const files = manifest.storage!.files;
   log.step(`Uploading ${files.length} file(s) → target Storage…`);
-  await uploadAll(source, target, files, summary);
+  await uploadAll(source, target, files, preexisting, summary);
 
   log.step("Reconciling every file against the target listing…");
   const actualByBucket = new Map<string, Map<string, number>>();
