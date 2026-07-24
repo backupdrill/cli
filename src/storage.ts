@@ -6,6 +6,7 @@ import {
   ListBucketsCommand,
   ListObjectsV2Command,
   GetObjectCommand,
+  type GetObjectCommandOutput,
 } from "@aws-sdk/client-s3";
 import { Upload } from "@aws-sdk/lib-storage";
 import type { SupabaseStorageConfig } from "./config.js";
@@ -52,6 +53,29 @@ async function* listObjects(
     }
     token = res.IsTruncated ? res.NextContinuationToken : undefined;
   } while (token);
+}
+
+/**
+ * 从 GetObject 响应提取文件的可恢复元数据。Supabase 的 S3 handler 把这些头直接
+ * 从 storage.objects.metadata / user_metadata 取出(content-type、cache-control、
+ * x-amz-meta-*,源码实证 2026-07-24)——所以这份元数据与刚流过的字节**原子一致**,
+ * 不存在"拷完再查 DB"的并发漂移窗口,也不依赖 DB 上 storage schema 的读权限。
+ * 缺席的头不落字段(= 源端未设置/未提供),不猜测。
+ */
+export function fileMetadataFromS3(got: GetObjectCommandOutput): {
+  contentType?: string;
+  cacheControl?: string;
+  contentEncoding?: string;
+  metadata?: Record<string, string>;
+  lastModified?: string;
+} {
+  const meta: ReturnType<typeof fileMetadataFromS3> = {};
+  if (got.ContentType) meta.contentType = got.ContentType;
+  if (got.CacheControl) meta.cacheControl = got.CacheControl;
+  if (got.ContentEncoding) meta.contentEncoding = got.ContentEncoding;
+  if (got.Metadata && Object.keys(got.Metadata).length) meta.metadata = got.Metadata;
+  if (got.LastModified) meta.lastModified = got.LastModified.toISOString();
+  return meta;
 }
 
 /**
@@ -122,7 +146,13 @@ export async function syncStorage(
         throw error;
       }
 
-      files.push({ bucket, key: obj.key, bytes, sha256: hash.digest("hex") });
+      files.push({
+        bucket,
+        key: obj.key,
+        bytes,
+        sha256: hash.digest("hex"),
+        ...fileMetadataFromS3(got),
+      });
       totalBytes += bytes;
     }
     log.step(`  ${bucket}: ${files.filter((f) => f.bucket === bucket).length} files`);
