@@ -8,7 +8,7 @@ import {
   sourceProjectRefs,
   NO_SOURCE_DATABASE,
 } from "../dist/restore.js";
-import { bucketsToRestore, reconcileFiles } from "../dist/storage-restore.js";
+import { bucketsToRestore, reconcileFiles, standardUploadBlocker } from "../dist/storage-restore.js";
 
 const REF = "abcdefghij0123456789";
 const POOLER = `postgresql://postgres.${REF}:pw@aws-0-us-east-1.pooler.supabase.com:5432/postgres`;
@@ -109,4 +109,22 @@ test("reconcileFiles:逐键对账——缺失/尺寸不符判失败,多余对象
   assert.deepEqual(r.missing, ["a/y.txt"]);
   assert.match(r.sizeMismatched[0], /b\/z\.txt/);
   assert.equal(r.extras, 2);
+});
+
+test("?user= 覆盖同样拒绝(pooler 租户在用户名里,覆盖 user = 换项目)", () => {
+  assert.throws(() => assertNoHostOverride(`${POOLER}?user=postgres.zzzzzzzzzz9876543210`), /override/);
+});
+
+test("sourceProjectRefs:manifest 自记的源 ref 是纯 flag 恢复的最后防线", () => {
+  const bare = { databaseUrl: NO_SOURCE_DATABASE };
+  assert.equal(sourceProjectRefs(bare).size, 0);
+  const withManifest = sourceProjectRefs(bare, { sourceProjectRef: REF });
+  assert.deepEqual([...withManifest], [REF]);
+});
+
+test("标准上传 5GB 上限:超限 = 诚实单文件失败(不假装传上,不整体中断)", () => {
+  assert.equal(standardUploadBlocker(5 * 1024 ** 3), null);
+  const blocked = standardUploadBlocker(6 * 1024 ** 3);
+  assert.match(blocked, /5 GB standard-upload limit/);
+  assert.match(blocked, /RECOVERY\.md/);
 });

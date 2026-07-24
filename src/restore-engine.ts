@@ -16,6 +16,34 @@ import { pgConnectOptions } from "./supabase-ca.js";
 
 export type RestoreTargetKind = "sandbox" | "supabase";
 
+/**
+ * 从连接串提取 Supabase 项目 ref(纯函数):直连主机 `db.<ref>.supabase.co` 或
+ * pooler 用户名 `postgres.<ref>`。放在引擎层:备份端(写 manifest.sourceProjectRef)
+ * 与恢复端(同源阻断)共用同一个身份判定。非 Supabase 形态返回 null。
+ */
+export function projectRefOf(connString: string): string | null {
+  try {
+    const url = new URL(connString);
+    const direct = url.hostname.match(/^db\.([a-z0-9]{16,})\.supabase\.co$/);
+    if (direct) return direct[1];
+    const pooled = url.username.match(/^postgres\.([a-z0-9]{16,})$/);
+    if (pooled) return pooled[1];
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+/** 从 Supabase Storage S3 端点(https://<ref>.storage.supabase.co/…)提取项目 ref。 */
+export function refFromStorageEndpoint(endpoint: string): string | null {
+  try {
+    const match = new URL(endpoint).hostname.match(/^([a-z0-9]{16,})\.(?:storage\.)?supabase\.co$/);
+    return match ? match[1] : null;
+  } catch {
+    return null;
+  }
+}
+
 export interface ClassifiedPass {
   /** allowlist 命中数(环境预期/托管冲突)——如实入报告,不算失败 */
   expectedSkips: number;
