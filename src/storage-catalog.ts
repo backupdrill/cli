@@ -81,7 +81,17 @@ export function catalogFromRows(
     if (r.mimetype) meta.contentType = r.mimetype;
     if (r.cache_control) meta.cacheControl = r.cache_control;
     if (r.content_encoding) meta.contentEncoding = r.content_encoding;
-    if (r.user_metadata && Object.keys(r.user_metadata).length) meta.metadata = r.user_metadata;
+    // Supabase 对 user_metadata 接受任意 JSON 值(数组/字符串/数字都合法)。manifest 契约
+    // 是普通对象;非对象根照单全收会写出 parseManifest 自己都拒读的 manifest——刚写完的
+    // 备份直接不可读。非对象 → 省略 = 未捕获,不猜测、不转换。
+    if (
+      typeof r.user_metadata === "object" &&
+      r.user_metadata !== null &&
+      !Array.isArray(r.user_metadata) &&
+      Object.keys(r.user_metadata).length
+    ) {
+      meta.metadata = r.user_metadata;
+    }
     if (r.updated_at) {
       meta.lastModified =
         r.updated_at instanceof Date ? r.updated_at.toISOString() : String(r.updated_at);
@@ -130,6 +140,9 @@ export async function inspectStorageCatalog(
       `select bucket_id, name,
               metadata->>'mimetype' as mimetype,
               metadata->>'cacheControl' as cache_control,
+              -- 实测(2026-07-24 spike):当前 Supabase storage-api 不把 Content-Encoding
+              -- 落进 metadata jsonb → 此列在真实 Supabase 上恒 null(= 未捕获)。保留选取:
+              -- 字段是 manifest 契约位,Supabase 未来落了就自动捕获
               metadata->>'contentEncoding' as content_encoding,
               user_metadata,
               updated_at

@@ -140,8 +140,16 @@ function assertManifestShape(m: Manifest): void {
   if (!Array.isArray(m.database.tables)) malformed("database.tables");
   for (const t of m.database.tables) {
     if (typeof t?.schema !== "string" || typeof t?.name !== "string") malformed("database.tables[]");
+    // estimatedRows 缺失/错型会让演练的"备份时非空的表恢复后不为空"检查静默失效
+    // (undefined > 0 恒 false)——空表假 PASS 是最不能接受的失败方式
+    if (typeof t.estimatedRows !== "number" || !Number.isFinite(t.estimatedRows) || t.estimatedRows < 0) {
+      malformed("database.tables[].estimatedRows");
+    }
   }
-  if (m.storage !== null && m.storage !== undefined) {
+  // 写入端恒写 storage: null(DB-only)或对象——字段整体缺失只可能是截断/损坏,
+  // 静默当成 DB-only 会跳过全部 Storage 验证与恢复
+  if (m.storage === undefined) malformed("storage section missing (null means DB-only)");
+  if (m.storage !== null) {
     if (typeof m.storage !== "object") malformed("storage section");
     if (typeof m.storage.fileCount !== "number" || typeof m.storage.totalBytes !== "number") {
       malformed("storage.fileCount/totalBytes");
