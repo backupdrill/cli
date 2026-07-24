@@ -7,7 +7,7 @@ import { Client } from "pg";
 import { S3Client } from "@aws-sdk/client-s3";
 import type { BackupConfig } from "./config.js";
 import { parseManifest } from "./manifest.js";
-import type { ExtensionInfo, Manifest } from "./manifest.js";
+import type { Manifest } from "./manifest.js";
 import {
   targetClient,
   resolveSnapshot,
@@ -15,7 +15,14 @@ import {
   downloadToFile,
   hashObject,
 } from "./snapshots.js";
-import { resolvePgRestoreBin } from "./pgbin.js";
+import {
+  SANDBOX_MANAGED_ERROR,
+  classifyBlocks,
+  finalizePass,
+  installExtensions,
+  restoreDatabaseArtifact,
+} from "./restore-engine.js";
+import { pgConnectOptions } from "./supabase-ca.js";
 import { log } from "./log.js";
 
 const execFileAsync = promisify(execFile);
@@ -131,60 +138,13 @@ async function startEphemeralPostgres(image: string): Promise<Ephemeral> {
   }
 }
 
-function quoteIdent(name: string): string {
-  return `"${name.replace(/"/g, '""')}"`;
-}
-
-/**
- * 恢复前把 manifest 记录的扩展装进沙箱(--schema 转储不含 CREATE EXTENSION)。
- * 必须装进与源库相同的 schema:dump 里的类型是限定名(如 extensions.vector)。
- * 装不上的扩展如实收集返回,**不在这里失败**——Supabase 项目普遍装着沙箱镜像
- * 没有的托管扩展(pg_graphql、supabase_vault…),public 转储通常并不引用它们;
- * 只有恢复真的因此失败时才升级为分类错误(见 drillDump)。
- */
-async function installExtensions(
-  connString: string,
-  extensions: ExtensionInfo[]
-): Promise<string[]> {
-  if (!extensions.length) return [];
-  const client = new Client({ connectionString: connString });
-  await client.connect();
-  const unavailable: string[] = [];
-  try {
-    for (const ext of extensions) {
-      try {
-        await client.query(`create schema if not exists ${quoteIdent(ext.schema)}`);
-        // CASCADE 自动带上依赖扩展,免受 manifest 里的安装顺序摆布
-        await client.query(
-          `create extension if not exists ${quoteIdent(ext.name)} schema ${quoteIdent(ext.schema)} cascade`
-        );
-      } catch {
-        unavailable.push(ext.name);
-      }
-    }
-  } finally {
-    await client.end();
-  }
-  return unavailable;
-}
+// installExtensions 已上移到统一引擎(restore-engine.ts):沙箱与真实恢复共用,
+// 唯一差异是调用方对"装不上"的裁决——沙箱记录后继续,真实目标阻断。
 
 /** post-data 第二遍恢复的结果:用户对象失败 vs Supabase 托管对象的沙箱预期跳过。 */
 interface PostDataResult {
   supabaseSkipped: number;
   failures: string[];
-}
-
-function spawnPgRestore(
-  bin: string,
-  args: string[]
-): Promise<{ code: number | null; stderr: string }> {
-  return new Promise((resolve, reject) => {
-    const proc = spawn(bin, args, { stdio: ["ignore", "ignore", "pipe"] });
-    let stderr = "";
-    proc.stderr.on("data", (d: Buffer) => (stderr += d.toString()));
-    proc.on("error", reject);
-    proc.on("close", (code) => resolve({ code, stderr }));
-  });
 }
 
 // 只有这些特征说明恢复失败源于沙箱缺扩展(限定类型/schema 解析不到、扩展装不上)。
@@ -193,80 +153,45 @@ function spawnPgRestore(
 const MISSING_EXTENSION_ERROR =
   /type "[^"]+" does not exist|schema "[^"]+" does not exist|extension "[^"]+" is not available/i;
 
-// 演练沙箱是裸 Postgres,Supabase 托管的 schema/角色必然缺席。post-data 里
-// 引用它们的失败是"环境预期",不是备份坏了;其余失败才是演练要抓的。
-const SUPABASE_MANAGED_ERROR =
-  /schema "(auth|storage|realtime|vault|extensions|graphql[a-z_]*)" does not exist|role "(authenticated|anon|service_role|supabase_[a-z_]+)" does not exist|\bauth\.uid\b|\bauth\.jwt\b/i;
-
-/** 把 pg_restore 的 stderr 拆成单个错误块并分类(Supabase 托管 vs 用户对象)。 */
+/** 兼容层:历史签名保留,分类逻辑的单一权威在统一引擎(restore-engine.ts)。 */
 export function classifyPostDataErrors(stderr: string): PostDataResult {
-  const blocks = stderr
-    .split(/(?=pg_restore: error:)/)
-    .filter((b) => /pg_restore: error:/.test(b));
-  let supabaseSkipped = 0;
-  const failures: string[] = [];
-  for (const block of blocks) {
-    // 只对 ERROR 原因行分类,不看 "Command was:" 之后的语句文本——否则一个恰好
-    // 引用 auth.uid 的用户对象因"损坏/语法错误"失败时,会被误判成预期跳过。
-    const cause = block.split(/Command was:/i)[0];
-    if (SUPABASE_MANAGED_ERROR.test(cause)) {
-      supabaseSkipped += 1;
-    } else {
-      failures.push(block.replace(/\s+/g, " ").trim().slice(0, 200));
-    }
-  }
-  return { supabaseSkipped, failures };
+  const classified = classifyBlocks(stderr, SANDBOX_MANAGED_ERROR);
+  return { supabaseSkipped: classified.expectedSkips, failures: classified.failures };
 }
 
-/**
- * post-data 第二遍的最终裁决:分类之外,非零退出却没解析到任何错误块(被信号杀死、
- * 归档器致命错误等)绝不能谎报"全部恢复"——记为通用失败。
- */
+/** 兼容层:见 restore-engine.ts finalizePass(非零退出且零错误块 = 通用失败)。 */
 export function postDataResult(code: number | null, stderr: string): PostDataResult {
-  const result = classifyPostDataErrors(stderr);
-  if (code !== 0 && result.supabaseSkipped === 0 && result.failures.length === 0) {
-    result.failures.push(
-      `pg_restore post-data exited with ${code === null ? "a signal" : `code ${code}`}: ` +
-        (stderr.trim().replace(/\s+/g, " ").slice(0, 200) || "(no stderr)")
-    );
-  }
-  return result;
+  const classified = finalizePass(code, stderr, classifyBlocks(stderr, SANDBOX_MANAGED_ERROR));
+  return { supabaseSkipped: classified.expectedSkips, failures: classified.failures };
 }
 
 /**
- * 两遍恢复(真实首演炸出的设计):
- * 1. pre-data+data —— 表结构 + 数据。任何错误都是硬失败:数据回不来 = 演练失败。
- * 2. post-data —— 用户自己的索引/约束/触发器**必须**恢复成功(它们是"备份完整"的
- *    一部分,一刀切跳过会让坏备份漏网);只有引用 Supabase 托管对象的失败
- *    (policy TO authenticated、FK → auth.users)才归类为沙箱预期,记入报告而非失败。
+ * 沙箱恢复 = 统一引擎(target: "sandbox")。pre-data 失败按硬失败抛出——数据回不来
+ * = 演练失败,且错误文本要供缺扩展归因(MISSING_EXTENSION_ERROR)使用;post-data
+ * 的托管对象跳过如实返回。pre-data 的 schema 冲突跳过(dump 自带 CREATE SCHEMA,
+ * 容器恒有 public)是非事件,不计入报告。
  */
 async function pgRestore(dumpPath: string, connString: string): Promise<PostDataResult> {
-  const pgRestoreBin = resolvePgRestoreBin();
-  const common = ["--no-owner", "--no-privileges", "--dbname", connString, dumpPath];
-
-  const first = await spawnPgRestore(pgRestoreBin, [
-    "--clean",
-    "--if-exists",
-    "--section=pre-data",
-    "--section=data",
-    ...common,
-  ]);
-  // pg_restore 对无害告警会返回非 0;仅在明确 error 时判失败
-  if (first.code !== 0 && /error:/i.test(first.stderr)) {
-    throw new Error(`pg_restore failed: ${first.stderr.trim()}`);
+  const result = await restoreDatabaseArtifact({ dumpPath, connString, target: "sandbox" });
+  if (result.preData.failures.length) {
+    throw new Error(`pg_restore failed: ${result.preData.failures.join(" | ")}`);
   }
-
-  const second = await spawnPgRestore(pgRestoreBin, ["--section=post-data", ...common]);
-  return postDataResult(second.code, second.stderr);
+  return {
+    supabaseSkipped: result.postData.expectedSkips,
+    failures: result.postData.failures,
+  };
 }
 
 // ── 校验 ────────────────────────────────────────────────────────────
 
-async function verifyRestored(
+/** 导出:真实恢复(restore.ts)复用同一套表级验证——两条路径对同一快照必须同一结论。 */
+export async function verifyRestored(
   connString: string,
   manifest: Manifest
 ): Promise<{ checks: DrillCheck[]; tableCount: number; rowTotal: number }> {
-  const client = new Client({ connectionString: connString });
+  // pgConnectOptions:真实 Supabase 目标(restore 复用本函数)需要打包根 CA;
+  // 沙箱的 docker 连接串非 Supabase 主机,原样透传,行为不变
+  const client = new Client(pgConnectOptions(connString));
   await client.connect();
   try {
     const schemas = manifest.database.schemas;

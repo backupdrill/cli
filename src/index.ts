@@ -4,7 +4,7 @@ import { loadConfig } from "./config.js";
 import { runBackup } from "./backup.js";
 import { runEstimate, type EgressPricing } from "./estimate.js";
 import { runDrill } from "./drill.js";
-import { runRestore } from "./restore.js";
+import { runRestore, NO_SOURCE_DATABASE } from "./restore.js";
 import { log } from "./log.js";
 import { TOOL_VERSION } from "./version.js";
 
@@ -156,30 +156,46 @@ program
   .option("--project-name <name>", "project name used in the object key")
   .action(async (opts) => {
     try {
-      const config = await loadConfig({
-        configPath: opts.config,
-        overrides: {
-          projectName: opts.projectName,
-          databaseUrl: "postgresql://unused", // restore 读桶,不连源库
-          storage: {
-            bucket: opts.bucket,
-            endpoint: opts.endpoint,
-            region: opts.region,
-            prefix: opts.prefix,
-          },
+      // 源库连接串不再无条件屏蔽:配置/环境里有真实源时,runRestore 的同源阻断门
+      // 要拿它比对;纯 flag 驱动(无任何源配置)才退回占位符
+      const overrides = {
+        projectName: opts.projectName,
+        storage: {
+          bucket: opts.bucket,
+          endpoint: opts.endpoint,
+          region: opts.region,
+          prefix: opts.prefix,
         },
-      });
+      };
+      let config;
+      try {
+        config = await loadConfig({ configPath: opts.config, overrides });
+      } catch (error) {
+        if (!/databaseUrl/.test((error as Error).message)) throw error;
+        config = await loadConfig({
+          configPath: opts.config,
+          overrides: { ...overrides, databaseUrl: NO_SOURCE_DATABASE },
+        });
+      }
       const result = await runRestore(config, {
         targetDatabaseUrl: opts.targetDatabaseUrl,
         storageDir: opts.storageDir,
         snapshot: opts.snapshot,
       });
-      log.ok(
-        `Restore complete — snapshot ${result.snapshot}: ` +
-          `database ${result.restoredToDatabase ? "restored" : "skipped"}, ` +
-          `${result.storageFilesWritten} Storage files written` +
-          (result.storageDir ? ` to ${result.storageDir}` : "")
-      );
+      const failedChecks = (result.databaseChecks ?? []).filter((c) => !c.pass);
+      const summary =
+        `snapshot ${result.snapshot}: ` +
+        `database ${result.restoredToDatabase ? "restored" : "skipped"}, ` +
+        `${result.storageFilesWritten} Storage files written` +
+        (result.storageDir ? ` to ${result.storageDir}` : "");
+      if (failedChecks.length) {
+        log.error(
+          `Restore finished with ${failedChecks.length} FAILED verification check(s) — ${summary}`
+        );
+        process.exitCode = 1;
+      } else {
+        log.ok(`Restore complete — ${summary}`);
+      }
     } catch (error) {
       log.error((error as Error).message);
       process.exitCode = 1;
