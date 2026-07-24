@@ -31,10 +31,14 @@ export interface EngineResult {
 
 export function spawnPgRestore(
   bin: string,
-  args: string[]
+  args: string[],
+  extraEnv: NodeJS.ProcessEnv = {}
 ): Promise<{ code: number | null; stderr: string }> {
   return new Promise((resolve, reject) => {
-    const proc = spawn(bin, args, { stdio: ["ignore", "ignore", "pipe"] });
+    const proc = spawn(bin, args, {
+      stdio: ["ignore", "ignore", "pipe"],
+      env: { ...process.env, ...extraEnv },
+    });
     let stderr = "";
     proc.stderr.on("data", (d: Buffer) => (stderr += d.toString()));
     // 不透传原始 spawn Error:node 会把 spawnargs(含 --dbname 连接串=凭据)挂在
@@ -81,27 +85,33 @@ export function classifyBlocks(stderr: string, allow: RegExp): ClassifiedPass {
 }
 
 /**
- * 一遍恢复的最终裁决:分类之外,非零退出却没解析到任何错误块(被信号杀死、
- * 归档器致命错误、非英文 locale…)绝不能谎报成功——记为通用失败。
+ * 一遍恢复的最终裁决,两条独立规则:
+ * 1. 被信号杀死(code=null)**无条件失败**——即使 stderr 里已有被 allowlist 解释的
+ *    错误块。真实目标恒有一个预期 schema 跳过,若跳过能抵扣信号死亡,中途被 OOM/kill
+ *    的半截恢复就会被报成功(评审第 7 轮抓出的假成功路径)。
+ * 2. 非零退出且零错误块(归档器致命错、非英文 locale…)同样不能谎报成功。
+ *    非零退出但每个错误都已分类 = pg_restore 对被忽略错误的正常退出形态,通过。
  */
 export function finalizePass(
   code: number | null,
   stderr: string,
   classified: ClassifiedPass
 ): ClassifiedPass {
-  if (code !== 0 && classified.expectedSkips === 0 && classified.failures.length === 0) {
+  const detail = stderr.trim().replace(/\s+/g, " ").slice(0, 200) || "(no stderr)";
+  if (code === null) {
     return {
       ...classified,
-      failures: [
-        `pg_restore exited with ${code === null ? "a signal" : `code ${code}`}: ` +
-          (stderr.trim().replace(/\s+/g, " ").slice(0, 200) || "(no stderr)"),
-      ],
+      failures: [...classified.failures, `pg_restore was killed by a signal: ${detail}`],
     };
+  }
+  if (code !== 0 && classified.expectedSkips === 0 && classified.failures.length === 0) {
+    return { ...classified, failures: [`pg_restore exited with code ${code}: ${detail}`] };
   }
   return classified;
 }
 
-function quoteIdent(name: string): string {
+/** 标识符转义(内嵌引号翻倍)。导出:任何把目录里读到的名字拼进 SQL 的地方都必须用它。 */
+export function quoteIdent(name: string): string {
   return `"${name.replace(/"/g, '""')}"`;
 }
 
@@ -145,15 +155,33 @@ export async function installExtensions(
  * 2. post-data —— 用户自己的索引/约束/触发器必须恢复成功;allowlist 按目标类型:
  *    沙箱豁免 Supabase 托管对象引用,真实 Supabase 目标零豁免。
  */
+/**
+ * 凭据不进 argv(D6 同源要求):连接串里的密码对 `ps` 全程可见——拆出来经
+ * PGPASSWORD 环境变量传给 libpq,argv 里的 URL 不再携带。解析不了的连接串
+ * 原样透传(libpq 自己适配的形态,不在这里破坏)。
+ */
+export function credentialSafeDbArgs(connString: string): { url: string; env: NodeJS.ProcessEnv } {
+  try {
+    const url = new URL(connString);
+    if (!url.password) return { url: connString, env: {} };
+    const password = decodeURIComponent(url.password);
+    url.password = "";
+    return { url: url.toString(), env: { PGPASSWORD: password } };
+  } catch {
+    return { url: connString, env: {} };
+  }
+}
+
 export async function restoreDatabaseArtifact(opts: {
   dumpPath: string;
   connString: string;
   target: RestoreTargetKind;
 }): Promise<EngineResult> {
   const bin = resolvePgRestoreBin();
-  const common = ["--no-owner", "--no-privileges", "--dbname", opts.connString, opts.dumpPath];
+  const { url, env } = credentialSafeDbArgs(opts.connString);
+  const common = ["--no-owner", "--no-privileges", "--dbname", url, opts.dumpPath];
 
-  const first = await spawnPgRestore(bin, ["--section=pre-data", "--section=data", ...common]);
+  const first = await spawnPgRestore(bin, ["--section=pre-data", "--section=data", ...common], env);
   const preData = finalizePass(
     first.code,
     first.stderr,
@@ -163,7 +191,7 @@ export async function restoreDatabaseArtifact(opts: {
     return { preData, postData: { expectedSkips: 0, failures: [] }, ok: false };
   }
 
-  const second = await spawnPgRestore(bin, ["--section=post-data", ...common]);
+  const second = await spawnPgRestore(bin, ["--section=post-data", ...common], env);
   const postData = finalizePass(
     second.code,
     second.stderr,

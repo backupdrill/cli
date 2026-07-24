@@ -24,6 +24,11 @@ export interface RestoreResult {
   restoredToDatabase: boolean;
   /** 表级验证结果(与演练同一套 verifyRestored);未恢复数据库时不存在 */
   databaseChecks?: DrillCheck[];
+  /**
+   * 验证总裁决(= databaseChecks 全 pass)。库级调用方(worker)必须看它,
+   * 不能只看 restoredToDatabase——"恢复完成"与"恢复通过验证"是两个事实。
+   */
+  databaseVerified?: boolean;
   storageFilesWritten: number;
   storageDir?: string;
 }
@@ -35,13 +40,33 @@ export interface RestoreResult {
 export const NO_SOURCE_DATABASE = "postgresql://unused";
 
 /**
+ * 从连接串提取 Supabase 项目 ref(纯函数):直连主机 `db.<ref>.supabase.co` 或
+ * pooler 用户名 `postgres.<ref>`。两种形态指向同一租户——只比 host/user 会漏掉
+ * "源填直连、目标填 pooler"的同项目组合(评审第 7 轮)。非 Supabase 形态返回 null。
+ */
+export function projectRefOf(connString: string): string | null {
+  try {
+    const url = new URL(connString);
+    const direct = url.hostname.match(/^db\.([a-z0-9]{16,})\.supabase\.co$/);
+    if (direct) return direct[1];
+    const pooled = url.username.match(/^postgres\.([a-z0-9]{16,})$/);
+    if (pooled) return pooled[1];
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+/**
  * 两个连接串是否指向同一数据库租户(纯函数,可测)。
- * 只比 host 不够:Supabase Session Pooler 的主机是区域级共享的
- * (aws-0-us-east-1.pooler.supabase.com 对同区所有项目相同),租户身份在
- * 用户名里(postgres.<ref>)——host 与 user 都相同才判同一目标。
+ * Supabase 双方以项目 ref 为准(直连/pooler 形态互认);其余退回 host+user 比对
+ * ——只比 host 不够:pooler 主机是区域级共享的,租户身份在用户名里。
  * 任一解析失败 → false(pg 侧会给出自己的连接错误,这里不误伤)。
  */
 export function sameDatabaseTarget(a: string, b: string): boolean {
+  const refA = projectRefOf(a);
+  const refB = projectRefOf(b);
+  if (refA !== null && refB !== null) return refA === refB;
   try {
     const ua = new URL(a);
     const ub = new URL(b);
@@ -53,21 +78,25 @@ export function sameDatabaseTarget(a: string, b: string): boolean {
 }
 
 /**
- * 空目标门(PRD §5.3.3 / 决策 D5):目标 schema 里存在任何用户关系即拒绝写入。
+ * 空目标门(PRD §5.3.3 / 决策 D5):目标 schema 里存在任何用户对象即拒绝写入。
  * "空"的定义来自 R0 spike:不是"schema 不存在"(Supabase 恒有 public),而是
- * schema 内零用户对象。关系之外的对象(函数、类型)不在此清单——它们冲突时会被
- * 引擎如实报为失败,此门是防误覆盖的闸,不是完备性证明。
+ * schema 内零用户对象——关系、函数/过程、独立类型(enum/domain/range/composite)
+ * 全部计入:只查关系时,"目标里只有函数"会放行,然后在 pre-data 中途撞冲突,
+ * 留下半截目标(评审第 7 轮)。
  */
 async function assertEmptyTarget(targetUrl: string, schemas: string[]): Promise<void> {
   const client = new Client(pgConnectOptions(targetUrl));
   await client.connect();
   try {
     const res = await client.query<{ n: string }>(
-      `select count(*)::bigint as n
-         from pg_class c
-         join pg_namespace n on n.oid = c.relnamespace
-        where n.nspname = any($1::text[])
-          and c.relkind in ('r', 'p', 'm', 'v', 'S', 'f')`,
+      `select
+         (select count(*) from pg_class c join pg_namespace n on n.oid = c.relnamespace
+           where n.nspname = any($1::text[]) and c.relkind in ('r','p','m','v','S','f','c'))
+       + (select count(*) from pg_proc p join pg_namespace n on n.oid = p.pronamespace
+           where n.nspname = any($1::text[]))
+       + (select count(*) from pg_type t join pg_namespace n on n.oid = t.typnamespace
+           where n.nspname = any($1::text[]) and t.typtype in ('e','d','r'))
+         as n`,
       [schemas]
     );
     const objectCount = Number(res.rows[0].n);
@@ -169,6 +198,7 @@ export async function runRestore(
       log.step("Verifying restored tables…");
       const verified = await verifyRestored(targetUrl, manifest);
       result.databaseChecks = verified.checks;
+      result.databaseVerified = verified.checks.every((c) => c.pass);
       for (const check of verified.checks) {
         (check.pass ? log.ok : log.warn)(`${check.name}: ${check.detail}`);
       }

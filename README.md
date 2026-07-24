@@ -168,11 +168,17 @@ backupdrill restore \
   --storage-dir ./recovered
 ```
 
-Or restore the dump by hand:
+Or restore the dump by hand — into an **empty** database, without `--clean`:
 
 ```bash
-pg_restore --clean --if-exists --no-owner --dbname "<target-connection-string>" dump.pgcustom
+pg_restore --no-owner --no-privileges --dbname "<target-connection-string>" dump.pgcustom
 ```
+
+Don't use `--clean` against a Supabase project: dropping and recreating the `public`
+schema silently wipes Supabase's default grants for `anon`/`authenticated` (the dump
+carries no ACLs), leaving the restored API returning 401s. One error is expected and
+harmless: `schema "public" already exists` — the target always has it. The
+`backupdrill restore` command above handles all of this (plus verification) for you.
 
 ## GitHub Action / scheduled backups
 
