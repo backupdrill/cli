@@ -28,9 +28,10 @@ export interface TableStat {
  */
 export interface BucketAttrs {
   name: string;
-  public: boolean | null;
-  fileSizeLimit: number | null;
-  allowedMimeTypes: string[] | null;
+  // 可选:属性缺席 = 该字段当次未捕获(与"值为 null = 源端未设置"是两种不同事实)
+  public?: boolean | null;
+  fileSizeLimit?: number | null;
+  allowedMimeTypes?: string[] | null;
 }
 
 /**
@@ -100,8 +101,9 @@ export interface StorageFile {
   key: string;
   bytes: number;
   sha256: string;
-  // ---- v2:恢复文件访问行为所需的非秘密元数据(读自源库 storage.objects,
-  // 与文件拷贝分属两次读取,极端并发写下可能有漂移)。缺失 = 未捕获,恢复端不猜测。
+  // ---- v2:恢复文件访问行为所需的非秘密元数据。随 syncStorage 的 GetObject 响应
+  // **原子捕获**(Supabase S3 handler 从 storage.objects.metadata/user_metadata 出这些头,
+  // 源码实证 2026-07-24)——与被拷贝的字节同一次读取,无漂移窗口。缺失 = 未捕获,不猜测。
   contentType?: string;
   cacheControl?: string;
   contentEncoding?: string;
@@ -135,7 +137,22 @@ function assertManifestShape(m: Manifest): void {
   if (typeof dump.sha256 !== "string" || !dump.sha256) malformed("dump.sha256");
   if (typeof dump.bytes !== "number") malformed("dump.bytes");
   if (typeof m.database !== "object" || m.database === null) malformed("database section missing");
-  if (!Array.isArray(m.database.schemas)) malformed("database.schemas");
+  // serverVersion 决定沙箱镜像 tag(parseInt)——不可解析的值会在起容器后才炸
+  if (typeof m.database.serverVersion !== "string" || !(parseInt(m.database.serverVersion, 10) > 0)) {
+    malformed("database.serverVersion");
+  }
+  if (!Array.isArray(m.database.schemas) || m.database.schemas.some((s) => typeof s !== "string" || !s)) {
+    malformed("database.schemas");
+  }
+  if (m.database.extensions !== undefined) {
+    if (!Array.isArray(m.database.extensions)) malformed("database.extensions");
+    for (const e of m.database.extensions) {
+      // 这些值会进 CREATE EXTENSION/SCHEMA 的标识符(quoteIdent 兜住注入,这里兜类型)
+      if (typeof e?.name !== "string" || !e.name || typeof e?.version !== "string" || typeof e?.schema !== "string" || !e.schema) {
+        malformed("database.extensions[]");
+      }
+    }
+  }
   if (typeof m.database.tableCount !== "number") malformed("database.tableCount");
   if (!Array.isArray(m.database.tables)) malformed("database.tables");
   // 写入端恒有 tableCount === tables.length;不相等 = tables 数组被截断/篡改,
@@ -171,6 +188,9 @@ function assertManifestShape(m: Manifest): void {
       if (typeof f.bytes !== "number" || typeof f.sha256 !== "string") malformed("storage.files[]");
       // 路径穿越防线:bucket/key 会被拼进本地写路径(restore)与目标上传路径。
       // manifest 是"从桶里来的数据"——被篡改时不得升级成任意文件写。
+      // 不破坏向后兼容(2026-07-24 实测):Supabase 在写入时就把 //、/./、/../ 和
+      // 前导 / 规范化掉、拒绝反斜杠 —— storage.objects.name(备份列举到的形态)
+      // 永远不含这些段,合法快照不可能被此处拒绝。
       if (!f.bucket || f.bucket.includes("/") || f.bucket.includes("\\") || f.bucket.includes("\0") || f.bucket === "." || f.bucket === "..") {
         malformed("storage.files[].bucket (unsafe path segment)");
       }
