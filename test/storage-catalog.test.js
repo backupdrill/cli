@@ -73,7 +73,10 @@ test("文件元数据:有值才落字段;空 user_metadata 省略;Date 序列化
   assert.deepEqual(fileMeta.get(fileMetaKey("avatars", "u2/pic.png")), {});
 });
 
-test("contentEncoding 捕获;嵌套 user_metadata 原样保留", () => {
+// 注意:真实 Supabase 当前不把 Content-Encoding 落进 metadata jsonb(2026-07-24 实测,
+// 见 spike findings)——此用例钉住的是映射层能力:未来写入端(或 Supabase 落键后)
+// 一旦提供值,采集不丢。生产路径上该字段恒为"未捕获"。
+test("contentEncoding 映射能力(生产 Supabase 当前恒 null);嵌套 user_metadata 原样保留", () => {
   const { fileMeta } = catalogFromRows(allBuckets, bucketRows, objectRows);
   assert.deepEqual(fileMeta.get(fileMetaKey("public-assets", "bundle.js.gz")), {
     contentType: "application/javascript",

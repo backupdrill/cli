@@ -7,7 +7,7 @@ const base = {
   toolVersion: "1.0.0",
   createdAt: "2026-07-22T00:00:00.000Z",
   projectName: "demo",
-  database: { serverVersion: "17.6", pgDumpVersion: "17.10", schemas: ["public"], tableCount: 1, estimatedRowTotal: 1, tables: [] },
+  database: { serverVersion: "17.6", pgDumpVersion: "17.10", schemas: ["public"], tableCount: 1, estimatedRowTotal: 1, tables: [{ schema: "public", name: "seed", estimatedRows: 1 }] },
   dump: { key: "k/dump.pgcustom", format: "custom", bytes: 1, sha256: "x" },
   storage: null,
 };
@@ -167,4 +167,43 @@ test("写入端形状 round-trip:按 backup.ts 的完整 v2 形状生成 → par
   };
   const m = parseManifest(JSON.stringify(written));
   assert.equal(m.storage.buckets[0].fileSizeLimit, 1048576);
+});
+
+// ---- 复审第 4 轮(pre-push 钩子):聚合数对账、路径穿越、显式 null 版本 ----
+
+test("tableCount 与 tables.length 不符 → malformed(截断的表清单会让逐表检查静默缩水)", () => {
+  const bad = { ...base, database: { ...base.database, tableCount: 5 } };
+  assert.throws(() => parseManifest(JSON.stringify(bad)), /malformed: database\.tableCount/);
+});
+
+test("storage 聚合数与 files 清单不符 → malformed", () => {
+  const wrongCount = { ...base, storage: { fileCount: 2, totalBytes: 0, files: [] } };
+  assert.throws(() => parseManifest(JSON.stringify(wrongCount)), /malformed: storage\.fileCount/);
+  const wrongBytes = {
+    ...base,
+    storage: { fileCount: 1, totalBytes: 99, files: [{ bucket: "b", key: "k", bytes: 1, sha256: "x" }] },
+  };
+  assert.throws(() => parseManifest(JSON.stringify(wrongBytes)), /malformed: storage\.totalBytes/);
+});
+
+test("路径穿越的 bucket/key → malformed(篡改的 manifest 不得升级成任意文件写)", () => {
+  const mk = (bucket, key) => ({
+    ...base,
+    storage: { fileCount: 1, totalBytes: 1, files: [{ bucket, key, bytes: 1, sha256: "x" }] },
+  });
+  assert.throws(() => parseManifest(JSON.stringify(mk("b", "../../etc/x"))), /unsafe path segment/);
+  assert.throws(() => parseManifest(JSON.stringify(mk("b", "/abs/path"))), /unsafe path segment/);
+  assert.throws(() => parseManifest(JSON.stringify(mk("b", "a//b"))), /unsafe path segment/);
+  assert.throws(() => parseManifest(JSON.stringify(mk("../up", "k"))), /unsafe path segment/);
+  assert.throws(() => parseManifest(JSON.stringify(mk("b", "a\\b"))), /unsafe path segment/);
+  // 合法的嵌套 key 与含空格 key 不受影响(Supabase 实测空格合法)
+  const ok = parseManifest(JSON.stringify(mk("b", "nested/dir with space/a.txt")));
+  assert.equal(ok.storage.files[0].key, "nested/dir with space/a.txt");
+});
+
+test("显式 schemaVersion: null → malformed(只有属性缺席才算旧快照)", () => {
+  assert.throws(
+    () => parseManifest(JSON.stringify({ ...base, schemaVersion: null })),
+    /malformed: schemaVersion/
+  );
 });
