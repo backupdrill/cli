@@ -20,6 +20,7 @@ import {
   classifyBlocks,
   finalizePass,
   installExtensions,
+  quoteIdent,
   restoreDatabaseArtifact,
 } from "./restore-engine.js";
 import { pgConnectOptions } from "./supabase-ca.js";
@@ -230,8 +231,10 @@ export async function verifyRestored(
         unpopulatedMatviews.add(key);
         continue;
       }
+      // 名字来自恢复出的库(= 来自 dump = 桶里的数据):必须走标识符转义,
+      // 内嵌引号的合法名不炸,构造名不注入
       const c = await client.query<{ n: string }>(
-        `select count(*)::bigint as n from "${t.schema}"."${t.name}"`
+        `select count(*)::bigint as n from ${quoteIdent(t.schema)}.${quoteIdent(t.name)}`
       );
       const n = Number(c.rows[0].n);
       counts.set(key, n);
