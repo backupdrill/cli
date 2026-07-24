@@ -115,3 +115,13 @@ test("id 与 name 不同的 bucket:按 id 匹配请求标识,对象元数据经 
   assert.equal(buckets[0].public, false);
   assert.equal(fileMeta.get(fileMetaKey("bkt_123", "pic.png")).contentType, "image/png");
 });
+
+test("user_metadata 是任意 JSON:非对象根(数组/字符串)省略 = 未捕获,不得毒化 manifest", () => {
+  const objects = [
+    { bucket_id: "avatars", name: "arr.txt", mimetype: null, cache_control: null, content_encoding: null, user_metadata: ["x"], updated_at: null },
+    { bucket_id: "avatars", name: "str.txt", mimetype: null, cache_control: null, content_encoding: null, user_metadata: "oops", updated_at: null },
+  ];
+  const { fileMeta } = catalogFromRows(allBuckets, bucketRows, objects);
+  assert.deepEqual(fileMeta.get(fileMetaKey("avatars", "arr.txt")), {});
+  assert.deepEqual(fileMeta.get(fileMetaKey("avatars", "str.txt")), {});
+});
