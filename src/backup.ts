@@ -272,10 +272,19 @@ export async function runBackup(config: BackupConfig): Promise<Manifest> {
   }
 
   // 非秘密源 ref 随快照自记(评审第 9 轮):纯 flag 恢复没有 config 可比对时,
-  // 同源阻断以它为最后防线
-  const sourceProjectRef =
-    projectRefOf(config.databaseUrl) ??
-    (config.supabaseStorage ? refFromStorageEndpoint(config.supabaseStorage.endpoint) : null);
+  // 同源阻断以它为最后防线。库与 Storage 指向不同项目 = 配置错了(一个 BackupDrill
+  // 项目只备一个 Supabase 项目)——混写会让快照只记住其一,另一半失去保护
+  const dbRef = projectRefOf(config.databaseUrl);
+  const storageRef = config.supabaseStorage
+    ? refFromStorageEndpoint(config.supabaseStorage.endpoint)
+    : null;
+  if (dbRef && storageRef && dbRef !== storageRef) {
+    throw new Error(
+      `database points at Supabase project "${dbRef}" but Storage at "${storageRef}" — ` +
+        `one BackupDrill project backs up one Supabase project; fix the config before backing up.`
+    );
+  }
+  const sourceProjectRef = dbRef ?? storageRef;
 
   const manifest: Manifest = {
     schemaVersion: MANIFEST_SCHEMA_VERSION,

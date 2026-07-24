@@ -124,7 +124,8 @@ test("sourceProjectRefs:manifest 自记的源 ref 是纯 flag 恢复的最后防
 
 test("TUS 阈值:默认 = 5GB 标准上传上限;env 可压低供活体验证小文件走 TUS 路径", () => {
   delete process.env.BACKUPDRILL_TUS_THRESHOLD;
-  assert.equal(tusThresholdBytes(), STANDARD_UPLOAD_LIMIT_BYTES);
+  assert.equal(tusThresholdBytes(), 6 * 1024 * 1024, "默认 6MB(Supabase resumable 建议线)");
+  assert.ok(STANDARD_UPLOAD_LIMIT_BYTES === 5 * 1024 ** 3, "5GB 常量仍是标准上传的硬上限");
   process.env.BACKUPDRILL_TUS_THRESHOLD = "1";
   assert.equal(tusThresholdBytes(), 1);
   delete process.env.BACKUPDRILL_TUS_THRESHOLD;
