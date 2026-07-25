@@ -115,36 +115,95 @@ export function bucketsToRestore(manifest: Manifest): { name: string; attrs: boo
   return [...fromAttrs].map(([name, attrs]) => ({ name, attrs }));
 }
 
-async function ensureBucket(
+interface ExistingBucketInfo {
+  public: boolean | null;
+  file_size_limit: number | null;
+  allowed_mime_types: string[] | null;
+}
+
+/** 只读探测:桶存在返回属性;确证不存在返回 null;其余失败抛错(不可验证 = 不动)。 */
+async function probeBucket(
   target: StorageRestoreTarget,
-  manifest: Manifest,
   name: string,
   summary: StorageRestoreSummary
-): Promise<void> {
-  const recorded = (manifest.storage!.buckets ?? []).find((b) => b.name === name);
-  // "可用的属性记录"必须含 public(安全属性):部分缺字段的记录按未捕获处理——
-  // "not captured, never guess" 对每个字段成立,不是对记录整体(评审第 14 轮)
-  const attrs = recorded && typeof recorded.public === "boolean" ? recorded : undefined;
-  // 属性未捕获(v1/降级快照)不自动创建(PRD §10.4:信息不足回退手动流程)——
-  // 猜一个可见性可能造出错误的访问行为;要求用户按自己知道的设置先建好桶
+): Promise<ExistingBucketInfo | null> {
+  const info = await storageApi(target, "GET", `/bucket/${encodeURIComponent(name)}`, {}, summary);
+  if (info.ok) return (await info.json()) as ExistingBucketInfo;
+  const text = await info.text();
+  if (info.status === 404 || /not found/i.test(text)) return null;
+  throw new Error(
+    `cannot probe bucket "${name}" (HTTP ${info.status}) — refusing to touch an unverifiable target`
+  );
+}
+
+/**
+ * 校验桶计划(零写入):所有安全裁决在任何创建/上传之前完成(评审第 15 轮 SF1)。
+ * 返回是否需要创建。抛错的情形:无属性快照的桶在目标缺失(手动回退,PRD §10.4)、
+ * 无属性快照撞上公开既有桶(上传即公开暴露)、public 漂移、属性不可读。
+ */
+function validateBucketPlan(
+  name: string,
+  attrs: { public?: boolean | null; fileSizeLimit?: number | null; allowedMimeTypes?: string[] | null } | undefined,
+  existing: ExistingBucketInfo | null,
+  summary: StorageRestoreSummary
+): { create: boolean } {
   if (!attrs) {
     summary.bucketsWithoutAttrs.push(name);
-    const probe = await storageApi(target, "GET", `/bucket/${encodeURIComponent(name)}`, {}, summary);
-    if (!probe.ok) {
+    if (!existing) {
       throw new Error(
         `bucket "${name}" has no recorded attributes in this snapshot (pre-2.0 backup) and does not ` +
           `exist on the target — create it manually with the visibility/limits you know, then re-run.`
       );
     }
-    const existing = (await probe.json()) as { public: boolean | null };
     summary.bucketsExisting.push(name);
     if (existing.public) {
-      summary.bucketAttrDrift.push(
-        `${name}: existing bucket is PUBLIC and the snapshot has no recorded attributes — uploaded files will be publicly readable`
+      // 评审第 15 轮:无属性快照 + 公开既有桶 → 上传即把可能私有的备份数据公开,
+      // 必须在写第一个字节之前拒绝,而不是传完了在退出码里认错
+      throw new Error(
+        `existing bucket "${name}" is PUBLIC and this snapshot has no recorded attributes — uploading ` +
+          `would make restored files publicly readable. Make the bucket private (or restore into a ` +
+          `fresh project), then re-run.`
       );
     }
-    return;
+    return { create: false };
   }
+  if (!existing) return { create: true };
+  summary.bucketsExisting.push(name);
+  // public 是安全属性:漂移 = 硬失败(私有文件进公开桶是数据暴露,不是"配置口味")
+  if (attrs.public !== null && attrs.public !== undefined && existing.public !== attrs.public) {
+    throw new Error(
+      `existing bucket "${name}" is ${existing.public ? "PUBLIC" : "private"} but the snapshot ` +
+        `recorded it as ${attrs.public ? "public" : "PRIVATE"} — fix the bucket's visibility ` +
+        `(or restore into a fresh project) before uploading files into it`
+    );
+  }
+  const drift: string[] = [];
+  if (
+    attrs.fileSizeLimit !== null &&
+    attrs.fileSizeLimit !== undefined &&
+    Number(existing.file_size_limit) !== attrs.fileSizeLimit
+  )
+    drift.push(`file_size_limit ${existing.file_size_limit} ≠ manifest ${attrs.fileSizeLimit}`);
+  if (
+    attrs.allowedMimeTypes !== null &&
+    attrs.allowedMimeTypes !== undefined &&
+    JSON.stringify([...(existing.allowed_mime_types ?? [])].sort()) !==
+      JSON.stringify([...attrs.allowedMimeTypes].sort())
+  )
+    drift.push(
+      `allowed_mime_types ${JSON.stringify(existing.allowed_mime_types)} ≠ manifest ${JSON.stringify(attrs.allowedMimeTypes)}`
+    );
+  if (drift.length) summary.bucketAttrDrift.push(`${name}: ${drift.join("; ")}`);
+  return { create: false };
+}
+
+/** 创建缺失桶(净度门通过后才会走到)。计划后出现的 409 = 并发竞态,如实失败。 */
+async function createBucket(
+  target: StorageRestoreTarget,
+  attrs: { public?: boolean | null; fileSizeLimit?: number | null; allowedMimeTypes?: string[] | null },
+  name: string,
+  summary: StorageRestoreSummary
+): Promise<void> {
   const payload: Record<string, unknown> = { name };
   if (attrs.public !== null && attrs.public !== undefined) payload.public = attrs.public;
   if (attrs.fileSizeLimit !== null && attrs.fileSizeLimit !== undefined)
@@ -158,59 +217,13 @@ async function ensureBucket(
     { body: JSON.stringify(payload), headers: { "Content-Type": "application/json" } },
     summary
   );
-  if (res.ok) {
-    summary.bucketsCreated.push(name);
-    return;
+  if (!res.ok) {
+    throw new Error(
+      `create bucket "${name}" failed: HTTP ${res.status} ${(await res.text()).slice(0, 160)}` +
+        (res.status === 409 ? " (bucket appeared concurrently — re-run to re-validate)" : "")
+    );
   }
-  const text = await res.text();
-  // 已存在 = 幂等重试的正常形态(PRD §5.3.4)。但要核对属性:既有桶的 public/限额
-  // 与 manifest 漂移时,恢复出的访问行为是错的——如实警告(不强改:可能是用户有意)
-  if (res.status === 409 || /already exists|Duplicate/i.test(text)) {
-    summary.bucketsExisting.push(name);
-    // 既有桶必须可验证(评审第 10 轮):读不到属性 = 不知道自己在往什么可见性的
-    // 桶里传文件,直接拒绝——尤其"manifest 说私有、既有桶是公开"会静默暴露数据
-    const info = await storageApi(target, "GET", `/bucket/${encodeURIComponent(name)}`, {}, summary);
-    if (!info.ok) {
-      throw new Error(
-        `existing bucket "${name}" attributes are unreadable (HTTP ${info.status}) — ` +
-          `refusing to upload into an unverifiable bucket`
-      );
-    }
-    const existing = (await info.json()) as {
-      public: boolean | null;
-      file_size_limit: number | null;
-      allowed_mime_types: string[] | null;
-    };
-    {
-      // public 是安全属性:漂移 = 硬失败(私有文件进公开桶是数据暴露,不是"配置口味")
-      if (attrs.public !== null && attrs.public !== undefined && existing.public !== attrs.public) {
-        throw new Error(
-          `existing bucket "${name}" is ${existing.public ? "PUBLIC" : "private"} but the snapshot ` +
-            `recorded it as ${attrs.public ? "public" : "PRIVATE"} — fix the bucket's visibility ` +
-            `(or restore into a fresh project) before uploading files into it`
-        );
-      }
-      const drift: string[] = [];
-      if (
-        attrs.fileSizeLimit !== null &&
-        attrs.fileSizeLimit !== undefined &&
-        Number(existing.file_size_limit) !== attrs.fileSizeLimit
-      )
-        drift.push(`file_size_limit ${existing.file_size_limit} ≠ manifest ${attrs.fileSizeLimit}`);
-      if (
-        attrs.allowedMimeTypes !== null &&
-        attrs.allowedMimeTypes !== undefined &&
-        JSON.stringify([...(existing.allowed_mime_types ?? [])].sort()) !==
-          JSON.stringify([...attrs.allowedMimeTypes].sort())
-      )
-        drift.push(
-          `allowed_mime_types ${JSON.stringify(existing.allowed_mime_types)} ≠ manifest ${JSON.stringify(attrs.allowedMimeTypes)}`
-        );
-      if (drift.length) summary.bucketAttrDrift.push(`${name}: ${drift.join("; ")}`);
-    }
-    return;
-  }
-  throw new Error(`create bucket "${name}" failed: HTTP ${res.status} ${text.slice(0, 160)}`);
+  summary.bucketsCreated.push(name);
 }
 
 // Supabase 标准上传的官方上限;超过则走 TUS 断点续传(PRD §5.4.2 大文件要求)
@@ -347,12 +360,15 @@ async function uploadViaTus(
       res = null; // 超时/网络错:统一走下方的重试/对准路径,只计一次失败
     }
     if (res && (res.status === 204 || res.status === 200)) {
-      const newOffset = Number(res.headers.get("upload-offset") ?? offset + chunk.length);
-      if (newOffset > offset) {
+      const header = Number(res.headers.get("upload-offset") ?? Number.NaN);
+      const newOffset = Number.isFinite(header) ? header : offset + chunk.length;
+      if (newOffset > offset && newOffset <= file.bytes) {
         offset = newOffset;
         chunkAttempts = 0;
+        continue;
       }
-      continue;
+      // 成功状态却没有推进(或越界的 offset):坏网关/代理形态——落进下方的
+      // 有界重试与 HEAD 对准,绝不原地死循环(评审第 15 轮)
     }
     if (res && !isRetryable(res.status) && res.status !== 409) {
       throw new Error(`TUS chunk failed: HTTP ${res.status} ${(await res.text()).slice(0, 160)}`);
@@ -401,9 +417,14 @@ async function uploadFile(
   };
   if (file.contentType) headers["Content-Type"] = file.contentType;
   if (file.cacheControl) headers["Cache-Control"] = file.cacheControl;
-  // 尽力回传:当前 Supabase 不把该头落进目录(R0 补充实证),但发送无害且服务端
-  // 一旦支持即自动保真;字段本身在 manifest/报告里是如实在场的
-  if (file.contentEncoding) headers["Content-Encoding"] = file.contentEncoding;
+  if (file.contentEncoding) {
+    // 尽力转发,但当前 Supabase 不持久化该头(R0 补充实证)——降级如实上报,不静默
+    headers["Content-Encoding"] = file.contentEncoding;
+    summary.metadataNotes.push(
+      `${file.bucket}/${file.key}: contentEncoding "${file.contentEncoding}" forwarded but not persisted ` +
+        `by current Supabase Storage — verify serving behavior manually`
+    );
+  }
   if (file.metadata) {
     headers["x-metadata"] = Buffer.from(JSON.stringify(file.metadata)).toString("base64");
   }
@@ -498,12 +519,15 @@ export function targetResidueViolations(
   preexisting: Map<string, Map<string, number>>
 ): string[] {
   const violations: string[] = [];
+  // 一次建索引(bucket\n key 作键,\n 不会出现在桶名里):大残留集的重试不能是二次方
+  const index = new Map<string, number>();
+  for (const f of files) index.set(`${f.bucket}\n${f.key}`, f.bytes);
   for (const [bucket, actual] of preexisting) {
     for (const [key, size] of actual) {
-      const manifestFile = files.find((f) => f.bucket === bucket && f.key === key);
-      if (!manifestFile) violations.push(`${bucket}/${key} (not in this snapshot)`);
-      else if (manifestFile.bytes !== size)
-        violations.push(`${bucket}/${key} (size ${size} ≠ manifest ${manifestFile.bytes})`);
+      const expected = index.get(`${bucket}\n${key}`);
+      if (expected === undefined) violations.push(`${bucket}/${key} (not in this snapshot)`);
+      else if (expected !== size)
+        violations.push(`${bucket}/${key} (size ${size} ≠ manifest ${expected})`);
     }
   }
   return violations;
@@ -651,20 +675,28 @@ export async function restoreStorage(
   };
 
   const buckets = bucketsToRestore(manifest);
-  log.step(`Ensuring ${buckets.length} bucket(s) on target…`);
+  // 阶段一(全只读):探测每个桶并完成全部安全裁决——任何创建/上传之前(评审第 15 轮)
+  log.step(`Probing ${buckets.length} bucket(s) on target (read-only)…`);
+  const usableAttrs = (name: string) => {
+    const recorded = (manifest.storage!.buckets ?? []).find((b) => b.name === name);
+    // "可用"必须含 public(安全属性):部分缺字段按未捕获处理,不猜
+    return recorded && typeof recorded.public === "boolean" ? recorded : undefined;
+  };
+  const plans: { name: string; create: boolean }[] = [];
   for (const bucket of buckets) {
-    await ensureBucket(target, manifest, bucket.name, summary);
+    const existing = await probeBucket(target, bucket.name, summary);
+    plans.push({
+      name: bucket.name,
+      create: validateBucketPlan(bucket.name, usableAttrs(bucket.name), existing, summary).create,
+    });
   }
 
-  // 上传前预检目标对象(评审第 11 轮):新建桶必空;既有桶列一遍,让"跳过/拒绝"
-  // 的裁决发生在任何写入之前
+  // 阶段二(仍零写入):残留净度——既有桶内容 ⊆ 本快照的同尺寸残留
   const preexisting = new Map<string, Map<string, number>>();
-  for (const bucket of buckets) {
+  for (const plan of plans) {
     preexisting.set(
-      bucket.name,
-      summary.bucketsExisting.includes(bucket.name)
-        ? await walkTargetObjects(target, bucket.name, summary)
-        : new Map()
+      plan.name,
+      plan.create ? new Map() : await walkTargetObjects(target, plan.name, summary)
     );
   }
 
@@ -677,6 +709,15 @@ export async function restoreStorage(
         `${violations.slice(0, 5).join(", ")}${violations.length > 5 ? ` …and ${violations.length - 5} more` : ""}. ` +
         `A restore target may only contain residue from a previous run of this same snapshot.`
     );
+  }
+
+  // 阶段三:全部只读检查通过,才开始写——先建缺失桶,再上传
+  const toCreate = plans.filter((p) => p.create);
+  if (toCreate.length) {
+    log.step(`Creating ${toCreate.length} bucket(s)…`);
+    for (const plan of toCreate) {
+      await createBucket(target, usableAttrs(plan.name)!, plan.name, summary);
+    }
   }
 
   log.step(`Uploading ${files.length} file(s) → target Storage…`);

@@ -166,6 +166,29 @@ export function sourceProjectRefs(config: BackupConfig, manifest?: Manifest): Se
 }
 
 /**
+ * 请求与快照内容必须相交(评审第 15 轮,纯函数可测):什么都不会做的调用
+ * 不得走到"Restore complete"——自动化会把 no-op 记成一次成功恢复。
+ */
+export function assertRequestApplies(
+  manifest: Manifest,
+  wantsDatabase: boolean,
+  wantsStorageUpload: boolean
+): void {
+  if (wantsStorageUpload && manifest.storage === null) {
+    throw new Error(
+      "this snapshot is database-only — there is no Storage to upload. Drop --target-supabase-url " +
+        "(and pass --database if the database restore is what you want)."
+    );
+  }
+  if (!wantsDatabase && !wantsStorageUpload && manifest.storage === null) {
+    throw new Error(
+      "nothing to do: no database restore was requested (--database) and this snapshot has no " +
+        "Storage files to download."
+    );
+  }
+}
+
+/**
  * 正式执行的确认门(PRD §5.3.3):用户必须键入目标 project ref(或非 Supabase 目标的
  * 主机名)与实际连接目标一致。误把生产源当目标是恢复流程里代价最不对称的失误,
  * 这道门要求人把目标身份亲手打一遍。
@@ -463,6 +486,8 @@ export async function runRestore(
     storageFilesWritten: 0,
   };
 
+  assertRequestApplies(manifest, !!opts.targetDatabaseUrl, !!storageTarget);
+
   // dry-run:只读预检后直接返回,零写入(PRD §5.3.2)
   if (opts.dryRun) {
     log.step(`Dry run for snapshot ${snapshot} — nothing will be written`);
@@ -620,6 +645,9 @@ export async function runRestore(
       }
       for (const drift of summary.bucketAttrDrift) {
         log.warn(`bucket attribute drift: ${drift}`);
+      }
+      for (const note of summary.metadataNotes) {
+        log.warn(`metadata: ${note}`);
       }
       if (summary.retries) log.warn(`transient failures retried: ${summary.retries}`);
       const rec = summary.reconcile;
