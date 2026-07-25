@@ -50,6 +50,8 @@ export interface StorageRestoreSummary {
   retries: number;
   reconcile: ReconcileReport;
   checksumSample: { checked: number; mismatched: string[] };
+  /** 元数据降级说明(如 TUS 路径不保真的字段)——如实上报,不静默丢 */
+  metadataNotes: string[];
   /** PRD §5.4.3:owner 语义边界,报告必须显示 */
   ownerNote: string;
 }
@@ -119,7 +121,10 @@ async function ensureBucket(
   name: string,
   summary: StorageRestoreSummary
 ): Promise<void> {
-  const attrs = (manifest.storage!.buckets ?? []).find((b) => b.name === name);
+  const recorded = (manifest.storage!.buckets ?? []).find((b) => b.name === name);
+  // "可用的属性记录"必须含 public(安全属性):部分缺字段的记录按未捕获处理——
+  // "not captured, never guess" 对每个字段成立,不是对记录整体(评审第 14 轮)
+  const attrs = recorded && typeof recorded.public === "boolean" ? recorded : undefined;
   // 属性未捕获(v1/降级快照)不自动创建(PRD §10.4:信息不足回退手动流程)——
   // 猜一个可见性可能造出错误的访问行为;要求用户按自己知道的设置先建好桶
   if (!attrs) {
@@ -242,6 +247,18 @@ async function uploadViaTus(
   summary: StorageRestoreSummary
 ): Promise<void> {
   const b64 = (s: string) => Buffer.from(s).toString("base64");
+  // TUS 通道保真面比标准上传窄:cacheControl 只能传 max-age 秒数,contentEncoding
+  // 无对应槽位——降级必须如实上报,不静默(评审第 14 轮)
+  if (file.cacheControl && file.cacheControl.replace(/max-age=\d+/, "").replace(/[,\s]/g, "")) {
+    summary.metadataNotes.push(
+      `${file.bucket}/${file.key}: Cache-Control directives beyond max-age not preserved over resumable upload ("${file.cacheControl}")`
+    );
+  }
+  if (file.contentEncoding) {
+    summary.metadataNotes.push(
+      `${file.bucket}/${file.key}: contentEncoding "${file.contentEncoding}" not preserved over resumable upload`
+    );
+  }
   const metaParts = [`bucketName ${b64(file.bucket)}`, `objectName ${b64(file.key)}`];
   if (file.contentType) metaParts.push(`contentType ${b64(file.contentType)}`);
   if (file.cacheControl) {
@@ -471,6 +488,27 @@ export async function walkTargetObjects(
   return out;
 }
 
+/**
+ * 写前净度检查(纯函数,可测):既有桶里只允许"本快照的同尺寸残留"。
+ * 任何外来对象或尺寸冲突都在**写第一个字节之前**整体拒绝——部分写入的脏目标
+ * 比干净失败难收拾得多(评审第 14 轮)。
+ */
+export function targetResidueViolations(
+  files: StorageFile[],
+  preexisting: Map<string, Map<string, number>>
+): string[] {
+  const violations: string[] = [];
+  for (const [bucket, actual] of preexisting) {
+    for (const [key, size] of actual) {
+      const manifestFile = files.find((f) => f.bucket === bucket && f.key === key);
+      if (!manifestFile) violations.push(`${bucket}/${key} (not in this snapshot)`);
+      else if (manifestFile.bytes !== size)
+        violations.push(`${bucket}/${key} (size ${size} ≠ manifest ${manifestFile.bytes})`);
+    }
+  }
+  return violations;
+}
+
 /** 逐键对账(纯函数,可测):manifest 每个文件都必须在目标出现且尺寸一致;多余对象另计。 */
 export function reconcileFiles(
   files: StorageFile[],
@@ -607,6 +645,7 @@ export async function restoreStorage(
     retries: 0,
     reconcile: { verified: 0, missing: [], sizeMismatched: [], extras: 0, matches: false },
     checksumSample: { checked: 0, mismatched: [] },
+    metadataNotes: [],
     ownerNote:
       "File bytes and supported metadata were restored. Original Auth ownership was not restored or verified.",
   };
@@ -630,6 +669,16 @@ export async function restoreStorage(
   }
 
   const files = manifest.storage!.files;
+  // 写前净度门:目标桶里除"本快照同尺寸残留"外有任何东西 → 一个字节都不写
+  const violations = targetResidueViolations(files, preexisting);
+  if (violations.length) {
+    throw new Error(
+      `target bucket(s) are not clean — refusing to write anything: ` +
+        `${violations.slice(0, 5).join(", ")}${violations.length > 5 ? ` …and ${violations.length - 5} more` : ""}. ` +
+        `A restore target may only contain residue from a previous run of this same snapshot.`
+    );
+  }
+
   log.step(`Uploading ${files.length} file(s) → target Storage…`);
   const skippedFiles: StorageFile[] = [];
   await uploadAll(source, target, files, preexisting, skippedFiles, summary);

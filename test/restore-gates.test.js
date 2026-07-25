@@ -8,7 +8,7 @@ import {
   sourceProjectRefs,
   NO_SOURCE_DATABASE,
 } from "../dist/restore.js";
-import { bucketsToRestore, reconcileFiles, tusThresholdBytes, STANDARD_UPLOAD_LIMIT_BYTES } from "../dist/storage-restore.js";
+import { bucketsToRestore, reconcileFiles, tusThresholdBytes, STANDARD_UPLOAD_LIMIT_BYTES, targetResidueViolations } from "../dist/storage-restore.js";
 
 const REF = "abcdefghij0123456789";
 const POOLER = `postgresql://postgres.${REF}:pw@aws-0-us-east-1.pooler.supabase.com:5432/postgres`;
@@ -193,4 +193,41 @@ test("credentialSafeDbArgs:坏的百分号编码 fail-closed;剥 ?password= 不�
   assert.equal(surgical.env.PGPASSWORD, "s3c");
   assert.ok(surgical.url.includes("options=-c%20statement_timeout%3D0"), "%20 不得变成 +");
   assert.ok(!surgical.url.includes("password="));
+});
+
+test("manifest sourceProjectRef 必须是合法 ref 形态:malformed 值拒读,不得当'身份已知'", async () => {
+  const { parseManifest } = await import("../dist/manifest.js");
+  const base = {
+    schemaVersion: 2, tool: "backupdrill-cli", toolVersion: "2.0.0",
+    createdAt: "2026-07-25T00:00:00.000Z", projectName: "d",
+    database: { serverVersion: "17.6", pgDumpVersion: "pg_dump (PostgreSQL) 18.4", schemas: ["public"], tableCount: 0, estimatedRowTotal: 0, tables: [] },
+    dump: { key: "k/dump.pgcustom", format: "custom", bytes: 1, sha256: "x" },
+    storage: null,
+  };
+  assert.doesNotThrow(() => parseManifest(JSON.stringify({ ...base, sourceProjectRef: REF })));
+  assert.throws(
+    () => parseManifest(JSON.stringify({ ...base, sourceProjectRef: "not a ref!" })),
+    /malformed: sourceProjectRef/
+  );
+});
+
+test("credentialSafeDbArgs:authority 与 ?password= 两处不同密码 → 拒绝(不赌 libpq 优先级)", async () => {
+  const { credentialSafeDbArgs } = await import("../dist/restore-engine.js");
+  assert.throws(
+    () => credentialSafeDbArgs("postgresql://u:one@h:5432/db?password=two"),
+    /two different passwords/
+  );
+  const same = credentialSafeDbArgs("postgresql://u:same@h:5432/db?password=same");
+  assert.equal(same.env.PGPASSWORD, "same");
+});
+
+test("写前净度门:既有桶只许本快照的同尺寸残留,外来对象/尺寸冲突全部列出", () => {
+  const files = [{ bucket: "a", key: "x.txt", bytes: 10, sha256: "h" }];
+  const clean = new Map([["a", new Map([["x.txt", 10]])]]);
+  assert.deepEqual(targetResidueViolations(files, clean), []);
+  const dirty = new Map([["a", new Map([["x.txt", 7], ["foreign.bin", 3]])]]);
+  const v = targetResidueViolations(files, dirty);
+  assert.equal(v.length, 2);
+  assert.ok(v.some((x) => x.includes("foreign.bin")));
+  assert.ok(v.some((x) => x.includes("size 7")));
 });

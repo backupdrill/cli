@@ -232,8 +232,17 @@ export function credentialSafeDbArgs(connString: string): { url: string; env: No
     if (passwordPart) {
       const rawValue = passwordPart.slice(passwordPart.indexOf("=") + 1);
       try {
-        password = password || decodeURIComponent(rawValue.replace(/\+/g, "%20"));
-      } catch {
+        const queryPassword = decodeURIComponent(rawValue.replace(/\+/g, "%20"));
+        // authority 与查询两处都给且不一致:libpq 的取值优先级和我们的猜测可能不同,
+        // 预检用 A 通过、pg_restore 用 B 失败的分叉不可接受——直接拒绝(评审第 14 轮)
+        if (password && queryPassword && password !== queryPassword) {
+          throw new Error(
+            "the connection string carries two different passwords (authority and ?password=) — remove one"
+          );
+        }
+        password = password || queryPassword;
+      } catch (error) {
+        if ((error as Error).message.includes("two different passwords")) throw error;
         throw new Error(
           "the connection string ?password= value contains malformed percent-encoding — " +
             "fix the URL; refusing to pass it through argv"
