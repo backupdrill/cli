@@ -419,6 +419,12 @@ export async function runRestore(
     dryRun?: boolean;
     /** 源身份不可考(v1 快照 + 无配置)时的显式风险认知——没有它一律拒绝写入 */
     acknowledgeUnverifiedSource?: boolean;
+    /**
+     * 跳过 Storage 阶段(既不回传也不本地下载)。用于把恢复拆成可独立重跑的两段
+     * (hosted 检查点重试):DB 阶段传此=true 只恢复库;Storage 阶段单独用
+     * targetSupabaseUrl 跑。不影响 CLI 默认行为。
+     */
+    skipStorage?: boolean;
     snapshot?: string;
     storageDir?: string;
   }
@@ -625,7 +631,9 @@ export async function runRestore(
     }
 
     // 2a. Storage → 目标项目回传(P0-D:给了目标 Storage 凭据时)
-    if (manifest.storage && storageTarget) {
+    if (opts.skipStorage) {
+      // DB-only 阶段(hosted 检查点重试):既不回传也不本地下载,Storage 单独一段跑
+    } else if (manifest.storage && storageTarget) {
       const summary = await restoreStorage(
         { s3, bucket: config.storage.bucket, base },
         storageTarget,
