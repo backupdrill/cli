@@ -21,6 +21,7 @@ import {
   projectRefOf,
   refFromStorageEndpoint,
   assertNoHostOverride,
+  normalizeHost,
 } from "./restore-engine.js";
 import { verifyRestored, type DrillCheck } from "./drill.js";
 import {
@@ -98,7 +99,7 @@ export function sameDatabaseTarget(a: string, b: string): boolean {
     if (!ua.hostname || !ub.hostname) return false;
     // 用户名按驱动语义(解码后)比较,与 projectRefOf 同一口径
     return (
-      ua.hostname === ub.hostname &&
+      normalizeHost(ua.hostname) === normalizeHost(ub.hostname) &&
       decodeURIComponent(ua.username) === decodeURIComponent(ub.username)
     );
   } catch {
@@ -110,7 +111,7 @@ export function sameDatabaseTarget(a: string, b: string): boolean {
  * 从目标 Project URL(https://<ref>.supabase.co)提取 ref。 */
 export function refFromSupabaseUrl(supabaseUrl: string): string | null {
   try {
-    const match = new URL(supabaseUrl).hostname.match(/^([a-z0-9]{16,})\.supabase\.co$/);
+    const match = normalizeHost(new URL(supabaseUrl).hostname).match(/^([a-z0-9]{16,})\.supabase\.co$/);
     return match ? match[1] : null;
   } catch {
     return null;
@@ -129,7 +130,7 @@ export function validateStorageTargetOrigin(supabaseUrl: string): string {
   } catch {
     throw new Error(`--target-supabase-url is not a valid URL: ${supabaseUrl}`);
   }
-  const ref = url.hostname.match(/^([a-z0-9]{16,})\.supabase\.co$/);
+  const ref = normalizeHost(url.hostname).match(/^([a-z0-9]{16,})\.supabase\.co$/);
   if (url.protocol !== "https:" || !ref || (url.pathname !== "/" && url.pathname !== "") || url.search) {
     throw new Error(
       `--target-supabase-url must be exactly https://<project-ref>.supabase.co — got "${supabaseUrl}". ` +

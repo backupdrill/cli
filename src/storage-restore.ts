@@ -120,17 +120,32 @@ async function ensureBucket(
   summary: StorageRestoreSummary
 ): Promise<void> {
   const attrs = (manifest.storage!.buckets ?? []).find((b) => b.name === name);
-  // 只在 manifest 有可靠值时恢复属性(PRD §5.4.1.3);未捕获 → 默认私有并如实上报
-  const payload: Record<string, unknown> = { name };
-  if (attrs) {
-    if (attrs.public !== null && attrs.public !== undefined) payload.public = attrs.public;
-    if (attrs.fileSizeLimit !== null && attrs.fileSizeLimit !== undefined)
-      payload.file_size_limit = attrs.fileSizeLimit;
-    if (attrs.allowedMimeTypes !== null && attrs.allowedMimeTypes !== undefined)
-      payload.allowed_mime_types = attrs.allowedMimeTypes;
-  } else {
+  // 属性未捕获(v1/降级快照)不自动创建(PRD §10.4:信息不足回退手动流程)——
+  // 猜一个可见性可能造出错误的访问行为;要求用户按自己知道的设置先建好桶
+  if (!attrs) {
     summary.bucketsWithoutAttrs.push(name);
+    const probe = await storageApi(target, "GET", `/bucket/${encodeURIComponent(name)}`, {}, summary);
+    if (!probe.ok) {
+      throw new Error(
+        `bucket "${name}" has no recorded attributes in this snapshot (pre-2.0 backup) and does not ` +
+          `exist on the target — create it manually with the visibility/limits you know, then re-run.`
+      );
+    }
+    const existing = (await probe.json()) as { public: boolean | null };
+    summary.bucketsExisting.push(name);
+    if (existing.public) {
+      summary.bucketAttrDrift.push(
+        `${name}: existing bucket is PUBLIC and the snapshot has no recorded attributes — uploaded files will be publicly readable`
+      );
+    }
+    return;
   }
+  const payload: Record<string, unknown> = { name };
+  if (attrs.public !== null && attrs.public !== undefined) payload.public = attrs.public;
+  if (attrs.fileSizeLimit !== null && attrs.fileSizeLimit !== undefined)
+    payload.file_size_limit = attrs.fileSizeLimit;
+  if (attrs.allowedMimeTypes !== null && attrs.allowedMimeTypes !== undefined)
+    payload.allowed_mime_types = attrs.allowedMimeTypes;
   const res = await storageApi(
     target,
     "POST",
@@ -161,7 +176,7 @@ async function ensureBucket(
       file_size_limit: number | null;
       allowed_mime_types: string[] | null;
     };
-    if (attrs) {
+    {
       // public 是安全属性:漂移 = 硬失败(私有文件进公开桶是数据暴露,不是"配置口味")
       if (attrs.public !== null && attrs.public !== undefined && existing.public !== attrs.public) {
         throw new Error(
@@ -187,11 +202,6 @@ async function ensureBucket(
           `allowed_mime_types ${JSON.stringify(existing.allowed_mime_types)} ≠ manifest ${JSON.stringify(attrs.allowedMimeTypes)}`
         );
       if (drift.length) summary.bucketAttrDrift.push(`${name}: ${drift.join("; ")}`);
-    } else if (existing.public) {
-      // manifest 无属性(v1 快照)而既有桶是公开的:文件将变为公开可读——必须醒目
-      summary.bucketAttrDrift.push(
-        `${name}: existing bucket is PUBLIC and the snapshot has no recorded attributes — uploaded files will be publicly readable`
-      );
     }
     return;
   }
@@ -334,16 +344,23 @@ async function uploadViaTus(
     if (chunkAttempts >= MAX_ATTEMPTS) {
       throw new Error(`TUS upload gave up after ${MAX_ATTEMPTS} attempts at offset ${offset}`);
     }
-    // 断点续传的核心:HEAD 问服务端"你收到哪了",从那里继续,不从零重来
-    const head = await fetch(uploadUrl, {
-      method: "HEAD",
-      headers: { ...storageHeaders(target.serviceRoleKey), "Tus-Resumable": "1.0.0" },
-      signal: AbortSignal.timeout(API_TIMEOUT_MS),
-    });
-    const serverOffset = Number(head.headers.get("upload-offset") ?? Number.NaN);
-    if (Number.isFinite(serverOffset) && serverOffset > offset) {
-      offset = serverOffset;
-      chunkAttempts = 0; // 服务端有进展 = 没卡住
+    // 断点续传的核心:HEAD 问服务端"你收到哪了",从那里继续,不从零重来。
+    // HEAD 自身的瞬断不额外惩罚:留在同一 offset,由 chunkAttempts 预算兜底
+    try {
+      const head = await fetch(uploadUrl, {
+        method: "HEAD",
+        headers: { ...storageHeaders(target.serviceRoleKey), "Tus-Resumable": "1.0.0" },
+        signal: AbortSignal.timeout(API_TIMEOUT_MS),
+      });
+      if (head.ok) {
+        const serverOffset = Number(head.headers.get("upload-offset") ?? Number.NaN);
+        if (Number.isFinite(serverOffset) && serverOffset > offset) {
+          offset = serverOffset;
+          chunkAttempts = 0; // 服务端有进展 = 没卡住
+        }
+      }
+    } catch {
+      /* HEAD 瞬断:保持当前 offset,下轮重试 */
     }
     summary.retries += 1;
     await new Promise((r) => setTimeout(r, 1000 * chunkAttempts * chunkAttempts));
