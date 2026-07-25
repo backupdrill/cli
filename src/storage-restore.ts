@@ -610,28 +610,15 @@ async function uploadAll(
   source: { s3: S3Client; bucket: string; base: string },
   target: StorageRestoreTarget,
   files: StorageFile[],
-  preexisting: Map<string, Map<string, number>>,
-  skippedFiles: StorageFile[],
+  verifiedResidue: Set<string>,
   summary: StorageRestoreSummary
 ): Promise<void> {
   let next = 0;
   const workers = Array.from({ length: Math.min(UPLOAD_CONCURRENCY, files.length) }, async () => {
     while (next < files.length) {
       const file = files[next++];
-      const existingSize = preexisting.get(file.bucket)?.get(file.key);
-      if (existingSize !== undefined) {
-        if (existingSize === file.bytes) {
-          // 同 key 同尺寸:暂记跳过,随后逐个重哈希裁决(同尺寸 ≠ 同字节,评审第 12 轮)
-          summary.filesSkippedIdentical += 1;
-          skippedFiles.push(file);
-        } else {
-          summary.filesFailed.push({
-            file: `${file.bucket}/${file.key}`,
-            reason: `target already has a conflicting object (size ${existingSize} ≠ manifest ${file.bytes}) — refusing to overwrite`,
-          });
-        }
-        continue;
-      }
+      // 计划阶段已逐字节验证的残留:跳过(冲突形态在净度门就整体拒绝了,到不了这里)
+      if (verifiedResidue.has(`${file.bucket}\n${file.key}`)) continue;
       try {
         await uploadFile(source, target, file, summary);
         summary.filesUploaded += 1;
@@ -652,12 +639,8 @@ async function uploadAll(
  * → 逐键对账 → 抽样校验和。bucket 创建失败抛出(没桶一切免谈),文件级失败收集
  * 入摘要由调用方裁决。
  */
-export async function restoreStorage(
-  source: { s3: S3Client; bucket: string; base: string },
-  target: StorageRestoreTarget,
-  manifest: Manifest
-): Promise<StorageRestoreSummary> {
-  const summary: StorageRestoreSummary = {
+function emptySummary(): StorageRestoreSummary {
+  return {
     bucketsCreated: [],
     bucketsExisting: [],
     bucketsWithoutAttrs: [],
@@ -673,9 +656,26 @@ export async function restoreStorage(
     ownerNote:
       "File bytes and supported metadata were restored. Original Auth ownership was not restored or verified.",
   };
+}
 
+interface StoragePlan {
+  plans: { name: string; create: boolean }[];
+  preexisting: Map<string, Map<string, number>>;
+  /** `${bucket}\n${key}`:已逐字节验证的同尺寸残留(上传阶段直接跳过) */
+  verifiedResidue: Set<string>;
+}
+
+/**
+ * 只读计划阶段(评审第 16 轮):探测/校验每个桶 → 残留净度 → 同尺寸残留逐个重哈希。
+ * 全部安全裁决在这里完成,零写入——供正式执行(数据库写入**之前**)与 dry-run 共用,
+ * 可预见的 Storage 冲突不得在库已恢复之后才发现。
+ */
+async function readOnlyStoragePlan(
+  target: StorageRestoreTarget,
+  manifest: Manifest,
+  summary: StorageRestoreSummary
+): Promise<StoragePlan> {
   const buckets = bucketsToRestore(manifest);
-  // 阶段一(全只读):探测每个桶并完成全部安全裁决——任何创建/上传之前(评审第 15 轮)
   log.step(`Probing ${buckets.length} bucket(s) on target (read-only)…`);
   const usableAttrs = (name: string) => {
     const recorded = (manifest.storage!.buckets ?? []).find((b) => b.name === name);
@@ -691,7 +691,6 @@ export async function restoreStorage(
     });
   }
 
-  // 阶段二(仍零写入):残留净度——既有桶内容 ⊆ 本快照的同尺寸残留
   const preexisting = new Map<string, Map<string, number>>();
   for (const plan of plans) {
     preexisting.set(
@@ -701,7 +700,6 @@ export async function restoreStorage(
   }
 
   const files = manifest.storage!.files;
-  // 写前净度门:目标桶里除"本快照同尺寸残留"外有任何东西 → 一个字节都不写
   const violations = targetResidueViolations(files, preexisting);
   if (violations.length) {
     throw new Error(
@@ -711,39 +709,68 @@ export async function restoreStorage(
     );
   }
 
+  // 同尺寸残留在**写第一个字节之前**逐个重哈希:损坏残留 = 目标不净,整体拒写
+  const verifiedResidue = new Set<string>();
+  const candidates = files.filter((f) => preexisting.get(f.bucket)?.get(f.key) === f.bytes);
+  if (candidates.length) {
+    log.step(`Verifying ${candidates.length} pre-existing object(s) byte-for-byte (read-only)…`);
+    for (const file of candidates) {
+      const mismatch = await hashMismatchOnTarget(target, file, summary);
+      if (mismatch) {
+        throw new Error(
+          `target residue ${file.bucket}/${file.key} differs from the snapshot (${mismatch}) — ` +
+            `the target is not clean; refusing to write anything`
+        );
+      }
+      verifiedResidue.add(`${file.bucket}\n${file.key}`);
+    }
+  }
+  return { plans, preexisting, verifiedResidue };
+}
+
+/** dry-run / 执行前预检的公开形态:一次性 scratch 摘要,只返回计划概要与警告。 */
+export async function planStorageRestore(
+  target: StorageRestoreTarget,
+  manifest: Manifest
+): Promise<{ bucketsToCreate: string[]; verifiedResidue: number; warnings: string[] }> {
+  const scratch = emptySummary();
+  const plan = await readOnlyStoragePlan(target, manifest, scratch);
+  return {
+    bucketsToCreate: plan.plans.filter((p) => p.create).map((p) => p.name),
+    verifiedResidue: plan.verifiedResidue.size,
+    warnings: [...scratch.bucketAttrDrift, ...scratch.metadataNotes],
+  };
+}
+
+export async function restoreStorage(
+  source: { s3: S3Client; bucket: string; base: string },
+  target: StorageRestoreTarget,
+  manifest: Manifest
+): Promise<StorageRestoreSummary> {
+  const summary = emptySummary();
+
+  const { plans, verifiedResidue } = await readOnlyStoragePlan(target, manifest, summary);
+  summary.filesSkippedIdentical = verifiedResidue.size;
+  const files = manifest.storage!.files;
+
   // 阶段三:全部只读检查通过,才开始写——先建缺失桶,再上传
   const toCreate = plans.filter((p) => p.create);
   if (toCreate.length) {
     log.step(`Creating ${toCreate.length} bucket(s)…`);
     for (const plan of toCreate) {
-      await createBucket(target, usableAttrs(plan.name)!, plan.name, summary);
+      // 计划阶段已证明该桶有含 public 的可用属性记录(否则走了手动回退)
+      const attrs = (manifest.storage!.buckets ?? []).find((b) => b.name === plan.name)!;
+      await createBucket(target, attrs, plan.name, summary);
     }
   }
 
   log.step(`Uploading ${files.length} file(s) → target Storage…`);
-  const skippedFiles: StorageFile[] = [];
-  await uploadAll(source, target, files, preexisting, skippedFiles, summary);
-
-  // 跳过的既有对象逐个重哈希(评审第 12 轮):跳过的前提是字节确证一致,
-  // 同尺寸的损坏/无关内容不得混进"干净恢复"
-  if (skippedFiles.length) {
-    log.step(`Verifying ${skippedFiles.length} pre-existing object(s) byte-for-byte…`);
-    for (const file of skippedFiles) {
-      const mismatch = await hashMismatchOnTarget(target, file, summary);
-      if (mismatch) {
-        summary.filesSkippedIdentical -= 1;
-        summary.filesFailed.push({
-          file: `${file.bucket}/${file.key}`,
-          reason: `pre-existing same-size object differs (${mismatch}) — refusing to overwrite`,
-        });
-      }
-    }
-  }
+  await uploadAll(source, target, files, verifiedResidue, summary);
 
   log.step("Reconciling every file against the target listing…");
   const actualByBucket = new Map<string, Map<string, number>>();
-  for (const bucket of buckets) {
-    actualByBucket.set(bucket.name, await walkTargetObjects(target, bucket.name, summary));
+  for (const plan of plans) {
+    actualByBucket.set(plan.name, await walkTargetObjects(target, plan.name, summary));
   }
 
   // 超时误报重裁(评审第 10 轮):上传"失败"但目标上尺寸吻合的文件(响应超时时
