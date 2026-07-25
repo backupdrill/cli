@@ -12,7 +12,7 @@ import { spawn } from "node:child_process";
 import { Client } from "pg";
 import type { ExtensionInfo } from "./manifest.js";
 import { resolvePgRestoreBin } from "./pgbin.js";
-import { pgConnectOptions } from "./supabase-ca.js";
+import { pgConnectOptions, dumpUrlFor } from "./supabase-ca.js";
 
 export type RestoreTargetKind = "sandbox" | "supabase";
 
@@ -298,7 +298,10 @@ export async function restoreDatabaseArtifact(opts: {
   target: RestoreTargetKind;
 }): Promise<EngineResult> {
   const bin = resolvePgRestoreBin();
-  const { url, env } = credentialSafeDbArgs(opts.connString);
+  // TLS 全链路 verify-full(创始人承诺项):pg_restore 与 pg_dump 同一改写——
+  // Supabase 主机强制 verify-full + 打包根 CA(libpq 的 require 不验证书,
+  // 中间人可拿到连接与数据);沙箱/外部主机原样透传。先改写 SSL 再拆密码。
+  const { url, env } = credentialSafeDbArgs(dumpUrlFor(opts.connString));
   const common = ["--no-owner", "--no-privileges", "--dbname", url, opts.dumpPath];
 
   const first = await spawnPgRestore(bin, ["--section=pre-data", "--section=data", ...common], env);
