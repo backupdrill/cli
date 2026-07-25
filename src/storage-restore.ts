@@ -29,7 +29,7 @@ export interface ReconcileReport {
   verified: number;
   missing: string[];
   sizeMismatched: string[];
-  /** 目标上存在但 manifest 没有的对象数(重试残留/并存数据)——如实报告,不判失败 */
+  /** 目标上存在但 manifest 没有的对象数——非快照内容混在恢复目标里 = 不是干净恢复,计入失败裁决 */
   extras: number;
   matches: boolean;
 }
@@ -209,7 +209,9 @@ const TUS_CHUNK_BYTES = 6 * 1024 * 1024;
  */
 export function tusThresholdBytes(): number {
   const env = Number(process.env.BACKUPDRILL_TUS_THRESHOLD ?? "");
-  return Number.isFinite(env) && env > 0 ? env : TUS_CHUNK_BYTES;
+  const chosen = Number.isFinite(env) && env > 0 ? env : TUS_CHUNK_BYTES;
+  // 钳制在标准上传硬上限内:env 调高也不能把 >5GB 文件送进必败的标准上传
+  return Math.min(chosen, STANDARD_UPLOAD_LIMIT_BYTES);
 }
 
 async function collectBody(body: unknown): Promise<Buffer> {
@@ -232,21 +234,39 @@ async function uploadViaTus(
   const b64 = (s: string) => Buffer.from(s).toString("base64");
   const metaParts = [`bucketName ${b64(file.bucket)}`, `objectName ${b64(file.key)}`];
   if (file.contentType) metaParts.push(`contentType ${b64(file.contentType)}`);
-  if (file.cacheControl) metaParts.push(`cacheControl ${b64(file.cacheControl)}`);
+  if (file.cacheControl) {
+    // Supabase 的 tus 生命周期把 cacheControl 当秒数解析,非数字整体回落 no-cache
+    // (实测:max-age=600 经 TUS 落成 no-cache)——只送数字部分;解析不出则不送
+    const maxAge = file.cacheControl.match(/max-age=(\d+)/)?.[1];
+    if (maxAge) metaParts.push(`cacheControl ${b64(maxAge)}`);
+  }
   if (file.metadata) metaParts.push(`metadata ${b64(JSON.stringify(file.metadata))}`);
 
-  const create = await fetch(`${target.supabaseUrl}/storage/v1/upload/resumable`, {
-    method: "POST",
-    headers: {
-      ...storageHeaders(target.serviceRoleKey),
-      "Tus-Resumable": "1.0.0",
-      "Upload-Length": String(file.bytes),
-      "Upload-Metadata": metaParts.join(","),
-    },
-    signal: AbortSignal.timeout(API_TIMEOUT_MS),
-  });
-  if (create.status !== 201) {
-    throw new Error(`TUS creation failed: HTTP ${create.status} ${(await create.text()).slice(0, 160)}`);
+  let create: Response | null = null;
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    try {
+      create = await fetch(`${target.supabaseUrl}/storage/v1/upload/resumable`, {
+        method: "POST",
+        headers: {
+          ...storageHeaders(target.serviceRoleKey),
+          "Tus-Resumable": "1.0.0",
+          "Upload-Length": String(file.bytes),
+          "Upload-Metadata": metaParts.join(","),
+        },
+        signal: AbortSignal.timeout(API_TIMEOUT_MS),
+      });
+      if (!isRetryable(create.status) || attempt === MAX_ATTEMPTS) break;
+    } catch (error) {
+      if (attempt === MAX_ATTEMPTS) throw error;
+      create = null;
+    }
+    summary.retries += 1;
+    await new Promise((r) => setTimeout(r, 1000 * attempt * attempt));
+  }
+  if (!create || create.status !== 201) {
+    throw new Error(
+      `TUS creation failed: HTTP ${create?.status ?? "network error"} ${create ? (await create.text()).slice(0, 160) : ""}`
+    );
   }
   const location = create.headers.get("location");
   if (!location) throw new Error("TUS creation returned no Location header");
@@ -263,14 +283,26 @@ async function uploadViaTus(
   let chunkAttempts = 0; // 每前进一步清零:重试预算属于"当前卡住的位置",不是整个文件
   while (offset < file.bytes) {
     const end = Math.min(offset + TUS_CHUNK_BYTES, file.bytes) - 1;
-    const got = await source.s3.send(
-      new GetObjectCommand({
-        Bucket: source.bucket,
-        Key: `${source.base}/storage/${file.bucket}/${file.key}`,
-        Range: `bytes=${offset}-${end}`,
-      })
-    );
-    const chunk = await collectBody(got.Body);
+    // 源侧 Range 读同样有界重试:一次 S3 瞬断不该报废一个大文件的续传
+    let chunk: Buffer | null = null;
+    for (let readAttempt = 1; readAttempt <= MAX_ATTEMPTS; readAttempt++) {
+      try {
+        const got = await source.s3.send(
+          new GetObjectCommand({
+            Bucket: source.bucket,
+            Key: `${source.base}/storage/${file.bucket}/${file.key}`,
+            Range: `bytes=${offset}-${end}`,
+          })
+        );
+        chunk = await collectBody(got.Body);
+        break;
+      } catch (error) {
+        if (readAttempt === MAX_ATTEMPTS) throw error;
+        summary.retries += 1;
+        await new Promise((r) => setTimeout(r, 1000 * readAttempt * readAttempt));
+      }
+    }
+    if (chunk === null) throw new Error("unreachable: range read retry exhausted");
     let res: Response | null = null;
     try {
       res = await fetch(uploadUrl, {
@@ -453,7 +485,9 @@ export function reconcileFiles(
     missing,
     sizeMismatched,
     extras,
-    matches: missing.length === 0 && sizeMismatched.length === 0,
+    // extras 也判不匹配(评审第 12 轮):恢复目标应当只含快照内容,混着外来对象
+    // 不是干净恢复——要共存请显式分桶,不给静默混装留门
+    matches: missing.length === 0 && sizeMismatched.length === 0 && extras === 0,
   };
 }
 
@@ -498,6 +532,7 @@ async function uploadAll(
   target: StorageRestoreTarget,
   files: StorageFile[],
   preexisting: Map<string, Map<string, number>>,
+  skippedFiles: StorageFile[],
   summary: StorageRestoreSummary
 ): Promise<void> {
   let next = 0;
@@ -507,8 +542,9 @@ async function uploadAll(
       const existingSize = preexisting.get(file.bucket)?.get(file.key);
       if (existingSize !== undefined) {
         if (existingSize === file.bytes) {
-          // 重试残留:同 key 同尺寸跳过;字节级正确性由抽样校验覆盖
+          // 同 key 同尺寸:暂记跳过,随后逐个重哈希裁决(同尺寸 ≠ 同字节,评审第 12 轮)
           summary.filesSkippedIdentical += 1;
+          skippedFiles.push(file);
         } else {
           summary.filesFailed.push({
             file: `${file.bucket}/${file.key}`,
@@ -578,7 +614,24 @@ export async function restoreStorage(
 
   const files = manifest.storage!.files;
   log.step(`Uploading ${files.length} file(s) → target Storage…`);
-  await uploadAll(source, target, files, preexisting, summary);
+  const skippedFiles: StorageFile[] = [];
+  await uploadAll(source, target, files, preexisting, skippedFiles, summary);
+
+  // 跳过的既有对象逐个重哈希(评审第 12 轮):跳过的前提是字节确证一致,
+  // 同尺寸的损坏/无关内容不得混进"干净恢复"
+  if (skippedFiles.length) {
+    log.step(`Verifying ${skippedFiles.length} pre-existing object(s) byte-for-byte…`);
+    for (const file of skippedFiles) {
+      const mismatch = await hashMismatchOnTarget(target, file, summary);
+      if (mismatch) {
+        summary.filesSkippedIdentical -= 1;
+        summary.filesFailed.push({
+          file: `${file.bucket}/${file.key}`,
+          reason: `pre-existing same-size object differs (${mismatch}) — refusing to overwrite`,
+        });
+      }
+    }
+  }
 
   log.step("Reconciling every file against the target listing…");
   const actualByBucket = new Map<string, Map<string, number>>();

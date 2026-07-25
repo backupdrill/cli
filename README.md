@@ -220,7 +220,7 @@ Before switching to a **daily** schedule, read the egress-cost section above —
 - [x] `estimate` — project your monthly Supabase egress cost before you schedule
 - [x] `drill` — restore a snapshot into an ephemeral Postgres and prove it comes back
 - [x] Storage-file integrity check inside the drill (checksums, sampled by default)
-- [x] `restore` — recover a snapshot into a target DB + pull Storage files down
+- [x] `restore` — recover a snapshot into a fresh Supabase project: database through the drill-grade engine with verification, Storage uploaded back with per-file reconciliation (local download remains an option)
 - [x] GitHub Action wrapper
 
 For scheduling, automated restore drills, and alerting, use the hosted service at [backupdrill.com](https://backupdrill.com).

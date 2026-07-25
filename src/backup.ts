@@ -11,7 +11,7 @@ import type { BucketAttrs, ExtensionInfo, Manifest, TableStat } from "./manifest
 import { syncStorage } from "./storage.js";
 import { inspectBucketAttrs } from "./storage-catalog.js";
 import { renderRecoveryDoc } from "./recovery-doc.js";
-import { projectRefOf, refFromStorageEndpoint } from "./restore-engine.js";
+import { projectRefOf, refFromStorageEndpoint, assertNoHostOverride } from "./restore-engine.js";
 import { log } from "./log.js";
 import { TOOL_VERSION } from "./version.js";
 import { pgConnectOptions, dumpUrlFor } from "./supabase-ca.js";
@@ -198,6 +198,22 @@ async function dumpToS3(
 }
 
 export async function runBackup(config: BackupConfig): Promise<Manifest> {
+  // 源身份先于一切传输(评审第 12 轮):①连接串不许带 ?host=/user= 覆盖——否则
+  // 快照记的 ref 与实际读取对象脱节,恢复端的同源保护随之失真;②库与 Storage
+  // 跨项目 = 配置错误,全量 dump+同步之后才发现会白烧 egress 还留下半截快照前缀
+  assertNoHostOverride(config.databaseUrl);
+  const dbRef = projectRefOf(config.databaseUrl);
+  const storageRef = config.supabaseStorage
+    ? refFromStorageEndpoint(config.supabaseStorage.endpoint)
+    : null;
+  if (dbRef && storageRef && dbRef !== storageRef) {
+    throw new Error(
+      `database points at Supabase project "${dbRef}" but Storage at "${storageRef}" — ` +
+        `one BackupDrill project backs up one Supabase project; fix the config before backing up.`
+    );
+  }
+  const sourceProjectRef = dbRef ?? storageRef;
+
   const pgDumpBin = process.env.BACKUPDRILL_PG_DUMP || "pg_dump";
 
   log.step("Inspecting database…");
@@ -270,21 +286,6 @@ export async function runBackup(config: BackupConfig): Promise<Manifest> {
         `${(synced.totalBytes / 1024 / 1024).toFixed(1)} MB)`
     );
   }
-
-  // 非秘密源 ref 随快照自记(评审第 9 轮):纯 flag 恢复没有 config 可比对时,
-  // 同源阻断以它为最后防线。库与 Storage 指向不同项目 = 配置错了(一个 BackupDrill
-  // 项目只备一个 Supabase 项目)——混写会让快照只记住其一,另一半失去保护
-  const dbRef = projectRefOf(config.databaseUrl);
-  const storageRef = config.supabaseStorage
-    ? refFromStorageEndpoint(config.supabaseStorage.endpoint)
-    : null;
-  if (dbRef && storageRef && dbRef !== storageRef) {
-    throw new Error(
-      `database points at Supabase project "${dbRef}" but Storage at "${storageRef}" — ` +
-        `one BackupDrill project backs up one Supabase project; fix the config before backing up.`
-    );
-  }
-  const sourceProjectRef = dbRef ?? storageRef;
 
   const manifest: Manifest = {
     schemaVersion: MANIFEST_SCHEMA_VERSION,
