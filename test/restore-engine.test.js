@@ -106,3 +106,16 @@ test("sameDatabaseTarget:源直连、目标 pooler 的同一项目 → 阻断(ho
   assert.equal(sameDatabaseTarget(direct, pooled), true);
   assert.equal(sameDatabaseTarget(direct, otherPooled), false);
 });
+
+test("pg_restore 的连接串经 dumpUrlFor:Supabase 主机 verify-full+CA,沙箱透传,密码仍出 argv", async () => {
+  const { credentialSafeDbArgs } = await import("../dist/restore-engine.js");
+  const { dumpUrlFor } = await import("../dist/supabase-ca.js");
+  const pooler = "postgresql://postgres.abcdefghij0123456789:pw@aws-0-us-east-1.pooler.supabase.com:5432/postgres?sslmode=require";
+  const { url, env } = credentialSafeDbArgs(dumpUrlFor(pooler));
+  assert.ok(url.includes("sslmode=verify-full"), "Supabase 主机必须 verify-full");
+  assert.ok(url.includes("sslrootcert="), "必须带打包 CA 路径");
+  assert.ok(!url.includes("pw"), "密码不进 argv");
+  assert.equal(env.PGPASSWORD, "pw");
+  const sandbox = credentialSafeDbArgs(dumpUrlFor("postgresql://postgres:drill@127.0.0.1:54321/postgres"));
+  assert.ok(!sandbox.url.includes("sslrootcert"), "非 Supabase 主机不套 CA");
+});
