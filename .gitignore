@@ -10,3 +10,6 @@ backupdrill.config.json
 
 # cross-review artifacts
 .review/
+
+# Supabase CLI 本地状态(含项目 ref):公开仓永不提交
+supabase/
