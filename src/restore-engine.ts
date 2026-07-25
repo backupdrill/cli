@@ -16,6 +16,12 @@ import { pgConnectOptions } from "./supabase-ca.js";
 
 export type RestoreTargetKind = "sandbox" | "supabase";
 
+/** 主机名规范化:剥掉合法的 DNS 根点(db.x.supabase.co. ≡ db.x.supabase.co)。
+ * 身份比较不规范化 = 一个尾点就能绕过同源阻断(supabase-ca 对同类早有钉子)。 */
+export function normalizeHost(hostname: string): string {
+  return hostname.replace(/\.$/, "").toLowerCase();
+}
+
 /**
  * 从连接串提取 Supabase 项目 ref(纯函数):直连主机 `db.<ref>.supabase.co` 或
  * pooler 用户名 `postgres.<ref>`。放在引擎层:备份端(写 manifest.sourceProjectRef)
@@ -24,7 +30,7 @@ export type RestoreTargetKind = "sandbox" | "supabase";
 export function projectRefOf(connString: string): string | null {
   try {
     const url = new URL(connString);
-    const direct = url.hostname.match(/^db\.([a-z0-9]{16,})\.supabase\.co$/);
+    const direct = normalizeHost(url.hostname).match(/^db\.([a-z0-9]{16,})\.supabase\.co$/);
     if (direct) return direct[1];
     // 用户名必须先解码再匹配:URL 解析器保留百分号编码,而 pg/libpq 会解码——
     // postgres%2Eref 在驱动眼里就是 postgres.ref,不解码 = 身份判定可被编码绕过
@@ -39,7 +45,7 @@ export function projectRefOf(connString: string): string | null {
 /** 从 Supabase Storage S3 端点(https://<ref>.storage.supabase.co/…)提取项目 ref。 */
 export function refFromStorageEndpoint(endpoint: string): string | null {
   try {
-    const match = new URL(endpoint).hostname.match(/^([a-z0-9]{16,})\.(?:storage\.)?supabase\.co$/);
+    const match = normalizeHost(new URL(endpoint).hostname).match(/^([a-z0-9]{16,})\.(?:storage\.)?supabase\.co$/);
     return match ? match[1] : null;
   } catch {
     return null;
@@ -191,18 +197,9 @@ export async function installExtensions(
  * 原样透传(libpq 自己适配的形态,不在这里破坏)。
  */
 export function credentialSafeDbArgs(connString: string): { url: string; env: NodeJS.ProcessEnv } {
+  let url: URL;
   try {
-    const url = new URL(connString);
-    let password = url.password ? decodeURIComponent(url.password) : "";
-    url.password = "";
-    // libpq 也认 ?password= 查询形式(评审第 12 轮)——同样不许进 argv;
-    // authority 与查询都在场时按 libpq 语义取 authority
-    const queryPassword = url.searchParams.get("password");
-    if (queryPassword !== null) {
-      password = password || queryPassword;
-      url.searchParams.delete("password");
-    }
-    return { url: url.toString(), env: password ? { PGPASSWORD: password } : {} };
+    url = new URL(connString);
   } catch {
     // 非 URL(libpq keyword)形态拆不了密码——含内联密码的一律拒绝,不赌
     if (/\bpassword\s*=/i.test(connString)) {
@@ -213,6 +210,40 @@ export function credentialSafeDbArgs(connString: string): { url: string; env: No
     }
     return { url: connString, env: {} };
   }
+  let password = "";
+  if (url.password) {
+    try {
+      password = decodeURIComponent(url.password);
+    } catch {
+      // 编码坏了不许 fail-open(评审第 13 轮):原样放行 = 密码整段留在 argv
+      throw new Error(
+        "the connection string password contains malformed percent-encoding — " +
+          "fix the URL; refusing to pass it through argv"
+      );
+    }
+    url.password = "";
+  }
+  // ?password= 同样不许进 argv(libpq 认它)。剥参不用 URLSearchParams.delete:
+  // 它会重序列化其余参数(%20 变 +),libpq 按字面处理,options 之类会被改坏
+  const rawQuery = url.search.startsWith("?") ? url.search.slice(1) : url.search;
+  if (rawQuery && /(^|&)password=/i.test(rawQuery)) {
+    const parts = rawQuery.split("&");
+    const passwordPart = parts.find((p) => /^password=/i.test(p));
+    if (passwordPart) {
+      const rawValue = passwordPart.slice(passwordPart.indexOf("=") + 1);
+      try {
+        password = password || decodeURIComponent(rawValue.replace(/\+/g, "%20"));
+      } catch {
+        throw new Error(
+          "the connection string ?password= value contains malformed percent-encoding — " +
+            "fix the URL; refusing to pass it through argv"
+        );
+      }
+    }
+    const kept = parts.filter((p) => !/^password=/i.test(p));
+    url.search = kept.length ? `?${kept.join("&")}` : "";
+  }
+  return { url: url.toString(), env: password ? { PGPASSWORD: password } : {} };
 }
 
 /**

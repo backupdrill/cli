@@ -255,7 +255,7 @@ program
         (result.storageSummary?.checksumSample.mismatched.length ?? 0) +
         // 属性漂移进裁决(评审第 10 轮):访问行为与快照不一致不算干净恢复
         (result.storageSummary?.bucketAttrDrift.length ?? 0) +
-        (rec ? rec.missing.length + rec.sizeMismatched.length : 0);
+        (rec ? rec.missing.length + rec.sizeMismatched.length + rec.extras : 0);
       const summary =
         `snapshot ${result.snapshot}: ` +
         `database ${result.restoredToDatabase ? "restored" : "skipped"}, ` +

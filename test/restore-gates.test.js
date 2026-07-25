@@ -172,3 +172,25 @@ test("reconcileFiles:extras 也判不匹配(恢复目标应当只含快照内容
   assert.equal(r.extras, 1);
   assert.equal(r.matches, false);
 });
+
+test("末尾 DNS 根点不绕身份判定:db.<ref>.supabase.co. 与无点形态同一租户", async () => {
+  const { projectRefOf, sameDatabaseTarget } = await import("../dist/restore.js");
+  const dotted = `postgresql://postgres:pw@db.${REF}.supabase.co.:5432/postgres`;
+  assert.equal(projectRefOf(dotted), REF);
+  assert.equal(refFromSupabaseUrl(`https://${REF}.supabase.co.`), REF);
+  assert.equal(sameDatabaseTarget(dotted, POOLER), true);
+});
+
+test("credentialSafeDbArgs:坏的百分号编码 fail-closed;剥 ?password= 不重编码其余参数", async () => {
+  const { credentialSafeDbArgs } = await import("../dist/restore-engine.js");
+  assert.throws(
+    () => credentialSafeDbArgs("postgresql://u:bad%zz@h:5432/db"),
+    /malformed percent-encoding/
+  );
+  const surgical = credentialSafeDbArgs(
+    "postgresql://u@h:5432/db?options=-c%20statement_timeout%3D0&password=s3c"
+  );
+  assert.equal(surgical.env.PGPASSWORD, "s3c");
+  assert.ok(surgical.url.includes("options=-c%20statement_timeout%3D0"), "%20 不得变成 +");
+  assert.ok(!surgical.url.includes("password="));
+});
