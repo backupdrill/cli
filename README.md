@@ -166,8 +166,8 @@ uploads the Storage files back — start with `--dry-run`, then confirm by typin
 the target's project ref:
 
 ```bash
-export BACKUPDRILL_TARGET_DATABASE_URL="postgresql://…/postgres"   # or let the hidden prompt ask
-export BACKUPDRILL_TARGET_SERVICE_ROLE_KEY="…"                     # only for Storage upload
+# credentials via hidden prompts (nothing lands in shell history); CI can inject
+# BACKUPDRILL_TARGET_DATABASE_URL / BACKUPDRILL_TARGET_SERVICE_ROLE_KEY as managed secrets instead
 backupdrill restore --database --target-supabase-url https://<ref>.supabase.co --dry-run
 backupdrill restore --database --target-supabase-url https://<ref>.supabase.co --confirm-target <ref>
 ```

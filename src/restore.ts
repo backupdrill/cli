@@ -440,15 +440,20 @@ export async function runRestore(
       );
     }
   }
-  // 源身份完全不可考(v1 老快照 + 纯 flag 恢复)时不 fail-open(评审第 10 轮):
-  // 同源阻断没有比对对象 = 目标填成源也拦不住。要么给原始配置,要么显式认知风险。
-  const sourceIdentityKnown = config.databaseUrl !== NO_SOURCE_DATABASE || sourceRefs.size > 0;
-  if ((opts.targetDatabaseUrl || storageTarget) && !sourceIdentityKnown && !opts.acknowledgeUnverifiedSource) {
+  // 源身份必须**对每类目标可比**才算已知(评审第 10/14 轮):
+  //  - 库目标:有真实源连接串即可(host+user 逐一可比),或有 ref;
+  //  - Storage 目标:只有 ref 能比(无关的外部 DATABASE_URL 不构成 Storage 侧身份)。
+  // 不可比 + 未显式认知风险 = 拒绝,不 fail-open。
+  const refIdentityKnown = sourceRefs.size > 0;
+  const dbIdentityComparable = config.databaseUrl !== NO_SOURCE_DATABASE || refIdentityKnown;
+  const unverifiable =
+    (opts.targetDatabaseUrl && !dbIdentityComparable) || (storageTarget && !refIdentityKnown);
+  if (unverifiable && !opts.acknowledgeUnverifiedSource) {
     throw new Error(
-      "source identity cannot be verified: this snapshot predates the manifest source-ref record " +
-        "and no source config is available, so same-source protection has nothing to compare against. " +
-        "Restore with the original backup config (-c backupdrill.config.json), or pass " +
-        "--acknowledge-unverified-source after double-checking the target is NOT the original project."
+      "source identity cannot be verified for every requested target (legacy snapshot without a " +
+        "comparable source record) — same-source protection would be inert. Restore with the original " +
+        "backup config (-c backupdrill.config.json), or pass --acknowledge-unverified-source after " +
+        "double-checking the target is NOT the original project."
     );
   }
 

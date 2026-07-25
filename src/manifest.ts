@@ -133,7 +133,10 @@ function optionalString(value: unknown, what: string): void {
 }
 
 function assertManifestShape(m: Manifest): void {
-  optionalString(m.sourceProjectRef, "sourceProjectRef");
+  // ref 驱动同源安全门:malformed 值会被当"身份已知"却永远匹配不上 = 保护静默失效
+  if (m.sourceProjectRef !== undefined && !/^[a-z0-9]{16,}$/.test(m.sourceProjectRef)) {
+    malformed("sourceProjectRef (not a Supabase project ref)");
+  }
   const d = m.dump as unknown;
   if (typeof d !== "object" || d === null) malformed("dump section missing");
   const dump = m.dump;
