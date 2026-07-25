@@ -231,3 +231,27 @@ test("写前净度门:既有桶只许本快照的同尺寸残留,外来对象/�
   assert.ok(v.some((x) => x.includes("foreign.bin")));
   assert.ok(v.some((x) => x.includes("size 7")));
 });
+
+test("credentialSafeDbArgs:编码过的键名(pass%77ord=)同样剥离;重复同值密码放行", async () => {
+  const { credentialSafeDbArgs } = await import("../dist/restore-engine.js");
+  const sneaky = credentialSafeDbArgs("postgresql://u@h:5432/db?pass%77ord=s3c&sslmode=require");
+  assert.equal(sneaky.env.PGPASSWORD, "s3c");
+  assert.ok(!/pass/i.test(new URL(sneaky.url).search), "编码键形态的密码参数必须剥掉");
+  assert.ok(sneaky.url.includes("sslmode=require"));
+  const dupes = credentialSafeDbArgs("postgresql://u@h/db?password=same&password=same");
+  assert.equal(dupes.env.PGPASSWORD, "same");
+  assert.throws(
+    () => credentialSafeDbArgs("postgresql://u@h/db?password=one&password=two"),
+    /two different passwords/
+  );
+});
+
+test("no-op 恢复拒绝:请求与快照内容必须相交", async () => {
+  const { assertRequestApplies } = await import("../dist/restore.js");
+  const dbOnly = { storage: null };
+  const withStorage = { storage: { fileCount: 0, totalBytes: 0, files: [] } };
+  assert.throws(() => assertRequestApplies(dbOnly, false, true), /database-only/);
+  assert.throws(() => assertRequestApplies(dbOnly, false, false), /nothing to do/);
+  assert.doesNotThrow(() => assertRequestApplies(dbOnly, true, false));
+  assert.doesNotThrow(() => assertRequestApplies(withStorage, false, false)); // 本地下载模式
+});

@@ -223,34 +223,49 @@ export function credentialSafeDbArgs(connString: string): { url: string; env: No
     }
     url.password = "";
   }
-  // ?password= 同样不许进 argv(libpq 认它)。剥参不用 URLSearchParams.delete:
+  // ?password= 同样不许进 argv(libpq 认它)。剥参按**解码后的键名**匹配
+  // (pass%77ord= 也是 password=,评审第 15 轮),不用 URLSearchParams.delete:
   // 它会重序列化其余参数(%20 变 +),libpq 按字面处理,options 之类会被改坏
   const rawQuery = url.search.startsWith("?") ? url.search.slice(1) : url.search;
-  if (rawQuery && /(^|&)password=/i.test(rawQuery)) {
-    const parts = rawQuery.split("&");
-    const passwordPart = parts.find((p) => /^password=/i.test(p));
-    if (passwordPart) {
-      const rawValue = passwordPart.slice(passwordPart.indexOf("=") + 1);
+  if (rawQuery) {
+    const kept: string[] = [];
+    const queryPasswords: string[] = [];
+    for (const part of rawQuery.split("&")) {
+      const eq = part.indexOf("=");
+      const rawKey = eq === -1 ? part : part.slice(0, eq);
+      let key: string;
       try {
-        const queryPassword = decodeURIComponent(rawValue.replace(/\+/g, "%20"));
-        // authority 与查询两处都给且不一致:libpq 的取值优先级和我们的猜测可能不同,
-        // 预检用 A 通过、pg_restore 用 B 失败的分叉不可接受——直接拒绝(评审第 14 轮)
-        if (password && queryPassword && password !== queryPassword) {
+        key = decodeURIComponent(rawKey.replace(/\+/g, "%20"));
+      } catch {
+        key = rawKey;
+      }
+      if (/^password$/i.test(key)) {
+        const rawValue = eq === -1 ? "" : part.slice(eq + 1);
+        try {
+          const value = decodeURIComponent(rawValue.replace(/\+/g, "%20"));
+          if (value) queryPasswords.push(value);
+        } catch {
           throw new Error(
-            "the connection string carries two different passwords (authority and ?password=) — remove one"
+            "the connection string ?password= value contains malformed percent-encoding — " +
+              "fix the URL; refusing to pass it through argv"
           );
         }
-        password = password || queryPassword;
-      } catch (error) {
-        if ((error as Error).message.includes("two different passwords")) throw error;
-        throw new Error(
-          "the connection string ?password= value contains malformed percent-encoding — " +
-            "fix the URL; refusing to pass it through argv"
-        );
+      } else {
+        kept.push(part);
       }
     }
-    const kept = parts.filter((p) => !/^password=/i.test(p));
-    url.search = kept.length ? `?${kept.join("&")}` : "";
+    if (queryPasswords.length) {
+      // authority 与查询、以及重复查询项之间不一致:libpq 的取值优先级和我们的猜测
+      // 可能不同,预检用 A 通过、pg_restore 用 B 失败的分叉不可接受——直接拒绝
+      const distinct = new Set(password ? [password, ...queryPasswords] : queryPasswords);
+      if (distinct.size > 1) {
+        throw new Error(
+          "the connection string carries two different passwords (authority/?password=) — remove one"
+        );
+      }
+      password = [...distinct][0];
+      url.search = kept.length ? `?${kept.join("&")}` : "";
+    }
   }
   return { url: url.toString(), env: password ? { PGPASSWORD: password } : {} };
 }
