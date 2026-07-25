@@ -1,17 +1,19 @@
 # backupdrill
 
-Open-source CLI to back up a **Supabase** project to **your own** S3/R2/B2 bucket — the Postgres database **and** Storage files, together — with a checksummed `manifest.json` so you can prove what was captured.
+Open-source CLI to back up a **Supabase** project to **your own** S3/R2/B2 bucket — the Postgres database and, once you configure its S3 keys, your Storage files — with a checksummed `manifest.json` so you can prove what was captured.
+
+Backup is half the job. `backupdrill drill` restores your latest snapshot into a throwaway Postgres and **verifies it actually restores** — because a backup you've never restored is a guess.
 
 Backups stream through the CLI on your machine (or your CI) straight to your bucket. **Your data never touches our servers, because there are none — this is just a CLI.**
 
-> Want this on a schedule, with **restore drills that prove your backup actually restores**, plus alerts and reports? That's the hosted service → **[backupdrill.com](https://backupdrill.com)**. This CLI is the DIY layer; the cloud adds scheduling, drills, alerting, and reports on top.
+> Want the same engine on a schedule, with drills that run themselves, alerts, and emailed reports? That's the hosted service → **[backupdrill.com](https://backupdrill.com)**. This CLI is the DIY layer; the cloud adds scheduling, alerting, and reports on top.
 
 🎥 Prefer watching? [Where do your backups actually go — explained in about a minute](https://backupdrill.com/guides/test-supabase-backup-restore#explainer-video).
 
 ## Why
 
 - Supabase's own database restore only brings back `storage.objects` **metadata**, not your actual Storage files.
-- Pro-plan backups keep 7 days and can't be pulled into your own infrastructure; PITR is $100/month per project.
+- Pro-plan backups keep 7 days and — on the physical backup process current projects use — can't be downloaded; PITR is $100/month per project.
 - A `pg_dump` you've never restored is a guess.
 
 This CLI gets your database into a bucket **you** control, with a manifest you can check.
