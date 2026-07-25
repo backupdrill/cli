@@ -193,12 +193,47 @@ export async function installExtensions(
 export function credentialSafeDbArgs(connString: string): { url: string; env: NodeJS.ProcessEnv } {
   try {
     const url = new URL(connString);
-    if (!url.password) return { url: connString, env: {} };
-    const password = decodeURIComponent(url.password);
+    let password = url.password ? decodeURIComponent(url.password) : "";
     url.password = "";
-    return { url: url.toString(), env: { PGPASSWORD: password } };
+    // libpq 也认 ?password= 查询形式(评审第 12 轮)——同样不许进 argv;
+    // authority 与查询都在场时按 libpq 语义取 authority
+    const queryPassword = url.searchParams.get("password");
+    if (queryPassword !== null) {
+      password = password || queryPassword;
+      url.searchParams.delete("password");
+    }
+    return { url: url.toString(), env: password ? { PGPASSWORD: password } : {} };
   } catch {
+    // 非 URL(libpq keyword)形态拆不了密码——含内联密码的一律拒绝,不赌
+    if (/\bpassword\s*=/i.test(connString)) {
+      throw new Error(
+        "keyword-style connection strings with an inline password are not accepted — " +
+          "use the URL form; the password is moved into PGPASSWORD automatically"
+      );
+    }
     return { url: connString, env: {} };
+  }
+}
+
+/**
+ * 拒绝连接串里的 host/hostaddr/user 查询覆盖:驱动会让它们改写实际连接目标/租户——
+ * 身份判定(ref/主机)看的是 authority,读写却发生在别处。备份侧(源身份自记)与
+ * 恢复侧(确认门/同源阻断)共用本检查。
+ */
+export function assertNoHostOverride(connString: string): void {
+  try {
+    const params = new URL(connString).searchParams;
+    for (const key of params.keys()) {
+      if (/^(host|hostaddr|user)$/i.test(key)) {
+        throw new Error(
+          `connection string carries a ?${key}= override — the effective server/identity would ` +
+            `differ from the URL authority that identity checks inspect. Use a plain connection string.`
+        );
+      }
+    }
+  } catch (error) {
+    if ((error as Error).message.includes("override")) throw error;
+    // URL 解析不了的连接串由 pg 自己报错,这里放行
   }
 }
 

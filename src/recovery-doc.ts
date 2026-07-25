@@ -57,8 +57,10 @@ export function renderRecoveryDoc(manifest: Manifest, ctx: RecoveryDocContext): 
   // 2.0 形态:凭据只经环境变量(argv 对全机器可见);写入需要键入目标 ref 确认。
   // DB-only 快照不出现 Storage 凭据与旗标——不为用不上的能力索要宽权限 key
   const cliRestoreCommand = [
-    `export BACKUPDRILL_TARGET_DATABASE_URL="<target-session-pooler-url>"`,
-    ...(storage ? [`export BACKUPDRILL_TARGET_SERVICE_ROLE_KEY="<target-service-role-key>"`] : []),
+    `read -rs BACKUPDRILL_TARGET_DATABASE_URL && export BACKUPDRILL_TARGET_DATABASE_URL   # hidden prompt`,
+    ...(storage
+      ? [`read -rs BACKUPDRILL_TARGET_SERVICE_ROLE_KEY && export BACKUPDRILL_TARGET_SERVICE_ROLE_KEY`]
+      : []),
     `backupdrill restore \\`,
     `  --snapshot ${shellQuote(ctx.snapshot)} \\`,
     `  --bucket ${shellQuote(ctx.bucket)} \\`,
@@ -145,7 +147,8 @@ npm install -g backupdrill
 ${cliRestoreCommand}
 \`\`\`
 
-Add \`--dry-run\` first to preview every check without writing anything.
+Add \`--dry-run\` first to preview every check without writing anything. (Skip the
+\`read\` lines to have the CLI prompt you itself; \`unset\` both variables afterwards.)
 The CLI verifies the archive checksum, refuses non-empty targets, installs the
 extensions, restores through the same engine the weekly drills use, verifies
 table counts and row presence afterwards, then rebuilds buckets, uploads the

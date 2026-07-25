@@ -48,7 +48,7 @@ test("手册与 manifest 一致:对象键、校验和、扩展、快照坐标全
   assert.ok(doc.includes("--confirm-target <target-ref>"), "命令含确认门(2.0 必填)");
   assert.ok(doc.includes("--database"), "命令用意图旗标而非凭据 flag");
   assert.ok(!doc.includes("--target-database-url"), "凭据 flag 已移除,手册不得再教");
-  assert.ok(doc.includes('export BACKUPDRILL_TARGET_DATABASE_URL="<target-session-pooler-url>"'), "凭据走环境变量占位");
+  assert.ok(doc.includes("read -rs BACKUPDRILL_TARGET_DATABASE_URL"), "凭据经隐藏输入,不进历史");
   assert.ok(doc.includes("--endpoint https://acct.r2.cloudflarestorage.com"), "CLI 命令带端点");
   assert.ok(doc.includes("storage/<bucket>/<key>"), "Storage 布局说明");
 });
@@ -64,7 +64,7 @@ test("恢复命令是引擎口径:无 --clean,写明 schema public 预期错误�
 test("诚实边界:未覆盖项明示;零秘密(占位符而非真实连接串)", () => {
   const doc = renderRecoveryDoc(manifest, ctx);
   assert.ok(/Auth users\/sessions, secret values, Edge Function/.test(doc), "未覆盖清单");
-  assert.ok(doc.includes("<target-session-pooler-url>"), "目标连接串只以占位符出现");
+  assert.ok(!/BACKUPDRILL_TARGET_DATABASE_URL="/.test(doc), "不再教用户把连接串写进 export 行");
   assert.ok(!/postgresql:\/\/[^<\s]+:[^<\s]+@/.test(doc), "不得出现带凭据形态的连接串");
 });
 

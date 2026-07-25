@@ -86,7 +86,7 @@ test("sourceProjectRefs:库连接串与 Storage 端点都能出 ref;占位符不
   assert.equal(sourceProjectRefs({ databaseUrl: NO_SOURCE_DATABASE }).size, 0);
 });
 
-test("reconcileFiles:逐键对账——缺失/尺寸不符判失败,多余对象只计数不判失败", () => {
+test("reconcileFiles:逐键对账——缺失/尺寸不符/多余对象都破坏 matches", () => {
   const files = [
     { bucket: "a", key: "x.txt", bytes: 10, sha256: "h1" },
     { bucket: "a", key: "y.txt", bytes: 20, sha256: "h2" },
@@ -122,12 +122,15 @@ test("sourceProjectRefs:manifest 自记的源 ref 是纯 flag 恢复的最后防
   assert.deepEqual([...withManifest], [REF]);
 });
 
-test("TUS 阈值:默认 = 5GB 标准上传上限;env 可压低供活体验证小文件走 TUS 路径", () => {
+test("TUS 阈值:默认 6MB(Supabase 建议线);env 覆盖被钳制在 5GB 硬上限内", () => {
   delete process.env.BACKUPDRILL_TUS_THRESHOLD;
   assert.equal(tusThresholdBytes(), 6 * 1024 * 1024, "默认 6MB(Supabase resumable 建议线)");
   assert.ok(STANDARD_UPLOAD_LIMIT_BYTES === 5 * 1024 ** 3, "5GB 常量仍是标准上传的硬上限");
   process.env.BACKUPDRILL_TUS_THRESHOLD = "1";
   assert.equal(tusThresholdBytes(), 1);
+  // 调高不许越过标准上传硬上限:>5GB 文件绝不能被送进必败的标准上传
+  process.env.BACKUPDRILL_TUS_THRESHOLD = String(10 * 1024 ** 3);
+  assert.equal(tusThresholdBytes(), STANDARD_UPLOAD_LIMIT_BYTES);
   delete process.env.BACKUPDRILL_TUS_THRESHOLD;
 });
 
@@ -137,4 +140,35 @@ test("projectRefOf:百分号编码的用户名按驱动语义解码后判定(编
     projectRefOf(`postgresql://postgres%2E${REF}:pw@aws-0-us-east-1.pooler.supabase.com:5432/postgres`),
     REF
   );
+});
+
+test("credentialSafeDbArgs:authority 与 ?password= 两种形态都出 argv;keyword 内联密码拒绝", async () => {
+  const { credentialSafeDbArgs } = await import("../dist/restore-engine.js");
+  const auth = credentialSafeDbArgs("postgresql://u:sec%40ret@h:5432/db");
+  assert.equal(auth.env.PGPASSWORD, "sec@ret");
+  assert.ok(!auth.url.includes("sec"));
+  const query = credentialSafeDbArgs("postgresql://u@h:5432/db?password=qsecret&sslmode=require");
+  assert.equal(query.env.PGPASSWORD, "qsecret");
+  assert.ok(!query.url.includes("qsecret"));
+  assert.ok(query.url.includes("sslmode=require"), "其余查询参数保留");
+  assert.throws(
+    () => credentialSafeDbArgs("host=h user=u password=ksecret dbname=db"),
+    /keyword-style.*not accepted/s
+  );
+});
+
+test("确认门:外部库目标 + Supabase Storage 目标的混搭直接拒绝(一个确认盖不住两个目标)", () => {
+  assert.throws(
+    () => assertConfirmedTarget("whatever", "postgresql://u:p@db.internal.example:5432/app", API),
+    /separately/
+  );
+});
+
+test("reconcileFiles:extras 也判不匹配(恢复目标应当只含快照内容)", () => {
+  const files = [{ bucket: "a", key: "x.txt", bytes: 10, sha256: "h1" }];
+  const withExtra = new Map([["a", new Map([["x.txt", 10], ["foreign.bin", 5]])]]);
+  const r = reconcileFiles(files, withExtra);
+  assert.equal(r.verified, 1);
+  assert.equal(r.extras, 1);
+  assert.equal(r.matches, false);
 });

@@ -1,4 +1,4 @@
-import { mkdtemp, mkdir, rm, readdir } from "node:fs/promises";
+import { mkdtemp, mkdir, rm, readdir, lstat } from "node:fs/promises";
 import { createWriteStream } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname, resolve, sep } from "node:path";
@@ -20,6 +20,7 @@ import {
   installExtensions,
   projectRefOf,
   refFromStorageEndpoint,
+  assertNoHostOverride,
 } from "./restore-engine.js";
 import { verifyRestored, type DrillCheck } from "./drill.js";
 import {
@@ -138,28 +139,8 @@ export function validateStorageTargetOrigin(supabaseUrl: string): string {
   return url.origin;
 }
 
-/**
- * 拒绝连接串里的 host/hostaddr 查询覆盖:node-pg 与 libpq 都会让 ?host= 改写实际
- * 连接目标——身份判定(ref/主机)看的是 authority,写入却发生在别处,确认门与
- * 同源阻断都会被绕过(评审第 8 轮)。恢复目标不接受这种形态,直说。
- */
-export function assertNoHostOverride(connString: string): void {
-  try {
-    const params = new URL(connString).searchParams;
-    for (const key of params.keys()) {
-      // user 同样是身份构件:pooler 的租户在用户名里,?user= 覆盖 = 换项目(评审第 9 轮)
-      if (/^(host|hostaddr|user)$/i.test(key)) {
-        throw new Error(
-          `target connection string carries a ?${key}= override — the effective server/identity would ` +
-            `differ from the URL authority that identity checks inspect. Use a plain connection string.`
-        );
-      }
-    }
-  } catch (error) {
-    if ((error as Error).message.includes("override")) throw error;
-    // URL 解析不了的连接串走不到这里的调用方(pg 会自己报错),放行
-  }
-}
+// assertNoHostOverride 上移到引擎层(备份侧的源身份自记也要用);此处转出口
+export { assertNoHostOverride } from "./restore-engine.js";
 
 /**
  * 备份配置能导出的全部源项目 ref:数据库连接串 + Storage 读取端点
@@ -200,6 +181,14 @@ export function assertConfirmedTarget(
     throw new Error(
       `the target database URL points at project "${dbRef}" but --target-supabase-url at "${apiRef}" — ` +
         `these are different projects; fix one of them.`
+    );
+  }
+  // 外部(非 Supabase)库目标 + Supabase Storage 目标:一个确认值盖不住两个不相干
+  // 的目标(评审第 12 轮)——这种混搭直接拒绝,分两次跑各自确认
+  if (targetDatabaseUrl && !dbRef && apiRef) {
+    throw new Error(
+      "the database target is not a Supabase project while the Storage target is — one confirmation " +
+        "cannot cover two unrelated targets. Run the database restore and the Storage restore separately."
     );
   }
   let expected = dbRef ?? apiRef;
@@ -647,6 +636,12 @@ export async function runRestore(
       const outDir = opts.storageDir ?? join(process.cwd(), `restored-storage-${snapshot}`);
       // 输出目录必须是新的/空的:路径锚定检查是词法层面的,防不住目录里**已有**的
       // 符号链接把写入引到别处;保证目录从空开始 = 所有子路径都由本进程创建,无链接可循
+      // 根路径若已存在,必须是真目录:mkdir/readdir/词法锚定都会跟随根上的符号链接,
+      // 一条预置的 link 就能把"新目录"指到别处(评审第 12 轮)
+      const rootStat = await lstat(outDir).catch(() => null);
+      if (rootStat && !rootStat.isDirectory()) {
+        throw new Error(`storage output path exists and is not a real directory: ${outDir}`);
+      }
       await mkdir(outDir, { recursive: true });
       if ((await readdir(outDir)).length > 0) {
         throw new Error(
