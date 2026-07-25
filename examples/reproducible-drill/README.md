@@ -5,7 +5,8 @@ Everything here reproduces the drill report published at
 commands. Run it and compare your output to ours.
 
 ```bash
-./run.sh
+npm install && npm run build     # run.sh calls ../../dist, which is not committed
+./examples/reproducible-drill/run.sh
 ```
 
 Requires Docker, Node ≥ 20, and `pg_dump`/`pg_restore` ≥ 17. It creates two
@@ -27,9 +28,12 @@ are the platform-specific ones:
   back" only judges tables that had rows at backup time
 
 Seed: 13 tables, 1,495,250 rows, ~197 MB on disk, plus 250 files (35 MB) in an
-S3-compatible store standing in for Supabase Storage. Both the row values and
-the file bytes are generated deterministically, so a rerun produces the same
-data — and the same per-file sha256.
+S3-compatible store standing in for Supabase Storage. Every value any published
+number depends on is generated deterministically — the file bytes, so per-file
+sha256 reproduces exactly, and the row values behind the invariant totals. Two
+things are deliberately not deterministic and do not feed any published figure:
+uuid primary keys (`gen_random_uuid()`) and the `now()` timestamps on four
+tables.
 
 ## What we measured
 
@@ -42,6 +46,7 @@ Backup:
 ✓ Database dumped (21.6 MB, sha256 210958d28579…)
 → Syncing Storage files…
 →   user-uploads: 250 files
+! Bucket attributes not captured (relation "storage.buckets" does not exist); this manifest will record them as absent — restore will say so instead of guessing.
 ✓ Storage synced (250 files, 33.6 MB)
 ✓ Recovery runbook written → …/RECOVERY.md
 ✓ Manifest written → …/manifest.json
@@ -64,8 +69,11 @@ Drill:
 ✓ Drill PASSED — 13 tables / 1,495,250 rows restored in 2.3s
 ```
 
-`check-invariants.mjs` is what `--check-cmd` runs inside the sandbox. It proves
-the data is genuinely there rather than trusting the structural checks:
+`check-invariants.mjs` is what `--check-cmd` runs inside the sandbox. Treat it
+as a template rather than strong evidence: a completed restore re-enforces
+foreign keys and recomputes that materialized view, so these particular
+assertions are close to tautologies. The point of the hook is the assertions
+only your own code can make.
 
 ```
 row counts: {"orders":"200000","order_items":"600000","customers":"20000","attachments":"250","events":"300000"}
@@ -81,7 +89,7 @@ We ran it three times. Worth knowing before you compare:
 |---|---|---|
 | Measured rows restored (1,495,250), table count, per-file sha256, the invariant numbers above | **Yes** | The drill counts rows in the restored database, and the fixture data is deterministic |
 | Manifest's `estimatedRows` — the `~1,495,499` in the backup line | **No** — we saw 1,495,250 / 1,745,499 / 1,495,499 | It is `n_live_tup`, a planner estimate the collector can inflate right after a bulk load |
-| Dump sha256 | **No** | `pg_dump` writes a creation timestamp into the archive header, so identical data still hashes differently |
+| Dump sha256 | **No** | Two reasons: the random uuid keys and `now()` stamps above mean the bytes genuinely differ, and `pg_dump` writes a creation timestamp into the archive header, so even identical data would not hash the same |
 | `pg_restore` seconds | **No** | Hardware |
 
 The first two rows are the reason the drill measures instead of trusting the
