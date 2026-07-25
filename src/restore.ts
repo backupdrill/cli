@@ -26,6 +26,7 @@ import {
 import { verifyRestored, type DrillCheck } from "./drill.js";
 import {
   restoreStorage,
+  planStorageRestore,
   type StorageRestoreSummary,
   type StorageRestoreTarget,
 } from "./storage-restore.js";
@@ -378,17 +379,18 @@ async function dryRunPreflight(
   }
 
   if (storageTarget) {
-    const res = await fetch(`${storageTarget.supabaseUrl}/storage/v1/bucket`, {
-      headers: {
-        Authorization: `Bearer ${storageTarget.serviceRoleKey}`,
-        apikey: storageTarget.serviceRoleKey,
-      },
-    });
-    if (res.ok) {
-      log.ok("target Storage API reachable (service key accepted)");
-    } else {
-      blockers.push(`target Storage API returned HTTP ${res.status}`);
-      log.error(`target Storage API: HTTP ${res.status} — check the URL and service-role key`);
+    // 完整的 Storage 只读计划(评审第 16 轮):dry-run 不止测可达性,把桶校验、
+    // 残留净度、残留哈希全部提前撞一遍
+    try {
+      const plan = await planStorageRestore(storageTarget, manifest);
+      log.ok(
+        `storage plan: ${plan.bucketsToCreate.length} bucket(s) to create, ` +
+          `${plan.verifiedResidue} verified residue file(s)`
+      );
+      for (const warning of plan.warnings) log.warn(warning);
+    } catch (error) {
+      blockers.push(`storage plan: ${(error as Error).message}`);
+      log.error(`storage plan: ${(error as Error).message}`);
     }
   } else if (manifest.storage) {
     log.warn("no Storage target credentials — files would be downloaded locally, not uploaded");
@@ -503,6 +505,14 @@ export async function runRestore(
 
   const workdir = await mkdtemp(join(tmpdir(), "backupdrill-restore-"));
   try {
+    // 0. Storage 只读计划先行(评审第 16 轮):可预见的 Storage 冲突必须在数据库
+    // 写入之前发现——"库好了、Storage 拒了"的半截目标是本序修掉的形态。
+    // 执行阶段(下方 2a)会重新计划:库恢复耗时内目标可能变化,复验是正确成本。
+    if (storageTarget && manifest.storage) {
+      log.step("Planning Storage restore (read-only, before any database write)…");
+      await planStorageRestore(storageTarget, manifest);
+    }
+
     // 1. 数据库(写入前依次过安全门:同源阻断 → 空目标 → 归档校验 → 扩展预装)
     if (opts.targetDatabaseUrl) {
       const targetUrl = opts.targetDatabaseUrl;
