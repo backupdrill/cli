@@ -16,8 +16,8 @@
 #   * the CLI is invoked with a scrubbed environment, so a BACKUPDRILL_* or
 #     DATABASE_URL already exported in your shell cannot redirect this fixture
 #     at a real database or a real bucket;
-#   * container names are unique to this invocation, so a concurrent run or an
-#     unrelated container is never removed.
+#   * only container IDs this run actually created are removed, so a concurrent
+#     run or an unrelated container is never touched.
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -29,7 +29,12 @@ else
   PG_DUMP="${BACKUPDRILL_PG_DUMP:-pg_dump}"
   PG_RESTORE="${BACKUPDRILL_PG_RESTORE:-pg_restore}"
 fi
-command -v "$PG_DUMP" >/dev/null 2>&1 || { echo "pg_dump not found — set PG_BIN or BACKUPDRILL_PG_DUMP" >&2; exit 1; }
+# 两个都先验,且主版本必须 >= 容器的 PG 17 —— 否则会在灌完 150 万行之后才失败
+for bin in "$PG_DUMP" "$PG_RESTORE"; do
+  command -v "$bin" >/dev/null 2>&1 || { echo "$bin not found — set PG_BIN or BACKUPDRILL_PG_DUMP/_PG_RESTORE" >&2; exit 1; }
+  major="$("$bin" --version | sed -E 's/.* ([0-9]+).*/\1/')"
+  [ "${major:-0}" -ge 17 ] 2>/dev/null || { echo "$bin is major $major; needs >= 17 to handle this fixture's PostgreSQL 17 source" >&2; exit 1; }
+done
 
 RUN_ID="$$"
 SOURCE_CONTAINER="bd-demo-source-$RUN_ID"
@@ -45,8 +50,12 @@ S3_SECRET_KEY="$(openssl rand -hex 24)"
 WORKDIR="$(mktemp -d)"
 CONFIG="$WORKDIR/backupdrill.config.json"
 
+# 只删本次 docker run 真正返回的 ID —— 按名字盲删会在 pid 复用时误伤别人的容器
+CREATED_IDS=()
 cleanup() {
-  docker rm -f "$SOURCE_CONTAINER" "$S3_CONTAINER" >/dev/null 2>&1 || true
+  for id in "${CREATED_IDS[@]:-}"; do
+    [ -n "$id" ] && docker rm -f "$id" >/dev/null 2>&1 || true
+  done
   rm -rf "$WORKDIR"
 }
 trap cleanup EXIT
@@ -72,14 +81,16 @@ wait_for() { # wait_for <label> <seconds> <command...>
 [ -f ../../dist/index.js ] || { echo "build first: pnpm install && pnpm build" >&2; exit 1; }
 
 echo "==> source Postgres 17"
-docker run -d --name "$SOURCE_CONTAINER" -e POSTGRES_PASSWORD="$PG_PASSWORD" \
-  -e POSTGRES_DB=appdb -p 127.0.0.1:"$PG_PORT":5432 postgres:17-alpine >/dev/null
+# 固定 tag:可变 tag 会让同一份代码日后跑在不同软件上。
+# 演练沙箱的镜像不在这里 —— 那个由引擎选。
+CREATED_IDS+=("$(docker run -d --name "$SOURCE_CONTAINER" -e POSTGRES_PASSWORD="$PG_PASSWORD" \
+  -e POSTGRES_DB=appdb -p 127.0.0.1:"$PG_PORT":5432 postgres:17.6-alpine)")
 wait_for "Postgres" 90 docker exec "$SOURCE_CONTAINER" pg_isready -U postgres
 
 echo "==> S3-compatible store (destination bucket + Storage source bucket)"
-docker run -d --name "$S3_CONTAINER" -p 127.0.0.1:"$S3_PORT":9000 \
+CREATED_IDS+=("$(docker run -d --name "$S3_CONTAINER" -p 127.0.0.1:"$S3_PORT":9000 \
   -e MINIO_ROOT_USER="$S3_ACCESS_KEY" -e MINIO_ROOT_PASSWORD="$S3_SECRET_KEY" \
-  minio/minio:latest server /data >/dev/null
+  minio/minio:RELEASE.2025-04-22T22-12-26Z server /data)")
 wait_for "MinIO" 90 curl -fsS "http://127.0.0.1:$S3_PORT/minio/health/live"
 
 sed -e "s|__PG_PASSWORD__|$PG_PASSWORD|" -e "s|__PG_PORT__|$PG_PORT|" \
@@ -104,6 +115,6 @@ BD_DEMO_PG_URL="postgresql://postgres:$PG_PASSWORD@127.0.0.1:$PG_PORT/appdb" \
 echo "==> backup"
 run_cli backup --config "$CONFIG"
 
-echo "==> drill (every file verified, plus business invariants in the sandbox)"
+echo "==> drill (every file verified, plus business invariants against the sandbox)"
 run_cli drill --config "$CONFIG" \
   --verify-all-files --check-cmd "node check-invariants.mjs"

@@ -57,7 +57,9 @@ test("run.sh references no file that git ignores", () => {
   }
 });
 
-test("no credential literals live in the fixture source", () => {
+// 这不是通用密钥扫描,只是钉住曾经被硬编码进来的那三个字面量不再复活。
+// 真正的通用防护应由仓库级 secret scanning 承担。
+test("the credentials that were once hard-coded here do not come back", () => {
   for (const file of ["run.sh", "storage-setup.mjs", "check-invariants.mjs", "config.template.json"]) {
     const body = readFileSync(join(exampleDir, file), "utf8");
     assert.doesNotMatch(body, /bdreport|sourcepw|secret-2026/, `${file} still carries a hard-coded credential`);
