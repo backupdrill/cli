@@ -37,11 +37,29 @@ console.log("orphan order_items:", orphanItems.n, "| orphan orders:", orphanOrde
 console.log("revenue orders vs matview:", totals.from_orders, "vs", totals.from_matview);
 
 const failures = [];
+
+// 逐表断言确切行数。只做自洽性检查是不够的:恢复丢了一半数据,外键和物化视图
+// 依然自洽(约束会被重建、matview 从已恢复的表重算),照样 exit 0。
+const EXPECTED = {
+  orders: 200000,
+  order_items: 600000,
+  customers: 20000,
+  attachments: 250,
+  events: 300000,
+};
+for (const [table, expected] of Object.entries(EXPECTED)) {
+  const actual = Number(counts[table]);
+  if (actual !== expected) failures.push(`${table} = ${actual}, expected ${expected}`);
+}
+// 固件的营收总额是确定性的,与行数一起钉死"数据真的回来了"
+const EXPECTED_REVENUE = "25099150000";
+if (String(totals.from_orders) !== EXPECTED_REVENUE)
+  failures.push(`revenue = ${totals.from_orders}, expected ${EXPECTED_REVENUE}`);
+
 if (orphanItems.n !== 0) failures.push(`${orphanItems.n} order_items reference a missing order`);
 if (orphanOrders.n !== 0) failures.push(`${orphanOrders.n} orders reference a missing customer`);
 if (String(totals.from_orders) !== String(totals.from_matview))
   failures.push("order_totals materialized view disagrees with orders");
-if (Number(counts.attachments) !== 250) failures.push(`attachments = ${counts.attachments}, expected 250`);
 
 await client.end();
 

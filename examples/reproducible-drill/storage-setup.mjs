@@ -4,11 +4,15 @@ import { createHash, createHmac } from "node:crypto";
 import { S3Client, CreateBucketCommand, PutObjectCommand } from "@aws-sdk/client-s3";
 import pg from "pg";
 
+// 凭据与端点由 run.sh 每次运行生成并经环境变量传入,源码里不留密钥
 const s3 = new S3Client({
-  endpoint: "http://127.0.0.1:19000",
+  endpoint: process.env.BD_DEMO_S3_ENDPOINT,
   region: "us-east-1",
   forcePathStyle: true,
-  credentials: { accessKeyId: "bdreport", secretAccessKey: "bdreport-secret-2026" },
+  credentials: {
+    accessKeyId: process.env.BD_DEMO_S3_ACCESS_KEY,
+    secretAccessKey: process.env.BD_DEMO_S3_SECRET_KEY,
+  },
 });
 
 for (const Bucket of ["user-uploads", "acme-backups"]) {
@@ -38,9 +42,7 @@ const KINDS = [
   { dir: "product-photos", ext: "jpg", type: "image/jpeg", min: 60_000, max: 400_000, n: 50 },
 ];
 
-const client = new pg.Client({
-  host: "127.0.0.1", port: 15432, user: "postgres", password: "sourcepw", database: "appdb",
-});
+const client = new pg.Client({ connectionString: process.env.BD_DEMO_PG_URL });
 await client.connect();
 const { rows: customers } = await client.query("select id from public.customers limit 400");
 
