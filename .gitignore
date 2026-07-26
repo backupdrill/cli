@@ -10,3 +10,7 @@ backupdrill.config.json
 
 # cross-review artifacts
 .review/
+
+# Supabase CLI 本地状态(含项目 ref):公开仓永不提交。
+# 只忽略本地状态目录,不要写成 supabase/ —— 那会连迁移/函数一起吞掉。
+/supabase/.temp/
