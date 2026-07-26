@@ -78,7 +78,11 @@ Drill:
 ✓ Drill PASSED — 13 tables / 1,495,250 rows restored in 2.3s
 ```
 
-`check-invariants.mjs` is what `--check-cmd` runs inside the sandbox. It asserts
+`check-invariants.mjs` is what `--check-cmd` runs. It runs on your machine, not
+inside the sandbox container — the drill hands it the sandbox's connection
+string via `BACKUPDRILL_SANDBOX_URL`, so it needs whatever runtime your check
+is written in, and it has your machine's privileges, not a container's. It
+asserts
 the exact row count of five tables and the exact revenue total, so losing part
 of the data fails the drill. Its other two assertions — no orphaned foreign
 keys, materialized view agreeing with its base table — are near-tautologies a
