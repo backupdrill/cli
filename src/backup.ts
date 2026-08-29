@@ -2,7 +2,6 @@ import { spawn, execFile } from "node:child_process";
 import { createHash } from "node:crypto";
 import { Transform } from "node:stream";
 import { promisify } from "node:util";
-import { Client } from "pg";
 import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
 import { Upload } from "@aws-sdk/lib-storage";
 import type { BackupConfig } from "./config.js";
@@ -14,7 +13,7 @@ import { renderRecoveryDoc } from "./recovery-doc.js";
 import { projectRefOf, refFromStorageEndpoint, assertNoHostOverride } from "./restore-engine.js";
 import { log } from "./log.js";
 import { TOOL_VERSION } from "./version.js";
-import { pgConnectOptions, dumpUrlFor } from "./supabase-ca.js";
+import { dumpUrlFor, connectPg } from "./supabase-ca.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -69,8 +68,7 @@ async function inspectDatabase(
 ): Promise<DbFacts> {
   // Supabase 主机 → 用打包的根 CA 做 verify-full(pooler 证书自签、不在系统信任库);
   // 非 Supabase(本 CLI 不限制目标)→ 保持默认,别把开源用户挡在门外
-  const client = new Client(pgConnectOptions(databaseUrl));
-  await client.connect();
+  const client = await connectPg(databaseUrl);
   try {
     const version = await client.query<{ server_version: string }>(
       "show server_version"

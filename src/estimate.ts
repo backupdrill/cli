@@ -1,8 +1,7 @@
-import { Client } from "pg";
 import type { BackupConfig } from "./config.js";
 import { measureStorage } from "./storage.js";
 import { log } from "./log.js";
-import { pgConnectOptions } from "./supabase-ca.js";
+import { connectPg } from "./supabase-ca.js";
 
 /**
  * Supabase egress 定价(2026-07-10 经核实,来源见 README「Egress & cost」)。
@@ -28,8 +27,7 @@ async function measureDbBytes(
   databaseUrl: string,
   schemas: string[]
 ): Promise<number> {
-  const client = new Client(pgConnectOptions(databaseUrl));
-  await client.connect();
+  const client = await connectPg(databaseUrl);
   try {
     // pg_total_relation_size 含索引+TOAST,是 egress 上界(真实转储经压缩、不含索引,更小)
     const res = await client.query<{ bytes: string }>(

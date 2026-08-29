@@ -5,7 +5,6 @@ import { join, dirname, resolve, sep } from "node:path";
 import { pipeline } from "node:stream/promises";
 import { type Readable } from "node:stream";
 import { GetObjectCommand } from "@aws-sdk/client-s3";
-import { Client } from "pg";
 import type { BackupConfig } from "./config.js";
 import { parseManifest } from "./manifest.js";
 import type { Manifest } from "./manifest.js";
@@ -30,7 +29,7 @@ import {
   type StorageRestoreSummary,
   type StorageRestoreTarget,
 } from "./storage-restore.js";
-import { pgConnectOptions } from "./supabase-ca.js";
+import { connectPg } from "./supabase-ca.js";
 import { resolvePgRestoreBin } from "./pgbin.js";
 import { parsePgDumpMajor } from "./backup.js";
 import { execFile } from "node:child_process";
@@ -245,8 +244,7 @@ export function assertConfirmedTarget(
  * 留下半截目标(评审第 7 轮)。
  */
 async function assertEmptyTarget(targetUrl: string, schemas: string[]): Promise<void> {
-  const client = new Client(pgConnectOptions(targetUrl));
-  await client.connect();
+  const client = await connectPg(targetUrl);
   try {
     const res = await client.query<{ n: string }>(
       `select
@@ -326,8 +324,7 @@ async function dryRunPreflight(
       blockers.push((error as Error).message);
       log.error(`empty-target check: ${(error as Error).message}`);
     }
-    const client = new Client(pgConnectOptions(targetUrl));
-    await client.connect();
+    const client = await connectPg(targetUrl);
     try {
       // SHOW 的结果列名是 server_version;用 current_setting 显式起别名,
       // 否则取错列得 NaN,而 NaN < x 恒 false = 版本降级永远查不出来
@@ -540,8 +537,7 @@ export async function runRestore(
 
       // 版本预检不只属于 dry-run:跳过 dry-run 直接执行时,目标比源旧照样会
       // 半途炸掉或部分恢复(评审第 8 轮)——写入前必须拦住
-      const versionClient = new Client(pgConnectOptions(targetUrl));
-      await versionClient.connect();
+      const versionClient = await connectPg(targetUrl);
       let targetMajor: number;
       try {
         const res = await versionClient.query<{ v: string }>(
