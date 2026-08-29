@@ -3,7 +3,6 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
-import { Client } from "pg";
 import { S3Client } from "@aws-sdk/client-s3";
 import type { BackupConfig } from "./config.js";
 import { parseManifest } from "./manifest.js";
@@ -23,7 +22,7 @@ import {
   quoteIdent,
   restoreDatabaseArtifact,
 } from "./restore-engine.js";
-import { pgConnectOptions } from "./supabase-ca.js";
+import { connectPg } from "./supabase-ca.js";
 import { log } from "./log.js";
 
 const execFileAsync = promisify(execFile);
@@ -192,8 +191,7 @@ export async function verifyRestored(
 ): Promise<{ checks: DrillCheck[]; tableCount: number; rowTotal: number }> {
   // pgConnectOptions:真实 Supabase 目标(restore 复用本函数)需要打包根 CA;
   // 沙箱的 docker 连接串非 Supabase 主机,原样透传,行为不变
-  const client = new Client(pgConnectOptions(connString));
-  await client.connect();
+  const client = await connectPg(connString);
   try {
     const schemas = manifest.database.schemas;
     // 口径必须与 manifest 统计端(backup.ts inspectDatabase)完全一致:

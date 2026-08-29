@@ -9,10 +9,9 @@
 //  3. dump 自带 CREATE SCHEMA,而目标(新容器或 Supabase)恒有同名 schema →
 //     pre-data 阶段的 schema "already exists" 是两类目标共同的预期冲突。
 import { spawn } from "node:child_process";
-import { Client } from "pg";
 import type { ExtensionInfo } from "./manifest.js";
 import { resolvePgRestoreBin } from "./pgbin.js";
-import { pgConnectOptions, dumpUrlFor } from "./supabase-ca.js";
+import { dumpUrlFor, connectPg } from "./supabase-ca.js";
 
 export type RestoreTargetKind = "sandbox" | "supabase";
 
@@ -164,8 +163,7 @@ export async function installExtensions(
   if (!extensions.length) return [];
   // pgConnectOptions:Supabase 主机自动带打包根 CA(node-pg 把 require 按 verify-full
   // 处理,裸 Client 对 pooler 必报 self-signed chain);沙箱等非 Supabase 目标原样透传
-  const client = new Client(pgConnectOptions(connString));
-  await client.connect();
+  const client = await connectPg(connString);
   const unavailable: string[] = [];
   try {
     for (const ext of extensions) {
