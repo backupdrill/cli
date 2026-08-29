@@ -1,13 +1,14 @@
 // 回归钉子(2026-08-28 复盘):引擎连客户数据库用的是裸 new Client(),没挂 error 监听。
 // node-postgres 在连接建立后被对端掐断时会在 client 上 emit "error",没人监听就是
 // uncaughtException —— 本引擎跑在 BackupDrill worker 进程里,一个客户库断连能杀掉整个 worker。
-import { test } from "node:test";
+import { test, mock } from "node:test";
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
 import { readFileSync, readdirSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { createServer } from "node:net";
+import pg from "pg";
 import { attachPgErrorGuard, connectPg } from "../dist/supabase-ca.js";
 
 const srcDir = join(dirname(dirname(fileURLToPath(import.meta.url))), "src");
@@ -71,20 +72,36 @@ test("connectPg + 真 pg.Client:连上后被对端掐断 → 进程不崩、后�
   const uncaught = [];
   const onUncaught = (error) => uncaught.push(error);
   process.on("uncaughtException", onUncaught);
+  // 证明监听挂在 connect() **之前**:包住 Client.prototype.connect,在它被调用的那一刻数监听
+  let listenersAtConnect = -1;
+  const originalConnect = pg.Client.prototype.connect;
+  const connectSpy = mock.method(pg.Client.prototype, "connect", function (...args) {
+    listenersAtConnect = this.listenerCount("error");
+    return originalConnect.apply(this, args);
+  });
+  let client;
   try {
-    const client = await connectPg(`postgresql://u:p@127.0.0.1:${port}/db`);
-    assert.equal(client.listenerCount("error"), 1, "监听必须在 connect 之前就挂上");
-    // 对端掐断
+    client = await connectPg(`postgresql://u:p@127.0.0.1:${port}/db`);
+    assert.equal(listenersAtConnect, 1, "监听必须在 connect() 被调用时就已挂上,晚一步就是握手后的空窗");
+    // 对端掐断;用 client 自己的 error 事件同步,不靠 sleep
+    const dropped = new Promise((resolve) => client.once("error", resolve));
     for (const s of sockets) s.destroy();
-    await new Promise((r) => setTimeout(r, 200));
+    const error = await Promise.race([
+      dropped,
+      new Promise((_, reject) => setTimeout(() => reject(new Error("no error event within 5s")), 5000)),
+    ]);
+    assert.match(error.message, /Connection terminated unexpectedly/);
     assert.equal(uncaught.length, 0, "断连变成了 uncaughtException —— 这就是会杀掉 worker 的路径");
     assert.equal(lines.length, 1, "断连要记一行,不能静默");
     assert.match(lines[0], /Connection terminated unexpectedly/);
     await assert.rejects(client.query("select 1"), /terminated|not queryable|closed/i, "断连后的查询要 reject 给调用方");
-    await client.end().catch(() => {});
   } finally {
+    connectSpy.mock.restore();
     process.off("uncaughtException", onUncaught);
     console.warn = originalWarn;
-    server.close();
+    // 无论断言成败都收干净:server.close() 不会关已接受的连接,漏一个就挂住测试进程
+    if (client) await client.end().catch(() => {});
+    for (const s of sockets) s.destroy();
+    await new Promise((resolve) => server.close(resolve));
   }
 });
