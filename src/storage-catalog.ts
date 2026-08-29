@@ -3,9 +3,8 @@
 // 零新增凭据(R0 spike 实证)。per-file 元数据不在这里:它随 syncStorage 的 GetObject
 // 响应原子捕获(见 storage.ts fileMetadataFromS3)。
 // 任何失败都由调用方降级为"未捕获"(manifest 缺 buckets 字段),绝不弄失败一次备份。
-import { Client } from "pg";
 import type { BucketAttrs } from "./manifest.js";
-import { pgConnectOptions } from "./supabase-ca.js";
+import { connectPg } from "./supabase-ca.js";
 
 interface BucketRow {
   id: string;
@@ -56,8 +55,7 @@ export async function inspectBucketAttrs(
   databaseUrl: string,
   bucketNames: string[]
 ): Promise<BucketAttrs[]> {
-  const client = new Client(pgConnectOptions(databaseUrl));
-  await client.connect();
+  const client = await connectPg(databaseUrl);
   try {
     const bucketRows = await client.query<BucketRow>(
       `select id, name, public, file_size_limit, allowed_mime_types

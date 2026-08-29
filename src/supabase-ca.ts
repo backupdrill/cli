@@ -1,3 +1,4 @@
+import { Client } from "pg";
 /**
  * Supabase Root 2021 CA —— 打包进引擎,用于对用户 Supabase 源库连接做 verify-full。
  *
@@ -243,4 +244,29 @@ export function pgConnectOptions(databaseUrl: string): {
 } {
   if (!isSupabaseHost(databaseUrl)) return { connectionString: databaseUrl };
   return { connectionString: stripSslParams(databaseUrl), ssl: SUPABASE_SSL };
+}
+
+/**
+ * 给一个 pg Client 挂上 error 监听。**必须在 connect() 之前挂。**
+ *
+ * 为什么:node-postgres 在连接建立后被对端掐断(Supabase 抖动、项目被暂停、网络抖)时,
+ * 除了让正在等的查询 reject,还会在 client 上 emit "error";EventEmitter 没有监听者的 "error"
+ * 直接抛成 uncaughtException。本引擎跑在 BackupDrill worker 进程里,一个客户库断连就能杀掉
+ * 整个 worker,连带打断其他客户正在跑的任务(2026-08-28 复盘)。挂上之后查询照常 reject、
+ * 调用方的 try/finally 照常收尾,进程活着。只记一行日志:断连的原因会从 reject 的错误里报出来。
+ */
+export function attachPgErrorGuard(client: {
+  on(event: "error", listener: (error: Error) => void): unknown;
+}): void {
+  client.on("error", (error) => {
+    console.warn(`[pg] connection error after connect: ${error.message}`);
+  });
+}
+
+/** 连接一个 Postgres:pgConnectOptions(TLS 口径)+ error 监听 + connect(),三步不可分开。 */
+export async function connectPg(databaseUrl: string): Promise<Client> {
+  const client = new Client(pgConnectOptions(databaseUrl));
+  attachPgErrorGuard(client);
+  await client.connect();
+  return client;
 }
