@@ -80,6 +80,7 @@ test("connectPg + 真 pg.Client:连上后被对端掐断 → 进程不崩、后�
     return originalConnect.apply(this, args);
   });
   let client;
+  let timeout;
   try {
     client = await connectPg(`postgresql://u:p@127.0.0.1:${port}/db`);
     assert.equal(listenersAtConnect, 1, "监听必须在 connect() 被调用时就已挂上,晚一步就是握手后的空窗");
@@ -88,7 +89,9 @@ test("connectPg + 真 pg.Client:连上后被对端掐断 → 进程不崩、后�
     for (const s of sockets) s.destroy();
     const error = await Promise.race([
       dropped,
-      new Promise((_, reject) => setTimeout(() => reject(new Error("no error event within 5s")), 5000)),
+      new Promise((_, reject) => {
+        timeout = setTimeout(() => reject(new Error("no error event within 5s")), 5000);
+      }),
     ]);
     assert.match(error.message, /Connection terminated unexpectedly/);
     assert.equal(uncaught.length, 0, "断连变成了 uncaughtException —— 这就是会杀掉 worker 的路径");
@@ -96,6 +99,7 @@ test("connectPg + 真 pg.Client:连上后被对端掐断 → 进程不崩、后�
     assert.match(lines[0], /Connection terminated unexpectedly/);
     await assert.rejects(client.query("select 1"), /terminated|not queryable|closed/i, "断连后的查询要 reject 给调用方");
   } finally {
+    clearTimeout(timeout); // 否则赢了竞速的那次也要拖住事件循环 5 秒
     connectSpy.mock.restore();
     process.off("uncaughtException", onUncaught);
     console.warn = originalWarn;
