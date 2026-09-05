@@ -43,8 +43,12 @@ export function projectRefOf(connString: string): string | null {
     if (direct) return direct[1];
     // 用户名必须先解码再匹配:URL 解析器保留百分号编码,而 pg/libpq 会解码——
     // postgres%2Eref 在驱动眼里就是 postgres.ref,不解码 = 身份判定可被编码绕过
-    // [\s\S] 而不是 .:Postgres 加引号的角色名可含换行,`.` 不匹配行终止符会让这类角色身份判定失效
-    const pooled = decodeURIComponent(url.username).match(/^[\s\S]+\.([a-z0-9]{16,})$/);
+    // [\s\S] 而不是 .:Postgres 加引号的角色名可含换行,`.` 不匹配行终止符会让这类角色身份判定失效。
+    // 解码后含 NUL 一律不认:启动包用 NUL 分隔字段,`postgres%00options%00reference=…%00x.<ref>`
+    // 在驱动/Supavisor 眼里是 user=postgres 外加一个 options 字段,身份判定看到的 ref 是假的(交叉审查)
+    const username = decodeURIComponent(url.username);
+    if (username.includes("\0")) return null;
+    const pooled = username.match(/^[\s\S]+\.([a-z0-9]{16,})$/);
     if (pooled && /\.pooler\.supabase\.com$/.test(normalizeHost(url.hostname))) return pooled[1];
     return null;
   } catch {
@@ -292,6 +296,20 @@ export function credentialSafeDbArgs(connString: string): { url: string; env: No
 export function assertNoHostOverride(connString: string): void {
   try {
     const url = new URL(connString);
+    // 用户名/密码/主机里解码后出现 NUL:启动包以 NUL 分隔字段,后面的内容会被当成额外的启动参数
+    // (options=reference=… 之类),连接目标与身份判定脱节。libpq 稍后也会拒,但驱动侧先发出的
+    // 启动包已经到了 pooler——在任何连接/身份判定之前就拒(交叉审查)。
+    for (const [label, raw] of [["username", url.username], ["password", url.password], ["host", url.hostname]] as const) {
+      let decoded = raw;
+      try {
+        decoded = decodeURIComponent(raw);
+      } catch {
+        // 非法编码:驱动同样解不开,按原样看
+      }
+      if (decoded.includes("\0")) {
+        throw new Error(`connection string ${label} contains a NUL byte override — use a plain connection string.`);
+      }
+    }
     const params = url.searchParams;
     const isSupabasePooler = /\.pooler\.supabase\.com$/.test(normalizeHost(url.hostname));
     for (const key of params.keys()) {
