@@ -156,6 +156,9 @@ test("projectRefOf / assertNoHostOverride:解码后含 NUL 的用户名不认、
   assert.equal(projectRefOf(viaQuery), null);
   assert.throws(() => assertNoHostOverride(`postgresql://postgres.${target}:pw@aws-0-us-east-1.pooler.supabase.com:5432/postgres%00x`), /NUL/);
   assert.doesNotThrow(() => assertNoHostOverride(`postgresql://postgres.${target}:pw@aws-0-us-east-1.pooler.supabase.com:5432/postgres`));
+  // WHATWG URL 解析不了、pg 却接受的形态(空主机 + ?host=):不能放行,身份判定为空
+  assert.throws(() => assertNoHostOverride("postgresql://postgres.cluster.alias@/postgres?host=aws-0-us-east-1.pooler.supabase.com"), /parsed|override/);
+  assert.throws(() => assertNoHostOverride("host=aws-0-us-east-1.pooler.supabase.com user=postgres"), /parsed/);
 });
 
 test("Supavisor 的 <user>.cluster.<alias> 保留语法:不当 ref,且连接在 I/O 前被拒;大写 CLUSTER 是普通角色", async () => {
