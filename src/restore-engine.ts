@@ -43,7 +43,8 @@ export function projectRefOf(connString: string): string | null {
     if (direct) return direct[1];
     // 用户名必须先解码再匹配:URL 解析器保留百分号编码,而 pg/libpq 会解码——
     // postgres%2Eref 在驱动眼里就是 postgres.ref,不解码 = 身份判定可被编码绕过
-    const pooled = decodeURIComponent(url.username).match(/^.+\.([a-z0-9]{16,})$/);
+    // [\s\S] 而不是 .:Postgres 加引号的角色名可含换行,`.` 不匹配行终止符会让这类角色身份判定失效
+    const pooled = decodeURIComponent(url.username).match(/^[\s\S]+\.([a-z0-9]{16,})$/);
     if (pooled && /\.pooler\.supabase\.com$/.test(normalizeHost(url.hostname))) return pooled[1];
     return null;
   } catch {
@@ -282,15 +283,23 @@ export function credentialSafeDbArgs(connString: string): { url: string; env: No
  * 拒绝连接串里的 host/hostaddr/user 查询覆盖:驱动会让它们改写实际连接目标/租户——
  * 身份判定(ref/主机)看的是 authority,读写却发生在别处。备份侧(源身份自记)与
  * 恢复侧(确认门/同源阻断)共用本检查。
+ * 同理拒绝 `?options=reference=<ref>`:Supavisor 让它优先于用户名里的租户段
+ * (handler_helpers.ex),`<role>.<A>?options=reference=B` 身份判 A、实际连 B(交叉审查)。
  */
 export function assertNoHostOverride(connString: string): void {
   try {
     const params = new URL(connString).searchParams;
-    for (const key of params.keys()) {
+    for (const [key, value] of params.entries()) {
       if (/^(host|hostaddr|user)$/i.test(key)) {
         throw new Error(
           `connection string carries a ?${key}= override — the effective server/identity would ` +
             `differ from the URL authority that identity checks inspect. Use a plain connection string.`
+        );
+      }
+      if (/^options$/i.test(key) && /reference\s*=/i.test(value)) {
+        throw new Error(
+          "connection string carries a ?options=reference= tenant override — the pooler would route to " +
+            "a different project than the username says. Use a plain connection string."
         );
       }
     }
