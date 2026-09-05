@@ -426,6 +426,11 @@ export async function runRestore(
     storageDir?: string;
   }
 ): Promise<RestoreResult> {
+  // 任何 I/O 之前先把源与目标的连接串过一遍覆盖/别名守卫:源串带集群别名或租户覆盖时
+  // 身份判定为空,同源阻断会失效——不能只查目标(交叉审查)。备份端 runBackup 对源做同样的事。
+  if (config.databaseUrl !== NO_SOURCE_DATABASE) assertNoHostOverride(config.databaseUrl);
+  if (opts.targetDatabaseUrl) assertNoHostOverride(opts.targetDatabaseUrl);
+
   const s3 = targetClient(config);
   const snapshotPrefix = await resolveSnapshot(s3, config, opts.snapshot);
   const snapshot = snapshotPrefix.replace(/\/$/, "").split("/").pop()!;
@@ -451,8 +456,6 @@ export async function runRestore(
           serviceRoleKey: opts.targetServiceRoleKey,
         }
       : null;
-  if (opts.targetDatabaseUrl) assertNoHostOverride(opts.targetDatabaseUrl);
-
   // 同源阻断(统一收口):目标(库或 Storage)的 ref 命中任何源项目 ref → 拒绝。
   // 覆盖 storage-only 组合:目标 Storage = 备份读取源的项目时,upsert 会改写源。
   const sourceRefs = sourceProjectRefs(config, manifest);
