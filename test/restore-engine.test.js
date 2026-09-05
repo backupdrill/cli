@@ -99,12 +99,17 @@ test("projectRefOf:直连主机与 pooler 用户名都能提取 ref;非 Supabase
   assert.equal(projectRefOf("postgresql://user:pw@localhost:5432/db"), null);
 });
 
-test("projectRefOf:自定义角色的 pooler 用户名(<role>.<ref>)同样提取 ref;大写/连字符角色名不认", async () => {
+test("projectRefOf:任意角色的 pooler 用户名(<role>.<ref>)都按最后一段提取 ref;非 pooler 主机不认", async () => {
   const { projectRefOf } = await import("../dist/restore.js");
   const ref = "abcdefghij0123456789";
   assert.equal(projectRefOf(`postgresql://backupdrill_ab12cd34ef56.${ref}:pw@aws-0-us-east-1.pooler.supabase.com:5432/postgres`), ref);
-  assert.equal(projectRefOf(`postgresql://Backup.${ref}:pw@aws-0-us-east-1.pooler.supabase.com:5432/postgres`), null);
-  assert.equal(projectRefOf(`postgresql://backup-role.${ref}:pw@aws-0-us-east-1.pooler.supabase.com:5432/postgres`), null);
+  // Supavisor 在最后一个点切租户:大写 / 连字符 / 带点的角色名都是合法租户身份
+  assert.equal(projectRefOf(`postgresql://Backup.${ref}:pw@aws-0-us-east-1.pooler.supabase.com:5432/postgres`), ref);
+  assert.equal(projectRefOf(`postgresql://backup-role.${ref}:pw@aws-0-us-east-1.pooler.supabase.com:5432/postgres`), ref);
+  assert.equal(projectRefOf(`postgresql://svc.reader.${ref}:pw@aws-0-us-east-1.pooler.supabase.com:5432/postgres`), ref);
+  // 同样形状的用户名落在非 Supabase 主机上不是租户身份
+  assert.equal(projectRefOf(`postgresql://backup_reader.${ref}:pw@db.internal.example:5432/postgres`), null);
+  assert.equal(projectRefOf(`postgresql://postgres.${ref}:pw@db.internal.example:5432/postgres`), null);
 });
 
 test("sameDatabaseTarget:免密接入的角色串与用户手输的 postgres 串指向同一项目 → 同源保护必须认得出", () => {
@@ -114,6 +119,8 @@ test("sameDatabaseTarget:免密接入的角色串与用户手输的 postgres 串
   const otherProject = `postgresql://postgres.zyxwvutsrq9876543210:pw@aws-0-us-east-1.pooler.supabase.com:5432/postgres`;
   assert.equal(sameDatabaseTarget(roleSource, postgresTarget), true);
   assert.equal(sameDatabaseTarget(roleSource, otherProject), false);
+  const upperRoleSource = `postgresql://Backup-Reader.${ref}:pw@aws-0-us-east-1.pooler.supabase.com:5432/postgres`;
+  assert.equal(sameDatabaseTarget(upperRoleSource, postgresTarget), true);
 });
 
 test("sameDatabaseTarget:源直连、目标 pooler 的同一项目 → 阻断(host/user 都不同也认得出)", () => {
