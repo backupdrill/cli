@@ -334,11 +334,13 @@ export function assertNoHostOverride(connString: string): void {
   }
   const params = url.searchParams;
   const isSupabasePooler = /\.pooler\.supabase\.com$/.test(normalizeHost(url.hostname));
-  let username = url.username;
+  let username: string;
   try {
     username = decodeURIComponent(url.username);
   } catch {
-    // 非法编码:驱动同样解不开,按原样看
+    // 非法百分号编码不能按原样放行:pg 会做部分解码(%75 → u,%GG 保留),这里看到的字符串
+    // 与驱动实际发出的用户名不同,别名/身份判定都可能被绕过(交叉审查)。解不开就拒。
+    throw new Error("connection string username has invalid percent-encoding — use a plain connection string.");
   }
   // 集群别名连接:我们解析不出它真正路由到哪个项目,身份判定为空 → 同源/目标一致性都没法保证,
   // 在任何 I/O 之前拒绝,而不是让"null 身份"静默放行
