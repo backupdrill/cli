@@ -123,15 +123,23 @@ test("sameDatabaseTarget:免密接入的角色串与用户手输的 postgres 串
   assert.equal(sameDatabaseTarget(upperRoleSource, postgresTarget), true);
 });
 
-test("assertNoHostOverride:?options=reference= 租户覆盖被拒;普通 options 放行", async () => {
+test("assertNoHostOverride:pooler 主机上任何 ?options= 都拒(含双重编码/大小写);非 pooler 主机的 options 放行", async () => {
   const { assertNoHostOverride } = await import("../dist/restore.js");
   const ref = "abcdefghij0123456789";
-  const base = `postgresql://svc.reader.${ref}:pw@aws-0-us-east-1.pooler.supabase.com:5432/postgres`;
-  assert.throws(() => assertNoHostOverride(`${base}?options=reference%3Dzyxwvutsrq9876543210`), /reference/);
-  assert.throws(() => assertNoHostOverride(`${base}?options=-c%20search_path%3Dpublic%20reference%20%3D%20zyxwvutsrq9876543210`), /reference/);
-  assert.throws(() => assertNoHostOverride(`${base}?OPTIONS=Reference%3Dzyxwvutsrq9876543210`), /reference/);
-  assert.doesNotThrow(() => assertNoHostOverride(`${base}?options=-c%20statement_timeout%3D0`));
-  assert.doesNotThrow(() => assertNoHostOverride(base));
+  const other = "zyxwvutsrq9876543210";
+  const pooler = `postgresql://svc.reader.${ref}:pw@aws-0-us-east-1.pooler.supabase.com:5432/postgres`;
+  assert.throws(() => assertNoHostOverride(`${pooler}?options=reference%3D${other}`), /options/);
+  // 双重编码:URL 层解一次得 %72eference,Supavisor 再解一次得 reference —— 不追它的解析器,整参数拒绝
+  assert.throws(() => assertNoHostOverride(`${pooler}?options=%2572eference%3D${other}`), /options/);
+  assert.throws(() => assertNoHostOverride(`${pooler}?OPTIONS=-c%20statement_timeout%3D0`), /options/);
+  assert.throws(() => assertNoHostOverride(`${pooler}?options=-c%20application_name%3Dreference%3Dbackup`), /options/);
+  // 编码过的 pooler 主机同样按解码后判定
+  assert.throws(() => assertNoHostOverride(`postgresql://postgres.${ref}:pw@aws-0-us-east-1.pooler.supabase%2Ecom:5432/postgres?options=reference%3D${other}`), /options/);
+  assert.doesNotThrow(() => assertNoHostOverride(pooler));
+  // 普通 Postgres 目标:options 没有租户语义,连 "reference" 这个词也不应误伤
+  const plain = `postgresql://app:pw@db.example.com:5432/app`;
+  assert.doesNotThrow(() => assertNoHostOverride(`${plain}?options=-c%20application_name%3Dreference%3Dbackup`));
+  assert.doesNotThrow(() => assertNoHostOverride(`${plain}?options=-c%20statement_timeout%3D0`));
 });
 
 test("projectRefOf:角色名含编码换行(加引号的 Postgres 角色可以)也按最后一段取 ref", async () => {

@@ -283,23 +283,28 @@ export function credentialSafeDbArgs(connString: string): { url: string; env: No
  * 拒绝连接串里的 host/hostaddr/user 查询覆盖:驱动会让它们改写实际连接目标/租户——
  * 身份判定(ref/主机)看的是 authority,读写却发生在别处。备份侧(源身份自记)与
  * 恢复侧(确认门/同源阻断)共用本检查。
- * 同理拒绝 `?options=reference=<ref>`:Supavisor 让它优先于用户名里的租户段
- * (handler_helpers.ex),`<role>.<A>?options=reference=B` 身份判 A、实际连 B(交叉审查)。
+ * Supabase pooler 主机上再拒绝**任何** `?options=`:Supavisor 从 options 里解析 `reference=<ref>`
+ * 并让它优先于用户名里的租户段(handler_helpers.ex),而且会再解一次编码、认反斜杠转义——
+ * 试图识别"哪种 options 值是租户覆盖"是在追它的解析器,`%2572eference` 这类双重编码就绕过了
+ * (交叉审查)。pooler 串本来就不需要 options,整个参数一律拒绝;非 pooler 主机(普通 Postgres
+ * 目标)的 options 没有租户语义,照常放行。
  */
 export function assertNoHostOverride(connString: string): void {
   try {
-    const params = new URL(connString).searchParams;
-    for (const [key, value] of params.entries()) {
+    const url = new URL(connString);
+    const params = url.searchParams;
+    const isSupabasePooler = /\.pooler\.supabase\.com$/.test(normalizeHost(url.hostname));
+    for (const key of params.keys()) {
       if (/^(host|hostaddr|user)$/i.test(key)) {
         throw new Error(
           `connection string carries a ?${key}= override — the effective server/identity would ` +
             `differ from the URL authority that identity checks inspect. Use a plain connection string.`
         );
       }
-      if (/^options$/i.test(key) && /reference\s*=/i.test(value)) {
+      if (isSupabasePooler && /^options$/i.test(key)) {
         throw new Error(
-          "connection string carries a ?options=reference= tenant override — the pooler would route to " +
-            "a different project than the username says. Use a plain connection string."
+          "connection string carries ?options= on a Supabase pooler host — the pooler reads a tenant override " +
+            "(reference=…) from it, so identity checks could not trust the username. Remove ?options= entirely."
         );
       }
     }
