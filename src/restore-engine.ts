@@ -15,10 +15,17 @@ import { dumpUrlFor, connectPg } from "./supabase-ca.js";
 
 export type RestoreTargetKind = "sandbox" | "supabase";
 
-/** 主机名规范化:剥掉合法的 DNS 根点(db.x.supabase.co. ≡ db.x.supabase.co)。
- * 身份比较不规范化 = 一个尾点就能绕过同源阻断(supabase-ca 对同类早有钉子)。 */
+/** 主机名规范化:先按驱动语义百分号解码(pg-connection-string / libpq 都会解码主机名,
+ * `supabase%2Ecom` 在驱动眼里就是 supabase.com),再剥掉合法的 DNS 根点(db.x.supabase.co. ≡
+ * db.x.supabase.co)。身份比较不规范化 = 一个尾点或一个 %2E 就能绕过同源阻断(交叉审查)。 */
 export function normalizeHost(hostname: string): string {
-  return hostname.replace(/\.$/, "").toLowerCase();
+  let decoded = hostname;
+  try {
+    decoded = decodeURIComponent(hostname);
+  } catch {
+    // 非法百分号序列:驱动同样解不开,按原样比较
+  }
+  return decoded.replace(/\.$/, "").toLowerCase();
 }
 
 /**
