@@ -321,14 +321,16 @@ export function assertNoHostOverride(connString: string): void {
   if (containsNul(connString)) {
     throw new Error("connection string contains a NUL byte — use a plain connection string.");
   }
-  // try 只包 URL 解析:解析不了的连接串由 pg 自己报错,这里放行。校验逻辑放在外面——
-  // 曾经把校验也包进 try 并按文案里有没有 "override" 决定是否重抛,新加的拒绝理由一旦措辞不同
-  // 就被静默吞掉(交叉审查抓到集群别名的拒绝就是这么失效的)。
+  // 解析不了的连接串直接拒:曾经"放行让 pg 自己报错",但 pg 的解析器比 WHATWG URL 宽
+  // (`postgresql://user@/db?host=…` 这类串 pg 接受、这里解析失败),放行 = 身份判定为空却照样连接
+  // (交叉审查)。校验逻辑放在 try 外面——曾按文案里有没有 "override" 决定重抛,新理由一措辞不同就被吞。
   let url: URL;
   try {
     url = new URL(connString);
   } catch {
-    return;
+    throw new Error(
+      "connection string could not be parsed as a URL — use a plain postgresql://user:password@host:port/database string."
+    );
   }
   const params = url.searchParams;
   const isSupabasePooler = /\.pooler\.supabase\.com$/.test(normalizeHost(url.hostname));
