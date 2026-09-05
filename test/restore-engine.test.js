@@ -158,10 +158,22 @@ test("projectRefOf / assertNoHostOverride:解码后含 NUL 的用户名不认、
   assert.doesNotThrow(() => assertNoHostOverride(`postgresql://postgres.${target}:pw@aws-0-us-east-1.pooler.supabase.com:5432/postgres`));
 });
 
-test("projectRefOf:Supavisor 的 <user>.cluster.<alias> 保留语法不当 ref(别名经成员关系解析,不是项目)", async () => {
-  const { projectRefOf } = await import("../dist/restore.js");
-  assert.equal(projectRefOf("postgresql://postgres.cluster.abcdefghijklmnopqrst:pw@aws-0-us-east-1.pooler.supabase.com:5432/postgres"), null);
-  assert.equal(projectRefOf("postgresql://postgres.CLUSTER.abcdefghijklmnopqrst:pw@aws-0-us-east-1.pooler.supabase.com:5432/postgres"), null);
+test("Supavisor 的 <user>.cluster.<alias> 保留语法:不当 ref,且连接在 I/O 前被拒;大写 CLUSTER 是普通角色", async () => {
+  const { projectRefOf, assertNoHostOverride } = await import("../dist/restore.js");
+  const ref = "abcdefghijklmnopqrst";
+  const pooler = "aws-0-us-east-1.pooler.supabase.com";
+  const alias = `postgresql://postgres.cluster.${ref}:pw@${pooler}:5432/postgres`;
+  const dottedAlias = `postgresql://postgres.cluster.alias.${ref}:pw@${pooler}:5432/postgres`;
+  assert.equal(projectRefOf(alias), null);
+  assert.equal(projectRefOf(dottedAlias), null);
+  assert.throws(() => assertNoHostOverride(alias), /cluster/);
+  assert.throws(() => assertNoHostOverride(dottedAlias), /cluster/);
+  // Supavisor 只认小写 .cluster.:大写是普通角色名,身份照常
+  const upper = `postgresql://postgres.CLUSTER.${ref}:pw@${pooler}:5432/postgres`;
+  assert.equal(projectRefOf(upper), ref);
+  assert.doesNotThrow(() => assertNoHostOverride(upper));
+  // 非 pooler 主机上 ".cluster." 没有特殊含义
+  assert.doesNotThrow(() => assertNoHostOverride(`postgresql://app.cluster.x:pw@db.example.com:5432/app`));
 });
 
 test("projectRefOf:角色名含编码换行(加引号的 Postgres 角色可以)也按最后一段取 ref", async () => {
