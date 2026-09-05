@@ -6,6 +6,9 @@ export { runBackup } from "./backup.js";
 export { SUPABASE_ROOT_CA, pgConnectOptions } from "./supabase-ca.js";
 export { runDrill, drillDump } from "./drill.js";
 export { runRestore } from "./restore.js";
+// 身份判定三件套对外导出:托管 worker 用它们与 app 侧 shared 的副本做同规则回归(交叉审查)
+export { projectRefOf, assertNoHostOverride } from "./restore-engine.js";
+export { sameDatabaseTarget } from "./restore.js";
 export { runEstimate, project } from "./estimate.js";
 export { loadConfig } from "./config.js";
 export {
