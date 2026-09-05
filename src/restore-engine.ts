@@ -18,6 +18,20 @@ export type RestoreTargetKind = "sandbox" | "supabase";
 /** 主机名规范化:先按驱动语义百分号解码(pg-connection-string / libpq 都会解码主机名,
  * `supabase%2Ecom` 在驱动眼里就是 supabase.com),再剥掉合法的 DNS 根点(db.x.supabase.co. ≡
  * db.x.supabase.co)。身份比较不规范化 = 一个尾点或一个 %2E 就能绕过同源阻断(交叉审查)。 */
+/**
+ * 连接串任何位置解码后出现 NUL(或原文里的 %00)都视为启动包字段注入:驱动把 NUL 当字段分隔符,
+ * 后面的内容(user=… / options=reference=…)会成为额外的启动参数,连接目标与身份判定脱节。
+ * 合法连接串不存在 NUL,整串一刀切,不再逐字段追(交叉审查:query 值里的 NUL 同样能注入)。
+ */
+export function containsNul(connString: string): boolean {
+  if (/%00/i.test(connString)) return true;
+  try {
+    return decodeURIComponent(connString).includes("\0");
+  } catch {
+    return connString.includes("\0");
+  }
+}
+
 export function normalizeHost(hostname: string): string {
   let decoded = hostname;
   try {
@@ -37,6 +51,7 @@ export function normalizeHost(hostname: string): string {
  * 与恢复端(同源阻断)共用同一个身份判定。非 Supabase 形态返回 null。
  */
 export function projectRefOf(connString: string): string | null {
+  if (containsNul(connString)) return null;
   try {
     const url = new URL(connString);
     const direct = normalizeHost(url.hostname).match(/^db\.([a-z0-9]{16,})\.supabase\.co$/);
@@ -46,9 +61,7 @@ export function projectRefOf(connString: string): string | null {
     // [\s\S] 而不是 .:Postgres 加引号的角色名可含换行,`.` 不匹配行终止符会让这类角色身份判定失效。
     // 解码后含 NUL 一律不认:启动包用 NUL 分隔字段,`postgres%00options%00reference=…%00x.<ref>`
     // 在驱动/Supavisor 眼里是 user=postgres 外加一个 options 字段,身份判定看到的 ref 是假的(交叉审查)
-    const username = decodeURIComponent(url.username);
-    if (username.includes("\0")) return null;
-    const pooled = username.match(/^[\s\S]+\.([a-z0-9]{16,})$/);
+    const pooled = decodeURIComponent(url.username).match(/^[\s\S]+\.([a-z0-9]{16,})$/);
     if (pooled && /\.pooler\.supabase\.com$/.test(normalizeHost(url.hostname))) return pooled[1];
     return null;
   } catch {
@@ -294,22 +307,13 @@ export function credentialSafeDbArgs(connString: string): { url: string; env: No
  * 目标)的 options 没有租户语义,照常放行。
  */
 export function assertNoHostOverride(connString: string): void {
+  // 整串 NUL 检查放在 URL 解析之前:query 值、路径、任何位置的 NUL 都是启动包注入,
+  // libpq 稍后也会拒,但驱动侧先发出的启动包已经到了 pooler——在任何连接之前就拒
+  if (containsNul(connString)) {
+    throw new Error("connection string contains a NUL byte — use a plain connection string.");
+  }
   try {
     const url = new URL(connString);
-    // 用户名/密码/主机里解码后出现 NUL:启动包以 NUL 分隔字段,后面的内容会被当成额外的启动参数
-    // (options=reference=… 之类),连接目标与身份判定脱节。libpq 稍后也会拒,但驱动侧先发出的
-    // 启动包已经到了 pooler——在任何连接/身份判定之前就拒(交叉审查)。
-    for (const [label, raw] of [["username", url.username], ["password", url.password], ["host", url.hostname]] as const) {
-      let decoded = raw;
-      try {
-        decoded = decodeURIComponent(raw);
-      } catch {
-        // 非法编码:驱动同样解不开,按原样看
-      }
-      if (decoded.includes("\0")) {
-        throw new Error(`connection string ${label} contains a NUL byte override — use a plain connection string.`);
-      }
-    }
     const params = url.searchParams;
     const isSupabasePooler = /\.pooler\.supabase\.com$/.test(normalizeHost(url.hostname));
     for (const key of params.keys()) {

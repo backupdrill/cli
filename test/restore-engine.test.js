@@ -150,6 +150,11 @@ test("projectRefOf / assertNoHostOverride:解码后含 NUL 的用户名不认、
   assert.equal(projectRefOf(smuggled), null);
   assert.throws(() => assertNoHostOverride(smuggled), /NUL/);
   assert.throws(() => assertNoHostOverride(`postgresql://postgres.${target}:p%00w@aws-0-us-east-1.pooler.supabase.com:5432/postgres`), /NUL/);
+  // query 值 / 路径里的 NUL 同样是启动包注入
+  const viaQuery = `postgresql://postgres.${target}:pw@aws-0-us-east-1.pooler.supabase.com:5432/postgres?application_name=x%00user%00postgres%00options%00reference%3D${source}`;
+  assert.throws(() => assertNoHostOverride(viaQuery), /NUL/);
+  assert.equal(projectRefOf(viaQuery), null);
+  assert.throws(() => assertNoHostOverride(`postgresql://postgres.${target}:pw@aws-0-us-east-1.pooler.supabase.com:5432/postgres%00x`), /NUL/);
   assert.doesNotThrow(() => assertNoHostOverride(`postgresql://postgres.${target}:pw@aws-0-us-east-1.pooler.supabase.com:5432/postgres`));
 });
 
