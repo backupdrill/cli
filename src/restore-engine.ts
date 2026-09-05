@@ -321,35 +321,44 @@ export function assertNoHostOverride(connString: string): void {
   if (containsNul(connString)) {
     throw new Error("connection string contains a NUL byte — use a plain connection string.");
   }
+  // try 只包 URL 解析:解析不了的连接串由 pg 自己报错,这里放行。校验逻辑放在外面——
+  // 曾经把校验也包进 try 并按文案里有没有 "override" 决定是否重抛,新加的拒绝理由一旦措辞不同
+  // 就被静默吞掉(交叉审查抓到集群别名的拒绝就是这么失效的)。
+  let url: URL;
   try {
-    const url = new URL(connString);
-    const params = url.searchParams;
-    const isSupabasePooler = /\.pooler\.supabase\.com$/.test(normalizeHost(url.hostname));
-    // 集群别名连接:我们解析不出它真正路由到哪个项目,身份判定为空 → 同源/目标一致性都没法保证,
-    // 在任何 I/O 之前拒绝,而不是让"null 身份"静默放行(交叉审查)
-    if (isSupabasePooler && isClusterAliasUsername(decodeURIComponent(url.username))) {
+    url = new URL(connString);
+  } catch {
+    return;
+  }
+  const params = url.searchParams;
+  const isSupabasePooler = /\.pooler\.supabase\.com$/.test(normalizeHost(url.hostname));
+  let username = url.username;
+  try {
+    username = decodeURIComponent(url.username);
+  } catch {
+    // 非法编码:驱动同样解不开,按原样看
+  }
+  // 集群别名连接:我们解析不出它真正路由到哪个项目,身份判定为空 → 同源/目标一致性都没法保证,
+  // 在任何 I/O 之前拒绝,而不是让"null 身份"静默放行
+  if (isSupabasePooler && isClusterAliasUsername(username)) {
+    throw new Error(
+      "connection string uses Supavisor's <user>.cluster.<alias> syntax — BackupDrill cannot resolve which project " +
+        "the alias routes to, so identity checks cannot run. Use the project's own pooler string (<user>.<project-ref>)."
+    );
+  }
+  for (const key of params.keys()) {
+    if (/^(host|hostaddr|user)$/i.test(key)) {
       throw new Error(
-        "connection string uses Supavisor's <user>.cluster.<alias> syntax — BackupDrill cannot resolve which project " +
-          "the alias routes to, so identity checks cannot run. Use the project's own pooler string (<user>.<project-ref>)."
+        `connection string carries a ?${key}= override — the effective server/identity would ` +
+          `differ from the URL authority that identity checks inspect. Use a plain connection string.`
       );
     }
-    for (const key of params.keys()) {
-      if (/^(host|hostaddr|user)$/i.test(key)) {
-        throw new Error(
-          `connection string carries a ?${key}= override — the effective server/identity would ` +
-            `differ from the URL authority that identity checks inspect. Use a plain connection string.`
-        );
-      }
-      if (isSupabasePooler && /^options$/i.test(key)) {
-        throw new Error(
-          "connection string carries ?options= on a Supabase pooler host — the pooler reads a tenant override " +
-            "(reference=…) from it, so identity checks could not trust the username. Remove ?options= entirely."
-        );
-      }
+    if (isSupabasePooler && /^options$/i.test(key)) {
+      throw new Error(
+        "connection string carries ?options= on a Supabase pooler host — the pooler reads a tenant override " +
+          "(reference=…) from it, so identity checks could not trust the username. Remove ?options= entirely."
+      );
     }
-  } catch (error) {
-    if ((error as Error).message.includes("override")) throw error;
-    // URL 解析不了的连接串由 pg 自己报错,这里放行
   }
 }
 
