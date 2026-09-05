@@ -23,7 +23,9 @@ export function normalizeHost(hostname: string): string {
 
 /**
  * 从连接串提取 Supabase 项目 ref(纯函数):直连主机 `db.<ref>.supabase.co` 或
- * pooler 用户名 `postgres.<ref>`。放在引擎层:备份端(写 manifest.sourceProjectRef)
+ * pooler 用户名 `<role>.<ref>`(默认 postgres,BackupDrill 免密接入建的 backupdrill_* 角色
+ * 同样走 Supavisor,租户身份只看最后一段 ref;角色名限小写字母/数字/下划线,与 Postgres 标识符
+ * 未加引号时的折叠规则一致)。放在引擎层:备份端(写 manifest.sourceProjectRef)
  * 与恢复端(同源阻断)共用同一个身份判定。非 Supabase 形态返回 null。
  */
 export function projectRefOf(connString: string): string | null {
@@ -33,7 +35,7 @@ export function projectRefOf(connString: string): string | null {
     if (direct) return direct[1];
     // 用户名必须先解码再匹配:URL 解析器保留百分号编码,而 pg/libpq 会解码——
     // postgres%2Eref 在驱动眼里就是 postgres.ref,不解码 = 身份判定可被编码绕过
-    const pooled = decodeURIComponent(url.username).match(/^postgres\.([a-z0-9]{16,})$/);
+    const pooled = decodeURIComponent(url.username).match(/^[a-z0-9_]+\.([a-z0-9]{16,})$/);
     if (pooled) return pooled[1];
     return null;
   } catch {
