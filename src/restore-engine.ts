@@ -15,26 +15,63 @@ import { dumpUrlFor, connectPg } from "./supabase-ca.js";
 
 export type RestoreTargetKind = "sandbox" | "supabase";
 
-/** 主机名规范化:剥掉合法的 DNS 根点(db.x.supabase.co. ≡ db.x.supabase.co)。
- * 身份比较不规范化 = 一个尾点就能绕过同源阻断(supabase-ca 对同类早有钉子)。 */
+/** 主机名规范化:先按驱动语义百分号解码(pg-connection-string / libpq 都会解码主机名,
+ * `supabase%2Ecom` 在驱动眼里就是 supabase.com),再剥掉合法的 DNS 根点(db.x.supabase.co. ≡
+ * db.x.supabase.co)。身份比较不规范化 = 一个尾点或一个 %2E 就能绕过同源阻断(交叉审查)。 */
+/**
+ * 连接串任何位置解码后出现 NUL(或原文里的 %00)都视为启动包字段注入:驱动把 NUL 当字段分隔符,
+ * 后面的内容(user=… / options=reference=…)会成为额外的启动参数,连接目标与身份判定脱节。
+ * 合法连接串不存在 NUL,整串一刀切,不再逐字段追(交叉审查:query 值里的 NUL 同样能注入)。
+ */
+export function containsNul(connString: string): boolean {
+  if (/%00/i.test(connString)) return true;
+  try {
+    return decodeURIComponent(connString).includes("\0");
+  } catch {
+    return connString.includes("\0");
+  }
+}
+
+/** Supavisor 集群别名语法:用户名里出现字面量小写 `.cluster.`(handler_helpers.ex),之后全是别名。 */
+export function isClusterAliasUsername(username: string): boolean {
+  return username.includes(".cluster.");
+}
+
 export function normalizeHost(hostname: string): string {
-  return hostname.replace(/\.$/, "").toLowerCase();
+  let decoded = hostname;
+  try {
+    decoded = decodeURIComponent(hostname);
+  } catch {
+    // 非法百分号序列:驱动同样解不开,按原样比较
+  }
+  return decoded.replace(/\.$/, "").toLowerCase();
 }
 
 /**
  * 从连接串提取 Supabase 项目 ref(纯函数):直连主机 `db.<ref>.supabase.co` 或
- * pooler 用户名 `postgres.<ref>`。放在引擎层:备份端(写 manifest.sourceProjectRef)
+ * pooler 用户名 `<role>.<ref>`:Supavisor 在**最后一个点**切分租户(handler_helpers.ex),角色名
+ * 可以含大写、连字符甚至点,所以角色段不做限制、只认最后一段 ref;并且必须是 Supabase pooler
+ * 主机——同样形状的用户名落在别的主机上不是 Supabase 租户身份(交叉审查)。
+ * 放在引擎层:备份端(写 manifest.sourceProjectRef)
  * 与恢复端(同源阻断)共用同一个身份判定。非 Supabase 形态返回 null。
  */
 export function projectRefOf(connString: string): string | null {
+  if (containsNul(connString)) return null;
   try {
     const url = new URL(connString);
     const direct = normalizeHost(url.hostname).match(/^db\.([a-z0-9]{16,})\.supabase\.co$/);
     if (direct) return direct[1];
     // 用户名必须先解码再匹配:URL 解析器保留百分号编码,而 pg/libpq 会解码——
     // postgres%2Eref 在驱动眼里就是 postgres.ref,不解码 = 身份判定可被编码绕过
-    const pooled = decodeURIComponent(url.username).match(/^postgres\.([a-z0-9]{16,})$/);
-    if (pooled) return pooled[1];
+    // [\s\S] 而不是 .:Postgres 加引号的角色名可含换行,`.` 不匹配行终止符会让这类角色身份判定失效。
+    // 解码后含 NUL 一律不认:启动包用 NUL 分隔字段,`postgres%00options%00reference=…%00x.<ref>`
+    // 在驱动/Supavisor 眼里是 user=postgres 外加一个 options 字段,身份判定看到的 ref 是假的(交叉审查)
+    const username = decodeURIComponent(url.username);
+    // `<user>.cluster.<alias>` 是 Supavisor 的保留语法(只认小写 `.cluster.`,别名可含点):
+    // 别名经成员关系解析到真正的项目,不是 ref,认不出就不猜;连接本身由 assertNoHostOverride 拒绝
+    if (isClusterAliasUsername(username)) return null;
+    const pooled = username.match(/^[\s\S]+\.([a-z0-9]{16,})$/);
+    if (pooled && /\.pooler\.supabase\.com$/.test(normalizeHost(url.hostname))) return pooled[1];
     return null;
   } catch {
     return null;
@@ -272,21 +309,60 @@ export function credentialSafeDbArgs(connString: string): { url: string; env: No
  * 拒绝连接串里的 host/hostaddr/user 查询覆盖:驱动会让它们改写实际连接目标/租户——
  * 身份判定(ref/主机)看的是 authority,读写却发生在别处。备份侧(源身份自记)与
  * 恢复侧(确认门/同源阻断)共用本检查。
+ * Supabase pooler 主机上再拒绝**任何** `?options=`:Supavisor 从 options 里解析 `reference=<ref>`
+ * 并让它优先于用户名里的租户段(handler_helpers.ex),而且会再解一次编码、认反斜杠转义——
+ * 试图识别"哪种 options 值是租户覆盖"是在追它的解析器,`%2572eference` 这类双重编码就绕过了
+ * (交叉审查)。pooler 串本来就不需要 options,整个参数一律拒绝;非 pooler 主机(普通 Postgres
+ * 目标)的 options 没有租户语义,照常放行。
  */
 export function assertNoHostOverride(connString: string): void {
+  // 整串 NUL 检查放在 URL 解析之前:query 值、路径、任何位置的 NUL 都是启动包注入,
+  // libpq 稍后也会拒,但驱动侧先发出的启动包已经到了 pooler——在任何连接之前就拒
+  if (containsNul(connString)) {
+    throw new Error("connection string contains a NUL byte — use a plain connection string.");
+  }
+  // 解析不了的连接串直接拒:曾经"放行让 pg 自己报错",但 pg 的解析器比 WHATWG URL 宽
+  // (`postgresql://user@/db?host=…` 这类串 pg 接受、这里解析失败),放行 = 身份判定为空却照样连接
+  // (交叉审查)。校验逻辑放在 try 外面——曾按文案里有没有 "override" 决定重抛,新理由一措辞不同就被吞。
+  let url: URL;
   try {
-    const params = new URL(connString).searchParams;
-    for (const key of params.keys()) {
-      if (/^(host|hostaddr|user)$/i.test(key)) {
-        throw new Error(
-          `connection string carries a ?${key}= override — the effective server/identity would ` +
-            `differ from the URL authority that identity checks inspect. Use a plain connection string.`
-        );
-      }
+    url = new URL(connString);
+  } catch {
+    throw new Error(
+      "connection string could not be parsed as a URL — use a plain postgresql://user:password@host:port/database string."
+    );
+  }
+  const params = url.searchParams;
+  const isSupabasePooler = /\.pooler\.supabase\.com$/.test(normalizeHost(url.hostname));
+  let username: string;
+  try {
+    username = decodeURIComponent(url.username);
+  } catch {
+    // 非法百分号编码不能按原样放行:pg 会做部分解码(%75 → u,%GG 保留),这里看到的字符串
+    // 与驱动实际发出的用户名不同,别名/身份判定都可能被绕过(交叉审查)。解不开就拒。
+    throw new Error("connection string username has invalid percent-encoding — use a plain connection string.");
+  }
+  // 集群别名连接:我们解析不出它真正路由到哪个项目,身份判定为空 → 同源/目标一致性都没法保证,
+  // 在任何 I/O 之前拒绝,而不是让"null 身份"静默放行
+  if (isSupabasePooler && isClusterAliasUsername(username)) {
+    throw new Error(
+      "connection string uses Supavisor's <user>.cluster.<alias> syntax — BackupDrill cannot resolve which project " +
+        "the alias routes to, so identity checks cannot run. Use the project's own pooler string (<user>.<project-ref>)."
+    );
+  }
+  for (const key of params.keys()) {
+    if (/^(host|hostaddr|user)$/i.test(key)) {
+      throw new Error(
+        `connection string carries a ?${key}= override — the effective server/identity would ` +
+          `differ from the URL authority that identity checks inspect. Use a plain connection string.`
+      );
     }
-  } catch (error) {
-    if ((error as Error).message.includes("override")) throw error;
-    // URL 解析不了的连接串由 pg 自己报错,这里放行
+    if (isSupabasePooler && /^options$/i.test(key)) {
+      throw new Error(
+        "connection string carries ?options= on a Supabase pooler host — the pooler reads a tenant override " +
+          "(reference=…) from it, so identity checks could not trust the username. Remove ?options= entirely."
+      );
+    }
   }
 }
 

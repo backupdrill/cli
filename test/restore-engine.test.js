@@ -99,6 +99,107 @@ test("projectRefOf:直连主机与 pooler 用户名都能提取 ref;非 Supabase
   assert.equal(projectRefOf("postgresql://user:pw@localhost:5432/db"), null);
 });
 
+test("projectRefOf:任意角色的 pooler 用户名(<role>.<ref>)都按最后一段提取 ref;非 pooler 主机不认", async () => {
+  const { projectRefOf } = await import("../dist/restore.js");
+  const ref = "abcdefghij0123456789";
+  assert.equal(projectRefOf(`postgresql://backupdrill_ab12cd34ef56.${ref}:pw@aws-0-us-east-1.pooler.supabase.com:5432/postgres`), ref);
+  // Supavisor 在最后一个点切租户:大写 / 连字符 / 带点的角色名都是合法租户身份
+  assert.equal(projectRefOf(`postgresql://Backup.${ref}:pw@aws-0-us-east-1.pooler.supabase.com:5432/postgres`), ref);
+  assert.equal(projectRefOf(`postgresql://backup-role.${ref}:pw@aws-0-us-east-1.pooler.supabase.com:5432/postgres`), ref);
+  assert.equal(projectRefOf(`postgresql://svc.reader.${ref}:pw@aws-0-us-east-1.pooler.supabase.com:5432/postgres`), ref);
+  // 同样形状的用户名落在非 Supabase 主机上不是租户身份
+  assert.equal(projectRefOf(`postgresql://backup_reader.${ref}:pw@db.internal.example:5432/postgres`), null);
+  assert.equal(projectRefOf(`postgresql://postgres.${ref}:pw@db.internal.example:5432/postgres`), null);
+});
+
+test("sameDatabaseTarget:免密接入的角色串与用户手输的 postgres 串指向同一项目 → 同源保护必须认得出", () => {
+  const ref = "abcdefghij0123456789";
+  const roleSource = `postgresql://backupdrill_ab12cd34ef56.${ref}:pw@aws-0-us-east-1.pooler.supabase.com:5432/postgres`;
+  const postgresTarget = `postgresql://postgres.${ref}:pw2@aws-0-us-east-1.pooler.supabase.com:5432/postgres`;
+  const otherProject = `postgresql://postgres.zyxwvutsrq9876543210:pw@aws-0-us-east-1.pooler.supabase.com:5432/postgres`;
+  assert.equal(sameDatabaseTarget(roleSource, postgresTarget), true);
+  assert.equal(sameDatabaseTarget(roleSource, otherProject), false);
+  const upperRoleSource = `postgresql://Backup-Reader.${ref}:pw@aws-0-us-east-1.pooler.supabase.com:5432/postgres`;
+  assert.equal(sameDatabaseTarget(upperRoleSource, postgresTarget), true);
+});
+
+test("assertNoHostOverride:pooler 主机上任何 ?options= 都拒(含双重编码/大小写);非 pooler 主机的 options 放行", async () => {
+  const { assertNoHostOverride } = await import("../dist/restore.js");
+  const ref = "abcdefghij0123456789";
+  const other = "zyxwvutsrq9876543210";
+  const pooler = `postgresql://svc.reader.${ref}:pw@aws-0-us-east-1.pooler.supabase.com:5432/postgres`;
+  assert.throws(() => assertNoHostOverride(`${pooler}?options=reference%3D${other}`), /options/);
+  // 双重编码:URL 层解一次得 %72eference,Supavisor 再解一次得 reference —— 不追它的解析器,整参数拒绝
+  assert.throws(() => assertNoHostOverride(`${pooler}?options=%2572eference%3D${other}`), /options/);
+  assert.throws(() => assertNoHostOverride(`${pooler}?OPTIONS=-c%20statement_timeout%3D0`), /options/);
+  assert.throws(() => assertNoHostOverride(`${pooler}?options=-c%20application_name%3Dreference%3Dbackup`), /options/);
+  // 编码过的 pooler 主机同样按解码后判定
+  assert.throws(() => assertNoHostOverride(`postgresql://postgres.${ref}:pw@aws-0-us-east-1.pooler.supabase%2Ecom:5432/postgres?options=reference%3D${other}`), /options/);
+  assert.doesNotThrow(() => assertNoHostOverride(pooler));
+  // 普通 Postgres 目标:options 没有租户语义,连 "reference" 这个词也不应误伤
+  const plain = `postgresql://app:pw@db.example.com:5432/app`;
+  assert.doesNotThrow(() => assertNoHostOverride(`${plain}?options=-c%20application_name%3Dreference%3Dbackup`));
+  assert.doesNotThrow(() => assertNoHostOverride(`${plain}?options=-c%20statement_timeout%3D0`));
+});
+
+test("projectRefOf / assertNoHostOverride:解码后含 NUL 的用户名不认、且被拒(启动包字段注入)", async () => {
+  const { projectRefOf, assertNoHostOverride } = await import("../dist/restore.js");
+  const source = "abcdefghij0123456789";
+  const target = "zyxwvutsrq9876543210";
+  const smuggled = `postgresql://postgres%00options%00reference%3D${source}%00application_name%00.${target}:pw@aws-0-us-east-1.pooler.supabase.com:5432/postgres`;
+  assert.equal(projectRefOf(smuggled), null);
+  assert.throws(() => assertNoHostOverride(smuggled), /NUL/);
+  assert.throws(() => assertNoHostOverride(`postgresql://postgres.${target}:p%00w@aws-0-us-east-1.pooler.supabase.com:5432/postgres`), /NUL/);
+  // query 值 / 路径里的 NUL 同样是启动包注入
+  const viaQuery = `postgresql://postgres.${target}:pw@aws-0-us-east-1.pooler.supabase.com:5432/postgres?application_name=x%00user%00postgres%00options%00reference%3D${source}`;
+  assert.throws(() => assertNoHostOverride(viaQuery), /NUL/);
+  assert.equal(projectRefOf(viaQuery), null);
+  assert.throws(() => assertNoHostOverride(`postgresql://postgres.${target}:pw@aws-0-us-east-1.pooler.supabase.com:5432/postgres%00x`), /NUL/);
+  assert.doesNotThrow(() => assertNoHostOverride(`postgresql://postgres.${target}:pw@aws-0-us-east-1.pooler.supabase.com:5432/postgres`));
+  // WHATWG URL 解析不了、pg 却接受的形态(空主机 + ?host=):不能放行,身份判定为空
+  assert.throws(() => assertNoHostOverride("postgresql://postgres.cluster.alias@/postgres?host=aws-0-us-east-1.pooler.supabase.com"), /parsed|override/);
+  assert.throws(() => assertNoHostOverride("host=aws-0-us-east-1.pooler.supabase.com user=postgres"), /parsed/);
+  // 非法百分号编码:pg 会部分解码(%75→u),按原样看会漏掉 .cluster. —— 解不开就拒
+  assert.throws(() => assertNoHostOverride(`postgresql://role%GG.cl%75ster.${target}:pw@aws-0-us-east-1.pooler.supabase.com:5432/postgres`), /percent-encoding/);
+  assert.equal(projectRefOf(`postgresql://role%GG.cl%75ster.${target}:pw@aws-0-us-east-1.pooler.supabase.com:5432/postgres`), null);
+});
+
+test("Supavisor 的 <user>.cluster.<alias> 保留语法:不当 ref,且连接在 I/O 前被拒;大写 CLUSTER 是普通角色", async () => {
+  const { projectRefOf, assertNoHostOverride } = await import("../dist/restore.js");
+  const ref = "abcdefghijklmnopqrst";
+  const pooler = "aws-0-us-east-1.pooler.supabase.com";
+  const alias = `postgresql://postgres.cluster.${ref}:pw@${pooler}:5432/postgres`;
+  const dottedAlias = `postgresql://postgres.cluster.alias.${ref}:pw@${pooler}:5432/postgres`;
+  assert.equal(projectRefOf(alias), null);
+  assert.equal(projectRefOf(dottedAlias), null);
+  assert.throws(() => assertNoHostOverride(alias), /cluster/);
+  assert.throws(() => assertNoHostOverride(dottedAlias), /cluster/);
+  // Supavisor 只认小写 .cluster.:大写是普通角色名,身份照常
+  const upper = `postgresql://postgres.CLUSTER.${ref}:pw@${pooler}:5432/postgres`;
+  assert.equal(projectRefOf(upper), ref);
+  assert.doesNotThrow(() => assertNoHostOverride(upper));
+  // 非 pooler 主机上 ".cluster." 没有特殊含义
+  assert.doesNotThrow(() => assertNoHostOverride(`postgresql://app.cluster.x:pw@db.example.com:5432/app`));
+});
+
+test("projectRefOf:角色名含编码换行(加引号的 Postgres 角色可以)也按最后一段取 ref", async () => {
+  const { projectRefOf } = await import("../dist/restore.js");
+  const ref = "abcdefghij0123456789";
+  assert.equal(projectRefOf(`postgresql://svc%0Areader.${ref}:pw@aws-0-us-east-1.pooler.supabase.com:5432/postgres`), ref);
+});
+
+test("projectRefOf / sameDatabaseTarget:百分号编码的主机名按驱动语义解码后判定(%2E 不得绕过同源保护)", async () => {
+  const { projectRefOf } = await import("../dist/restore.js");
+  const ref = "abcdefghij0123456789";
+  const encodedPooler = `postgresql://postgres.${ref}:pw@aws-0-us-east-1.pooler.supabase%2Ecom:5432/postgres`;
+  const encodedDirect = `postgresql://postgres:pw@db.${ref}.supabase%2Eco:5432/postgres`;
+  const plain = `postgresql://postgres.${ref}:pw@aws-0-us-east-1.pooler.supabase.com:5432/postgres`;
+  assert.equal(projectRefOf(encodedPooler), ref);
+  assert.equal(projectRefOf(encodedDirect), ref);
+  assert.equal(sameDatabaseTarget(encodedPooler, plain), true);
+  assert.equal(sameDatabaseTarget(encodedPooler, encodedPooler), true);
+});
+
 test("sameDatabaseTarget:源直连、目标 pooler 的同一项目 → 阻断(host/user 都不同也认得出)", () => {
   const direct = "postgresql://postgres:pw@db.abcdefghij0123456789.supabase.co:5432/postgres";
   const pooled = "postgresql://postgres.abcdefghij0123456789:pw@aws-0-us-east-1.pooler.supabase.com:5432/postgres";
