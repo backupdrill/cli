@@ -123,6 +123,18 @@ test("sameDatabaseTarget:免密接入的角色串与用户手输的 postgres 串
   assert.equal(sameDatabaseTarget(upperRoleSource, postgresTarget), true);
 });
 
+test("projectRefOf / sameDatabaseTarget:百分号编码的主机名按驱动语义解码后判定(%2E 不得绕过同源保护)", async () => {
+  const { projectRefOf } = await import("../dist/restore.js");
+  const ref = "abcdefghij0123456789";
+  const encodedPooler = `postgresql://postgres.${ref}:pw@aws-0-us-east-1.pooler.supabase%2Ecom:5432/postgres`;
+  const encodedDirect = `postgresql://postgres:pw@db.${ref}.supabase%2Eco:5432/postgres`;
+  const plain = `postgresql://postgres.${ref}:pw@aws-0-us-east-1.pooler.supabase.com:5432/postgres`;
+  assert.equal(projectRefOf(encodedPooler), ref);
+  assert.equal(projectRefOf(encodedDirect), ref);
+  assert.equal(sameDatabaseTarget(encodedPooler, plain), true);
+  assert.equal(sameDatabaseTarget(encodedPooler, encodedPooler), true);
+});
+
 test("sameDatabaseTarget:源直连、目标 pooler 的同一项目 → 阻断(host/user 都不同也认得出)", () => {
   const direct = "postgresql://postgres:pw@db.abcdefghij0123456789.supabase.co:5432/postgres";
   const pooled = "postgresql://postgres.abcdefghij0123456789:pw@aws-0-us-east-1.pooler.supabase.com:5432/postgres";
