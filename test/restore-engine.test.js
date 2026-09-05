@@ -99,6 +99,23 @@ test("projectRefOf:直连主机与 pooler 用户名都能提取 ref;非 Supabase
   assert.equal(projectRefOf("postgresql://user:pw@localhost:5432/db"), null);
 });
 
+test("projectRefOf:自定义角色的 pooler 用户名(<role>.<ref>)同样提取 ref;大写/连字符角色名不认", async () => {
+  const { projectRefOf } = await import("../dist/restore.js");
+  const ref = "abcdefghij0123456789";
+  assert.equal(projectRefOf(`postgresql://backupdrill_ab12cd34ef56.${ref}:pw@aws-0-us-east-1.pooler.supabase.com:5432/postgres`), ref);
+  assert.equal(projectRefOf(`postgresql://Backup.${ref}:pw@aws-0-us-east-1.pooler.supabase.com:5432/postgres`), null);
+  assert.equal(projectRefOf(`postgresql://backup-role.${ref}:pw@aws-0-us-east-1.pooler.supabase.com:5432/postgres`), null);
+});
+
+test("sameDatabaseTarget:免密接入的角色串与用户手输的 postgres 串指向同一项目 → 同源保护必须认得出", () => {
+  const ref = "abcdefghij0123456789";
+  const roleSource = `postgresql://backupdrill_ab12cd34ef56.${ref}:pw@aws-0-us-east-1.pooler.supabase.com:5432/postgres`;
+  const postgresTarget = `postgresql://postgres.${ref}:pw2@aws-0-us-east-1.pooler.supabase.com:5432/postgres`;
+  const otherProject = `postgresql://postgres.zyxwvutsrq9876543210:pw@aws-0-us-east-1.pooler.supabase.com:5432/postgres`;
+  assert.equal(sameDatabaseTarget(roleSource, postgresTarget), true);
+  assert.equal(sameDatabaseTarget(roleSource, otherProject), false);
+});
+
 test("sameDatabaseTarget:源直连、目标 pooler 的同一项目 → 阻断(host/user 都不同也认得出)", () => {
   const direct = "postgresql://postgres:pw@db.abcdefghij0123456789.supabase.co:5432/postgres";
   const pooled = "postgresql://postgres.abcdefghij0123456789:pw@aws-0-us-east-1.pooler.supabase.com:5432/postgres";
