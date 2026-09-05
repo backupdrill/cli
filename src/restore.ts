@@ -428,7 +428,10 @@ export async function runRestore(
 ): Promise<RestoreResult> {
   // 任何 I/O 之前先把源与目标的连接串过一遍覆盖/别名守卫:源串带集群别名或租户覆盖时
   // 身份判定为空,同源阻断会失效——不能只查目标(交叉审查)。备份端 runBackup 对源做同样的事。
-  if (config.databaseUrl !== NO_SOURCE_DATABASE) assertNoHostOverride(config.databaseUrl);
+  // 源守卫只在**有远端目标**时才需要:纯本地下载(无目标库、无目标 Storage)不写任何远端,
+  // 老快照的源配置哪怕不可考也应能下载出来(交叉审查)。
+  const hasRemoteTarget = Boolean(opts.targetDatabaseUrl || opts.targetSupabaseUrl);
+  if (hasRemoteTarget && config.databaseUrl !== NO_SOURCE_DATABASE) assertNoHostOverride(config.databaseUrl);
   if (opts.targetDatabaseUrl) assertNoHostOverride(opts.targetDatabaseUrl);
 
   const s3 = targetClient(config);

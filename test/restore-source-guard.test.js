@@ -28,6 +28,11 @@ test("runRestore:源配置带 ?options= 租户覆盖 → I/O 前拒绝", async (
   await assert.rejects(runRestore(config, { dryRun: true }), /options/);
 });
 
+test("runRestore:纯本地下载(无远端目标)不因源配置不可考而被拒——老快照仍能取出", async () => {
+  const config = { databaseUrl: `postgresql://postgres.cluster.${REF}:pw@${POOLER}:5432/postgres`, storage };
+  await assert.rejects(runRestore(config, { dryRun: true }), (error) => !/cluster|options/.test(String(error.message)));
+});
+
 test("runRestore:目标串是集群别名同样在 I/O 前拒绝", async () => {
   const config = { databaseUrl: `postgresql://postgres.${REF}:pw@${POOLER}:5432/postgres`, storage };
   await assert.rejects(
