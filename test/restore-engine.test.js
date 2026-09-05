@@ -142,6 +142,17 @@ test("assertNoHostOverride:pooler 主机上任何 ?options= 都拒(含双重编�
   assert.doesNotThrow(() => assertNoHostOverride(`${plain}?options=-c%20statement_timeout%3D0`));
 });
 
+test("projectRefOf / assertNoHostOverride:解码后含 NUL 的用户名不认、且被拒(启动包字段注入)", async () => {
+  const { projectRefOf, assertNoHostOverride } = await import("../dist/restore.js");
+  const source = "abcdefghij0123456789";
+  const target = "zyxwvutsrq9876543210";
+  const smuggled = `postgresql://postgres%00options%00reference%3D${source}%00application_name%00.${target}:pw@aws-0-us-east-1.pooler.supabase.com:5432/postgres`;
+  assert.equal(projectRefOf(smuggled), null);
+  assert.throws(() => assertNoHostOverride(smuggled), /NUL/);
+  assert.throws(() => assertNoHostOverride(`postgresql://postgres.${target}:p%00w@aws-0-us-east-1.pooler.supabase.com:5432/postgres`), /NUL/);
+  assert.doesNotThrow(() => assertNoHostOverride(`postgresql://postgres.${target}:pw@aws-0-us-east-1.pooler.supabase.com:5432/postgres`));
+});
+
 test("projectRefOf:角色名含编码换行(加引号的 Postgres 角色可以)也按最后一段取 ref", async () => {
   const { projectRefOf } = await import("../dist/restore.js");
   const ref = "abcdefghij0123456789";
