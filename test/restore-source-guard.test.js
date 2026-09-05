@@ -23,14 +23,21 @@ test("runRestore:源配置是 Supavisor 集群别名串 → I/O 前拒绝", asyn
   );
 });
 
-test("runRestore:源配置带 ?options= 租户覆盖 → I/O 前拒绝", async () => {
+test("runRestore:源配置带 ?options= 租户覆盖、且有远端目标 → I/O 前拒绝", async () => {
   const config = { databaseUrl: `postgresql://postgres.${REF}:pw@${POOLER}:5432/postgres?options=reference%3Dzyxwvutsrqponmlkjihg`, storage };
-  await assert.rejects(runRestore(config, { dryRun: true }), /options/);
+  await assert.rejects(
+    runRestore(config, { targetDatabaseUrl: `postgresql://postgres.zyxwvutsrqponmlkjihg:pw@${POOLER}:5432/postgres`, dryRun: true }),
+    /options/
+  );
 });
 
-test("runRestore:纯本地下载(无远端目标)不因源配置不可考而被拒——老快照仍能取出", async () => {
+test("runRestore:纯本地下载(无远端目标)不因源配置不可考而被拒——守卫放行后才到桶 I/O", async () => {
   const config = { databaseUrl: `postgresql://postgres.cluster.${REF}:pw@${POOLER}:5432/postgres`, storage };
-  await assert.rejects(runRestore(config, { dryRun: true }), (error) => !/cluster|options/.test(String(error.message)));
+  // 断言失败发生在桶 I/O(不可达的 storage 主机),而不是守卫:证明本地下载路径没被源守卫拦下
+  await assert.rejects(runRestore(config, { dryRun: true }), (error) => {
+    const message = String(error && error.message);
+    return !/cluster|options/.test(message) && /ENOTFOUND|getaddrinfo|invalid\.localhost\.test|ECONNREFUSED|EAI_AGAIN/.test(message);
+  });
 });
 
 test("runRestore:目标串是集群别名同样在 I/O 前拒绝", async () => {
