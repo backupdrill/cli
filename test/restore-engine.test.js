@@ -123,6 +123,23 @@ test("sameDatabaseTarget:免密接入的角色串与用户手输的 postgres 串
   assert.equal(sameDatabaseTarget(upperRoleSource, postgresTarget), true);
 });
 
+test("assertNoHostOverride:?options=reference= 租户覆盖被拒;普通 options 放行", async () => {
+  const { assertNoHostOverride } = await import("../dist/restore.js");
+  const ref = "abcdefghij0123456789";
+  const base = `postgresql://svc.reader.${ref}:pw@aws-0-us-east-1.pooler.supabase.com:5432/postgres`;
+  assert.throws(() => assertNoHostOverride(`${base}?options=reference%3Dzyxwvutsrq9876543210`), /reference/);
+  assert.throws(() => assertNoHostOverride(`${base}?options=-c%20search_path%3Dpublic%20reference%20%3D%20zyxwvutsrq9876543210`), /reference/);
+  assert.throws(() => assertNoHostOverride(`${base}?OPTIONS=Reference%3Dzyxwvutsrq9876543210`), /reference/);
+  assert.doesNotThrow(() => assertNoHostOverride(`${base}?options=-c%20statement_timeout%3D0`));
+  assert.doesNotThrow(() => assertNoHostOverride(base));
+});
+
+test("projectRefOf:角色名含编码换行(加引号的 Postgres 角色可以)也按最后一段取 ref", async () => {
+  const { projectRefOf } = await import("../dist/restore.js");
+  const ref = "abcdefghij0123456789";
+  assert.equal(projectRefOf(`postgresql://svc%0Areader.${ref}:pw@aws-0-us-east-1.pooler.supabase.com:5432/postgres`), ref);
+});
+
 test("projectRefOf / sameDatabaseTarget:百分号编码的主机名按驱动语义解码后判定(%2E 不得绕过同源保护)", async () => {
   const { projectRefOf } = await import("../dist/restore.js");
   const ref = "abcdefghij0123456789";
