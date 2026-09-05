@@ -61,7 +61,11 @@ export function projectRefOf(connString: string): string | null {
     // [\s\S] 而不是 .:Postgres 加引号的角色名可含换行,`.` 不匹配行终止符会让这类角色身份判定失效。
     // 解码后含 NUL 一律不认:启动包用 NUL 分隔字段,`postgres%00options%00reference=…%00x.<ref>`
     // 在驱动/Supavisor 眼里是 user=postgres 外加一个 options 字段,身份判定看到的 ref 是假的(交叉审查)
-    const pooled = decodeURIComponent(url.username).match(/^[\s\S]+\.([a-z0-9]{16,})$/);
+    const username = decodeURIComponent(url.username);
+    // `<user>.cluster.<alias>` 是 Supavisor 的保留语法:最后一段是集群别名,经成员关系解析到
+    // 真正的项目,不是 ref。认不出真实项目就不猜(交叉审查)。
+    if (/\.cluster\.[^.]+$/i.test(username)) return null;
+    const pooled = username.match(/^[\s\S]+\.([a-z0-9]{16,})$/);
     if (pooled && /\.pooler\.supabase\.com$/.test(normalizeHost(url.hostname))) return pooled[1];
     return null;
   } catch {

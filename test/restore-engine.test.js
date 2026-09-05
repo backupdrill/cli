@@ -158,6 +158,12 @@ test("projectRefOf / assertNoHostOverride:解码后含 NUL 的用户名不认、
   assert.doesNotThrow(() => assertNoHostOverride(`postgresql://postgres.${target}:pw@aws-0-us-east-1.pooler.supabase.com:5432/postgres`));
 });
 
+test("projectRefOf:Supavisor 的 <user>.cluster.<alias> 保留语法不当 ref(别名经成员关系解析,不是项目)", async () => {
+  const { projectRefOf } = await import("../dist/restore.js");
+  assert.equal(projectRefOf("postgresql://postgres.cluster.abcdefghijklmnopqrst:pw@aws-0-us-east-1.pooler.supabase.com:5432/postgres"), null);
+  assert.equal(projectRefOf("postgresql://postgres.CLUSTER.abcdefghijklmnopqrst:pw@aws-0-us-east-1.pooler.supabase.com:5432/postgres"), null);
+});
+
 test("projectRefOf:角色名含编码换行(加引号的 Postgres 角色可以)也按最后一段取 ref", async () => {
   const { projectRefOf } = await import("../dist/restore.js");
   const ref = "abcdefghij0123456789";
