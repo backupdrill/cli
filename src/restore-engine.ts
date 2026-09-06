@@ -135,8 +135,10 @@ export function libpqChildEnv(
 ): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = {};
   // node-postgres 独有的 sslmode 值:no-verify = 加密但**不验证书**。libpq 里最接近的是 require,
-  // 但 require 一旦看到 sslrootcert 就升级成 verify-ca、遇到 sslrootcert=system 直接拒连——所以
-  // 翻译时连同证书相关变量一起去掉,子进程才真的是"加密、不验",与 Node 侧行为一致(交叉审查)。
+  // 但 require 一旦找到根证书就升级成 verify-ca(显式 sslrootcert、sslrootcert=system,或默认
+  // 发现 ~/.postgresql/root.crt 都算),遇到 sslrootcert=system 还直接拒连。翻译时:去掉 CRL 变量,
+  // 并把 PGSSLROOTCERT 指向一个不存在的路径——libpq 对显式路径 stat 失败时在 require 模式下
+  // 跳过验证、且不再去找默认的 root.crt,子进程才真的是"加密、不验",与 Node 侧一致(交叉审查)。
   const noVerify = base.PGSSLMODE === "no-verify";
   for (const [key, value] of Object.entries(base)) {
     if (LIBPQ_TARGET_ENV.has(key)) continue;
@@ -150,8 +152,12 @@ export function libpqChildEnv(
     }
     env[key] = value;
   }
+  if (noVerify) env.PGSSLROOTCERT = NO_VERIFY_ROOTCERT_SENTINEL;
   return { ...env, ...extraEnv };
 }
+
+/** 见 libpqChildEnv:一个绝不存在的根证书路径 = 让 libpq 的 require 既不验证也不去找默认 root.crt。 */
+export const NO_VERIFY_ROOTCERT_SENTINEL = "/nonexistent/backupdrill-no-verify-root.crt";
 
 export function spawnPgRestore(
   bin: string,
