@@ -106,8 +106,10 @@ export interface EngineResult {
  * URL。TLS 策略(PGSSLMODE / PGSSLROOTCERT…)、超时、编码、应用名这类**不改目标**的变量保留——
  * 外部 Postgres 用户常靠 PGSSLMODE=require 上 TLS,一刀切剔除等于把他们降级到 prefer(交叉审查)。
  * Supabase 主机的 TLS 由 dumpUrlFor 直接写进 URL(verify-full + 打包 CA),不依赖环境。
- * PGPASSWORD 保留:URL 不带密码时 node-postgres 同样读它,两个客户端才对得上;URL 带密码时
- * credentialSafeDbArgs 会显式覆盖。PGPASSFILE 剔除:node-postgres 不读它,留着就是两边不一致。
+ * 密码来源保留:URL 不带密码时 node-postgres 同样读 PGPASSWORD,也经 pgpass 模块读 PGPASSFILE,
+ * 两个客户端才对得上;URL 带密码时 credentialSafeDbArgs 会显式覆盖。
+ * 服务文件三件套(PGSERVICE / PGSERVICEFILE / PGSYSCONFDIR)剔除:pg_service.conf 能整段改写
+ * host/options,是 libpq 独有的旁路;URL 里的 ?service= 也在 assertNoHostOverride 拒绝。
  */
 const LIBPQ_TARGET_ENV = new Set([
   "PGHOST",
@@ -115,9 +117,9 @@ const LIBPQ_TARGET_ENV = new Set([
   "PGPORT",
   "PGDATABASE",
   "PGUSER",
-  "PGPASSFILE",
   "PGSERVICE",
   "PGSERVICEFILE",
+  "PGSYSCONFDIR",
   "PGTARGETSESSIONATTRS",
 ]);
 
@@ -132,14 +134,19 @@ export function libpqChildEnv(
   opts: { supabaseHost: boolean } = { supabaseHost: false }
 ): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = {};
+  // node-postgres 独有的 sslmode 值:no-verify = 加密但**不验证书**。libpq 里最接近的是 require,
+  // 但 require 一旦看到 sslrootcert 就升级成 verify-ca、遇到 sslrootcert=system 直接拒连——所以
+  // 翻译时连同证书相关变量一起去掉,子进程才真的是"加密、不验",与 Node 侧行为一致(交叉审查)。
+  const noVerify = base.PGSSLMODE === "no-verify";
   for (const [key, value] of Object.entries(base)) {
     if (LIBPQ_TARGET_ENV.has(key)) continue;
     if (opts.supabaseHost && key === "PGOPTIONS") continue;
-    // node-postgres 独有的 sslmode 值:no-verify = 加密但不验证书 ≈ libpq 的 require;
-    // 原样传给 libpq 会报 invalid sslmode value,让 Node 侧能连的外部库在 pg_dump 一步失败
-    if (key === "PGSSLMODE" && value === "no-verify") {
-      env[key] = "require";
-      continue;
+    if (noVerify) {
+      if (key === "PGSSLMODE") {
+        env[key] = "require";
+        continue;
+      }
+      if (key === "PGSSLROOTCERT" || key === "PGSSLCRL" || key === "PGSSLCRLDIR") continue;
     }
     env[key] = value;
   }
@@ -405,9 +412,10 @@ export function assertNoHostOverride(connString: string): void {
   }
   for (const key of params.keys()) {
     // dbname 也算目标覆盖:libpq 让 ?dbname= 压过路径里的库名,node-postgres 却不认这个键——
-    // 预检看的是一个库、pg_restore 写的是另一个(交叉审查)。URLSearchParams 已把键解码,
-    // %64bname 这类编码形态同样命中。
-    if (/^(host|hostaddr|user|dbname)$/i.test(key)) {
+    // 预检看的是一个库、pg_restore 写的是另一个。service/servicefile 让 libpq 从 pg_service.conf
+    // 整段加载 host/options(含租户覆盖),node-postgres 不认——同样拒绝(交叉审查)。
+    // URLSearchParams 已把键解码,%64bname 这类编码形态同样命中。
+    if (/^(host|hostaddr|user|dbname|service|servicefile)$/i.test(key)) {
       throw new Error(
         `connection string carries a ?${key}= override — the effective server/identity would ` +
           `differ from the URL authority that identity checks inspect. Use a plain connection string.`
