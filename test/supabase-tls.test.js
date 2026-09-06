@@ -215,11 +215,35 @@ test("CA 文件被外部删除后能自愈重建(长驻 worker 不至于之后�
   assert.equal(readFileSync(second, "utf8"), SUPABASE_ROOT_CA);
 });
 
-test("pgConnectOptions:每个连接显式带 options(挡住继承的 PGOPTIONS),直连与 Supabase 主机都一样", () => {
-  const supa = pgConnectOptions("postgresql://u:p@aws-0-us-east-1.pooler.supabase.com:5432/db");
-  const plain = pgConnectOptions("postgresql://u:p@db.example.com:5432/db");
-  assert.equal(supa.options, "-c application_name=backupdrill");
-  assert.equal(plain.options, "-c application_name=backupdrill");
-  // node-postgres 的 val() 只在 config.options 为假值时读 PGOPTIONS:真值 = 环境变量被忽略
-  assert.ok(supa.options.length > 0);
+test("环境隔离:敌意的 PGPORT/PGDATABASE/PGOPTIONS 在场时,Node 客户端与 pg_dump 的目标仍逐字段一致", () => {
+  const saved = { PGPORT: process.env.PGPORT, PGDATABASE: process.env.PGDATABASE, PGOPTIONS: process.env.PGOPTIONS };
+  process.env.PGPORT = "65432";
+  process.env.PGDATABASE = "review_empty_target";
+  process.env.PGOPTIONS = "reference=zyxwvutsrqponmlkjihg";
+  try {
+    for (const url of [
+      "postgresql://u:p@db.example.com/",
+      "postgresql://u:p@db.example.com",
+      "postgresql://u:p@aws-0-us-east-1.pooler.supabase.com/",
+      "postgresql://u:p@db.example.com/?options=",
+    ]) {
+      const cp = new Client(pgConnectOptions(url)).connectionParameters;
+      assert.equal(String(cp.port), "5432", `port from env leaked for ${url}`);
+      assert.equal(cp.database, "postgres", `database from env leaked for ${url}`);
+      assert.equal(cp.options, "-c application_name=backupdrill", `PGOPTIONS leaked for ${url}`);
+      // 子进程拿到的 --dbname 同样把端口与库名写死
+      const dumpUrl = dumpUrlFor(url);
+      assert.match(dumpUrl, /:5432\/postgres/, `dump url not pinned for ${url}: ${dumpUrl}`);
+      assert.doesNotMatch(dumpUrl, /options=(&|$)/);
+    }
+    // URL 里显式写了端口/库名/非空 options 的,原样尊重(那是用户意图,不是环境变量)
+    const explicit = new Client(pgConnectOptions("postgresql://u:p@db.example.com:6543/mydb?options=-c%20search_path%3Dapp")).connectionParameters;
+    assert.equal(String(explicit.port), "6543");
+    assert.equal(explicit.database, "mydb");
+    assert.equal(explicit.options, "-c search_path=app");
+  } finally {
+    for (const [k, v] of Object.entries(saved)) {
+      if (v === undefined) delete process.env[k]; else process.env[k] = v;
+    }
+  }
 });
