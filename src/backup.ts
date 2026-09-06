@@ -152,7 +152,7 @@ async function dumpToS3(
       dumpDbUrl,
     ],
     // 环境剔除改写目标/身份的 PG* 变量:pg_dump 只认 --dbname 里的 URL(TLS 策略等保留)
-    { stdio: ["ignore", "pipe", "pipe"], env: libpqChildEnv({}, { supabaseHost: isSupabaseHost(config.databaseUrl) }) }
+    { stdio: ["ignore", "pipe", "pipe"], env: libpqChildEnv({}, process.env, { supabaseHost: isSupabaseHost(config.databaseUrl) }) }
   );
 
   let stderr = "";

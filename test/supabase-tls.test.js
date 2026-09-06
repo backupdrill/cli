@@ -264,5 +264,36 @@ test("normalizeConnectionTarget:删空 options 不重写其它参数(%20 不能�
   // 全部参数都被删光时不留孤零零的 ?
   assert.equal(normalizeConnectionTarget("postgresql://u:p@db.example.com:5432/db?options="), "postgresql://u:p@db.example.com:5432/db");
   // 用户名含百分号编码时,缺省库名沿用同一编码形态(驱动解码后即用户名)
-  assert.equal(normalizeConnectionTarget("postgresql://app%2Dro:p@db.example.com"), "postgresql://app%2Dro:p@db.example.com:5432/app%2Dro");
+  // 缺省库名 = 解码后的用户名、不再编码:两个客户端都拿到 app-ro(node-postgres 不解码路径)
+  assert.equal(normalizeConnectionTarget("postgresql://app%2Dro:p@db.example.com"), "postgresql://app%2Dro:p@db.example.com:5432/app-ro");
+});
+
+test("缺省库名与用户名编码:两个客户端必须得到同一个库名;做不到就拒绝", async () => {
+  const { normalizeConnectionTarget } = await import("../dist/supabase-ca.js");
+  // %40 解码后是 @,可原样进路径:libpq 与 node-postgres 都拿到 app@reader
+  const a = normalizeConnectionTarget("postgresql://app%40reader:p@db.example.com");
+  assert.equal(a, "postgresql://app%40reader:p@db.example.com:5432/app@reader");
+  assert.equal(new Client(pgConnectOptions("postgresql://app%40reader:p@db.example.com")).connectionParameters.database, "app@reader");
+  // %3A → ":" 同样可以原样进路径
+  assert.equal(normalizeConnectionTarget("postgresql://a%3Ab:p@db.example.com"), "postgresql://a%3Ab:p@db.example.com:5432/a:b");
+  // %2F → "/" 进路径会改变结构,%20 → 空格会被重新编码(两边解码规则不同)→ 要求显式库名
+  assert.throws(() => normalizeConnectionTarget("postgresql://app%2Fro:p@db.example.com"), /add \/<database>/);
+  assert.throws(() => normalizeConnectionTarget("postgresql://app%20ro:p@db.example.com"), /add \/<database>/);
+  // 显式写了库名的一律不动
+  assert.equal(normalizeConnectionTarget("postgresql://app%2Fro:p@db.example.com/mydb"), "postgresql://app%2Fro:p@db.example.com:5432/mydb");
+});
+
+test("缺省用户名:拒绝(libpq 退回 OS 用户、node-postgres 退回环境变量,两边分叉),敌意 PGDATABASE 也进不来", () => {
+  const saved = { PGDATABASE: process.env.PGDATABASE, PGUSER: process.env.PGUSER };
+  process.env.PGDATABASE = "review_empty_target";
+  process.env.PGUSER = "evil";
+  try {
+    assert.throws(() => pgConnectOptions("postgresql://db.example.com"), /user name/);
+    assert.throws(() => pgConnectOptions("postgresql://db.example.com/"), /user name/);
+    assert.throws(() => dumpUrlFor("postgresql://:p@db.example.com/"), /user name/);
+  } finally {
+    for (const [k, v] of Object.entries(saved)) {
+      if (v === undefined) delete process.env[k]; else process.env[k] = v;
+    }
+  }
 });

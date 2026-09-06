@@ -128,8 +128,8 @@ const LIBPQ_TARGET_ENV = new Set([
  */
 export function libpqChildEnv(
   extraEnv: NodeJS.ProcessEnv = {},
-  opts: { supabaseHost: boolean } = { supabaseHost: false },
-  base: NodeJS.ProcessEnv = process.env
+  base: NodeJS.ProcessEnv = process.env,
+  opts: { supabaseHost: boolean } = { supabaseHost: false }
 ): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = {};
   for (const [key, value] of Object.entries(base)) {
@@ -149,7 +149,7 @@ export function spawnPgRestore(
   return new Promise((resolve, reject) => {
     const proc = spawn(bin, args, {
       stdio: ["ignore", "ignore", "pipe"],
-      env: libpqChildEnv(extraEnv, opts),
+      env: libpqChildEnv(extraEnv, process.env, opts),
     });
     let stderr = "";
     proc.stderr.on("data", (d: Buffer) => (stderr += d.toString()));
