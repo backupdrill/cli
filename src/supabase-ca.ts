@@ -311,7 +311,9 @@ export function normalizeConnectionTarget(databaseUrl: string): string {
     }
     // 空的 sslmode(?sslmode=)两边对不上:libpq 报 invalid sslmode value,Node 回退环境变量——拒绝。
     // 只管 sslmode:空 host= 等已有各自的既定处理(stripSslParams / forceVerifyFull 那套),不在这里动
-    if (pairs.some((pair) => keyOf(pair) === "sslmode" && pair.includes("=") && valueOf(pair) === "")) {
+    // 两个驱动都取最后一个 sslmode:只有最后一个为空才算空(?sslmode=&sslmode=verify-full 是合法的)
+    const sslModePairs = pairs.filter((pair) => keyOf(pair) === "sslmode" && pair.includes("="));
+    if (sslModePairs.length > 0 && valueOf(sslModePairs[sslModePairs.length - 1]) === "") {
       throw new Error('connection string parameter "sslmode" is empty — remove it or give it a value.');
     }
     const kept = pairs.filter((pair) => {
