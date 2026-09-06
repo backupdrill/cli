@@ -220,3 +220,20 @@ test("pg_restore 的连接串经 dumpUrlFor:Supabase 主机 verify-full+CA,沙�
   const sandbox = credentialSafeDbArgs(dumpUrlFor("postgresql://postgres:drill@127.0.0.1:54321/postgres"));
   assert.ok(!sandbox.url.includes("sslrootcert"), "非 Supabase 主机不套 CA");
 });
+
+test("libpqChildEnv:剔除父进程全部 PG* 变量,保留其它变量并叠加显式给的", async () => {
+  const { libpqChildEnv } = await import("../dist/restore-engine.js");
+  const base = { PATH: "/usr/bin", HOME: "/h", PGOPTIONS: "reference=evil", PGHOST: "evil", PGPASSFILE: "/x", PGSERVICE: "s", PG: "x", PGX_NOT_LIBPQ: "y", PGlower: "keep?" };
+  const env = libpqChildEnv({ PGPASSWORD: "pw" }, base);
+  assert.equal(env.PATH, "/usr/bin");
+  assert.equal(env.HOME, "/h");
+  assert.equal(env.PGOPTIONS, undefined);
+  assert.equal(env.PGHOST, undefined);
+  assert.equal(env.PGPASSFILE, undefined);
+  assert.equal(env.PGSERVICE, undefined);
+  assert.equal(env.PG, undefined);
+  assert.equal(env.PGX_NOT_LIBPQ, undefined);
+  // 小写不是 libpq 变量(libpq 只认大写),照常保留
+  assert.equal(env.PGlower, "keep?");
+  assert.equal(env.PGPASSWORD, "pw");
+});

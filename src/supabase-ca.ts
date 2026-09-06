@@ -238,12 +238,21 @@ export function dumpUrlFor(databaseUrl: string): string {
  *
  * 非 Supabase 主机(本 CLI 不限制目标)原样返回:不剥、不套,尊重用户自己的 sslmode。
  */
+/**
+ * 每个 pg Client 都显式带 startup `options`。为什么:node-postgres 只在 config.options 为假值时
+ * 才读环境变量 PGOPTIONS,而 Supavisor 会从 options 里解析 `reference=<ref>` 并让它优先于用户名
+ * 里的租户——继承的 PGOPTIONS 能把连接悄悄路由到别的项目(交叉审查)。给一个无害的真值就把
+ * 环境变量挡在门外;顺带在 pg_stat_activity 里能认出是谁在连(直连主机时可见,pooler 会改写)。
+ */
+export const PG_CLIENT_OPTIONS = "-c application_name=backupdrill";
+
 export function pgConnectOptions(databaseUrl: string): {
   connectionString: string;
+  options: string;
   ssl?: typeof SUPABASE_SSL;
 } {
-  if (!isSupabaseHost(databaseUrl)) return { connectionString: databaseUrl };
-  return { connectionString: stripSslParams(databaseUrl), ssl: SUPABASE_SSL };
+  if (!isSupabaseHost(databaseUrl)) return { connectionString: databaseUrl, options: PG_CLIENT_OPTIONS };
+  return { connectionString: stripSslParams(databaseUrl), options: PG_CLIENT_OPTIONS, ssl: SUPABASE_SSL };
 }
 
 /**
