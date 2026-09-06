@@ -404,7 +404,10 @@ export function assertNoHostOverride(connString: string): void {
     );
   }
   for (const key of params.keys()) {
-    if (/^(host|hostaddr|user)$/i.test(key)) {
+    // dbname 也算目标覆盖:libpq 让 ?dbname= 压过路径里的库名,node-postgres 却不认这个键——
+    // 预检看的是一个库、pg_restore 写的是另一个(交叉审查)。URLSearchParams 已把键解码,
+    // %64bname 这类编码形态同样命中。
+    if (/^(host|hostaddr|user|dbname)$/i.test(key)) {
       throw new Error(
         `connection string carries a ?${key}= override — the effective server/identity would ` +
           `differ from the URL authority that identity checks inspect. Use a plain connection string.`
