@@ -285,6 +285,8 @@ test("normalizeConnectionTarget:删空 options 不重写其它参数(%20 不能�
   assert.throws(() => normalizeConnectionTarget("postgresql://u:p@db.example.com:5432/db?application_name"), /has no value/);
   // 空的 sslmode(?sslmode=)libpq 报 invalid value、Node 回退环境变量:拒绝(options 组另有规则,其它键不管)
   assert.throws(() => normalizeConnectionTarget("postgresql://u:p@db.example.com:5432/db?sslmode=verify-full&sslmode="), /is empty/);
+  // 最后一个非空 → 合法(两个驱动都取最后一个),原样保留
+  assert.equal(normalizeConnectionTarget("postgresql://u:p@db.example.com:5432/db?sslmode=&sslmode=verify-full"), "postgresql://u:p@db.example.com:5432/db?sslmode=&sslmode=verify-full");
   assert.equal(normalizeConnectionTarget("postgresql://u:p@db.example.com:5432/db?application_name="), "postgresql://u:p@db.example.com:5432/db?application_name=");
   // 全部参数都被删光时不留孤零零的 ?
   assert.equal(normalizeConnectionTarget("postgresql://u:p@db.example.com:5432/db?options="), "postgresql://u:p@db.example.com:5432/db");
