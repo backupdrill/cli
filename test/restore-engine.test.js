@@ -1,5 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import fs from "node:fs";
 import {
   classifyBlocks,
   finalizePass,
@@ -157,8 +158,19 @@ test("projectRefOf / assertNoHostOverride:解码后含 NUL 的用户名不认、
   assert.throws(() => assertNoHostOverride(`postgresql://postgres.${target}:pw@aws-0-us-east-1.pooler.supabase.com:5432/postgres%00x`), /NUL/);
   assert.doesNotThrow(() => assertNoHostOverride(`postgresql://postgres.${target}:pw@aws-0-us-east-1.pooler.supabase.com:5432/postgres`));
   // WHATWG URL 解析不了、pg 却接受的形态(空主机 + ?host=):不能放行,身份判定为空
-  assert.throws(() => assertNoHostOverride("postgresql://postgres.cluster.alias@/postgres?host=aws-0-us-east-1.pooler.supabase.com"), /parsed|override/);
+  assert.throws(() => assertNoHostOverride("postgresql://postgres.cluster.alias@/postgres?host=aws-0-us-east-1.pooler.supabase.com"), /parsed|override|no host/);
   assert.throws(() => assertNoHostOverride("host=aws-0-us-east-1.pooler.supabase.com user=postgres"), /parsed/);
+  // ?service= / ?servicefile=:libpq 从 pg_service.conf 整段加载 host/options,node-postgres 不认 → 拒绝
+  assert.throws(() => assertNoHostOverride(`postgresql://app:pw@db.example.com/app?service=prod`), /service/);
+  assert.throws(() => assertNoHostOverride(`postgresql://app:pw@aws-0-us-east-1.pooler.supabase.com/postgres?servicefile=%2Fetc%2Fpg_service.conf`), /servicefile/);
+  // ?dbname= 覆盖:libpq 用它压过路径,node-postgres 不认 → 两个客户端连到不同的库 → 拒绝(含编码键)
+  assert.throws(() => assertNoHostOverride(`postgresql://app:pw@db.example.com/app?dbname=postgres`), /dbname/);
+  assert.throws(() => assertNoHostOverride(`postgresql://app:pw@db.example.com?%64bname=postgres`), /dbname/i);
+  assert.throws(() => assertNoHostOverride(`postgresql://app:pw@db.example.com/app?DBNAME=postgres`), /dbname/i);
+  // 空 authority:主机只能来自环境变量,Node 与子进程各自回退 → 拒绝
+  assert.throws(() => assertNoHostOverride("postgresql:///postgres"), /no host/);
+  // 带 userinfo 却空主机的形态 WHATWG 直接解析失败:同样是拒绝,只是文案不同
+  assert.throws(() => assertNoHostOverride("postgresql://u:p@/postgres"), /no host|parsed/);
   // 非法百分号编码:pg 会部分解码(%75→u),按原样看会漏掉 .cluster. —— 解不开就拒
   assert.throws(() => assertNoHostOverride(`postgresql://role%GG.cl%75ster.${target}:pw@aws-0-us-east-1.pooler.supabase.com:5432/postgres`), /percent-encoding/);
   assert.equal(projectRefOf(`postgresql://role%GG.cl%75ster.${target}:pw@aws-0-us-east-1.pooler.supabase.com:5432/postgres`), null);
@@ -221,19 +233,65 @@ test("pg_restore 的连接串经 dumpUrlFor:Supabase 主机 verify-full+CA,沙�
   assert.ok(!sandbox.url.includes("sslrootcert"), "非 Supabase 主机不套 CA");
 });
 
-test("libpqChildEnv:剔除父进程全部 PG* 变量,保留其它变量并叠加显式给的", async () => {
+test("libpqChildEnv:只剔除改写目标/身份的 PG* 变量;TLS 策略、超时、PGPASSWORD 保留;PGOPTIONS 只在 Supabase 主机剔除", async () => {
   const { libpqChildEnv } = await import("../dist/restore-engine.js");
-  const base = { PATH: "/usr/bin", HOME: "/h", PGOPTIONS: "reference=evil", PGHOST: "evil", PGPASSFILE: "/x", PGSERVICE: "s", PG: "x", PGX_NOT_LIBPQ: "y", PGlower: "keep?" };
-  const env = libpqChildEnv({ PGPASSWORD: "pw" }, base);
-  assert.equal(env.PATH, "/usr/bin");
-  assert.equal(env.HOME, "/h");
-  assert.equal(env.PGOPTIONS, undefined);
-  assert.equal(env.PGHOST, undefined);
-  assert.equal(env.PGPASSFILE, undefined);
-  assert.equal(env.PGSERVICE, undefined);
-  assert.equal(env.PG, undefined);
-  assert.equal(env.PGX_NOT_LIBPQ, undefined);
-  // 小写不是 libpq 变量(libpq 只认大写),照常保留
-  assert.equal(env.PGlower, "keep?");
-  assert.equal(env.PGPASSWORD, "pw");
+  const base = {
+    PATH: "/usr/bin", HOME: "/h",
+    PGHOST: "evil", PGHOSTADDR: "1.2.3.4", PGPORT: "65432", PGDATABASE: "evil", PGUSER: "evil",
+    PGPASSFILE: "/x", PGSERVICE: "s", PGSERVICEFILE: "/sf", PGSYSCONFDIR: "/etc/pg", PGTARGETSESSIONATTRS: "any",
+    PGOPTIONS: "reference=evil",
+    PGSSLMODE: "require", PGSSLROOTCERT: "/ca.pem", PGCONNECT_TIMEOUT: "10", PGAPPNAME: "x", PGPASSWORD: "envpw",
+  };
+  const plain = libpqChildEnv({}, base, { supabaseHost: false });
+  for (const k of ["PGHOST", "PGHOSTADDR", "PGPORT", "PGDATABASE", "PGUSER", "PGSERVICE", "PGSERVICEFILE", "PGSYSCONFDIR", "PGTARGETSESSIONATTRS"]) {
+    assert.equal(plain[k], undefined, `${k} should be stripped`);
+  }
+  // PGPASSFILE 是密码来源不是目标:node-postgres 经 pgpass 也读它,保留才两边一致
+  assert.equal(plain.PGPASSFILE, "/x");
+  // 不改目标的变量保留:外部 Postgres 靠 PGSSLMODE=require 上 TLS,不能被降级成 prefer
+  assert.equal(plain.PGSSLMODE, "require");
+  assert.equal(plain.PGSSLROOTCERT, "/ca.pem");
+  assert.equal(plain.PGCONNECT_TIMEOUT, "10");
+  assert.equal(plain.PGAPPNAME, "x");
+  assert.equal(plain.PGPASSWORD, "envpw");
+  assert.equal(plain.PATH, "/usr/bin");
+  // 非 Supabase 主机:Node 侧也读 PGOPTIONS,子进程同样保留 → 两边一致
+  assert.equal(plain.PGOPTIONS, "reference=evil");
+  // Supabase 主机:Node 侧已钉死 options,子进程剔除 PGOPTIONS → 两边一致
+  const supa = libpqChildEnv({}, base, { supabaseHost: true });
+  assert.equal(supa.PGOPTIONS, undefined);
+  assert.equal(supa.PGSSLMODE, "require");
+  // 显式给的覆盖环境
+  assert.equal(libpqChildEnv({ PGPASSWORD: "explicit" }, base, { supabaseHost: true }).PGPASSWORD, "explicit");
+  // 既有的两参签名(extraEnv, base)不变:第三个参数缺省 = 非 Supabase 主机
+  assert.equal(libpqChildEnv({}, base).PGOPTIONS, "reference=evil");
+  assert.equal(libpqChildEnv({}, base).PGHOST, undefined);
+  // node-postgres 独有的 no-verify 翻译成 libpq 认识的 require,并去掉会让 require 升级/拒连的证书变量
+  const { NO_VERIFY_ROOTCERT_SENTINEL } = await import("../dist/restore-engine.js");
+  const translated = libpqChildEnv({}, { PGSSLMODE: "no-verify", PGSSLROOTCERT: "system", PGSSLCRL: "/crl", PGSSLCRLDIR: "/crls", PGSSLCERT: "/c.pem" });
+  assert.equal(translated.PGSSLMODE, "require");
+  // 指向不存在的路径:libpq 在 require 下跳过验证且不再去找 ~/.postgresql/root.crt
+  assert.equal(translated.PGSSLROOTCERT, NO_VERIFY_ROOTCERT_SENTINEL);
+  assert.ok(!fs.existsSync(NO_VERIFY_ROOTCERT_SENTINEL));
+  // 没有 PGSSLROOTCERT 的 no-verify 同样要设哨兵(默认发现 root.crt 也会升级成 verify-ca)
+  assert.equal(libpqChildEnv({}, { PGSSLMODE: "no-verify" }).PGSSLROOTCERT, NO_VERIFY_ROOTCERT_SENTINEL);
+  // URL 自带 sslmode(压过环境变量)时不翻译、不设哨兵:verify-full 还得靠 ~/.postgresql/root.crt
+  const urlPinned = libpqChildEnv({}, { PGSSLMODE: "no-verify", PGSSLROOTCERT: "/ca.pem" }, { supabaseHost: false, urlSslMode: "verify-full" });
+  assert.equal(urlPinned.PGSSLMODE, "no-verify");
+  assert.equal(urlPinned.PGSSLROOTCERT, "/ca.pem");
+  const { urlSslModeOf } = await import("../dist/restore-engine.js");
+  assert.equal(urlSslModeOf("postgresql://u:p@h/db?sslmode=verify-full"), "verify-full");
+  assert.equal(urlSslModeOf("postgresql://u:p@h/db"), null);
+  assert.equal(urlSslModeOf("not a url"), null);
+  // 重复参数取最后一个(libpq 与 pg 同);最后一个为空视同没写
+  assert.equal(urlSslModeOf("postgresql://u:p@h/db?sslmode=&sslmode=verify-full"), "verify-full");
+  // 末尾空 sslmode 在 normalizeConnectionTarget 已被拒绝,这里只保证取值函数不崩
+  assert.equal(urlSslModeOf("postgresql://u:p@h/db?sslmode=verify-full&sslmode="), null);
+  assert.equal(translated.PGSSLCRL, undefined);
+  assert.equal(translated.PGSSLCRLDIR, undefined);
+  assert.equal(translated.PGSSLCERT, "/c.pem"); // 客户端证书不影响"验不验服务器",保留
+  // 其它 sslmode 原样,证书变量也原样
+  const full = libpqChildEnv({}, { PGSSLMODE: "verify-full", PGSSLROOTCERT: "/ca.pem" });
+  assert.equal(full.PGSSLMODE, "verify-full");
+  assert.equal(full.PGSSLROOTCERT, "/ca.pem");
 });
