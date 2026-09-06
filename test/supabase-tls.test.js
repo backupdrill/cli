@@ -222,30 +222,107 @@ test("环境隔离:敌意的 PGPORT/PGDATABASE/PGOPTIONS 在场时,Node 客户�
   process.env.PGOPTIONS = "reference=zyxwvutsrqponmlkjihg";
   try {
     for (const url of [
-      "postgresql://u:p@db.example.com/",
-      "postgresql://u:p@db.example.com",
-      "postgresql://u:p@aws-0-us-east-1.pooler.supabase.com/",
-      "postgresql://u:p@db.abcdefghijklmnopqrst.supabase.co/?options=",
+      "postgresql://appuser:p@db.example.com/",
+      "postgresql://appuser:p@db.example.com",
+      "postgresql://postgres.abcdefghijklmnopqrst:p@aws-0-us-east-1.pooler.supabase.com/",
+      "postgresql://postgres:p@db.abcdefghijklmnopqrst.supabase.co/?options=",
     ]) {
       const cp = new Client(pgConnectOptions(url)).connectionParameters;
+      const user = new URL(url).username;
       assert.equal(String(cp.port), "5432", `port from env leaked for ${url}`);
-      assert.equal(cp.database, "postgres", `database from env leaked for ${url}`);
-      // 租户覆盖只存在于 Supavisor:Supabase 主机必须挡住 PGOPTIONS;自带 Postgres 的主机尊重用户环境
+      // 库名缺省 = 用户名(libpq 与 node-postgres 的共同语义),不是环境变量,也不是 postgres
+      assert.equal(cp.database, user, `database default wrong for ${url}: ${cp.database}`);
       if (/supabase\.(co|com)/.test(url)) {
         assert.equal(cp.options, "-c application_name=backupdrill", `PGOPTIONS leaked for ${url}`);
       } else {
         assert.equal(cp.options, "reference=zyxwvutsrqponmlkjihg", `non-Supabase host should keep the user's PGOPTIONS: ${url}`);
       }
-      // 子进程拿到的 --dbname 同样把端口与库名写死
       const dumpUrl = dumpUrlFor(url);
-      assert.match(dumpUrl, /:5432\/postgres/, `dump url not pinned for ${url}: ${dumpUrl}`);
-      assert.doesNotMatch(dumpUrl, /options=(&|$)/);
+      assert.ok(dumpUrl.includes(`:5432/${user}`), `dump url not pinned for ${url}: ${dumpUrl}`);
+      assert.doesNotMatch(dumpUrl, /[?&]options=(&|$)/);
     }
-    // URL 里显式写了端口/库名/非空 options 的,原样尊重(那是用户意图,不是环境变量)
+    // URL 里显式写了端口/库名/非空 options 的,原样尊重
     const explicit = new Client(pgConnectOptions("postgresql://u:p@db.example.com:6543/mydb?options=-c%20search_path%3Dapp")).connectionParameters;
     assert.equal(String(explicit.port), "6543");
     assert.equal(explicit.database, "mydb");
     assert.equal(explicit.options, "-c search_path=app");
+  } finally {
+    for (const [k, v] of Object.entries(saved)) {
+      if (v === undefined) delete process.env[k]; else process.env[k] = v;
+    }
+  }
+});
+
+test("normalizeConnectionTarget:删空 options 不重写其它参数(%20 不能变 +);重复 options 只删空的那份", async () => {
+  const { normalizeConnectionTarget } = await import("../dist/supabase-ca.js");
+  const a = normalizeConnectionTarget("postgresql://u:p@db.example.com:5432/db?options=&password=hello%20world&x=a+b");
+  assert.equal(a, "postgresql://u:p@db.example.com:5432/db?password=hello%20world&x=a+b");
+  // 重复 options 按"最后一个生效":最后一个非空 → 整组原样保留;最后一个为空 → 整组剔除
+  // (只删空的会让更早的非空 options 复活,例如把只读模式偷偷开回来——交叉审查)
+  const b = normalizeConnectionTarget("postgresql://u:p@db.example.com:5432/db?options=&options=-c%20search_path%3Dapp");
+  assert.equal(b, "postgresql://u:p@db.example.com:5432/db?options=&options=-c%20search_path%3Dapp");
+  const c = normalizeConnectionTarget("postgresql://u:p@db.example.com:5432/db?options=-c%20default_transaction_read_only%3Don&options=");
+  assert.equal(c, "postgresql://u:p@db.example.com:5432/db");
+  {
+    // 这条断言依赖环境里没有 PGOPTIONS(外部主机刻意继承它):先清掉再恢复
+    const savedOptions = process.env.PGOPTIONS;
+    delete process.env.PGOPTIONS;
+    try {
+      assert.equal(new Client(pgConnectOptions("postgresql://u:p@db.example.com:5432/db?options=-c%20x%3D1&options=")).connectionParameters.options, undefined);
+    } finally {
+      if (savedOptions !== undefined) process.env.PGOPTIONS = savedOptions;
+    }
+  }
+  // 键大小写敏感:OPTIONS 是另一个键(pg 不认、libpq 拒),不能把合法的小写 options 一起删掉
+  const d = normalizeConnectionTarget("postgresql://u:p@db.example.com:5432/db?options=-c%20default_transaction_read_only%3Don&OPTIONS=");
+  assert.equal(d, "postgresql://u:p@db.example.com:5432/db?options=-c%20default_transaction_read_only%3Don&OPTIONS=");
+  // 空片段与裸键一律清掉(libpq 会报 missing key/value separator,Node 却接受)
+  assert.equal(normalizeConnectionTarget("postgresql://u:p@db.example.com:5432/db?&application_name=x&"), "postgresql://u:p@db.example.com:5432/db?application_name=x");
+  assert.equal(normalizeConnectionTarget("postgresql://u:p@db.example.com:5432/db?options&options=-c%20statement_timeout%3D0"), "postgresql://u:p@db.example.com:5432/db?options=-c%20statement_timeout%3D0");
+  assert.equal(normalizeConnectionTarget("postgresql://u:p@db.example.com:5432/db?options=-c%20x%3D1&options"), "postgresql://u:p@db.example.com:5432/db");
+  // 其它键的裸形态两边语义对不上(删掉会让 sslmode=disable 复活成明文):拒绝
+  assert.throws(() => normalizeConnectionTarget("postgresql://u:p@db.example.com:5432/db?sslmode=disable&sslmode"), /has no value/);
+  assert.throws(() => normalizeConnectionTarget("postgresql://u:p@db.example.com:5432/db?application_name"), /has no value/);
+  // 空的 sslmode(?sslmode=)libpq 报 invalid value、Node 回退环境变量:拒绝(options 组另有规则,其它键不管)
+  assert.throws(() => normalizeConnectionTarget("postgresql://u:p@db.example.com:5432/db?sslmode=verify-full&sslmode="), /is empty/);
+  // 最后一个非空 → 合法(两个驱动都取最后一个),原样保留
+  assert.equal(normalizeConnectionTarget("postgresql://u:p@db.example.com:5432/db?sslmode=&sslmode=verify-full"), "postgresql://u:p@db.example.com:5432/db?sslmode=&sslmode=verify-full");
+  assert.equal(normalizeConnectionTarget("postgresql://u:p@db.example.com:5432/db?application_name="), "postgresql://u:p@db.example.com:5432/db?application_name=");
+  // 全部参数都被删光时不留孤零零的 ?
+  assert.equal(normalizeConnectionTarget("postgresql://u:p@db.example.com:5432/db?options="), "postgresql://u:p@db.example.com:5432/db");
+  // 用户名含百分号编码时,缺省库名沿用同一编码形态(驱动解码后即用户名)
+  // 缺省库名 = 解码后的用户名、不再编码:两个客户端都拿到 app-ro(node-postgres 不解码路径)
+  assert.equal(normalizeConnectionTarget("postgresql://app%2Dro:p@db.example.com"), "postgresql://app%2Dro:p@db.example.com:5432/app-ro");
+});
+
+test("缺省库名与用户名编码:两个客户端必须得到同一个库名;做不到就拒绝", async () => {
+  const { normalizeConnectionTarget } = await import("../dist/supabase-ca.js");
+  // %40 解码后是 @,可原样进路径:libpq 与 node-postgres 都拿到 app@reader
+  const a = normalizeConnectionTarget("postgresql://app%40reader:p@db.example.com");
+  assert.equal(a, "postgresql://app%40reader:p@db.example.com:5432/app@reader");
+  assert.equal(new Client(pgConnectOptions("postgresql://app%40reader:p@db.example.com")).connectionParameters.database, "app@reader");
+  // %3A → ":" 同样可以原样进路径
+  assert.equal(normalizeConnectionTarget("postgresql://a%3Ab:p@db.example.com"), "postgresql://a%3Ab:p@db.example.com:5432/a:b");
+  // 空格与 Unicode:URL 会重新编码,但 decodeURI(node-postgres)与 decodeURIComponent(libpq)解出同一个名字 → 允许
+  assert.equal(normalizeConnectionTarget("postgresql://app%20ro:p@db.example.com"), "postgresql://app%20ro:p@db.example.com:5432/app%20ro");
+  assert.equal(new Client(pgConnectOptions("postgresql://app%20ro:p@db.example.com")).connectionParameters.database, "app ro");
+  assert.equal(new Client(pgConnectOptions("postgresql://%E6%B5%8B:p@db.example.com")).connectionParameters.database, "测");
+  // / 破坏路径结构;? 和 # 会被编成保留字序列(node 不解、libpq 解);% 有歧义 → 要求显式库名
+  for (const u of ["app%2Fro", "app%3Fro", "app%23ro", "app%25ro"]) {
+    assert.throws(() => normalizeConnectionTarget(`postgresql://${u}:p@db.example.com`), /add \/<database>/, u);
+  }
+  // 显式写了库名的一律不动
+  assert.equal(normalizeConnectionTarget("postgresql://app%2Fro:p@db.example.com/mydb"), "postgresql://app%2Fro:p@db.example.com:5432/mydb");
+});
+
+test("缺省用户名:拒绝(libpq 退回 OS 用户、node-postgres 退回环境变量,两边分叉),敌意 PGDATABASE 也进不来", () => {
+  const saved = { PGDATABASE: process.env.PGDATABASE, PGUSER: process.env.PGUSER };
+  process.env.PGDATABASE = "review_empty_target";
+  process.env.PGUSER = "evil";
+  try {
+    assert.throws(() => pgConnectOptions("postgresql://db.example.com"), /user name/);
+    assert.throws(() => pgConnectOptions("postgresql://db.example.com/"), /user name/);
+    assert.throws(() => dumpUrlFor("postgresql://:p@db.example.com/"), /user name/);
   } finally {
     for (const [k, v] of Object.entries(saved)) {
       if (v === undefined) delete process.env[k]; else process.env[k] = v;

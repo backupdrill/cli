@@ -216,7 +216,7 @@ function effectiveHost(databaseUrl: string): string | null {
   return host || null;
 }
 
-function isSupabaseHost(databaseUrl: string): boolean {
+export function isSupabaseHost(databaseUrl: string): boolean {
   const host = effectiveHost(databaseUrl);
   return host !== null && SUPABASE_HOST.test(host);
 }
@@ -239,10 +239,89 @@ export function normalizeConnectionTarget(databaseUrl: string): string {
   } catch {
     return databaseUrl;
   }
+  // 空 authority 形态(postgresql:///db?host=…):URL 解析得到空主机,node-pg 却能接受——这类串由
+  // dumpUrlFor 的主机识别与 assertNoHostOverride 的 ?host= 拒绝各自处理,这里不碰、不猜
+  if (!url.hostname) return databaseUrl;
   if (!url.port) url.port = "5432";
-  if (!url.pathname || url.pathname === "/") url.pathname = "/postgres";
-  if (url.searchParams.has("options") && url.searchParams.get("options") === "") {
-    url.searchParams.delete("options");
+  // 没有用户名就没有可钉死的身份与缺省库名(libpq 退回操作系统用户、node-postgres 退回 PGUSER/
+  // PGDATABASE 环境变量,两边立刻分叉):直接拒绝,连接串必须自带用户名
+  if (!url.username) {
+    throw new Error("connection string must include a user name (postgresql://user:password@host:port/database).");
+  }
+  // 库名缺省 = 用户名:这是 libpq 与 node-postgres 共同的语义(两者都在 dbname 缺失时回退到
+  // user),写死它只是不让环境变量 PGDATABASE 插进来,不改变既有连接串的目标(交叉审查:
+  // 曾错写成 postgres,会让 postgresql://app:pw@host 这类外部库串静默换库)。
+  // 路径里的百分号编码两个客户端解法不同:libpq 全部解码,node-postgres(pg-connection-string)
+  // 用 decodeURI——保留字(/ ? # : @ & = + $ , ;)的编码不解。所以缺省库名用**解码后的用户名**
+  // 写进路径,让 URL 只对需要的字符做编码,再逐一验证两种解法得到同一个库名;做不到就要求显式库名。
+  if (!url.pathname || url.pathname === "/") {
+    let user: string;
+    try {
+      user = decodeURIComponent(url.username);
+    } catch {
+      throw new Error("connection string user name has invalid percent-encoding.");
+    }
+    const explicit = "connection string omits the database name and the user name cannot serve as the default — add /<database> after the host.";
+    // / 破坏路径结构,? # 会被编成保留字序列(两边解法分叉),% 本身有歧义,控制字符不进路径
+    if (/[/?#%\u0000-\u001f\u007f]/.test(user) || user === "") throw new Error(explicit);
+    url.pathname = `/${user}`;
+    const encoded = url.pathname.slice(1);
+    let libpqView: string;
+    let nodeView: string;
+    try {
+      libpqView = decodeURIComponent(encoded);
+      nodeView = decodeURI(encoded);
+    } catch {
+      throw new Error(explicit);
+    }
+    if (libpqView !== user || nodeView !== user) throw new Error(explicit);
+  }
+  // options 参数按"最后一个生效"的驱动语义处理(pg-connection-string 与 libpq 对重复参数都取最后
+  // 一个):最后一个 options 为空 → 整组 options 全部剔除(空值会让 pg 回退读 PGOPTIONS;只删空的
+  // 那份会让更早的非空 options 复活,改变语义——交叉审查);最后一个非空 → 原样保留整组。
+  // 按原文操作、不经 URLSearchParams 重新序列化,否则其它参数值里的 %20 会被改写成 +
+  // (pg 解成空格、libpq 按字面 + 处理,两边密码就对不上)。
+  if (url.search) {
+    // 空片段(?&x=1)与无 = 的裸键(?options&…)Node 能容忍、libpq 报 "missing key/value separator":
+    // 一律清掉,两边看到同一份 query。键按**大小写敏感**比对:驱动的键是大小写敏感的
+    // (OPTIONS 对 pg 是另一个键、对 libpq 是非法关键字),按不敏感归组会把合法的小写 options 一起删掉。
+    const pairs = url.search.slice(1).split("&").filter((pair) => pair !== "");
+    const keyOf = (pair: string): string => {
+      const eq = pair.indexOf("=");
+      const rawKey = eq === -1 ? pair : pair.slice(0, eq);
+      try {
+        return decodeURIComponent(rawKey);
+      } catch {
+        return rawKey; // 编码坏了按原文比对
+      }
+    };
+    const valueOf = (pair: string): string => {
+      const eq = pair.indexOf("=");
+      return eq === -1 ? "" : pair.slice(eq + 1);
+    };
+    const optionPairs = pairs.filter((pair) => keyOf(pair) === "options");
+    const lastIsEmpty = optionPairs.length > 0 && valueOf(optionPairs[optionPairs.length - 1]) === "";
+    // 其它键的裸形态(?sslmode=disable&sslmode)两边语义对不上:Node 取最后一个(空 → 回退环境变量),
+    // libpq 直接报错;静默删掉会让更早的值(这里是 disable = 明文)复活。不猜,拒绝(交叉审查)。
+    const bareOther = pairs.find((pair) => !pair.includes("=") && keyOf(pair) !== "options");
+    if (bareOther !== undefined) {
+      throw new Error(
+        `connection string parameter "${keyOf(bareOther)}" has no value — remove it or give it a value.`
+      );
+    }
+    // 空的 sslmode(?sslmode=)两边对不上:libpq 报 invalid sslmode value,Node 回退环境变量——拒绝。
+    // 只管 sslmode:空 host= 等已有各自的既定处理(stripSslParams / forceVerifyFull 那套),不在这里动
+    // 两个驱动都取最后一个 sslmode:只有最后一个为空才算空(?sslmode=&sslmode=verify-full 是合法的)
+    const sslModePairs = pairs.filter((pair) => keyOf(pair) === "sslmode" && pair.includes("="));
+    if (sslModePairs.length > 0 && valueOf(sslModePairs[sslModePairs.length - 1]) === "") {
+      throw new Error('connection string parameter "sslmode" is empty — remove it or give it a value.');
+    }
+    const kept = pairs.filter((pair) => {
+      // options 组:最后一个为空/裸 → 整组删;否则只留带 = 的(裸的已被后面的值取代,libpq 会报错)
+      if (keyOf(pair) === "options") return !lastIsEmpty && pair.includes("=");
+      return true;
+    });
+    url.search = kept.length ? `?${kept.join("&")}` : "";
   }
   return url.toString();
 }

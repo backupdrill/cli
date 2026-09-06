@@ -11,7 +11,7 @@
 import { spawn } from "node:child_process";
 import type { ExtensionInfo } from "./manifest.js";
 import { resolvePgRestoreBin } from "./pgbin.js";
-import { dumpUrlFor, connectPg } from "./supabase-ca.js";
+import { dumpUrlFor, connectPg, isSupabaseHost } from "./supabase-ca.js";
 
 export type RestoreTargetKind = "sandbox" | "supabase";
 
@@ -102,31 +102,87 @@ export interface EngineResult {
 }
 
 /**
- * libpq 子进程(pg_dump / pg_restore)的环境:剔除父进程里所有 `PG*` 变量,再叠加我们显式要给的
- * (如 credentialSafeDbArgs 的 PGPASSWORD)。libpq 会读 PGOPTIONS / PGHOST / PGSERVICE / PGPASSFILE
- * 等几十个环境变量,任何一个都能让实际连接偏离 --dbname 里的 URL(PGOPTIONS=reference=… 甚至能
- * 换租户)。连接信息全部走 URL,子进程不该继承这些(交叉审查)。
+ * libpq 环境变量里会改写**连接到哪里、以谁的身份**的那些:剔除它们,子进程才只认 --dbname 里的
+ * URL。TLS 策略(PGSSLMODE / PGSSLROOTCERT…)、超时、编码、应用名这类**不改目标**的变量保留——
+ * 外部 Postgres 用户常靠 PGSSLMODE=require 上 TLS,一刀切剔除等于把他们降级到 prefer(交叉审查)。
+ * Supabase 主机的 TLS 由 dumpUrlFor 直接写进 URL(verify-full + 打包 CA),不依赖环境。
+ * 密码来源保留:URL 不带密码时 node-postgres 同样读 PGPASSWORD,也经 pgpass 模块读 PGPASSFILE,
+ * 两个客户端才对得上;URL 带密码时 credentialSafeDbArgs 会显式覆盖。
+ * 服务文件三件套(PGSERVICE / PGSERVICEFILE / PGSYSCONFDIR)剔除:pg_service.conf 能整段改写
+ * host/options,是 libpq 独有的旁路;URL 里的 ?service= 也在 assertNoHostOverride 拒绝。
+ */
+const LIBPQ_TARGET_ENV = new Set([
+  "PGHOST",
+  "PGHOSTADDR",
+  "PGPORT",
+  "PGDATABASE",
+  "PGUSER",
+  "PGSERVICE",
+  "PGSERVICEFILE",
+  "PGSYSCONFDIR",
+  "PGTARGETSESSIONATTRS",
+]);
+
+/**
+ * libpq 子进程(pg_dump / pg_restore)的环境。`supabaseHost` 为真时再剔除 PGOPTIONS:Supavisor 会从
+ * options 里读租户覆盖(reference=…),而 Node 客户端对 Supabase 主机已显式钉死 options;非 Supabase
+ * 主机两边都尊重用户的 PGOPTIONS——两个客户端在任何情况下看到的都是同一份连接语义。
  */
 export function libpqChildEnv(
   extraEnv: NodeJS.ProcessEnv = {},
-  base: NodeJS.ProcessEnv = process.env
+  base: NodeJS.ProcessEnv = process.env,
+  opts: { supabaseHost: boolean; urlSslMode?: string | null } = { supabaseHost: false }
 ): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = {};
+  // node-postgres 独有的 sslmode 值:no-verify = 加密但**不验证书**。libpq 里最接近的是 require,
+  // 但 require 一旦找到根证书就升级成 verify-ca(显式 sslrootcert、sslrootcert=system,或默认
+  // 发现 ~/.postgresql/root.crt 都算),遇到 sslrootcert=system 还直接拒连。翻译时:去掉 CRL 变量,
+  // 并把 PGSSLROOTCERT 指向一个不存在的路径——libpq 对显式路径 stat 失败时在 require 模式下
+  // 跳过验证、且不再去找默认的 root.crt,子进程才真的是"加密、不验",与 Node 侧一致(交叉审查)。
+  // URL 里自带 sslmode 时它压过环境变量(两个客户端都如此),这时不做 no-verify 翻译——否则
+  // 哨兵根证书会让 verify-full 因"证书文件不存在"而拒连(交叉审查)
+  const noVerify = base.PGSSLMODE === "no-verify" && !opts.urlSslMode;
   for (const [key, value] of Object.entries(base)) {
-    if (!/^PG[A-Z_]*$/.test(key)) env[key] = value;
+    if (LIBPQ_TARGET_ENV.has(key)) continue;
+    if (opts.supabaseHost && key === "PGOPTIONS") continue;
+    if (noVerify) {
+      if (key === "PGSSLMODE") {
+        env[key] = "require";
+        continue;
+      }
+      if (key === "PGSSLROOTCERT" || key === "PGSSLCRL" || key === "PGSSLCRLDIR") continue;
+    }
+    env[key] = value;
   }
+  if (noVerify) env.PGSSLROOTCERT = NO_VERIFY_ROOTCERT_SENTINEL;
   return { ...env, ...extraEnv };
+}
+
+/** 见 libpqChildEnv:一个绝不存在的根证书路径 = 让 libpq 的 require 既不验证也不去找默认 root.crt。 */
+export const NO_VERIFY_ROOTCERT_SENTINEL = "/nonexistent/backupdrill-no-verify-root.crt";
+
+/** 连接串 query 里的 sslmode(驱动语义:URL 优先于环境变量);解析不了或没写 → null。 */
+export function urlSslModeOf(connString: string): string | null {
+  try {
+    // 重复参数两个驱动都取最后一个;最后一个为空视同没写(pg 会回退环境变量)
+    const all = new URL(connString).searchParams.getAll("sslmode");
+    const last = all.length ? all[all.length - 1] : "";
+    return last === "" ? null : last;
+  } catch {
+    return null;
+  }
 }
 
 export function spawnPgRestore(
   bin: string,
   args: string[],
-  extraEnv: NodeJS.ProcessEnv = {}
+  extraEnv: NodeJS.ProcessEnv = {},
+  opts: { supabaseHost: boolean; urlSslMode?: string | null } = { supabaseHost: false }
 ): Promise<{ code: number | null; stderr: string }> {
   return new Promise((resolve, reject) => {
     const proc = spawn(bin, args, {
       stdio: ["ignore", "ignore", "pipe"],
-      env: libpqChildEnv(extraEnv),
+      env: libpqChildEnv(extraEnv, process.env, opts),
     });
     let stderr = "";
     proc.stderr.on("data", (d: Buffer) => (stderr += d.toString()));
@@ -349,6 +405,13 @@ export function assertNoHostOverride(connString: string): void {
       "connection string could not be parsed as a URL — use a plain postgresql://user:password@host:port/database string."
     );
   }
+  // 空 authority(postgresql:///db):主机只能来自环境变量或 ?host=,Node 与 libpq 子进程各自
+  // 回退到不同默认值,身份判定也无从谈起——必须显式写主机(交叉审查)
+  if (!url.hostname) {
+    throw new Error(
+      "connection string has no host — use a plain postgresql://user:password@host:port/database string."
+    );
+  }
   const params = url.searchParams;
   const isSupabasePooler = /\.pooler\.supabase\.com$/.test(normalizeHost(url.hostname));
   let username: string;
@@ -368,7 +431,11 @@ export function assertNoHostOverride(connString: string): void {
     );
   }
   for (const key of params.keys()) {
-    if (/^(host|hostaddr|user)$/i.test(key)) {
+    // dbname 也算目标覆盖:libpq 让 ?dbname= 压过路径里的库名,node-postgres 却不认这个键——
+    // 预检看的是一个库、pg_restore 写的是另一个。service/servicefile 让 libpq 从 pg_service.conf
+    // 整段加载 host/options(含租户覆盖),node-postgres 不认——同样拒绝(交叉审查)。
+    // URLSearchParams 已把键解码,%64bname 这类编码形态同样命中。
+    if (/^(host|hostaddr|user|dbname|service|servicefile)$/i.test(key)) {
       throw new Error(
         `connection string carries a ?${key}= override — the effective server/identity would ` +
           `differ from the URL authority that identity checks inspect. Use a plain connection string.`
@@ -394,8 +461,9 @@ export async function restoreDatabaseArtifact(opts: {
   // 中间人可拿到连接与数据);沙箱/外部主机原样透传。先改写 SSL 再拆密码。
   const { url, env } = credentialSafeDbArgs(dumpUrlFor(opts.connString));
   const common = ["--no-owner", "--no-privileges", "--dbname", url, opts.dumpPath];
+  const childOpts = { supabaseHost: isSupabaseHost(opts.connString), urlSslMode: urlSslModeOf(url) };
 
-  const first = await spawnPgRestore(bin, ["--section=pre-data", "--section=data", ...common], env);
+  const first = await spawnPgRestore(bin, ["--section=pre-data", "--section=data", ...common], env, childOpts);
   const preData = finalizePass(
     first.code,
     first.stderr,
@@ -405,7 +473,7 @@ export async function restoreDatabaseArtifact(opts: {
     return { preData, postData: { expectedSkips: 0, failures: [] }, ok: false };
   }
 
-  const second = await spawnPgRestore(bin, ["--section=post-data", ...common], env);
+  const second = await spawnPgRestore(bin, ["--section=post-data", ...common], env, childOpts);
   const postData = finalizePass(
     second.code,
     second.stderr,
