@@ -239,11 +239,37 @@ export function normalizeConnectionTarget(databaseUrl: string): string {
   } catch {
     return databaseUrl;
   }
+  // 空 authority 形态(postgresql:///db?host=…):URL 解析得到空主机,node-pg 却能接受——这类串由
+  // dumpUrlFor 的主机识别与 assertNoHostOverride 的 ?host= 拒绝各自处理,这里不碰、不猜
+  if (!url.hostname) return databaseUrl;
   if (!url.port) url.port = "5432";
+  // 没有用户名就没有可钉死的身份与缺省库名(libpq 退回操作系统用户、node-postgres 退回 PGUSER/
+  // PGDATABASE 环境变量,两边立刻分叉):直接拒绝,连接串必须自带用户名
+  if (!url.username) {
+    throw new Error("connection string must include a user name (postgresql://user:password@host:port/database).");
+  }
   // 库名缺省 = 用户名:这是 libpq 与 node-postgres 共同的语义(两者都在 dbname 缺失时回退到
   // user),写死它只是不让环境变量 PGDATABASE 插进来,不改变既有连接串的目标(交叉审查:
-  // 曾错写成 postgres,会让 postgresql://app:pw@host 这类外部库串静默换库)
-  if (!url.pathname || url.pathname === "/") url.pathname = `/${url.username}`;
+  // 曾错写成 postgres,会让 postgresql://app:pw@host 这类外部库串静默换库)。
+  // 路径里的百分号编码两个客户端处理不同(libpq 解码,node-postgres 按字面用),所以缺省库名
+  // 只能用**解码后无需再编码**的用户名原样写进路径;其它情况要求显式写库名。
+  if (!url.pathname || url.pathname === "/") {
+    let user: string;
+    try {
+      user = decodeURIComponent(url.username);
+    } catch {
+      throw new Error("connection string user name has invalid percent-encoding.");
+    }
+    if (!/^[A-Za-z0-9_.@+:-]+$/.test(user)) {
+      throw new Error(
+        "connection string omits the database name and the user name cannot serve as the default — add /<database> after the host."
+      );
+    }
+    url.pathname = `/${user}`;
+    if (url.pathname !== `/${user}`) {
+      throw new Error("connection string omits the database name — add /<database> after the host.");
+    }
+  }
   // 空的 options 参数按原文剔除:不经 URLSearchParams 重新序列化,否则其它参数值里的 %20
   // 会被改写成 +(pg 解成空格、libpq 按字面 + 处理,两边密码就对不上);只删空值,非空的
   // options 是用户显式意图,原样保留(含重复出现时的非空那份)

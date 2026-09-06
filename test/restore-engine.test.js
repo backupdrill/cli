@@ -230,7 +230,7 @@ test("libpqChildEnv:只剔除改写目标/身份的 PG* 变量;TLS 策略、超�
     PGOPTIONS: "reference=evil",
     PGSSLMODE: "require", PGSSLROOTCERT: "/ca.pem", PGCONNECT_TIMEOUT: "10", PGAPPNAME: "x", PGPASSWORD: "envpw",
   };
-  const plain = libpqChildEnv({}, { supabaseHost: false }, base);
+  const plain = libpqChildEnv({}, base, { supabaseHost: false });
   for (const k of ["PGHOST", "PGHOSTADDR", "PGPORT", "PGDATABASE", "PGUSER", "PGPASSFILE", "PGSERVICE", "PGSERVICEFILE", "PGTARGETSESSIONATTRS"]) {
     assert.equal(plain[k], undefined, `${k} should be stripped`);
   }
@@ -244,9 +244,12 @@ test("libpqChildEnv:只剔除改写目标/身份的 PG* 变量;TLS 策略、超�
   // 非 Supabase 主机:Node 侧也读 PGOPTIONS,子进程同样保留 → 两边一致
   assert.equal(plain.PGOPTIONS, "reference=evil");
   // Supabase 主机:Node 侧已钉死 options,子进程剔除 PGOPTIONS → 两边一致
-  const supa = libpqChildEnv({}, { supabaseHost: true }, base);
+  const supa = libpqChildEnv({}, base, { supabaseHost: true });
   assert.equal(supa.PGOPTIONS, undefined);
   assert.equal(supa.PGSSLMODE, "require");
   // 显式给的覆盖环境
-  assert.equal(libpqChildEnv({ PGPASSWORD: "explicit" }, { supabaseHost: true }, base).PGPASSWORD, "explicit");
+  assert.equal(libpqChildEnv({ PGPASSWORD: "explicit" }, base, { supabaseHost: true }).PGPASSWORD, "explicit");
+  // 既有的两参签名(extraEnv, base)不变:第三个参数缺省 = 非 Supabase 主机
+  assert.equal(libpqChildEnv({}, base).PGOPTIONS, "reference=evil");
+  assert.equal(libpqChildEnv({}, base).PGHOST, undefined);
 });
