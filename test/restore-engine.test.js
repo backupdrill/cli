@@ -157,8 +157,12 @@ test("projectRefOf / assertNoHostOverride:解码后含 NUL 的用户名不认、
   assert.throws(() => assertNoHostOverride(`postgresql://postgres.${target}:pw@aws-0-us-east-1.pooler.supabase.com:5432/postgres%00x`), /NUL/);
   assert.doesNotThrow(() => assertNoHostOverride(`postgresql://postgres.${target}:pw@aws-0-us-east-1.pooler.supabase.com:5432/postgres`));
   // WHATWG URL 解析不了、pg 却接受的形态(空主机 + ?host=):不能放行,身份判定为空
-  assert.throws(() => assertNoHostOverride("postgresql://postgres.cluster.alias@/postgres?host=aws-0-us-east-1.pooler.supabase.com"), /parsed|override/);
+  assert.throws(() => assertNoHostOverride("postgresql://postgres.cluster.alias@/postgres?host=aws-0-us-east-1.pooler.supabase.com"), /parsed|override|no host/);
   assert.throws(() => assertNoHostOverride("host=aws-0-us-east-1.pooler.supabase.com user=postgres"), /parsed/);
+  // 空 authority:主机只能来自环境变量,Node 与子进程各自回退 → 拒绝
+  assert.throws(() => assertNoHostOverride("postgresql:///postgres"), /no host/);
+  // 带 userinfo 却空主机的形态 WHATWG 直接解析失败:同样是拒绝,只是文案不同
+  assert.throws(() => assertNoHostOverride("postgresql://u:p@/postgres"), /no host|parsed/);
   // 非法百分号编码:pg 会部分解码(%75→u),按原样看会漏掉 .cluster. —— 解不开就拒
   assert.throws(() => assertNoHostOverride(`postgresql://role%GG.cl%75ster.${target}:pw@aws-0-us-east-1.pooler.supabase.com:5432/postgres`), /percent-encoding/);
   assert.equal(projectRefOf(`postgresql://role%GG.cl%75ster.${target}:pw@aws-0-us-east-1.pooler.supabase.com:5432/postgres`), null);
@@ -252,4 +256,7 @@ test("libpqChildEnv:只剔除改写目标/身份的 PG* 变量;TLS 策略、超�
   // 既有的两参签名(extraEnv, base)不变:第三个参数缺省 = 非 Supabase 主机
   assert.equal(libpqChildEnv({}, base).PGOPTIONS, "reference=evil");
   assert.equal(libpqChildEnv({}, base).PGHOST, undefined);
+  // node-postgres 独有的 no-verify 翻译成 libpq 认识的 require;其它值原样
+  assert.equal(libpqChildEnv({}, { PGSSLMODE: "no-verify" }).PGSSLMODE, "require");
+  assert.equal(libpqChildEnv({}, { PGSSLMODE: "verify-full" }).PGSSLMODE, "verify-full");
 });

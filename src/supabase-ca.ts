@@ -251,8 +251,9 @@ export function normalizeConnectionTarget(databaseUrl: string): string {
   // 库名缺省 = 用户名:这是 libpq 与 node-postgres 共同的语义(两者都在 dbname 缺失时回退到
   // user),写死它只是不让环境变量 PGDATABASE 插进来,不改变既有连接串的目标(交叉审查:
   // 曾错写成 postgres,会让 postgresql://app:pw@host 这类外部库串静默换库)。
-  // 路径里的百分号编码两个客户端处理不同(libpq 解码,node-postgres 按字面用),所以缺省库名
-  // 只能用**解码后无需再编码**的用户名原样写进路径;其它情况要求显式写库名。
+  // 路径里的百分号编码两个客户端解法不同:libpq 全部解码,node-postgres(pg-connection-string)
+  // 用 decodeURI——保留字(/ ? # : @ & = + $ , ;)的编码不解。所以缺省库名用**解码后的用户名**
+  // 写进路径,让 URL 只对需要的字符做编码,再逐一验证两种解法得到同一个库名;做不到就要求显式库名。
   if (!url.pathname || url.pathname === "/") {
     let user: string;
     try {
@@ -260,15 +261,20 @@ export function normalizeConnectionTarget(databaseUrl: string): string {
     } catch {
       throw new Error("connection string user name has invalid percent-encoding.");
     }
-    if (!/^[A-Za-z0-9_.@+:-]+$/.test(user)) {
-      throw new Error(
-        "connection string omits the database name and the user name cannot serve as the default — add /<database> after the host."
-      );
-    }
+    const explicit = "connection string omits the database name and the user name cannot serve as the default — add /<database> after the host.";
+    // / 破坏路径结构,? # 会被编成保留字序列(两边解法分叉),% 本身有歧义,控制字符不进路径
+    if (/[/?#%\u0000-\u001f\u007f]/.test(user) || user === "") throw new Error(explicit);
     url.pathname = `/${user}`;
-    if (url.pathname !== `/${user}`) {
-      throw new Error("connection string omits the database name — add /<database> after the host.");
+    const encoded = url.pathname.slice(1);
+    let libpqView: string;
+    let nodeView: string;
+    try {
+      libpqView = decodeURIComponent(encoded);
+      nodeView = decodeURI(encoded);
+    } catch {
+      throw new Error(explicit);
     }
+    if (libpqView !== user || nodeView !== user) throw new Error(explicit);
   }
   // 空的 options 参数按原文剔除:不经 URLSearchParams 重新序列化,否则其它参数值里的 %20
   // 会被改写成 +(pg 解成空格、libpq 按字面 + 处理,两边密码就对不上);只删空值,非空的

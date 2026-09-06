@@ -276,9 +276,14 @@ test("缺省库名与用户名编码:两个客户端必须得到同一个库名;
   assert.equal(new Client(pgConnectOptions("postgresql://app%40reader:p@db.example.com")).connectionParameters.database, "app@reader");
   // %3A → ":" 同样可以原样进路径
   assert.equal(normalizeConnectionTarget("postgresql://a%3Ab:p@db.example.com"), "postgresql://a%3Ab:p@db.example.com:5432/a:b");
-  // %2F → "/" 进路径会改变结构,%20 → 空格会被重新编码(两边解码规则不同)→ 要求显式库名
-  assert.throws(() => normalizeConnectionTarget("postgresql://app%2Fro:p@db.example.com"), /add \/<database>/);
-  assert.throws(() => normalizeConnectionTarget("postgresql://app%20ro:p@db.example.com"), /add \/<database>/);
+  // 空格与 Unicode:URL 会重新编码,但 decodeURI(node-postgres)与 decodeURIComponent(libpq)解出同一个名字 → 允许
+  assert.equal(normalizeConnectionTarget("postgresql://app%20ro:p@db.example.com"), "postgresql://app%20ro:p@db.example.com:5432/app%20ro");
+  assert.equal(new Client(pgConnectOptions("postgresql://app%20ro:p@db.example.com")).connectionParameters.database, "app ro");
+  assert.equal(new Client(pgConnectOptions("postgresql://%E6%B5%8B:p@db.example.com")).connectionParameters.database, "测");
+  // / 破坏路径结构;? 和 # 会被编成保留字序列(node 不解、libpq 解);% 有歧义 → 要求显式库名
+  for (const u of ["app%2Fro", "app%3Fro", "app%23ro", "app%25ro"]) {
+    assert.throws(() => normalizeConnectionTarget(`postgresql://${u}:p@db.example.com`), /add \/<database>/, u);
+  }
   // 显式写了库名的一律不动
   assert.equal(normalizeConnectionTarget("postgresql://app%2Fro:p@db.example.com/mydb"), "postgresql://app%2Fro:p@db.example.com:5432/mydb");
 });

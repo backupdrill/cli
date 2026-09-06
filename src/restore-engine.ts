@@ -135,6 +135,12 @@ export function libpqChildEnv(
   for (const [key, value] of Object.entries(base)) {
     if (LIBPQ_TARGET_ENV.has(key)) continue;
     if (opts.supabaseHost && key === "PGOPTIONS") continue;
+    // node-postgres 独有的 sslmode 值:no-verify = 加密但不验证书 ≈ libpq 的 require;
+    // 原样传给 libpq 会报 invalid sslmode value,让 Node 侧能连的外部库在 pg_dump 一步失败
+    if (key === "PGSSLMODE" && value === "no-verify") {
+      env[key] = "require";
+      continue;
+    }
     env[key] = value;
   }
   return { ...env, ...extraEnv };
@@ -370,6 +376,13 @@ export function assertNoHostOverride(connString: string): void {
   } catch {
     throw new Error(
       "connection string could not be parsed as a URL — use a plain postgresql://user:password@host:port/database string."
+    );
+  }
+  // 空 authority(postgresql:///db):主机只能来自环境变量或 ?host=,Node 与 libpq 子进程各自
+  // 回退到不同默认值,身份判定也无从谈起——必须显式写主机(交叉审查)
+  if (!url.hostname) {
+    throw new Error(
+      "connection string has no host — use a plain postgresql://user:password@host:port/database string."
     );
   }
   const params = url.searchParams;
