@@ -14,6 +14,7 @@ import { projectRefOf, refFromStorageEndpoint, assertNoHostOverride } from "./re
 import { log } from "./log.js";
 import { TOOL_VERSION } from "./version.js";
 import { dumpUrlFor, connectPg } from "./supabase-ca.js";
+import { libpqChildEnv } from "./restore-engine.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -150,7 +151,8 @@ async function dumpToS3(
       "--dbname",
       dumpDbUrl,
     ],
-    { stdio: ["ignore", "pipe", "pipe"] }
+    // 环境剔除全部 PG*:pg_dump 只认 --dbname 里的 URL,不让 PGOPTIONS/PGHOST 之类改写目标
+    { stdio: ["ignore", "pipe", "pipe"], env: libpqChildEnv() }
   );
 
   let stderr = "";

@@ -3,11 +3,11 @@
 export { runBackup } from "./backup.js";
 // verify-full:只导出**原子** API。刻意不导出裸 SUPABASE_SSL —— 它一旦和 connectionString
 // 搭配使用,URL 里的 sslmode=disable 又会把它覆盖掉,等于把这次修掉的绕过再放回去。
-export { SUPABASE_ROOT_CA, pgConnectOptions } from "./supabase-ca.js";
+export { SUPABASE_ROOT_CA, pgConnectOptions, PG_CLIENT_OPTIONS, normalizeConnectionTarget } from "./supabase-ca.js";
 export { runDrill, drillDump } from "./drill.js";
 export { runRestore } from "./restore.js";
 // 身份判定三件套对外导出:托管 worker 用它们与 app 侧 shared 的副本做同规则回归(交叉审查)
-export { projectRefOf, assertNoHostOverride } from "./restore-engine.js";
+export { projectRefOf, assertNoHostOverride, libpqChildEnv } from "./restore-engine.js";
 export { sameDatabaseTarget } from "./restore.js";
 export { runEstimate, project } from "./estimate.js";
 export { loadConfig } from "./config.js";
