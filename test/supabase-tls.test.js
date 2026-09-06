@@ -225,12 +225,17 @@ test("环境隔离:敌意的 PGPORT/PGDATABASE/PGOPTIONS 在场时,Node 客户�
       "postgresql://u:p@db.example.com/",
       "postgresql://u:p@db.example.com",
       "postgresql://u:p@aws-0-us-east-1.pooler.supabase.com/",
-      "postgresql://u:p@db.example.com/?options=",
+      "postgresql://u:p@db.abcdefghijklmnopqrst.supabase.co/?options=",
     ]) {
       const cp = new Client(pgConnectOptions(url)).connectionParameters;
       assert.equal(String(cp.port), "5432", `port from env leaked for ${url}`);
       assert.equal(cp.database, "postgres", `database from env leaked for ${url}`);
-      assert.equal(cp.options, "-c application_name=backupdrill", `PGOPTIONS leaked for ${url}`);
+      // 租户覆盖只存在于 Supavisor:Supabase 主机必须挡住 PGOPTIONS;自带 Postgres 的主机尊重用户环境
+      if (/supabase\.(co|com)/.test(url)) {
+        assert.equal(cp.options, "-c application_name=backupdrill", `PGOPTIONS leaked for ${url}`);
+      } else {
+        assert.equal(cp.options, "reference=zyxwvutsrqponmlkjihg", `non-Supabase host should keep the user's PGOPTIONS: ${url}`);
+      }
       // 子进程拿到的 --dbname 同样把端口与库名写死
       const dumpUrl = dumpUrlFor(url);
       assert.match(dumpUrl, /:5432\/postgres/, `dump url not pinned for ${url}: ${dumpUrl}`);

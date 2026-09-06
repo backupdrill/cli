@@ -265,21 +265,23 @@ export function dumpUrlFor(databaseUrl: string): string {
  * 非 Supabase 主机(本 CLI 不限制目标)原样返回:不剥、不套,尊重用户自己的 sslmode。
  */
 /**
- * 每个 pg Client 都显式带 startup `options`。为什么:node-postgres 只在 config.options 为假值时
- * 才读环境变量 PGOPTIONS,而 Supavisor 会从 options 里解析 `reference=<ref>` 并让它优先于用户名
- * 里的租户——继承的 PGOPTIONS 能把连接悄悄路由到别的项目(交叉审查)。给一个无害的真值就把
- * 环境变量挡在门外;顺带在 pg_stat_activity 里能认出是谁在连(直连主机时可见,pooler 会改写)。
+ * Supabase 主机的 pg Client 显式带 startup `options`。为什么:node-postgres 只在 config.options
+ * 为假值时才读环境变量 PGOPTIONS,而 Supavisor 会从 options 里解析 `reference=<ref>` 并让它优先于
+ * 用户名里的租户——继承的 PGOPTIONS 能把连接悄悄路由到别的项目(交叉审查)。给一个无害的真值就把
+ * 环境变量挡在门外(Supavisor 与直连 Postgres 都实测接受);顺带在 pg_stat_activity 里能认出是谁在连。
+ * 只对 Supabase 主机做:租户覆盖只存在于 Supavisor,而 PgBouncer 这类中间件默认拒绝陌生的启动参数
+ * (unsupported startup parameter: options),别给自带 Postgres 的用户制造回归。
  */
 export const PG_CLIENT_OPTIONS = "-c application_name=backupdrill";
 
 export function pgConnectOptions(databaseUrl: string): {
   connectionString: string;
-  options: string;
+  options?: string;
   ssl?: typeof SUPABASE_SSL;
 } {
   // 与 dumpUrlFor 同一份规范化:Node 客户端与 libpq 子进程看到的目标必须逐字段一致
   const normalized = normalizeConnectionTarget(databaseUrl);
-  if (!isSupabaseHost(normalized)) return { connectionString: normalized, options: PG_CLIENT_OPTIONS };
+  if (!isSupabaseHost(normalized)) return { connectionString: normalized };
   return { connectionString: stripSslParams(normalized), options: PG_CLIENT_OPTIONS, ssl: SUPABASE_SSL };
 }
 
