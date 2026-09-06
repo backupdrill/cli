@@ -280,6 +280,9 @@ test("normalizeConnectionTarget:删空 options 不重写其它参数(%20 不能�
   assert.equal(normalizeConnectionTarget("postgresql://u:p@db.example.com:5432/db?&application_name=x&"), "postgresql://u:p@db.example.com:5432/db?application_name=x");
   assert.equal(normalizeConnectionTarget("postgresql://u:p@db.example.com:5432/db?options&options=-c%20statement_timeout%3D0"), "postgresql://u:p@db.example.com:5432/db?options=-c%20statement_timeout%3D0");
   assert.equal(normalizeConnectionTarget("postgresql://u:p@db.example.com:5432/db?options=-c%20x%3D1&options"), "postgresql://u:p@db.example.com:5432/db");
+  // 其它键的裸形态两边语义对不上(删掉会让 sslmode=disable 复活成明文):拒绝
+  assert.throws(() => normalizeConnectionTarget("postgresql://u:p@db.example.com:5432/db?sslmode=disable&sslmode"), /has no value/);
+  assert.throws(() => normalizeConnectionTarget("postgresql://u:p@db.example.com:5432/db?application_name"), /has no value/);
   // 全部参数都被删光时不留孤零零的 ?
   assert.equal(normalizeConnectionTarget("postgresql://u:p@db.example.com:5432/db?options="), "postgresql://u:p@db.example.com:5432/db");
   // 用户名含百分号编码时,缺省库名沿用同一编码形态(驱动解码后即用户名)
