@@ -159,6 +159,9 @@ test("projectRefOf / assertNoHostOverride:解码后含 NUL 的用户名不认、
   // WHATWG URL 解析不了、pg 却接受的形态(空主机 + ?host=):不能放行,身份判定为空
   assert.throws(() => assertNoHostOverride("postgresql://postgres.cluster.alias@/postgres?host=aws-0-us-east-1.pooler.supabase.com"), /parsed|override|no host/);
   assert.throws(() => assertNoHostOverride("host=aws-0-us-east-1.pooler.supabase.com user=postgres"), /parsed/);
+  // ?service= / ?servicefile=:libpq 从 pg_service.conf 整段加载 host/options,node-postgres 不认 → 拒绝
+  assert.throws(() => assertNoHostOverride(`postgresql://app:pw@db.example.com/app?service=prod`), /service/);
+  assert.throws(() => assertNoHostOverride(`postgresql://app:pw@aws-0-us-east-1.pooler.supabase.com/postgres?servicefile=%2Fetc%2Fpg_service.conf`), /servicefile/);
   // ?dbname= 覆盖:libpq 用它压过路径,node-postgres 不认 → 两个客户端连到不同的库 → 拒绝(含编码键)
   assert.throws(() => assertNoHostOverride(`postgresql://app:pw@db.example.com/app?dbname=postgres`), /dbname/);
   assert.throws(() => assertNoHostOverride(`postgresql://app:pw@db.example.com?%64bname=postgres`), /dbname/i);
@@ -234,14 +237,16 @@ test("libpqChildEnv:只剔除改写目标/身份的 PG* 变量;TLS 策略、超�
   const base = {
     PATH: "/usr/bin", HOME: "/h",
     PGHOST: "evil", PGHOSTADDR: "1.2.3.4", PGPORT: "65432", PGDATABASE: "evil", PGUSER: "evil",
-    PGPASSFILE: "/x", PGSERVICE: "s", PGSERVICEFILE: "/sf", PGTARGETSESSIONATTRS: "any",
+    PGPASSFILE: "/x", PGSERVICE: "s", PGSERVICEFILE: "/sf", PGSYSCONFDIR: "/etc/pg", PGTARGETSESSIONATTRS: "any",
     PGOPTIONS: "reference=evil",
     PGSSLMODE: "require", PGSSLROOTCERT: "/ca.pem", PGCONNECT_TIMEOUT: "10", PGAPPNAME: "x", PGPASSWORD: "envpw",
   };
   const plain = libpqChildEnv({}, base, { supabaseHost: false });
-  for (const k of ["PGHOST", "PGHOSTADDR", "PGPORT", "PGDATABASE", "PGUSER", "PGPASSFILE", "PGSERVICE", "PGSERVICEFILE", "PGTARGETSESSIONATTRS"]) {
+  for (const k of ["PGHOST", "PGHOSTADDR", "PGPORT", "PGDATABASE", "PGUSER", "PGSERVICE", "PGSERVICEFILE", "PGSYSCONFDIR", "PGTARGETSESSIONATTRS"]) {
     assert.equal(plain[k], undefined, `${k} should be stripped`);
   }
+  // PGPASSFILE 是密码来源不是目标:node-postgres 经 pgpass 也读它,保留才两边一致
+  assert.equal(plain.PGPASSFILE, "/x");
   // 不改目标的变量保留:外部 Postgres 靠 PGSSLMODE=require 上 TLS,不能被降级成 prefer
   assert.equal(plain.PGSSLMODE, "require");
   assert.equal(plain.PGSSLROOTCERT, "/ca.pem");
@@ -260,7 +265,15 @@ test("libpqChildEnv:只剔除改写目标/身份的 PG* 变量;TLS 策略、超�
   // 既有的两参签名(extraEnv, base)不变:第三个参数缺省 = 非 Supabase 主机
   assert.equal(libpqChildEnv({}, base).PGOPTIONS, "reference=evil");
   assert.equal(libpqChildEnv({}, base).PGHOST, undefined);
-  // node-postgres 独有的 no-verify 翻译成 libpq 认识的 require;其它值原样
-  assert.equal(libpqChildEnv({}, { PGSSLMODE: "no-verify" }).PGSSLMODE, "require");
-  assert.equal(libpqChildEnv({}, { PGSSLMODE: "verify-full" }).PGSSLMODE, "verify-full");
+  // node-postgres 独有的 no-verify 翻译成 libpq 认识的 require,并去掉会让 require 升级/拒连的证书变量
+  const translated = libpqChildEnv({}, { PGSSLMODE: "no-verify", PGSSLROOTCERT: "system", PGSSLCRL: "/crl", PGSSLCRLDIR: "/crls", PGSSLCERT: "/c.pem" });
+  assert.equal(translated.PGSSLMODE, "require");
+  assert.equal(translated.PGSSLROOTCERT, undefined);
+  assert.equal(translated.PGSSLCRL, undefined);
+  assert.equal(translated.PGSSLCRLDIR, undefined);
+  assert.equal(translated.PGSSLCERT, "/c.pem"); // 客户端证书不影响"验不验服务器",保留
+  // 其它 sslmode 原样,证书变量也原样
+  const full = libpqChildEnv({}, { PGSSLMODE: "verify-full", PGSSLROOTCERT: "/ca.pem" });
+  assert.equal(full.PGSSLMODE, "verify-full");
+  assert.equal(full.PGSSLROOTCERT, "/ca.pem");
 });
