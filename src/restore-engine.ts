@@ -101,6 +101,23 @@ export interface EngineResult {
   ok: boolean;
 }
 
+/**
+ * libpq 子进程(pg_dump / pg_restore)的环境:剔除父进程里所有 `PG*` 变量,再叠加我们显式要给的
+ * (如 credentialSafeDbArgs 的 PGPASSWORD)。libpq 会读 PGOPTIONS / PGHOST / PGSERVICE / PGPASSFILE
+ * 等几十个环境变量,任何一个都能让实际连接偏离 --dbname 里的 URL(PGOPTIONS=reference=… 甚至能
+ * 换租户)。连接信息全部走 URL,子进程不该继承这些(交叉审查)。
+ */
+export function libpqChildEnv(
+  extraEnv: NodeJS.ProcessEnv = {},
+  base: NodeJS.ProcessEnv = process.env
+): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = {};
+  for (const [key, value] of Object.entries(base)) {
+    if (!/^PG[A-Z_]*$/.test(key)) env[key] = value;
+  }
+  return { ...env, ...extraEnv };
+}
+
 export function spawnPgRestore(
   bin: string,
   args: string[],
@@ -109,7 +126,7 @@ export function spawnPgRestore(
   return new Promise((resolve, reject) => {
     const proc = spawn(bin, args, {
       stdio: ["ignore", "ignore", "pipe"],
-      env: { ...process.env, ...extraEnv },
+      env: libpqChildEnv(extraEnv),
     });
     let stderr = "";
     proc.stderr.on("data", (d: Buffer) => (stderr += d.toString()));

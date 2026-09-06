@@ -214,3 +214,12 @@ test("CA 文件被外部删除后能自愈重建(长驻 worker 不至于之后�
   assert.ok(existsSync(second), "应重建出可用的 CA 文件");
   assert.equal(readFileSync(second, "utf8"), SUPABASE_ROOT_CA);
 });
+
+test("pgConnectOptions:每个连接显式带 options(挡住继承的 PGOPTIONS),直连与 Supabase 主机都一样", () => {
+  const supa = pgConnectOptions("postgresql://u:p@aws-0-us-east-1.pooler.supabase.com:5432/db");
+  const plain = pgConnectOptions("postgresql://u:p@db.example.com:5432/db");
+  assert.equal(supa.options, "-c application_name=backupdrill");
+  assert.equal(plain.options, "-c application_name=backupdrill");
+  // node-postgres 的 val() 只在 config.options 为假值时读 PGOPTIONS:真值 = 环境变量被忽略
+  assert.ok(supa.options.length > 0);
+});
