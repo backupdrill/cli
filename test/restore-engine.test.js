@@ -1,5 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import fs from "node:fs";
 import {
   classifyBlocks,
   finalizePass,
@@ -266,9 +267,14 @@ test("libpqChildEnv:只剔除改写目标/身份的 PG* 变量;TLS 策略、超�
   assert.equal(libpqChildEnv({}, base).PGOPTIONS, "reference=evil");
   assert.equal(libpqChildEnv({}, base).PGHOST, undefined);
   // node-postgres 独有的 no-verify 翻译成 libpq 认识的 require,并去掉会让 require 升级/拒连的证书变量
+  const { NO_VERIFY_ROOTCERT_SENTINEL } = await import("../dist/restore-engine.js");
   const translated = libpqChildEnv({}, { PGSSLMODE: "no-verify", PGSSLROOTCERT: "system", PGSSLCRL: "/crl", PGSSLCRLDIR: "/crls", PGSSLCERT: "/c.pem" });
   assert.equal(translated.PGSSLMODE, "require");
-  assert.equal(translated.PGSSLROOTCERT, undefined);
+  // 指向不存在的路径:libpq 在 require 下跳过验证且不再去找 ~/.postgresql/root.crt
+  assert.equal(translated.PGSSLROOTCERT, NO_VERIFY_ROOTCERT_SENTINEL);
+  assert.ok(!fs.existsSync(NO_VERIFY_ROOTCERT_SENTINEL));
+  // 没有 PGSSLROOTCERT 的 no-verify 同样要设哨兵(默认发现 root.crt 也会升级成 verify-ca)
+  assert.equal(libpqChildEnv({}, { PGSSLMODE: "no-verify" }).PGSSLROOTCERT, NO_VERIFY_ROOTCERT_SENTINEL);
   assert.equal(translated.PGSSLCRL, undefined);
   assert.equal(translated.PGSSLCRLDIR, undefined);
   assert.equal(translated.PGSSLCERT, "/c.pem"); // 客户端证书不影响"验不验服务器",保留

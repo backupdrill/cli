@@ -257,10 +257,13 @@ test("normalizeConnectionTarget:删空 options 不重写其它参数(%20 不能�
   const { normalizeConnectionTarget } = await import("../dist/supabase-ca.js");
   const a = normalizeConnectionTarget("postgresql://u:p@db.example.com:5432/db?options=&password=hello%20world&x=a+b");
   assert.equal(a, "postgresql://u:p@db.example.com:5432/db?password=hello%20world&x=a+b");
+  // 重复 options 按"最后一个生效":最后一个非空 → 整组原样保留;最后一个为空 → 整组剔除
+  // (只删空的会让更早的非空 options 复活,例如把只读模式偷偷开回来——交叉审查)
   const b = normalizeConnectionTarget("postgresql://u:p@db.example.com:5432/db?options=&options=-c%20search_path%3Dapp");
-  assert.equal(b, "postgresql://u:p@db.example.com:5432/db?options=-c%20search_path%3Dapp");
-  const c = normalizeConnectionTarget("postgresql://u:p@db.example.com:5432/db?options=-c%20search_path%3Dapp&options=");
-  assert.equal(c, "postgresql://u:p@db.example.com:5432/db?options=-c%20search_path%3Dapp");
+  assert.equal(b, "postgresql://u:p@db.example.com:5432/db?options=&options=-c%20search_path%3Dapp");
+  const c = normalizeConnectionTarget("postgresql://u:p@db.example.com:5432/db?options=-c%20default_transaction_read_only%3Don&options=");
+  assert.equal(c, "postgresql://u:p@db.example.com:5432/db");
+  assert.equal(new Client(pgConnectOptions("postgresql://u:p@db.example.com:5432/db?options=-c%20x%3D1&options=")).connectionParameters.options, undefined);
   // 全部参数都被删光时不留孤零零的 ?
   assert.equal(normalizeConnectionTarget("postgresql://u:p@db.example.com:5432/db?options="), "postgresql://u:p@db.example.com:5432/db");
   // 用户名含百分号编码时,缺省库名沿用同一编码形态(驱动解码后即用户名)

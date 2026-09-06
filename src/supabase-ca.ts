@@ -276,27 +276,32 @@ export function normalizeConnectionTarget(databaseUrl: string): string {
     }
     if (libpqView !== user || nodeView !== user) throw new Error(explicit);
   }
-  // 空的 options 参数按原文剔除:不经 URLSearchParams 重新序列化,否则其它参数值里的 %20
-  // 会被改写成 +(pg 解成空格、libpq 按字面 + 处理,两边密码就对不上);只删空值,非空的
-  // options 是用户显式意图,原样保留(含重复出现时的非空那份)
+  // options 参数按"最后一个生效"的驱动语义处理(pg-connection-string 与 libpq 对重复参数都取最后
+  // 一个):最后一个 options 为空 → 整组 options 全部剔除(空值会让 pg 回退读 PGOPTIONS;只删空的
+  // 那份会让更早的非空 options 复活,改变语义——交叉审查);最后一个非空 → 原样保留整组。
+  // 按原文操作、不经 URLSearchParams 重新序列化,否则其它参数值里的 %20 会被改写成 +
+  // (pg 解成空格、libpq 按字面 + 处理,两边密码就对不上)。
   if (url.search) {
-    const kept = url.search
-      .slice(1)
-      .split("&")
-      .filter((pair) => {
-        if (pair === "") return false;
-        const eq = pair.indexOf("=");
-        const rawKey = eq === -1 ? pair : pair.slice(0, eq);
-        const value = eq === -1 ? "" : pair.slice(eq + 1);
-        let key = rawKey;
-        try {
-          key = decodeURIComponent(rawKey);
-        } catch {
-          // 编码坏了按原文比对
-        }
-        return !(key.toLowerCase() === "options" && value === "");
-      });
-    url.search = kept.length ? `?${kept.join("&")}` : "";
+    const pairs = url.search.slice(1).split("&").filter((pair) => pair !== "");
+    const keyOf = (pair: string): string => {
+      const eq = pair.indexOf("=");
+      const rawKey = eq === -1 ? pair : pair.slice(0, eq);
+      try {
+        return decodeURIComponent(rawKey).toLowerCase();
+      } catch {
+        return rawKey.toLowerCase(); // 编码坏了按原文比对
+      }
+    };
+    const valueOf = (pair: string): string => {
+      const eq = pair.indexOf("=");
+      return eq === -1 ? "" : pair.slice(eq + 1);
+    };
+    const optionPairs = pairs.filter((pair) => keyOf(pair) === "options");
+    const lastIsEmpty = optionPairs.length > 0 && valueOf(optionPairs[optionPairs.length - 1]) === "";
+    if (lastIsEmpty) {
+      const kept = pairs.filter((pair) => keyOf(pair) !== "options");
+      url.search = kept.length ? `?${kept.join("&")}` : "";
+    }
   }
   return url.toString();
 }
