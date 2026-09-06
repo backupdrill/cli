@@ -159,6 +159,10 @@ test("projectRefOf / assertNoHostOverride:解码后含 NUL 的用户名不认、
   // WHATWG URL 解析不了、pg 却接受的形态(空主机 + ?host=):不能放行,身份判定为空
   assert.throws(() => assertNoHostOverride("postgresql://postgres.cluster.alias@/postgres?host=aws-0-us-east-1.pooler.supabase.com"), /parsed|override|no host/);
   assert.throws(() => assertNoHostOverride("host=aws-0-us-east-1.pooler.supabase.com user=postgres"), /parsed/);
+  // ?dbname= 覆盖:libpq 用它压过路径,node-postgres 不认 → 两个客户端连到不同的库 → 拒绝(含编码键)
+  assert.throws(() => assertNoHostOverride(`postgresql://app:pw@db.example.com/app?dbname=postgres`), /dbname/);
+  assert.throws(() => assertNoHostOverride(`postgresql://app:pw@db.example.com?%64bname=postgres`), /dbname/i);
+  assert.throws(() => assertNoHostOverride(`postgresql://app:pw@db.example.com/app?DBNAME=postgres`), /dbname/i);
   // 空 authority:主机只能来自环境变量,Node 与子进程各自回退 → 拒绝
   assert.throws(() => assertNoHostOverride("postgresql:///postgres"), /no host/);
   // 带 userinfo 却空主机的形态 WHATWG 直接解析失败:同样是拒绝,只是文案不同
