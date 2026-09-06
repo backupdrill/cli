@@ -216,7 +216,7 @@ function effectiveHost(databaseUrl: string): string | null {
   return host || null;
 }
 
-function isSupabaseHost(databaseUrl: string): boolean {
+export function isSupabaseHost(databaseUrl: string): boolean {
   const host = effectiveHost(databaseUrl);
   return host !== null && SUPABASE_HOST.test(host);
 }
@@ -240,9 +240,31 @@ export function normalizeConnectionTarget(databaseUrl: string): string {
     return databaseUrl;
   }
   if (!url.port) url.port = "5432";
-  if (!url.pathname || url.pathname === "/") url.pathname = "/postgres";
-  if (url.searchParams.has("options") && url.searchParams.get("options") === "") {
-    url.searchParams.delete("options");
+  // 库名缺省 = 用户名:这是 libpq 与 node-postgres 共同的语义(两者都在 dbname 缺失时回退到
+  // user),写死它只是不让环境变量 PGDATABASE 插进来,不改变既有连接串的目标(交叉审查:
+  // 曾错写成 postgres,会让 postgresql://app:pw@host 这类外部库串静默换库)
+  if (!url.pathname || url.pathname === "/") url.pathname = `/${url.username}`;
+  // 空的 options 参数按原文剔除:不经 URLSearchParams 重新序列化,否则其它参数值里的 %20
+  // 会被改写成 +(pg 解成空格、libpq 按字面 + 处理,两边密码就对不上);只删空值,非空的
+  // options 是用户显式意图,原样保留(含重复出现时的非空那份)
+  if (url.search) {
+    const kept = url.search
+      .slice(1)
+      .split("&")
+      .filter((pair) => {
+        if (pair === "") return false;
+        const eq = pair.indexOf("=");
+        const rawKey = eq === -1 ? pair : pair.slice(0, eq);
+        const value = eq === -1 ? "" : pair.slice(eq + 1);
+        let key = rawKey;
+        try {
+          key = decodeURIComponent(rawKey);
+        } catch {
+          // 编码坏了按原文比对
+        }
+        return !(key.toLowerCase() === "options" && value === "");
+      });
+    url.search = kept.length ? `?${kept.join("&")}` : "";
   }
   return url.toString();
 }

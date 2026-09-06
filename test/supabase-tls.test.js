@@ -222,26 +222,26 @@ test("环境隔离:敌意的 PGPORT/PGDATABASE/PGOPTIONS 在场时,Node 客户�
   process.env.PGOPTIONS = "reference=zyxwvutsrqponmlkjihg";
   try {
     for (const url of [
-      "postgresql://u:p@db.example.com/",
-      "postgresql://u:p@db.example.com",
-      "postgresql://u:p@aws-0-us-east-1.pooler.supabase.com/",
-      "postgresql://u:p@db.abcdefghijklmnopqrst.supabase.co/?options=",
+      "postgresql://appuser:p@db.example.com/",
+      "postgresql://appuser:p@db.example.com",
+      "postgresql://postgres.abcdefghijklmnopqrst:p@aws-0-us-east-1.pooler.supabase.com/",
+      "postgresql://postgres:p@db.abcdefghijklmnopqrst.supabase.co/?options=",
     ]) {
       const cp = new Client(pgConnectOptions(url)).connectionParameters;
+      const user = new URL(url).username;
       assert.equal(String(cp.port), "5432", `port from env leaked for ${url}`);
-      assert.equal(cp.database, "postgres", `database from env leaked for ${url}`);
-      // 租户覆盖只存在于 Supavisor:Supabase 主机必须挡住 PGOPTIONS;自带 Postgres 的主机尊重用户环境
+      // 库名缺省 = 用户名(libpq 与 node-postgres 的共同语义),不是环境变量,也不是 postgres
+      assert.equal(cp.database, user, `database default wrong for ${url}: ${cp.database}`);
       if (/supabase\.(co|com)/.test(url)) {
         assert.equal(cp.options, "-c application_name=backupdrill", `PGOPTIONS leaked for ${url}`);
       } else {
         assert.equal(cp.options, "reference=zyxwvutsrqponmlkjihg", `non-Supabase host should keep the user's PGOPTIONS: ${url}`);
       }
-      // 子进程拿到的 --dbname 同样把端口与库名写死
       const dumpUrl = dumpUrlFor(url);
-      assert.match(dumpUrl, /:5432\/postgres/, `dump url not pinned for ${url}: ${dumpUrl}`);
-      assert.doesNotMatch(dumpUrl, /options=(&|$)/);
+      assert.ok(dumpUrl.includes(`:5432/${user}`), `dump url not pinned for ${url}: ${dumpUrl}`);
+      assert.doesNotMatch(dumpUrl, /[?&]options=(&|$)/);
     }
-    // URL 里显式写了端口/库名/非空 options 的,原样尊重(那是用户意图,不是环境变量)
+    // URL 里显式写了端口/库名/非空 options 的,原样尊重
     const explicit = new Client(pgConnectOptions("postgresql://u:p@db.example.com:6543/mydb?options=-c%20search_path%3Dapp")).connectionParameters;
     assert.equal(String(explicit.port), "6543");
     assert.equal(explicit.database, "mydb");
@@ -251,4 +251,18 @@ test("环境隔离:敌意的 PGPORT/PGDATABASE/PGOPTIONS 在场时,Node 客户�
       if (v === undefined) delete process.env[k]; else process.env[k] = v;
     }
   }
+});
+
+test("normalizeConnectionTarget:删空 options 不重写其它参数(%20 不能变 +);重复 options 只删空的那份", async () => {
+  const { normalizeConnectionTarget } = await import("../dist/supabase-ca.js");
+  const a = normalizeConnectionTarget("postgresql://u:p@db.example.com:5432/db?options=&password=hello%20world&x=a+b");
+  assert.equal(a, "postgresql://u:p@db.example.com:5432/db?password=hello%20world&x=a+b");
+  const b = normalizeConnectionTarget("postgresql://u:p@db.example.com:5432/db?options=&options=-c%20search_path%3Dapp");
+  assert.equal(b, "postgresql://u:p@db.example.com:5432/db?options=-c%20search_path%3Dapp");
+  const c = normalizeConnectionTarget("postgresql://u:p@db.example.com:5432/db?options=-c%20search_path%3Dapp&options=");
+  assert.equal(c, "postgresql://u:p@db.example.com:5432/db?options=-c%20search_path%3Dapp");
+  // 全部参数都被删光时不留孤零零的 ?
+  assert.equal(normalizeConnectionTarget("postgresql://u:p@db.example.com:5432/db?options="), "postgresql://u:p@db.example.com:5432/db");
+  // 用户名含百分号编码时,缺省库名沿用同一编码形态(驱动解码后即用户名)
+  assert.equal(normalizeConnectionTarget("postgresql://app%2Dro:p@db.example.com"), "postgresql://app%2Dro:p@db.example.com:5432/app%2Dro");
 });
