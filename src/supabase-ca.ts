@@ -222,10 +222,36 @@ function isSupabaseHost(databaseUrl: string): boolean {
 }
 
 /** pg_dump 用:Supabase 主机才改写成 verify-full;其它原样透传。 */
+/**
+ * 把连接目标写死在连接串里:端口缺省 5432、库名缺省 postgres、并去掉**空的** options 参数。
+ * 为什么:node-pg 与 libpq 对"URL 里没写的字段"各自回退到环境变量(PGPORT / PGDATABASE /
+ * PGOPTIONS…)。子进程环境已剔除 PG*,而 Node 侧的预检客户端仍会读——两边可能连到不同的
+ * 库/端口,空目标检查看的是一个库、pg_restore 写的是另一个(交叉审查)。Node 客户端与
+ * pg_dump/pg_restore 都用规范化后的串,谁也不再依赖环境变量补字段。
+ * 空的 `?options=` 会让 pg 的 val() 回退读 PGOPTIONS,同样去掉;非空 options 是用户显式意图,
+ * 保留(pooler 主机上任何 options 已被 assertNoHostOverride 拒绝)。
+ * 解析不了的串原样返回:上游守卫(assertNoHostOverride / assertSafeDatabaseUrl)负责拒绝。
+ */
+export function normalizeConnectionTarget(databaseUrl: string): string {
+  let url: URL;
+  try {
+    url = new URL(databaseUrl);
+  } catch {
+    return databaseUrl;
+  }
+  if (!url.port) url.port = "5432";
+  if (!url.pathname || url.pathname === "/") url.pathname = "/postgres";
+  if (url.searchParams.has("options") && url.searchParams.get("options") === "") {
+    url.searchParams.delete("options");
+  }
+  return url.toString();
+}
+
 export function dumpUrlFor(databaseUrl: string): string {
-  return isSupabaseHost(databaseUrl)
-    ? forceVerifyFull(databaseUrl, supabaseCaFile())
-    : databaseUrl;
+  const normalized = normalizeConnectionTarget(databaseUrl);
+  return isSupabaseHost(normalized)
+    ? forceVerifyFull(normalized, supabaseCaFile())
+    : normalized;
 }
 
 /**
@@ -238,12 +264,25 @@ export function dumpUrlFor(databaseUrl: string): string {
  *
  * 非 Supabase 主机(本 CLI 不限制目标)原样返回:不剥、不套,尊重用户自己的 sslmode。
  */
+/**
+ * Supabase 主机的 pg Client 显式带 startup `options`。为什么:node-postgres 只在 config.options
+ * 为假值时才读环境变量 PGOPTIONS,而 Supavisor 会从 options 里解析 `reference=<ref>` 并让它优先于
+ * 用户名里的租户——继承的 PGOPTIONS 能把连接悄悄路由到别的项目(交叉审查)。给一个无害的真值就把
+ * 环境变量挡在门外(Supavisor 与直连 Postgres 都实测接受);顺带在 pg_stat_activity 里能认出是谁在连。
+ * 只对 Supabase 主机做:租户覆盖只存在于 Supavisor,而 PgBouncer 这类中间件默认拒绝陌生的启动参数
+ * (unsupported startup parameter: options),别给自带 Postgres 的用户制造回归。
+ */
+export const PG_CLIENT_OPTIONS = "-c application_name=backupdrill";
+
 export function pgConnectOptions(databaseUrl: string): {
   connectionString: string;
+  options?: string;
   ssl?: typeof SUPABASE_SSL;
 } {
-  if (!isSupabaseHost(databaseUrl)) return { connectionString: databaseUrl };
-  return { connectionString: stripSslParams(databaseUrl), ssl: SUPABASE_SSL };
+  // 与 dumpUrlFor 同一份规范化:Node 客户端与 libpq 子进程看到的目标必须逐字段一致
+  const normalized = normalizeConnectionTarget(databaseUrl);
+  if (!isSupabaseHost(normalized)) return { connectionString: normalized };
+  return { connectionString: stripSslParams(normalized), options: PG_CLIENT_OPTIONS, ssl: SUPABASE_SSL };
 }
 
 /**
