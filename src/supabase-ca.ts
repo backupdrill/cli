@@ -301,10 +301,18 @@ export function normalizeConnectionTarget(databaseUrl: string): string {
     };
     const optionPairs = pairs.filter((pair) => keyOf(pair) === "options");
     const lastIsEmpty = optionPairs.length > 0 && valueOf(optionPairs[optionPairs.length - 1]) === "";
+    // 其它键的裸形态(?sslmode=disable&sslmode)两边语义对不上:Node 取最后一个(空 → 回退环境变量),
+    // libpq 直接报错;静默删掉会让更早的值(这里是 disable = 明文)复活。不猜,拒绝(交叉审查)。
+    const bareOther = pairs.find((pair) => !pair.includes("=") && keyOf(pair) !== "options");
+    if (bareOther !== undefined) {
+      throw new Error(
+        `connection string parameter "${keyOf(bareOther)}" has no value — remove it or give it a value.`
+      );
+    }
     const kept = pairs.filter((pair) => {
-      // options 组:最后一个为空 → 整组删;否则只留带 = 的(裸键 libpq 报错,且已被后面的值取代)
+      // options 组:最后一个为空/裸 → 整组删;否则只留带 = 的(裸的已被后面的值取代,libpq 会报错)
       if (keyOf(pair) === "options") return !lastIsEmpty && pair.includes("=");
-      return pair.includes("="); // 其它裸键 libpq 也会拒,清掉
+      return true;
     });
     url.search = kept.length ? `?${kept.join("&")}` : "";
   }

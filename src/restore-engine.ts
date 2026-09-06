@@ -164,7 +164,10 @@ export const NO_VERIFY_ROOTCERT_SENTINEL = "/nonexistent/backupdrill-no-verify-r
 /** 连接串 query 里的 sslmode(驱动语义:URL 优先于环境变量);解析不了或没写 → null。 */
 export function urlSslModeOf(connString: string): string | null {
   try {
-    return new URL(connString).searchParams.get("sslmode");
+    // 重复参数两个驱动都取最后一个;最后一个为空视同没写(pg 会回退环境变量)
+    const all = new URL(connString).searchParams.getAll("sslmode");
+    const last = all.length ? all[all.length - 1] : "";
+    return last === "" ? null : last;
   } catch {
     return null;
   }

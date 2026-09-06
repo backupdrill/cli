@@ -283,6 +283,9 @@ test("libpqChildEnv:只剔除改写目标/身份的 PG* 变量;TLS 策略、超�
   assert.equal(urlSslModeOf("postgresql://u:p@h/db?sslmode=verify-full"), "verify-full");
   assert.equal(urlSslModeOf("postgresql://u:p@h/db"), null);
   assert.equal(urlSslModeOf("not a url"), null);
+  // 重复参数取最后一个(libpq 与 pg 同);最后一个为空视同没写
+  assert.equal(urlSslModeOf("postgresql://u:p@h/db?sslmode=&sslmode=verify-full"), "verify-full");
+  assert.equal(urlSslModeOf("postgresql://u:p@h/db?sslmode=verify-full&sslmode="), null);
   assert.equal(translated.PGSSLCRL, undefined);
   assert.equal(translated.PGSSLCRLDIR, undefined);
   assert.equal(translated.PGSSLCERT, "/c.pem"); // 客户端证书不影响"验不验服务器",保留
