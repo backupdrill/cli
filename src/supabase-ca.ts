@@ -222,10 +222,36 @@ function isSupabaseHost(databaseUrl: string): boolean {
 }
 
 /** pg_dump 用:Supabase 主机才改写成 verify-full;其它原样透传。 */
+/**
+ * 把连接目标写死在连接串里:端口缺省 5432、库名缺省 postgres、并去掉**空的** options 参数。
+ * 为什么:node-pg 与 libpq 对"URL 里没写的字段"各自回退到环境变量(PGPORT / PGDATABASE /
+ * PGOPTIONS…)。子进程环境已剔除 PG*,而 Node 侧的预检客户端仍会读——两边可能连到不同的
+ * 库/端口,空目标检查看的是一个库、pg_restore 写的是另一个(交叉审查)。Node 客户端与
+ * pg_dump/pg_restore 都用规范化后的串,谁也不再依赖环境变量补字段。
+ * 空的 `?options=` 会让 pg 的 val() 回退读 PGOPTIONS,同样去掉;非空 options 是用户显式意图,
+ * 保留(pooler 主机上任何 options 已被 assertNoHostOverride 拒绝)。
+ * 解析不了的串原样返回:上游守卫(assertNoHostOverride / assertSafeDatabaseUrl)负责拒绝。
+ */
+export function normalizeConnectionTarget(databaseUrl: string): string {
+  let url: URL;
+  try {
+    url = new URL(databaseUrl);
+  } catch {
+    return databaseUrl;
+  }
+  if (!url.port) url.port = "5432";
+  if (!url.pathname || url.pathname === "/") url.pathname = "/postgres";
+  if (url.searchParams.has("options") && url.searchParams.get("options") === "") {
+    url.searchParams.delete("options");
+  }
+  return url.toString();
+}
+
 export function dumpUrlFor(databaseUrl: string): string {
-  return isSupabaseHost(databaseUrl)
-    ? forceVerifyFull(databaseUrl, supabaseCaFile())
-    : databaseUrl;
+  const normalized = normalizeConnectionTarget(databaseUrl);
+  return isSupabaseHost(normalized)
+    ? forceVerifyFull(normalized, supabaseCaFile())
+    : normalized;
 }
 
 /**
@@ -251,8 +277,10 @@ export function pgConnectOptions(databaseUrl: string): {
   options: string;
   ssl?: typeof SUPABASE_SSL;
 } {
-  if (!isSupabaseHost(databaseUrl)) return { connectionString: databaseUrl, options: PG_CLIENT_OPTIONS };
-  return { connectionString: stripSslParams(databaseUrl), options: PG_CLIENT_OPTIONS, ssl: SUPABASE_SSL };
+  // 与 dumpUrlFor 同一份规范化:Node 客户端与 libpq 子进程看到的目标必须逐字段一致
+  const normalized = normalizeConnectionTarget(databaseUrl);
+  if (!isSupabaseHost(normalized)) return { connectionString: normalized, options: PG_CLIENT_OPTIONS };
+  return { connectionString: stripSslParams(normalized), options: PG_CLIENT_OPTIONS, ssl: SUPABASE_SSL };
 }
 
 /**
