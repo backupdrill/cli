@@ -309,6 +309,11 @@ export function normalizeConnectionTarget(databaseUrl: string): string {
         `connection string parameter "${keyOf(bareOther)}" has no value — remove it or give it a value.`
       );
     }
+    // 空的 sslmode(?sslmode=)两边对不上:libpq 报 invalid sslmode value,Node 回退环境变量——拒绝。
+    // 只管 sslmode:空 host= 等已有各自的既定处理(stripSslParams / forceVerifyFull 那套),不在这里动
+    if (pairs.some((pair) => keyOf(pair) === "sslmode" && pair.includes("=") && valueOf(pair) === "")) {
+      throw new Error('connection string parameter "sslmode" is empty — remove it or give it a value.');
+    }
     const kept = pairs.filter((pair) => {
       // options 组:最后一个为空/裸 → 整组删;否则只留带 = 的(裸的已被后面的值取代,libpq 会报错)
       if (keyOf(pair) === "options") return !lastIsEmpty && pair.includes("=");
