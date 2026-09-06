@@ -275,6 +275,14 @@ test("libpqChildEnv:只剔除改写目标/身份的 PG* 变量;TLS 策略、超�
   assert.ok(!fs.existsSync(NO_VERIFY_ROOTCERT_SENTINEL));
   // 没有 PGSSLROOTCERT 的 no-verify 同样要设哨兵(默认发现 root.crt 也会升级成 verify-ca)
   assert.equal(libpqChildEnv({}, { PGSSLMODE: "no-verify" }).PGSSLROOTCERT, NO_VERIFY_ROOTCERT_SENTINEL);
+  // URL 自带 sslmode(压过环境变量)时不翻译、不设哨兵:verify-full 还得靠 ~/.postgresql/root.crt
+  const urlPinned = libpqChildEnv({}, { PGSSLMODE: "no-verify", PGSSLROOTCERT: "/ca.pem" }, { supabaseHost: false, urlSslMode: "verify-full" });
+  assert.equal(urlPinned.PGSSLMODE, "no-verify");
+  assert.equal(urlPinned.PGSSLROOTCERT, "/ca.pem");
+  const { urlSslModeOf } = await import("../dist/restore-engine.js");
+  assert.equal(urlSslModeOf("postgresql://u:p@h/db?sslmode=verify-full"), "verify-full");
+  assert.equal(urlSslModeOf("postgresql://u:p@h/db"), null);
+  assert.equal(urlSslModeOf("not a url"), null);
   assert.equal(translated.PGSSLCRL, undefined);
   assert.equal(translated.PGSSLCRLDIR, undefined);
   assert.equal(translated.PGSSLCERT, "/c.pem"); // 客户端证书不影响"验不验服务器",保留

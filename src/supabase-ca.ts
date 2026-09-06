@@ -282,14 +282,17 @@ export function normalizeConnectionTarget(databaseUrl: string): string {
   // 按原文操作、不经 URLSearchParams 重新序列化,否则其它参数值里的 %20 会被改写成 +
   // (pg 解成空格、libpq 按字面 + 处理,两边密码就对不上)。
   if (url.search) {
+    // 空片段(?&x=1)与无 = 的裸键(?options&…)Node 能容忍、libpq 报 "missing key/value separator":
+    // 一律清掉,两边看到同一份 query。键按**大小写敏感**比对:驱动的键是大小写敏感的
+    // (OPTIONS 对 pg 是另一个键、对 libpq 是非法关键字),按不敏感归组会把合法的小写 options 一起删掉。
     const pairs = url.search.slice(1).split("&").filter((pair) => pair !== "");
     const keyOf = (pair: string): string => {
       const eq = pair.indexOf("=");
       const rawKey = eq === -1 ? pair : pair.slice(0, eq);
       try {
-        return decodeURIComponent(rawKey).toLowerCase();
+        return decodeURIComponent(rawKey);
       } catch {
-        return rawKey.toLowerCase(); // 编码坏了按原文比对
+        return rawKey; // 编码坏了按原文比对
       }
     };
     const valueOf = (pair: string): string => {
@@ -298,10 +301,12 @@ export function normalizeConnectionTarget(databaseUrl: string): string {
     };
     const optionPairs = pairs.filter((pair) => keyOf(pair) === "options");
     const lastIsEmpty = optionPairs.length > 0 && valueOf(optionPairs[optionPairs.length - 1]) === "";
-    if (lastIsEmpty) {
-      const kept = pairs.filter((pair) => keyOf(pair) !== "options");
-      url.search = kept.length ? `?${kept.join("&")}` : "";
-    }
+    const kept = pairs.filter((pair) => {
+      // options 组:最后一个为空 → 整组删;否则只留带 = 的(裸键 libpq 报错,且已被后面的值取代)
+      if (keyOf(pair) === "options") return !lastIsEmpty && pair.includes("=");
+      return pair.includes("="); // 其它裸键 libpq 也会拒,清掉
+    });
+    url.search = kept.length ? `?${kept.join("&")}` : "";
   }
   return url.toString();
 }

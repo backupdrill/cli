@@ -131,7 +131,7 @@ const LIBPQ_TARGET_ENV = new Set([
 export function libpqChildEnv(
   extraEnv: NodeJS.ProcessEnv = {},
   base: NodeJS.ProcessEnv = process.env,
-  opts: { supabaseHost: boolean } = { supabaseHost: false }
+  opts: { supabaseHost: boolean; urlSslMode?: string | null } = { supabaseHost: false }
 ): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = {};
   // node-postgres 独有的 sslmode 值:no-verify = 加密但**不验证书**。libpq 里最接近的是 require,
@@ -139,7 +139,9 @@ export function libpqChildEnv(
   // 发现 ~/.postgresql/root.crt 都算),遇到 sslrootcert=system 还直接拒连。翻译时:去掉 CRL 变量,
   // 并把 PGSSLROOTCERT 指向一个不存在的路径——libpq 对显式路径 stat 失败时在 require 模式下
   // 跳过验证、且不再去找默认的 root.crt,子进程才真的是"加密、不验",与 Node 侧一致(交叉审查)。
-  const noVerify = base.PGSSLMODE === "no-verify";
+  // URL 里自带 sslmode 时它压过环境变量(两个客户端都如此),这时不做 no-verify 翻译——否则
+  // 哨兵根证书会让 verify-full 因"证书文件不存在"而拒连(交叉审查)
+  const noVerify = base.PGSSLMODE === "no-verify" && !opts.urlSslMode;
   for (const [key, value] of Object.entries(base)) {
     if (LIBPQ_TARGET_ENV.has(key)) continue;
     if (opts.supabaseHost && key === "PGOPTIONS") continue;
@@ -159,11 +161,20 @@ export function libpqChildEnv(
 /** 见 libpqChildEnv:一个绝不存在的根证书路径 = 让 libpq 的 require 既不验证也不去找默认 root.crt。 */
 export const NO_VERIFY_ROOTCERT_SENTINEL = "/nonexistent/backupdrill-no-verify-root.crt";
 
+/** 连接串 query 里的 sslmode(驱动语义:URL 优先于环境变量);解析不了或没写 → null。 */
+export function urlSslModeOf(connString: string): string | null {
+  try {
+    return new URL(connString).searchParams.get("sslmode");
+  } catch {
+    return null;
+  }
+}
+
 export function spawnPgRestore(
   bin: string,
   args: string[],
   extraEnv: NodeJS.ProcessEnv = {},
-  opts: { supabaseHost: boolean } = { supabaseHost: false }
+  opts: { supabaseHost: boolean; urlSslMode?: string | null } = { supabaseHost: false }
 ): Promise<{ code: number | null; stderr: string }> {
   return new Promise((resolve, reject) => {
     const proc = spawn(bin, args, {
@@ -447,7 +458,7 @@ export async function restoreDatabaseArtifact(opts: {
   // 中间人可拿到连接与数据);沙箱/外部主机原样透传。先改写 SSL 再拆密码。
   const { url, env } = credentialSafeDbArgs(dumpUrlFor(opts.connString));
   const common = ["--no-owner", "--no-privileges", "--dbname", url, opts.dumpPath];
-  const childOpts = { supabaseHost: isSupabaseHost(opts.connString) };
+  const childOpts = { supabaseHost: isSupabaseHost(opts.connString), urlSslMode: urlSslModeOf(url) };
 
   const first = await spawnPgRestore(bin, ["--section=pre-data", "--section=data", ...common], env, childOpts);
   const preData = finalizePass(

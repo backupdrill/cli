@@ -263,7 +263,23 @@ test("normalizeConnectionTarget:删空 options 不重写其它参数(%20 不能�
   assert.equal(b, "postgresql://u:p@db.example.com:5432/db?options=&options=-c%20search_path%3Dapp");
   const c = normalizeConnectionTarget("postgresql://u:p@db.example.com:5432/db?options=-c%20default_transaction_read_only%3Don&options=");
   assert.equal(c, "postgresql://u:p@db.example.com:5432/db");
-  assert.equal(new Client(pgConnectOptions("postgresql://u:p@db.example.com:5432/db?options=-c%20x%3D1&options=")).connectionParameters.options, undefined);
+  {
+    // 这条断言依赖环境里没有 PGOPTIONS(外部主机刻意继承它):先清掉再恢复
+    const savedOptions = process.env.PGOPTIONS;
+    delete process.env.PGOPTIONS;
+    try {
+      assert.equal(new Client(pgConnectOptions("postgresql://u:p@db.example.com:5432/db?options=-c%20x%3D1&options=")).connectionParameters.options, undefined);
+    } finally {
+      if (savedOptions !== undefined) process.env.PGOPTIONS = savedOptions;
+    }
+  }
+  // 键大小写敏感:OPTIONS 是另一个键(pg 不认、libpq 拒),不能把合法的小写 options 一起删掉
+  const d = normalizeConnectionTarget("postgresql://u:p@db.example.com:5432/db?options=-c%20default_transaction_read_only%3Don&OPTIONS=");
+  assert.equal(d, "postgresql://u:p@db.example.com:5432/db?options=-c%20default_transaction_read_only%3Don&OPTIONS=");
+  // 空片段与裸键一律清掉(libpq 会报 missing key/value separator,Node 却接受)
+  assert.equal(normalizeConnectionTarget("postgresql://u:p@db.example.com:5432/db?&application_name=x&"), "postgresql://u:p@db.example.com:5432/db?application_name=x");
+  assert.equal(normalizeConnectionTarget("postgresql://u:p@db.example.com:5432/db?options&options=-c%20statement_timeout%3D0"), "postgresql://u:p@db.example.com:5432/db?options=-c%20statement_timeout%3D0");
+  assert.equal(normalizeConnectionTarget("postgresql://u:p@db.example.com:5432/db?options=-c%20x%3D1&options"), "postgresql://u:p@db.example.com:5432/db");
   // 全部参数都被删光时不留孤零零的 ?
   assert.equal(normalizeConnectionTarget("postgresql://u:p@db.example.com:5432/db?options="), "postgresql://u:p@db.example.com:5432/db");
   // 用户名含百分号编码时,缺省库名沿用同一编码形态(驱动解码后即用户名)
