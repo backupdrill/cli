@@ -221,19 +221,32 @@ test("pg_restore 的连接串经 dumpUrlFor:Supabase 主机 verify-full+CA,沙�
   assert.ok(!sandbox.url.includes("sslrootcert"), "非 Supabase 主机不套 CA");
 });
 
-test("libpqChildEnv:剔除父进程全部 PG* 变量,保留其它变量并叠加显式给的", async () => {
+test("libpqChildEnv:只剔除改写目标/身份的 PG* 变量;TLS 策略、超时、PGPASSWORD 保留;PGOPTIONS 只在 Supabase 主机剔除", async () => {
   const { libpqChildEnv } = await import("../dist/restore-engine.js");
-  const base = { PATH: "/usr/bin", HOME: "/h", PGOPTIONS: "reference=evil", PGHOST: "evil", PGPASSFILE: "/x", PGSERVICE: "s", PG: "x", PGX_NOT_LIBPQ: "y", PGlower: "keep?" };
-  const env = libpqChildEnv({ PGPASSWORD: "pw" }, base);
-  assert.equal(env.PATH, "/usr/bin");
-  assert.equal(env.HOME, "/h");
-  assert.equal(env.PGOPTIONS, undefined);
-  assert.equal(env.PGHOST, undefined);
-  assert.equal(env.PGPASSFILE, undefined);
-  assert.equal(env.PGSERVICE, undefined);
-  assert.equal(env.PG, undefined);
-  assert.equal(env.PGX_NOT_LIBPQ, undefined);
-  // 小写不是 libpq 变量(libpq 只认大写),照常保留
-  assert.equal(env.PGlower, "keep?");
-  assert.equal(env.PGPASSWORD, "pw");
+  const base = {
+    PATH: "/usr/bin", HOME: "/h",
+    PGHOST: "evil", PGHOSTADDR: "1.2.3.4", PGPORT: "65432", PGDATABASE: "evil", PGUSER: "evil",
+    PGPASSFILE: "/x", PGSERVICE: "s", PGSERVICEFILE: "/sf", PGTARGETSESSIONATTRS: "any",
+    PGOPTIONS: "reference=evil",
+    PGSSLMODE: "require", PGSSLROOTCERT: "/ca.pem", PGCONNECT_TIMEOUT: "10", PGAPPNAME: "x", PGPASSWORD: "envpw",
+  };
+  const plain = libpqChildEnv({}, { supabaseHost: false }, base);
+  for (const k of ["PGHOST", "PGHOSTADDR", "PGPORT", "PGDATABASE", "PGUSER", "PGPASSFILE", "PGSERVICE", "PGSERVICEFILE", "PGTARGETSESSIONATTRS"]) {
+    assert.equal(plain[k], undefined, `${k} should be stripped`);
+  }
+  // 不改目标的变量保留:外部 Postgres 靠 PGSSLMODE=require 上 TLS,不能被降级成 prefer
+  assert.equal(plain.PGSSLMODE, "require");
+  assert.equal(plain.PGSSLROOTCERT, "/ca.pem");
+  assert.equal(plain.PGCONNECT_TIMEOUT, "10");
+  assert.equal(plain.PGAPPNAME, "x");
+  assert.equal(plain.PGPASSWORD, "envpw");
+  assert.equal(plain.PATH, "/usr/bin");
+  // 非 Supabase 主机:Node 侧也读 PGOPTIONS,子进程同样保留 → 两边一致
+  assert.equal(plain.PGOPTIONS, "reference=evil");
+  // Supabase 主机:Node 侧已钉死 options,子进程剔除 PGOPTIONS → 两边一致
+  const supa = libpqChildEnv({}, { supabaseHost: true }, base);
+  assert.equal(supa.PGOPTIONS, undefined);
+  assert.equal(supa.PGSSLMODE, "require");
+  // 显式给的覆盖环境
+  assert.equal(libpqChildEnv({ PGPASSWORD: "explicit" }, { supabaseHost: true }, base).PGPASSWORD, "explicit");
 });

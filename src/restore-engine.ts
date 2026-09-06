@@ -11,7 +11,7 @@
 import { spawn } from "node:child_process";
 import type { ExtensionInfo } from "./manifest.js";
 import { resolvePgRestoreBin } from "./pgbin.js";
-import { dumpUrlFor, connectPg } from "./supabase-ca.js";
+import { dumpUrlFor, connectPg, isSupabaseHost } from "./supabase-ca.js";
 
 export type RestoreTargetKind = "sandbox" | "supabase";
 
@@ -102,18 +102,40 @@ export interface EngineResult {
 }
 
 /**
- * libpq 子进程(pg_dump / pg_restore)的环境:剔除父进程里所有 `PG*` 变量,再叠加我们显式要给的
- * (如 credentialSafeDbArgs 的 PGPASSWORD)。libpq 会读 PGOPTIONS / PGHOST / PGSERVICE / PGPASSFILE
- * 等几十个环境变量,任何一个都能让实际连接偏离 --dbname 里的 URL(PGOPTIONS=reference=… 甚至能
- * 换租户)。连接信息全部走 URL,子进程不该继承这些(交叉审查)。
+ * libpq 环境变量里会改写**连接到哪里、以谁的身份**的那些:剔除它们,子进程才只认 --dbname 里的
+ * URL。TLS 策略(PGSSLMODE / PGSSLROOTCERT…)、超时、编码、应用名这类**不改目标**的变量保留——
+ * 外部 Postgres 用户常靠 PGSSLMODE=require 上 TLS,一刀切剔除等于把他们降级到 prefer(交叉审查)。
+ * Supabase 主机的 TLS 由 dumpUrlFor 直接写进 URL(verify-full + 打包 CA),不依赖环境。
+ * PGPASSWORD 保留:URL 不带密码时 node-postgres 同样读它,两个客户端才对得上;URL 带密码时
+ * credentialSafeDbArgs 会显式覆盖。PGPASSFILE 剔除:node-postgres 不读它,留着就是两边不一致。
+ */
+const LIBPQ_TARGET_ENV = new Set([
+  "PGHOST",
+  "PGHOSTADDR",
+  "PGPORT",
+  "PGDATABASE",
+  "PGUSER",
+  "PGPASSFILE",
+  "PGSERVICE",
+  "PGSERVICEFILE",
+  "PGTARGETSESSIONATTRS",
+]);
+
+/**
+ * libpq 子进程(pg_dump / pg_restore)的环境。`supabaseHost` 为真时再剔除 PGOPTIONS:Supavisor 会从
+ * options 里读租户覆盖(reference=…),而 Node 客户端对 Supabase 主机已显式钉死 options;非 Supabase
+ * 主机两边都尊重用户的 PGOPTIONS——两个客户端在任何情况下看到的都是同一份连接语义。
  */
 export function libpqChildEnv(
   extraEnv: NodeJS.ProcessEnv = {},
+  opts: { supabaseHost: boolean } = { supabaseHost: false },
   base: NodeJS.ProcessEnv = process.env
 ): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = {};
   for (const [key, value] of Object.entries(base)) {
-    if (!/^PG[A-Z_]*$/.test(key)) env[key] = value;
+    if (LIBPQ_TARGET_ENV.has(key)) continue;
+    if (opts.supabaseHost && key === "PGOPTIONS") continue;
+    env[key] = value;
   }
   return { ...env, ...extraEnv };
 }
@@ -121,12 +143,13 @@ export function libpqChildEnv(
 export function spawnPgRestore(
   bin: string,
   args: string[],
-  extraEnv: NodeJS.ProcessEnv = {}
+  extraEnv: NodeJS.ProcessEnv = {},
+  opts: { supabaseHost: boolean } = { supabaseHost: false }
 ): Promise<{ code: number | null; stderr: string }> {
   return new Promise((resolve, reject) => {
     const proc = spawn(bin, args, {
       stdio: ["ignore", "ignore", "pipe"],
-      env: libpqChildEnv(extraEnv),
+      env: libpqChildEnv(extraEnv, opts),
     });
     let stderr = "";
     proc.stderr.on("data", (d: Buffer) => (stderr += d.toString()));
@@ -394,8 +417,9 @@ export async function restoreDatabaseArtifact(opts: {
   // 中间人可拿到连接与数据);沙箱/外部主机原样透传。先改写 SSL 再拆密码。
   const { url, env } = credentialSafeDbArgs(dumpUrlFor(opts.connString));
   const common = ["--no-owner", "--no-privileges", "--dbname", url, opts.dumpPath];
+  const childOpts = { supabaseHost: isSupabaseHost(opts.connString) };
 
-  const first = await spawnPgRestore(bin, ["--section=pre-data", "--section=data", ...common], env);
+  const first = await spawnPgRestore(bin, ["--section=pre-data", "--section=data", ...common], env, childOpts);
   const preData = finalizePass(
     first.code,
     first.stderr,
@@ -405,7 +429,7 @@ export async function restoreDatabaseArtifact(opts: {
     return { preData, postData: { expectedSkips: 0, failures: [] }, ok: false };
   }
 
-  const second = await spawnPgRestore(bin, ["--section=post-data", ...common], env);
+  const second = await spawnPgRestore(bin, ["--section=post-data", ...common], env, childOpts);
   const postData = finalizePass(
     second.code,
     second.stderr,
