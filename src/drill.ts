@@ -21,6 +21,7 @@ import {
   installExtensions,
   quoteIdent,
   restoreDatabaseArtifact,
+  installSandboxShim,
 } from "./restore-engine.js";
 import { connectPg } from "./supabase-ca.js";
 import { log } from "./log.js";
@@ -171,8 +172,12 @@ export function postDataResult(code: number | null, stderr: string): PostDataRes
  * 的托管对象跳过如实返回。pre-data 的 schema 冲突跳过(dump 自带 CREATE SCHEMA,
  * 容器恒有 public)是非事件,不计入报告。
  */
-async function pgRestore(dumpPath: string, connString: string): Promise<PostDataResult> {
-  const result = await restoreDatabaseArtifact({ dumpPath, connString, target: "sandbox" });
+async function pgRestore(
+  dumpPath: string,
+  connString: string,
+  dumpedSchemas: string[]
+): Promise<PostDataResult> {
+  const result = await restoreDatabaseArtifact({ dumpPath, connString, target: "sandbox", dumpedSchemas });
   if (result.preData.failures.length) {
     throw new Error(`pg_restore failed: ${result.preData.failures.join(" | ")}`);
   }
@@ -436,6 +441,12 @@ export async function drillDump(
     // 旧 manifest(≤0.1.1)没有 extensions 字段 → 不装任何扩展,行为与从前一致
     const extensions = manifest.database.extensions ?? [];
     const unavailable = await installExtensions(pg.connString, extensions);
+    // Supabase 运行面的桩(auth.uid() 等 + 标准角色):没有它,参数/列默认值里引用
+    // auth.uid() 的函数与表在 pre-data 就建不出来 —— 见 installSandboxShim 头注。
+    // 转储自己带了 auth schema 就不建函数,否则 pg_restore 会撞 "already exists"。
+    await installSandboxShim(pg.connString, {
+      authFunctions: !manifest.database.schemas.includes("auth"),
+    });
     if (extensions.length) {
       // 装不上 ≠ 演练失败:扩展本体不在 public 转储里,没丢任何已备份的数据;
       // 若恢复真的需要它,下面的 pgRestore 会失败并给出分类错误
@@ -453,7 +464,7 @@ export async function drillDump(
     log.step("Restoring into ephemeral Postgres…");
     let postData: PostDataResult;
     try {
-      postData = await pgRestore(dumpPath, pg.connString);
+      postData = await pgRestore(dumpPath, pg.connString, manifest.database.schemas);
     } catch (error) {
       // 沙箱装不上扩展 + 错误特征命中"缺类型/schema/扩展" → 假设式归因到沙箱环境
       // (不对备份健康下断言);其余失败与扩展无关,必须原样抛出
@@ -477,7 +488,7 @@ export async function drillDump(
         postData.failures.length > 0
           ? `${postData.failures.length} failed: ${postData.failures[0]}`
           : postData.supabaseSkipped > 0
-            ? `user objects restored; ${postData.supabaseSkipped} Supabase-managed object(s) skipped (auth schema/roles do not exist in the drill sandbox)`
+            ? `user objects restored; ${postData.supabaseSkipped} Supabase-managed object(s) skipped (Supabase-managed tables such as auth.users do not exist in the drill sandbox)`
             : "all post-data objects restored",
     });
 

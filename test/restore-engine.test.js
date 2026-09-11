@@ -4,6 +4,8 @@ import fs from "node:fs";
 import {
   classifyBlocks,
   finalizePass,
+  sandboxManagedError,
+  sandboxShimSql,
   SANDBOX_MANAGED_ERROR,
   SCHEMA_EXISTS_ERROR,
 } from "../dist/restore-engine.js";
@@ -43,6 +45,127 @@ test("真实 Supabase 目标的 post-data 零豁免:沙箱 allowlist 不适用",
   const supabase = classifyBlocks(roleError, /(?!)/);
   assert.equal(supabase.expectedSkips, 0);
   assert.equal(supabase.failures.length, 1);
+});
+
+// 沙箱有了 auth 桩之后,缺席的形态从 schema/role 级变成 relation/function 级(2026-09-11)
+test("沙箱 allowlist:shim 之后的新形态(FK → auth.users、没桩的 auth 函数)是预期跳过", () => {
+  const fkToAuthUsers =
+    'pg_restore: error: could not execute query: ERROR:  relation "auth.users" does not exist\nCommand was: ALTER TABLE ONLY public.profile ADD CONSTRAINT profile_user_id_fkey FOREIGN KEY (user_id) REFERENCES auth.users(id);\n';
+  const unstubbedFn =
+    'pg_restore: error: could not execute query: ERROR:  function auth.something(uuid) does not exist\nCommand was: CREATE POLICY p ON t USING (auth.something(id));\n';
+  // 签名带空格:多参数、多词类型(交叉审查复现:[^ ]+ 在第一个空格就断,整条变成真失败)
+  const multiArg =
+    'pg_restore: error: could not execute query: ERROR:  function auth.can_read(uuid, uuid) does not exist\nCommand was: CREATE POLICY p2 ON t USING (auth.can_read(a, b));\n';
+  const multiWordType =
+    'pg_restore: error: could not execute query: ERROR:  function auth.by_name(character varying) does not exist\nCommand was: CREATE POLICY p3 ON t USING (auth.by_name(n));\n';
+  const r = classifyBlocks(fkToAuthUsers + unstubbedFn + multiArg + multiWordType, SANDBOX_MANAGED_ERROR);
+  assert.equal(r.expectedSkips, 4);
+  assert.equal(r.failures.length, 0);
+  // extensions 里缺函数/表 = 扩展没装上或用户把自己的函数放进去了,必须是真失败:
+  // 交叉审查复现过 UNIQUE 索引调 extensions.normalize_key(text) 被吞成跳过 → 缺索引却 PASS
+  const extFn =
+    'pg_restore: error: could not execute query: ERROR:  function extensions.normalize_key(text) does not exist\nCommand was: CREATE UNIQUE INDEX k ON public.t (extensions.normalize_key(v));\n';
+  const extRel =
+    'pg_restore: error: could not execute query: ERROR:  relation "extensions.lookup" does not exist\nCommand was: ALTER TABLE ONLY public.t ADD CONSTRAINT fk FOREIGN KEY (x) REFERENCES extensions.lookup(id);\n';
+  const ext = classifyBlocks(extFn + extRel, SANDBOX_MANAGED_ERROR);
+  assert.equal(ext.expectedSkips, 0);
+  assert.equal(ext.failures.length, 2);
+  // 用户自己 schema 里的缺表绝不能被这条规则吞掉
+  const userTable =
+    'pg_restore: error: could not execute query: ERROR:  relation "public.orders" does not exist\nCommand was: ALTER TABLE ONLY public.items ADD CONSTRAINT fk FOREIGN KEY (o) REFERENCES public.orders(id);\n';
+  const u = classifyBlocks(userTable, SANDBOX_MANAGED_ERROR);
+  assert.equal(u.expectedSkips, 0);
+  assert.equal(u.failures.length, 1);
+});
+
+// 转储自带 auth(BACKUPDRILL_SCHEMAS=public,auth)时不建函数桩,否则 pg_restore 的
+// CREATE FUNCTION auth.uid() 撞 "already exists" 把本来能过的演练弄挂(交叉审查 2026-09-11)
+test("sandboxShimSql:转储带 auth 就只建角色,不带才建 auth 函数桩", () => {
+  const withFns = sandboxShimSql({ authFunctions: true });
+  assert.match(withFns, /create schema if not exists auth/);
+  assert.match(withFns, /function auth\.uid\(\)/);
+  assert.match(withFns, /'anon', 'authenticated', 'service_role'/);
+  const rolesOnly = sandboxShimSql({ authFunctions: false });
+  assert.doesNotMatch(rolesOnly, /auth\.uid|create schema/);
+  assert.match(rolesOnly, /'anon', 'authenticated', 'service_role'/);
+});
+
+// DETAIL 行里的是用户行值,不是错误原因:一条唯一索引失败,其 DETAIL 恰好含 allowlist 的
+// 文字,绝不能被吞成跳过(交叉审查 2026-09-11,PG17 复现)
+test("classifyBlocks 只看 ERROR 行:DETAIL/CONTEXT/LINE 里的文字不参与分类", () => {
+  const dupKeyWithPoisonDetail =
+    'pg_restore: error: could not execute query: ERROR:  duplicate key value violates unique constraint "msg_key"\n' +
+    'DETAIL:  Key (message)=(relation "auth.users" does not exist) already exists.\n' +
+    'Command was: CREATE UNIQUE INDEX msg_key ON public.log (message);\n';
+  const r = classifyBlocks(dupKeyWithPoisonDetail, SANDBOX_MANAGED_ERROR);
+  assert.equal(r.expectedSkips, 0);
+  assert.equal(r.failures.length, 1);
+  assert.match(r.failures[0], /duplicate key/);
+  // 反向:真正的托管缺席,原因就在 ERROR 行,照常豁免(LINE 提示行不参与也不影响)
+  const realManaged =
+    'pg_restore: error: could not execute query: ERROR:  relation "auth.users" does not exist\n' +
+    'LINE 1: ...FOREIGN KEY (user_id) REFERENCES auth.users(id)\n' +
+    'Command was: ALTER TABLE ONLY public.profile ADD CONSTRAINT fk FOREIGN KEY (user_id) REFERENCES auth.users(id);\n';
+  const m = classifyBlocks(realManaged, SANDBOX_MANAGED_ERROR);
+  assert.equal(m.expectedSkips, 1);
+  assert.equal(m.failures.length, 0);
+});
+
+// 第四轮(交叉审查,PG17 复现):主消息本身也能内嵌行值 —— 表达式索引 (col::uuid) 撞上
+// 内容恰好是一条诊断文字的行。allowlist 两端锚定后,子串永远匹配不上整条主消息。
+test("allowlist 两端锚定:主消息内嵌的行值不算缺对象诊断", () => {
+  const poisonedPrimary =
+    'pg_restore: error: could not execute query: ERROR:  invalid input syntax for type uuid: "relation "auth.users" does not exist"\n' +
+    'Command was: CREATE UNIQUE INDEX u ON public.t ((v::uuid));\n';
+  const r = classifyBlocks(poisonedPrimary, SANDBOX_MANAGED_ERROR);
+  assert.equal(r.expectedSkips, 0);
+  assert.equal(r.failures.length, 1);
+  // 同理 pre-data:主消息里包含 already exists 但不是 schema 冲突本身,必须失败
+  const poisonedPre =
+    'pg_restore: error: could not execute query: ERROR:  invalid input syntax for type uuid: "schema "x" already exists"\n' +
+    'Command was: COPY public.t (v) FROM stdin;\n';
+  const q = classifyBlocks(poisonedPre, SCHEMA_EXISTS_ERROR);
+  assert.equal(q.expectedSkips, 0);
+  assert.equal(q.failures.length, 1);
+  // 没有 ERROR: 前缀的致命错整行当主消息,锚定 allowlist 不认 → 失败
+  const fatal = 'pg_restore: error: could not open input file "x.dump": No such file or directory\n';
+  const f = classifyBlocks(fatal, SANDBOX_MANAGED_ERROR);
+  assert.equal(f.failures.length, 1);
+});
+
+// 第五轮(交叉审查):转储自己带了 auth,auth 里的对象就是用户的备份内容,缺了是真失败。
+// 与 sandboxShimSql "带 auth 就不建桩"对称:桩不建、豁免也不给。
+test("sandboxManagedError:转储带了的托管 schema 不再豁免;没带的照旧;角色恒豁免", () => {
+  const missingAuthFn =
+    'pg_restore: error: could not execute query: ERROR:  function auth.normalize_key(text) does not exist\nCommand was: CREATE UNIQUE INDEX k ON public.t (auth.normalize_key(v));\n';
+  const missingAuthRel =
+    'pg_restore: error: could not execute query: ERROR:  relation "auth.users" does not exist\nCommand was: ALTER TABLE ONLY public.profile ADD CONSTRAINT fk FOREIGN KEY (u) REFERENCES auth.users(id);\n';
+  const missingStorage =
+    'pg_restore: error: could not execute query: ERROR:  relation "storage.objects" does not exist\nCommand was: CREATE VIEW v AS SELECT 1 FROM storage.objects;\n';
+  const missingRole =
+    'pg_restore: error: could not execute query: ERROR:  role "authenticated" does not exist\nCommand was: CREATE POLICY p ON t TO authenticated;\n';
+
+  // 只转 public(托管 worker 的恒定形态):auth/storage 缺席全是预期
+  const publicOnly = classifyBlocks(missingAuthFn + missingAuthRel + missingStorage + missingRole, sandboxManagedError(["public"]));
+  assert.equal(publicOnly.expectedSkips, 4);
+  assert.equal(publicOnly.failures.length, 0);
+
+  // 转了 public + auth:auth 里缺的是真失败;storage 与角色照旧豁免
+  const withAuth = classifyBlocks(missingAuthFn + missingAuthRel + missingStorage + missingRole, sandboxManagedError(["public", "auth"]));
+  assert.equal(withAuth.expectedSkips, 2, "storage + role stay exempt");
+  assert.equal(withAuth.failures.length, 2, "both auth absences are real failures");
+  assert.match(withAuth.failures[0], /normalize_key/);
+  assert.match(withAuth.failures[1], /auth\.users/);
+
+  // 模式条目(graphql[a-z_]*)按正则整体匹配转储的 schema 名
+  const withGraphql = classifyBlocks(
+    'pg_restore: error: could not execute query: ERROR:  relation "graphql_public.x" does not exist\nCommand was: X;\n',
+    sandboxManagedError(["public", "graphql_public"])
+  );
+  assert.equal(withGraphql.failures.length, 1);
+
+  // 默认导出 = 什么都没转
+  assert.equal(SANDBOX_MANAGED_ERROR.source, sandboxManagedError().source);
 });
 
 // ── finalizePass:R0 假成功回归钉子(替代已删除的 pgRestoreOutcome 用例)──
