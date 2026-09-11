@@ -2,7 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
 import { createHash, randomBytes } from "node:crypto";
-import { readFileSync, statSync, mkdtempSync } from "node:fs";
+import { readFileSync, statSync, mkdtempSync, writeFileSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { S3Client } from "@aws-sdk/client-s3";
@@ -251,5 +251,52 @@ test("慢磁盘竞态:源先断、上一块的写还在途 → 重试前等它�
     assert.ok(start > 0);
   } finally {
     await b.close();
+  }
+});
+
+test("404 时不碰目标文件:已有内容原样保留(不再先截断再失败)", async () => {
+  const b = await fakeBucket("404");
+  const dest = join(dir, "keep-me.bin");
+  writeFileSync(dest, "precious");
+  try {
+    await assert.rejects(downloadToFile(b.s3, "bucket", "missing", dest, { maxAttempts: 2 }));
+    assert.equal(readFileSync(dest, "utf8"), "precious", "a failed request must not truncate the destination");
+  } finally {
+    await b.close();
+  }
+});
+
+test("重试耗尽:句柄在在途写落定之后才关闭,慢写不会撞上已关闭的 fd", async () => {
+  // 每次都掐断 → 用完 2 次尝试后终态失败;写延迟 150ms 保证失败时有一块还在途
+  const requests = [];
+  const server = http.createServer((req, res) => {
+    requests.push(req.headers.range ?? null);
+    res.writeHead(requests.length === 1 ? 200 : 206, {
+      "content-length": String(DATA.length - (requests.length === 1 ? 0 : 100_000)),
+      ...(requests.length > 1 ? { "content-range": `bytes 100000-${DATA.length - 1}/${DATA.length}` } : {}),
+      "accept-ranges": "bytes",
+      etag: ETAG,
+    });
+    res.write(DATA.subarray(0, 100_000), () => res.socket.destroy());
+  });
+  await new Promise((r) => server.listen(0, "127.0.0.1", r));
+  const { port } = server.address();
+  const s3 = new S3Client({
+    region: "us-east-1", endpoint: `http://127.0.0.1:${port}`, forcePathStyle: true,
+    credentials: { accessKeyId: "t", secretAccessKey: "t" }, maxAttempts: 1,
+  });
+  let closedAt = null, lastWriteDoneAt = null;
+  const fh = fakeHandle({ step: 1 << 20, delayMs: 150 });
+  const origWrite = fh.write.bind(fh), origClose = fh.close.bind(fh);
+  fh.write = async (...a) => { const r = await origWrite(...a); lastWriteDoneAt = Date.now(); return r; };
+  fh.close = async () => { closedAt = Date.now(); return origClose(); };
+  try {
+    await assert.rejects(
+      downloadToFile(s3, "bucket", "dump", "/dev/null", { maxAttempts: 2, openFile: async () => fh })
+    );
+    assert.ok(closedAt !== null, "handle must be closed on terminal failure");
+    assert.ok(lastWriteDoneAt !== null && lastWriteDoneAt <= closedAt, "close must come after the last in-flight write settled");
+  } finally {
+    await new Promise((r) => server.close(r));
   }
 });
