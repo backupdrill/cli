@@ -438,8 +438,11 @@ export async function drillDump(
     const extensions = manifest.database.extensions ?? [];
     const unavailable = await installExtensions(pg.connString, extensions);
     // Supabase 运行面的桩(auth.uid() 等 + 标准角色):没有它,参数/列默认值里引用
-    // auth.uid() 的函数与表在 pre-data 就建不出来 —— 见 installSandboxShim 头注
-    await installSandboxShim(pg.connString);
+    // auth.uid() 的函数与表在 pre-data 就建不出来 —— 见 installSandboxShim 头注。
+    // 转储自己带了 auth schema 就不建函数,否则 pg_restore 会撞 "already exists"。
+    await installSandboxShim(pg.connString, {
+      authFunctions: !manifest.database.schemas.includes("auth"),
+    });
     if (extensions.length) {
       // 装不上 ≠ 演练失败:扩展本体不在 public 转储里,没丢任何已备份的数据;
       // 若恢复真的需要它,下面的 pgRestore 会失败并给出分类错误
@@ -481,7 +484,7 @@ export async function drillDump(
         postData.failures.length > 0
           ? `${postData.failures.length} failed: ${postData.failures[0]}`
           : postData.supabaseSkipped > 0
-            ? `user objects restored; ${postData.supabaseSkipped} Supabase-managed object(s) skipped (auth schema/roles do not exist in the drill sandbox)`
+            ? `user objects restored; ${postData.supabaseSkipped} Supabase-managed object(s) skipped (Supabase-managed tables such as auth.users do not exist in the drill sandbox)`
             : "all post-data objects restored",
     });
 
