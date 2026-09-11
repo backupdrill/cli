@@ -146,7 +146,10 @@ export async function downloadToFile(
 ): Promise<{ bytes: number; sha256: string }> {
   const maxAttempts = opts.maxAttempts ?? DOWNLOAD_MAX_ATTEMPTS;
   const hash = createHash("sha256");
-  const fh: WritableHandle = await (opts.openFile ?? ((path) => open(path, "w")))(dest);
+  const openFile = opts.openFile ?? ((path: string) => open(path, "w"));
+  // 目标文件推迟到首个响应到手后再打开(交叉审查 2026-09-12):"w" 会先截断,404/403 这种
+  // 请求都没成的失败不该顺手毁掉调用方路径上已有的文件。
+  let fh: WritableHandle | null = null;
   let written = 0; // 已落盘 = 已哈希 = 续传起点
   let total: number | null = null;
   let etag: string | undefined;
@@ -182,10 +185,12 @@ export async function downloadToFile(
           );
         }
         if (total === null && typeof res.ContentLength === "number") total = res.ContentLength;
+        if (fh === null) fh = await openFile(dest);
+        const handle = fh;
 
         const sink = new Writable({
           write(chunk: Buffer, _enc, cb) {
-            inFlight = writeFully(fh, chunk, written).then(
+            inFlight = writeFully(handle, chunk, written).then(
               (n) => {
                 hash.update(chunk.subarray(0, n));
                 written += n;
@@ -228,7 +233,9 @@ export async function downloadToFile(
       }
     }
   } finally {
-    await fh.close();
+    // 终态失败时上一块的写可能还在途:先让它落定再关句柄,别让慢写撞上已关闭的 fd
+    await inFlight.catch(() => {});
+    if (fh !== null) await fh.close();
   }
 }
 
