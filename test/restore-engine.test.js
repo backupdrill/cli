@@ -110,6 +110,28 @@ test("classifyBlocks 只看 ERROR 行:DETAIL/CONTEXT/LINE 里的文字不参与�
   assert.equal(m.failures.length, 0);
 });
 
+// 第四轮(交叉审查,PG17 复现):主消息本身也能内嵌行值 —— 表达式索引 (col::uuid) 撞上
+// 内容恰好是一条诊断文字的行。allowlist 两端锚定后,子串永远匹配不上整条主消息。
+test("allowlist 两端锚定:主消息内嵌的行值不算缺对象诊断", () => {
+  const poisonedPrimary =
+    'pg_restore: error: could not execute query: ERROR:  invalid input syntax for type uuid: "relation "auth.users" does not exist"\n' +
+    'Command was: CREATE UNIQUE INDEX u ON public.t ((v::uuid));\n';
+  const r = classifyBlocks(poisonedPrimary, SANDBOX_MANAGED_ERROR);
+  assert.equal(r.expectedSkips, 0);
+  assert.equal(r.failures.length, 1);
+  // 同理 pre-data:主消息里包含 already exists 但不是 schema 冲突本身,必须失败
+  const poisonedPre =
+    'pg_restore: error: could not execute query: ERROR:  invalid input syntax for type uuid: "schema "x" already exists"\n' +
+    'Command was: COPY public.t (v) FROM stdin;\n';
+  const q = classifyBlocks(poisonedPre, SCHEMA_EXISTS_ERROR);
+  assert.equal(q.expectedSkips, 0);
+  assert.equal(q.failures.length, 1);
+  // 没有 ERROR: 前缀的致命错整行当主消息,锚定 allowlist 不认 → 失败
+  const fatal = 'pg_restore: error: could not open input file "x.dump": No such file or directory\n';
+  const f = classifyBlocks(fatal, SANDBOX_MANAGED_ERROR);
+  assert.equal(f.failures.length, 1);
+});
+
 // ── finalizePass:R0 假成功回归钉子(替代已删除的 pgRestoreOutcome 用例)──
 
 test("非零退出且零错误块 → 通用失败(signal kill / 非英文 locale / 空 stderr)", () => {

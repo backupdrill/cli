@@ -209,22 +209,29 @@ const MANAGED_SCHEMAS = "auth|storage|realtime|vault|extensions|graphql[a-z_]*";
 // 吞成跳过就是给一份缺索引的备份盖"通过"章。schema 级形态保留原样(那是 schema 本身
 // 没建出来的老路径)。
 const MANAGED_OBJECT_SCHEMAS = "auth|storage|realtime|vault|graphql[a-z_]*";
+// **两端锚定**(交叉审查 2026-09-11 第四轮,终结子串匹配这一整类):allowlist 匹配的是
+// classifyBlocks 抽出来的**整条主消息**,必须从头到尾就是一条"缺对象"诊断。不锚定的话,
+// 用户行值能借道混进来 —— 表达式索引 `(col::uuid)` 建索引时撞上一行内容恰好是
+// `relation "auth.users" does not exist` 的数据,主消息就是
+// `invalid input syntax for type uuid: "relation "auth.users" does not exist"`,子串一匹配,
+// 一条建失败的唯一索引就被报成了预期跳过。旧的 \bauth\.uid\b / \bauth\.jwt\b 裸子串一并
+// 删掉:它们唯一对应的真实诊断是 `function auth.uid() does not exist`,下面的 function 分支已覆盖。
 export const SANDBOX_MANAGED_ERROR = new RegExp(
-  [
-    `schema "(${MANAGED_SCHEMAS})" does not exist`,
-    `relation "(${MANAGED_OBJECT_SCHEMAS})\\.[^"]+" does not exist`,
-    // 完整签名:auth.can_read(uuid, uuid) / auth.x(character varying) 都带空格
-    `function (${MANAGED_OBJECT_SCHEMAS})\\.[^(]+\\([^)]*\\) does not exist`,
-    `role "(authenticated|anon|service_role|supabase_[a-z_]+)" does not exist`,
-    "\\bauth\\.uid\\b",
-    "\\bauth\\.jwt\\b",
-  ].join("|"),
+  "^(?:" +
+    [
+      `schema "(${MANAGED_SCHEMAS})" does not exist`,
+      `relation "(${MANAGED_OBJECT_SCHEMAS})\\.[^"]+" does not exist`,
+      // 完整签名:auth.can_read(uuid, uuid) / auth.x(character varying) 都带空格
+      `function (${MANAGED_OBJECT_SCHEMAS})\\.[^(]+\\([^)]*\\) does not exist`,
+      `role "(authenticated|anon|service_role|supabase_[a-z_]+)" does not exist`,
+    ].join("|") +
+    ")$",
   "i"
 );
 
 // pre-data 唯一的预期冲突(见文件头注 3)。目标空门/新容器保证没有其他冲突源,
-// 任何别的 "already exists" 都是真冲突,必须失败。
-export const SCHEMA_EXISTS_ERROR = /schema "[^"]+" already exists/i;
+// 任何别的 "already exists" 都是真冲突,必须失败。同样两端锚定。
+export const SCHEMA_EXISTS_ERROR = /^schema "[^"]+" already exists$/i;
 
 const NEVER_MATCH = /(?!)/;
 
@@ -236,6 +243,8 @@ const NEVER_MATCH = /(?!)/;
  * —— `Key (message)=(relation "auth.users" does not exist) already exists` 是用户的数据,
  * 不是错误原因,拿它匹配等于让用户数据决定演练结论;一条失败的唯一索引就能这样混过去。
  * Postgres 的主消息恒为单行,且在块的第一行(`pg_restore: error: ... ERROR:  …`)。
+ * 抽出 `ERROR:` 之后的那段作为主消息,allowlist 对它**整条**匹配(两端锚定,见上);
+ * 没有 `ERROR:` 前缀的块(归档器致命错等)整行当主消息,锚定的 allowlist 不会认它 → 失败。
  */
 export function classifyBlocks(stderr: string, allow: RegExp): ClassifiedPass {
   const blocks = stderr
@@ -244,8 +253,9 @@ export function classifyBlocks(stderr: string, allow: RegExp): ClassifiedPass {
   let expectedSkips = 0;
   const failures: string[] = [];
   for (const block of blocks) {
-    const cause = block.split("\n")[0];
-    if (allow.test(cause)) {
+    const firstLine = block.split("\n")[0];
+    const message = firstLine.replace(/^.*?\bERROR:\s+/, "").trim();
+    if (allow.test(message)) {
       expectedSkips += 1;
     } else {
       failures.push(block.replace(/\s+/g, " ").trim().slice(0, 200));
