@@ -195,22 +195,78 @@ export function spawnPgRestore(
   });
 }
 
-// 演练沙箱是裸 Postgres,Supabase 托管的 schema/角色必然缺席。post-data 里
-// 引用它们的失败是"环境预期",不是备份坏了;其余失败才是演练要抓的。
-// 真实 Supabase 目标不适用:角色/托管 schema 恒在,post-data 全严格。
-export const SANDBOX_MANAGED_ERROR =
-  /schema "(auth|storage|realtime|vault|extensions|graphql[a-z_]*)" does not exist|role "(authenticated|anon|service_role|supabase_[a-z_]+)" does not exist|\bauth\.uid\b|\bauth\.jwt\b/i;
+// 演练沙箱是裸 Postgres,Supabase 托管的 schema/表必然缺席。post-data 里引用它们的
+// 失败是"环境预期",不是备份坏了;其余失败才是演练要抓的。
+// 真实 Supabase 目标不适用:托管 schema/角色恒在,post-data 全严格。
+//
+// 沙箱经 installSandboxShim 预置了 auth schema 的桩函数与三个标准角色(2026-09-11),
+// 所以缺席的形态从 schema/role 级变成了 relation/function 级(FK → auth.users、
+// 调到没桩的 auth.xxx())。旧形态保留:manifest 更老的路径、或 shim 本身没装上时仍会出现。
+// 托管 schema 两张清单。relation/function 级豁免**刻意不含 extensions**(交叉审查
+// 2026-09-11 复现):那个 schema 装的是扩展对象,installExtensions 能装的都装了;里面还缺
+// 函数/表 = 扩展没装上,或用户把自己的函数放进了 extensions —— 两种都该让演练失败并走
+// "沙箱装不上扩展"的归因,吞成跳过就是给一份缺索引的备份盖"通过"章。schema 级形态保留
+// (那是 schema 本身没建出来的老路径)。条目是正则片段(graphql[a-z_]* 覆盖 graphql_public)。
+const MANAGED_SCHEMA_PATTERNS = ["auth", "storage", "realtime", "vault", "extensions", "graphql[a-z_]*"];
+const MANAGED_OBJECT_SCHEMA_PATTERNS = ["auth", "storage", "realtime", "vault", "graphql[a-z_]*"];
+
+/** 从托管清单里剔掉**这份转储自己带了**的 schema:带了就不再是"沙箱预期缺席"。 */
+function notDumped(patterns: string[], dumpedSchemas: string[]): string[] {
+  return patterns.filter(
+    (pattern) => !dumpedSchemas.some((schema) => new RegExp(`^(?:${pattern})$`, "i").test(schema))
+  );
+}
+
+/**
+ * 沙箱 allowlist,**按 manifest 实际转储的 schema 生成**(交叉审查 2026-09-11 第五轮):
+ * CLI 用户用 BACKUPDRILL_SCHEMAS=public,auth 把 auth 也转了,那 auth 里的对象就是**他自己的**
+ * 备份内容 —— 缺了是真失败,不能再当托管缺席豁免;否则一条依赖 auth.normalize_key() 的
+ * 唯一索引建不出来,演练照样 PASS。这是 installSandboxShim "转储带 auth 就不建桩"的对称
+ * 另一半:桩不建、豁免也不给,两边口径一致。角色豁免不受影响 —— 转储里从来没有 CREATE ROLE。
+ *
+ * **两端锚定**(第四轮,终结子串匹配这一整类):匹配的是 classifyBlocks 抽出来的**整条主消息**,
+ * 必须从头到尾就是一条"缺对象"诊断。不锚定的话用户行值能借道混进来 —— 表达式索引 `(col::uuid)`
+ * 撞上一行内容恰好是 `relation "auth.users" does not exist` 的数据,主消息就是
+ * `invalid input syntax for type uuid: "relation "auth.users" does not exist"`,子串一匹配,
+ * 一条建失败的唯一索引就被报成了预期跳过。旧的 \bauth\.uid\b / \bauth\.jwt\b 裸子串已删:
+ * 它们唯一对应的真实诊断 `function auth.uid() does not exist` 由 function 分支覆盖。
+ */
+export function sandboxManagedError(dumpedSchemas: string[] = []): RegExp {
+  const schemas = notDumped(MANAGED_SCHEMA_PATTERNS, dumpedSchemas).join("|");
+  const objects = notDumped(MANAGED_OBJECT_SCHEMA_PATTERNS, dumpedSchemas).join("|");
+  const alternatives = [
+    ...(schemas ? [`schema "(${schemas})" does not exist`] : []),
+    ...(objects
+      ? [
+          `relation "(${objects})\\.[^"]+" does not exist`,
+          // 完整签名:auth.can_read(uuid, uuid) / auth.x(character varying) 都带空格
+          `function (${objects})\\.[^(]+\\([^)]*\\) does not exist`,
+        ]
+      : []),
+    `role "(authenticated|anon|service_role|supabase_[a-z_]+)" does not exist`,
+  ];
+  return new RegExp(`^(?:${alternatives.join("|")})$`, "i");
+}
+
+/** 默认形态(什么托管 schema 都没转):兼容层与"只转 public"的托管 worker 路径。 */
+export const SANDBOX_MANAGED_ERROR = sandboxManagedError();
 
 // pre-data 唯一的预期冲突(见文件头注 3)。目标空门/新容器保证没有其他冲突源,
-// 任何别的 "already exists" 都是真冲突,必须失败。
-export const SCHEMA_EXISTS_ERROR = /schema "[^"]+" already exists/i;
+// 任何别的 "already exists" 都是真冲突,必须失败。同样两端锚定。
+export const SCHEMA_EXISTS_ERROR = /^schema "[^"]+" already exists$/i;
 
 const NEVER_MATCH = /(?!)/;
 
 /**
  * 把 pg_restore 的 stderr 拆成单个错误块并按 allowlist 分类。
- * 只对 ERROR 原因行分类,不看 "Command was:" 之后的语句文本——否则一个恰好
- * 引用 auth.uid 的用户对象因"损坏/语法错误"失败时,会被误判成预期跳过。
+ * **只对 ERROR 那一行分类**:不看 "Command was:" 之后的语句文本,也不看 DETAIL /
+ * CONTEXT / LINE 行。前者的理由:一个恰好引用 auth.uid 的用户对象因"损坏/语法错误"
+ * 失败时,会被误判成预期跳过。后者(交叉审查 2026-09-11 复现):DETAIL 里带的是**行值**
+ * —— `Key (message)=(relation "auth.users" does not exist) already exists` 是用户的数据,
+ * 不是错误原因,拿它匹配等于让用户数据决定演练结论;一条失败的唯一索引就能这样混过去。
+ * Postgres 的主消息恒为单行,且在块的第一行(`pg_restore: error: ... ERROR:  …`)。
+ * 抽出 `ERROR:` 之后的那段作为主消息,allowlist 对它**整条**匹配(两端锚定,见上);
+ * 没有 `ERROR:` 前缀的块(归档器致命错等)整行当主消息,锚定的 allowlist 不会认它 → 失败。
  */
 export function classifyBlocks(stderr: string, allow: RegExp): ClassifiedPass {
   const blocks = stderr
@@ -219,8 +275,9 @@ export function classifyBlocks(stderr: string, allow: RegExp): ClassifiedPass {
   let expectedSkips = 0;
   const failures: string[] = [];
   for (const block of blocks) {
-    const cause = block.split(/Command was:/i)[0];
-    if (allow.test(cause)) {
+    const firstLine = block.split("\n")[0];
+    const message = firstLine.replace(/^.*?\bERROR:\s+/, "").trim();
+    if (allow.test(message)) {
       expectedSkips += 1;
     } else {
       failures.push(block.replace(/\s+/g, " ").trim().slice(0, 200));
@@ -291,6 +348,64 @@ export async function installExtensions(
     await client.end();
   }
   return unavailable;
+}
+
+/**
+ * 沙箱专用:预置 Supabase 的最小运行面,让**引用**它的用户对象能建出来被验证,而不是
+ * 被当作"托管对象跳过"。只装桩,不装数据 —— 演练验证的是用户自己的 schema。
+ *
+ * 触因(2026-09-11,真实用户 105 表 12 GB 库的首次演练):`create function
+ * public.is_admin(p uuid default auth.uid())` —— 函数在 pre-data,参数默认值建函数时
+ * 就要解析,沙箱没有 auth schema 就整遍硬失败。同一根因还会吃掉更常见的
+ * `create table ... (created_by uuid default auth.uid())`:表建不出来、数据也没了,
+ * 演练只能报"缺表"。把 pre-data 的容错放宽不解决后者;补上运行面两者都解决。
+ *
+ * 桩的形状:
+ *   auth.uid() → uuid、auth.jwt() → jsonb、auth.role() → text、auth.email() → text,
+ *   全部返回 null(恢复过程中不会真调它们:COPY 不求值列默认,策略/函数体不执行);
+ *   角色 anon / authenticated / service_role(nologin):RLS 策略的 `to authenticated`
+ *   要它们在场才能建。转储带 --no-privileges,不会有 GRANT 引用这些角色。
+ * 刻意不建 auth.users 之类的表:空的 auth.users 会让 FK 校验在 post-data 真失败,
+ * 比"缺表跳过"更糟。FK → auth.users 仍按 SANDBOX_MANAGED_ERROR 的 relation 形态跳过。
+ *
+ * 转储自带 auth schema 时(CLI 的 BACKUPDRILL_SCHEMAS=public,auth,自托管场景)**不建函数**:
+ * pg_restore 的 CREATE FUNCTION auth.uid() 会撞我们的桩报 "already exists",而那是 pre-data、
+ * 全严格 → 一次本来能过的演练被 shim 弄挂(交叉审查 2026-09-11)。角色照建:转储里
+ * 从来没有 CREATE ROLE。
+ *
+ * **绝不对真实 Supabase 目标调用**:那里 auth 是真的,create or replace 会覆盖平台函数。
+ */
+export function sandboxShimSql(opts: { authFunctions: boolean }): string {
+  const roles = `
+      do $$
+      declare r text;
+      begin
+        foreach r in array array['anon', 'authenticated', 'service_role'] loop
+          if not exists (select 1 from pg_roles where rolname = r) then
+            execute format('create role %I nologin', r);
+          end if;
+        end loop;
+      end $$;`;
+  if (!opts.authFunctions) return roles;
+  return `
+      create schema if not exists auth;
+      create or replace function auth.uid() returns uuid language sql stable as $$ select null::uuid $$;
+      create or replace function auth.jwt() returns jsonb language sql stable as $$ select null::jsonb $$;
+      create or replace function auth.role() returns text language sql stable as $$ select null::text $$;
+      create or replace function auth.email() returns text language sql stable as $$ select null::text $$;
+      ${roles}`;
+}
+
+export async function installSandboxShim(
+  connString: string,
+  opts: { authFunctions: boolean }
+): Promise<void> {
+  const client = await connectPg(connString);
+  try {
+    await client.query(sandboxShimSql(opts));
+  } finally {
+    await client.end();
+  }
 }
 
 /**
@@ -454,6 +569,8 @@ export async function restoreDatabaseArtifact(opts: {
   dumpPath: string;
   connString: string;
   target: RestoreTargetKind;
+  /** manifest.database.schemas:沙箱 allowlist 据此剔掉转储自带的托管 schema(见 sandboxManagedError)。 */
+  dumpedSchemas?: string[];
 }): Promise<EngineResult> {
   const bin = resolvePgRestoreBin();
   // TLS 全链路 verify-full(创始人承诺项):pg_restore 与 pg_dump 同一改写——
@@ -477,7 +594,10 @@ export async function restoreDatabaseArtifact(opts: {
   const postData = finalizePass(
     second.code,
     second.stderr,
-    classifyBlocks(second.stderr, opts.target === "sandbox" ? SANDBOX_MANAGED_ERROR : NEVER_MATCH)
+    classifyBlocks(
+      second.stderr,
+      opts.target === "sandbox" ? sandboxManagedError(opts.dumpedSchemas ?? []) : NEVER_MATCH
+    )
   );
 
   return { preData, postData, ok: postData.failures.length === 0 };

@@ -61,6 +61,19 @@ test(
         "create table demo(id int primary key, v text); insert into demo select g, 'row'||g from generate_series(1,100) g; " +
         "create role authenticated nologin; alter table demo enable row level security; " +
         "create policy demo_read on demo for select to authenticated using (true); " +
+        // 模拟 Supabase 的 auth 运行面(源库真有;--schema=public 转储不带它们):
+        // 用户对象在**签名/列默认值**里引用 auth.uid() —— 这是 pre-data,建不出来整遍就炸,
+        // 2026-09-11 真实用户 105 表库的首次演练就死在这。沙箱 shim 必须让它们建得出来。
+        "create schema auth; create function auth.uid() returns uuid language sql as $$ select null::uuid $$; " +
+        "create table auth.users(id uuid primary key); " +
+        "create function public.is_admin(p_user_id uuid default auth.uid()) returns boolean language sql as $$ select false $$; " +
+        "comment on function public.is_admin(uuid) is 'admin?'; " +
+        "create table owned(id int primary key, owner uuid default auth.uid()); insert into owned select g, null from generate_series(1,20) g; " +
+        // FK → auth.users:沙箱刻意不建 auth.users(空表会让 FK 校验真失败),必须按托管对象跳过
+        "create table profile(id int primary key, user_id uuid references auth.users(id)); insert into profile values (1, null), (2, null); " +
+        // 函数**体**引用 auth.users:pg_dump 头部 set check_function_bodies = false,恢复时不校验体,
+        // 建得出来、演练照过 —— 只有真调用才炸。这正是 README 说"要靠 --check-cmd 去练"的那类对象。
+        "create function public.find_user() returns void language plpgsql as $$ begin perform 1 from auth.users; end $$; " +
         // matview + 分区表 = 曾经的必然 FAIL 回归:manifest 统计端含它们而校验端不含,
         // 表数不符 + 误报缺表。修复后两端同口径,这个组合必须 PASS。
         "create materialized view demo_mv as select id, v from demo where id <= 10; " +
@@ -89,13 +102,15 @@ test(
         serverVersion: "17.4", pgDumpVersion: "test", schemas: ["public"],
         // 口径 = 普通表 + matview + 分区父表 + 分区子表(与备份统计端一致);
         // 分区父表不存行(estimatedRows 0),行数落在子分区上(1..49 / 50..100)
-        tableCount: 5, estimatedRowTotal: 210,
+        tableCount: 7, estimatedRowTotal: 232,
         tables: [
           { schema: "public", name: "demo", estimatedRows: 100 },
           { schema: "public", name: "demo_mv", estimatedRows: 10 },
           { schema: "public", name: "parted", estimatedRows: 0 },
           { schema: "public", name: "parted_a", estimatedRows: 49 },
           { schema: "public", name: "parted_b", estimatedRows: 51 },
+          { schema: "public", name: "owned", estimatedRows: 20 },
+          { schema: "public", name: "profile", estimatedRows: 2 },
         ],
       },
       dump: { key: "seed/dump.pgcustom", format: "custom", bytes, sha256: sha },
@@ -103,15 +118,19 @@ test(
     };
 
     // 2. PASS:好备份应通过;行数 = demo 100 + matview 10 + 分区叶子 100(父表不重复计)
+    //    + owned 20 + profile 2。owned 的 20 行是 shim 的直接证据:没有 auth.uid() 桩,
+    //    这张表在 pre-data 就建不出来,行数会少 20、表数会少 1。
     const good = await drillDump(dumpPath, manifest, "good");
     assert.equal(good.pass, true, "good backup should pass");
-    assert.equal(good.restoredRowTotal, 210);
-    assert.equal(good.restoredTableCount, 5);
-    // post-data 语义:用户的 PK 恢复成功,Supabase 式 policy(TO authenticated)被
-    // 归类为沙箱预期跳过——两边都不许把演练翻成失败,也不许假装没跳过
+    assert.equal(good.restoredRowTotal, 232);
+    assert.equal(good.restoredTableCount, 7);
+    // pre-data 全严格:is_admin(default auth.uid()) 与它的 comment 建不出来会让上面直接失败;
+    // find_user() 的函数体引用 auth.users 但恢复时不校验体(check_function_bodies=off),所以也过。
+    // post-data 语义:PK 恢复成功;policy(to authenticated)有了角色桩之后**真的建出来了**,
+    // 不再是跳过;唯一的预期跳过是 FK → auth.users(沙箱刻意不建那张表)。
     const pd = good.checks.find((c) => c.name === "post-data objects");
     assert.ok(pd?.pass, "user post-data objects (PK) must restore");
-    assert.match(pd.detail, /Supabase-managed/, "the policy skip must be reported");
+    assert.match(pd.detail, /1 Supabase-managed object\(s\) skipped/, "exactly the auth.users FK is skipped");
 
     // 3. FAIL:manifest 谎报一张 dump 里没有的表,演练必须抓到
     const tampered = {
