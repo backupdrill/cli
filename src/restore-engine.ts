@@ -203,12 +203,18 @@ export function spawnPgRestore(
 // 所以缺席的形态从 schema/role 级变成了 relation/function 级(FK → auth.users、
 // 调到没桩的 auth.xxx())。旧形态保留:manifest 更老的路径、或 shim 本身没装上时仍会出现。
 const MANAGED_SCHEMAS = "auth|storage|realtime|vault|extensions|graphql[a-z_]*";
+// relation/function 级豁免**刻意不含 extensions**(交叉审查 2026-09-11 复现):那个 schema
+// 装的是扩展对象,installExtensions 能装的都装了;里面还缺函数/表 = 扩展没装上,或用户
+// 把自己的函数放进了 extensions —— 两种都该让演练失败并走"沙箱装不上扩展"的归因,
+// 吞成跳过就是给一份缺索引的备份盖"通过"章。schema 级形态保留原样(那是 schema 本身
+// 没建出来的老路径)。
+const MANAGED_OBJECT_SCHEMAS = "auth|storage|realtime|vault|graphql[a-z_]*";
 export const SANDBOX_MANAGED_ERROR = new RegExp(
   [
     `schema "(${MANAGED_SCHEMAS})" does not exist`,
-    `relation "(${MANAGED_SCHEMAS})\\.[^"]+" does not exist`,
+    `relation "(${MANAGED_OBJECT_SCHEMAS})\\.[^"]+" does not exist`,
     // 完整签名:auth.can_read(uuid, uuid) / auth.x(character varying) 都带空格
-    `function (${MANAGED_SCHEMAS})\\.[^(]+\\([^)]*\\) does not exist`,
+    `function (${MANAGED_OBJECT_SCHEMAS})\\.[^(]+\\([^)]*\\) does not exist`,
     `role "(authenticated|anon|service_role|supabase_[a-z_]+)" does not exist`,
     "\\bauth\\.uid\\b",
     "\\bauth\\.jwt\\b",

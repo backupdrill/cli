@@ -60,6 +60,15 @@ test("沙箱 allowlist:shim 之后的新形态(FK → auth.users、没桩的 aut
   const r = classifyBlocks(fkToAuthUsers + unstubbedFn + multiArg + multiWordType, SANDBOX_MANAGED_ERROR);
   assert.equal(r.expectedSkips, 4);
   assert.equal(r.failures.length, 0);
+  // extensions 里缺函数/表 = 扩展没装上或用户把自己的函数放进去了,必须是真失败:
+  // 交叉审查复现过 UNIQUE 索引调 extensions.normalize_key(text) 被吞成跳过 → 缺索引却 PASS
+  const extFn =
+    'pg_restore: error: could not execute query: ERROR:  function extensions.normalize_key(text) does not exist\nCommand was: CREATE UNIQUE INDEX k ON public.t (extensions.normalize_key(v));\n';
+  const extRel =
+    'pg_restore: error: could not execute query: ERROR:  relation "extensions.lookup" does not exist\nCommand was: ALTER TABLE ONLY public.t ADD CONSTRAINT fk FOREIGN KEY (x) REFERENCES extensions.lookup(id);\n';
+  const ext = classifyBlocks(extFn + extRel, SANDBOX_MANAGED_ERROR);
+  assert.equal(ext.expectedSkips, 0);
+  assert.equal(ext.failures.length, 2);
   // 用户自己 schema 里的缺表绝不能被这条规则吞掉
   const userTable =
     'pg_restore: error: could not execute query: ERROR:  relation "public.orders" does not exist\nCommand was: ALTER TABLE ONLY public.items ADD CONSTRAINT fk FOREIGN KEY (o) REFERENCES public.orders(id);\n';
