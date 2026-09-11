@@ -6,7 +6,7 @@ import { readFileSync, statSync, mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { S3Client } from "@aws-sdk/client-s3";
-import { downloadToFile } from "../dist/snapshots.js";
+import { downloadToFile, writeFully } from "../dist/snapshots.js";
 
 // 2026-09-12:12 GB dump 单条 HTTPS 流第 10 分钟被对端关掉,整次演练报废、无续传。
 // 这里用本地假桶 + 真 SDK 复现"半路掐断"并验证按 Range 续传后字节与哈希都对。
@@ -168,6 +168,87 @@ test("404 是事实不是故障:立刻抛,不重试", async () => {
   try {
     await assert.rejects(downloadToFile(b.s3, "bucket", "missing", join(dir, "404.bin"), { maxAttempts: 4 }));
     assert.equal(b.requests.length, 1, "no retry on 404");
+  } finally {
+    await b.close();
+  }
+});
+
+// ── 短写 / 半块出错 / 慢写竞态(交叉审查 2026-09-12)──────────────────────────
+
+/** 假句柄:每次只写 `step` 字节;可在写到第 `failAt` 字节后抛错;可加延迟。 */
+function fakeHandle({ step = 3, failAt = Infinity, delayMs = 0 } = {}) {
+  const chunks = [];
+  let size = 0;
+  return {
+    calls: 0,
+    chunks,
+    get size() { return size; },
+    async write(buffer, offset, length, position) {
+      this.calls += 1;
+      if (delayMs) await new Promise((r) => setTimeout(r, delayMs));
+      const n = Math.min(step, length);
+      if (position + n > failAt) throw new Error("disk full (injected)");
+      chunks.push(buffer.subarray(offset, offset + n));
+      size = Math.max(size, position + n);
+      return { bytesWritten: n };
+    },
+    async close() {},
+  };
+}
+
+test("writeFully:一次只写 3 字节的句柄也要写满整块,返回真正落盘的字节数", async () => {
+  const fh = fakeHandle({ step: 3 });
+  const n = await writeFully(fh, Buffer.from("ABCDEFGH"), 0);
+  assert.equal(n, 8);
+  assert.equal(fh.calls, 3, "8 bytes at 3 per write = 3 calls");
+  assert.equal(Buffer.concat(fh.chunks).toString(), "ABCDEFGH");
+});
+
+test("writeFully:半块出错时把已确认字节数挂在错误上(哈希/起点据此对齐磁盘)", async () => {
+  const fh = fakeHandle({ step: 3, failAt: 6 });
+  await assert.rejects(writeFully(fh, Buffer.from("ABCDEFGH"), 0), (err) => {
+    assert.match(err.message, /disk full/);
+    assert.equal(err.confirmedBytes, 6);
+    return true;
+  });
+});
+
+test("短写句柄 + 半路掐断 + 续传:哈希与字节仍与源逐字一致(校验和只盖真落盘的字节)", async () => {
+  const b = await fakeBucket("cut-first");
+  const fh = fakeHandle({ step: 7919 }); // 素数步长,保证块边界与写边界错开
+  try {
+    const r = await downloadToFile(b.s3, "bucket", "dump", "/dev/null", {
+      maxAttempts: 4,
+      openFile: async () => fh,
+    });
+    assert.equal(r.bytes, DATA.length);
+    assert.equal(r.sha256, SHA);
+    assert.ok(Buffer.concat(fh.chunks).equals(DATA));
+    const start = Number(/bytes=(\d+)-/.exec(b.requests[1].range)[1]);
+    // 起点是已确认的**完整块**边界(每个网络 chunk 写满才计数),落在送达的前缀之内;
+    // "没洞没重叠"由上面 Buffer.concat(...).equals(DATA) 证明
+    assert.ok(start > 0 && start <= 400_000, `resume offset must be a confirmed byte count inside the prefix, got ${start}`);
+  } finally {
+    await b.close();
+  }
+});
+
+test("慢磁盘竞态:源先断、上一块的写还在途 → 重试前等它落定,续传起点 = 磁盘字节数", async () => {
+  const b = await fakeBucket("cut-first");
+  // 每次写延迟 150ms:pipeline 会在最后一块还没写完时就因源断而 reject
+  const fh = fakeHandle({ step: 1 << 20, delayMs: 150 });
+  try {
+    const r = await downloadToFile(b.s3, "bucket", "dump", "/dev/null", {
+      maxAttempts: 4,
+      openFile: async () => fh,
+    });
+    assert.equal(r.bytes, DATA.length);
+    assert.equal(r.sha256, SHA);
+    assert.ok(Buffer.concat(fh.chunks).equals(DATA), "no hole, no overlap");
+    const start = Number(/bytes=(\d+)-/.exec(b.requests[1].range)[1]);
+    // 第二次请求的 Range 起点必须等于当时磁盘上真有的字节数——用最终文件反推:
+    // 所有块拼起来正好等于源,说明起点没错位(错位会留下洞或重叠,equals 就会失败)
+    assert.ok(start > 0);
   } finally {
     await b.close();
   }
