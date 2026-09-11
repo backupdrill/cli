@@ -21,6 +21,7 @@ import {
   installExtensions,
   quoteIdent,
   restoreDatabaseArtifact,
+  installSandboxShim,
 } from "./restore-engine.js";
 import { connectPg } from "./supabase-ca.js";
 import { log } from "./log.js";
@@ -436,6 +437,9 @@ export async function drillDump(
     // 旧 manifest(≤0.1.1)没有 extensions 字段 → 不装任何扩展,行为与从前一致
     const extensions = manifest.database.extensions ?? [];
     const unavailable = await installExtensions(pg.connString, extensions);
+    // Supabase 运行面的桩(auth.uid() 等 + 标准角色):没有它,参数/列默认值里引用
+    // auth.uid() 的函数与表在 pre-data 就建不出来 —— 见 installSandboxShim 头注
+    await installSandboxShim(pg.connString);
     if (extensions.length) {
       // 装不上 ≠ 演练失败:扩展本体不在 public 转储里,没丢任何已备份的数据;
       // 若恢复真的需要它,下面的 pgRestore 会失败并给出分类错误
