@@ -71,6 +71,9 @@ test(
         "create table owned(id int primary key, owner uuid default auth.uid()); insert into owned select g, null from generate_series(1,20) g; " +
         // FK → auth.users:沙箱刻意不建 auth.users(空表会让 FK 校验真失败),必须按托管对象跳过
         "create table profile(id int primary key, user_id uuid references auth.users(id)); insert into profile values (1, null), (2, null); " +
+        // 函数**体**引用 auth.users:pg_dump 头部 set check_function_bodies = false,恢复时不校验体,
+        // 建得出来、演练照过 —— 只有真调用才炸。这正是 README 说"要靠 --check-cmd 去练"的那类对象。
+        "create function public.find_user() returns void language plpgsql as $$ begin perform 1 from auth.users; end $$; " +
         // matview + 分区表 = 曾经的必然 FAIL 回归:manifest 统计端含它们而校验端不含,
         // 表数不符 + 误报缺表。修复后两端同口径,这个组合必须 PASS。
         "create materialized view demo_mv as select id, v from demo where id <= 10; " +
@@ -121,7 +124,8 @@ test(
     assert.equal(good.pass, true, "good backup should pass");
     assert.equal(good.restoredRowTotal, 232);
     assert.equal(good.restoredTableCount, 7);
-    // pre-data 全严格:is_admin(default auth.uid()) 与它的 comment 建不出来会让上面直接失败。
+    // pre-data 全严格:is_admin(default auth.uid()) 与它的 comment 建不出来会让上面直接失败;
+    // find_user() 的函数体引用 auth.users 但恢复时不校验体(check_function_bodies=off),所以也过。
     // post-data 语义:PK 恢复成功;policy(to authenticated)有了角色桩之后**真的建出来了**,
     // 不再是跳过;唯一的预期跳过是 FK → auth.users(沙箱刻意不建那张表)。
     const pd = good.checks.find((c) => c.name === "post-data objects");
