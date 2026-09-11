@@ -4,6 +4,7 @@ import fs from "node:fs";
 import {
   classifyBlocks,
   finalizePass,
+  sandboxManagedError,
   sandboxShimSql,
   SANDBOX_MANAGED_ERROR,
   SCHEMA_EXISTS_ERROR,
@@ -130,6 +131,41 @@ test("allowlist 两端锚定:主消息内嵌的行值不算缺对象诊断", () 
   const fatal = 'pg_restore: error: could not open input file "x.dump": No such file or directory\n';
   const f = classifyBlocks(fatal, SANDBOX_MANAGED_ERROR);
   assert.equal(f.failures.length, 1);
+});
+
+// 第五轮(交叉审查):转储自己带了 auth,auth 里的对象就是用户的备份内容,缺了是真失败。
+// 与 sandboxShimSql "带 auth 就不建桩"对称:桩不建、豁免也不给。
+test("sandboxManagedError:转储带了的托管 schema 不再豁免;没带的照旧;角色恒豁免", () => {
+  const missingAuthFn =
+    'pg_restore: error: could not execute query: ERROR:  function auth.normalize_key(text) does not exist\nCommand was: CREATE UNIQUE INDEX k ON public.t (auth.normalize_key(v));\n';
+  const missingAuthRel =
+    'pg_restore: error: could not execute query: ERROR:  relation "auth.users" does not exist\nCommand was: ALTER TABLE ONLY public.profile ADD CONSTRAINT fk FOREIGN KEY (u) REFERENCES auth.users(id);\n';
+  const missingStorage =
+    'pg_restore: error: could not execute query: ERROR:  relation "storage.objects" does not exist\nCommand was: CREATE VIEW v AS SELECT 1 FROM storage.objects;\n';
+  const missingRole =
+    'pg_restore: error: could not execute query: ERROR:  role "authenticated" does not exist\nCommand was: CREATE POLICY p ON t TO authenticated;\n';
+
+  // 只转 public(托管 worker 的恒定形态):auth/storage 缺席全是预期
+  const publicOnly = classifyBlocks(missingAuthFn + missingAuthRel + missingStorage + missingRole, sandboxManagedError(["public"]));
+  assert.equal(publicOnly.expectedSkips, 4);
+  assert.equal(publicOnly.failures.length, 0);
+
+  // 转了 public + auth:auth 里缺的是真失败;storage 与角色照旧豁免
+  const withAuth = classifyBlocks(missingAuthFn + missingAuthRel + missingStorage + missingRole, sandboxManagedError(["public", "auth"]));
+  assert.equal(withAuth.expectedSkips, 2, "storage + role stay exempt");
+  assert.equal(withAuth.failures.length, 2, "both auth absences are real failures");
+  assert.match(withAuth.failures[0], /normalize_key/);
+  assert.match(withAuth.failures[1], /auth\.users/);
+
+  // 模式条目(graphql[a-z_]*)按正则整体匹配转储的 schema 名
+  const withGraphql = classifyBlocks(
+    'pg_restore: error: could not execute query: ERROR:  relation "graphql_public.x" does not exist\nCommand was: X;\n',
+    sandboxManagedError(["public", "graphql_public"])
+  );
+  assert.equal(withGraphql.failures.length, 1);
+
+  // 默认导出 = 什么都没转
+  assert.equal(SANDBOX_MANAGED_ERROR.source, sandboxManagedError().source);
 });
 
 // ── finalizePass:R0 假成功回归钉子(替代已删除的 pgRestoreOutcome 用例)──
