@@ -172,8 +172,12 @@ export function postDataResult(code: number | null, stderr: string): PostDataRes
  * 的托管对象跳过如实返回。pre-data 的 schema 冲突跳过(dump 自带 CREATE SCHEMA,
  * 容器恒有 public)是非事件,不计入报告。
  */
-async function pgRestore(dumpPath: string, connString: string): Promise<PostDataResult> {
-  const result = await restoreDatabaseArtifact({ dumpPath, connString, target: "sandbox" });
+async function pgRestore(
+  dumpPath: string,
+  connString: string,
+  dumpedSchemas: string[]
+): Promise<PostDataResult> {
+  const result = await restoreDatabaseArtifact({ dumpPath, connString, target: "sandbox", dumpedSchemas });
   if (result.preData.failures.length) {
     throw new Error(`pg_restore failed: ${result.preData.failures.join(" | ")}`);
   }
@@ -460,7 +464,7 @@ export async function drillDump(
     log.step("Restoring into ephemeral Postgres…");
     let postData: PostDataResult;
     try {
-      postData = await pgRestore(dumpPath, pg.connString);
+      postData = await pgRestore(dumpPath, pg.connString, manifest.database.schemas);
     } catch (error) {
       // 沙箱装不上扩展 + 错误特征命中"缺类型/schema/扩展" → 假设式归因到沙箱环境
       // (不对备份健康下断言);其余失败与扩展无关,必须原样抛出

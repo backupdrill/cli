@@ -202,32 +202,54 @@ export function spawnPgRestore(
 // 沙箱经 installSandboxShim 预置了 auth schema 的桩函数与三个标准角色(2026-09-11),
 // 所以缺席的形态从 schema/role 级变成了 relation/function 级(FK → auth.users、
 // 调到没桩的 auth.xxx())。旧形态保留:manifest 更老的路径、或 shim 本身没装上时仍会出现。
-const MANAGED_SCHEMAS = "auth|storage|realtime|vault|extensions|graphql[a-z_]*";
-// relation/function 级豁免**刻意不含 extensions**(交叉审查 2026-09-11 复现):那个 schema
-// 装的是扩展对象,installExtensions 能装的都装了;里面还缺函数/表 = 扩展没装上,或用户
-// 把自己的函数放进了 extensions —— 两种都该让演练失败并走"沙箱装不上扩展"的归因,
-// 吞成跳过就是给一份缺索引的备份盖"通过"章。schema 级形态保留原样(那是 schema 本身
-// 没建出来的老路径)。
-const MANAGED_OBJECT_SCHEMAS = "auth|storage|realtime|vault|graphql[a-z_]*";
-// **两端锚定**(交叉审查 2026-09-11 第四轮,终结子串匹配这一整类):allowlist 匹配的是
-// classifyBlocks 抽出来的**整条主消息**,必须从头到尾就是一条"缺对象"诊断。不锚定的话,
-// 用户行值能借道混进来 —— 表达式索引 `(col::uuid)` 建索引时撞上一行内容恰好是
-// `relation "auth.users" does not exist` 的数据,主消息就是
-// `invalid input syntax for type uuid: "relation "auth.users" does not exist"`,子串一匹配,
-// 一条建失败的唯一索引就被报成了预期跳过。旧的 \bauth\.uid\b / \bauth\.jwt\b 裸子串一并
-// 删掉:它们唯一对应的真实诊断是 `function auth.uid() does not exist`,下面的 function 分支已覆盖。
-export const SANDBOX_MANAGED_ERROR = new RegExp(
-  "^(?:" +
-    [
-      `schema "(${MANAGED_SCHEMAS})" does not exist`,
-      `relation "(${MANAGED_OBJECT_SCHEMAS})\\.[^"]+" does not exist`,
-      // 完整签名:auth.can_read(uuid, uuid) / auth.x(character varying) 都带空格
-      `function (${MANAGED_OBJECT_SCHEMAS})\\.[^(]+\\([^)]*\\) does not exist`,
-      `role "(authenticated|anon|service_role|supabase_[a-z_]+)" does not exist`,
-    ].join("|") +
-    ")$",
-  "i"
-);
+// 托管 schema 两张清单。relation/function 级豁免**刻意不含 extensions**(交叉审查
+// 2026-09-11 复现):那个 schema 装的是扩展对象,installExtensions 能装的都装了;里面还缺
+// 函数/表 = 扩展没装上,或用户把自己的函数放进了 extensions —— 两种都该让演练失败并走
+// "沙箱装不上扩展"的归因,吞成跳过就是给一份缺索引的备份盖"通过"章。schema 级形态保留
+// (那是 schema 本身没建出来的老路径)。条目是正则片段(graphql[a-z_]* 覆盖 graphql_public)。
+const MANAGED_SCHEMA_PATTERNS = ["auth", "storage", "realtime", "vault", "extensions", "graphql[a-z_]*"];
+const MANAGED_OBJECT_SCHEMA_PATTERNS = ["auth", "storage", "realtime", "vault", "graphql[a-z_]*"];
+
+/** 从托管清单里剔掉**这份转储自己带了**的 schema:带了就不再是"沙箱预期缺席"。 */
+function notDumped(patterns: string[], dumpedSchemas: string[]): string[] {
+  return patterns.filter(
+    (pattern) => !dumpedSchemas.some((schema) => new RegExp(`^(?:${pattern})$`, "i").test(schema))
+  );
+}
+
+/**
+ * 沙箱 allowlist,**按 manifest 实际转储的 schema 生成**(交叉审查 2026-09-11 第五轮):
+ * CLI 用户用 BACKUPDRILL_SCHEMAS=public,auth 把 auth 也转了,那 auth 里的对象就是**他自己的**
+ * 备份内容 —— 缺了是真失败,不能再当托管缺席豁免;否则一条依赖 auth.normalize_key() 的
+ * 唯一索引建不出来,演练照样 PASS。这是 installSandboxShim "转储带 auth 就不建桩"的对称
+ * 另一半:桩不建、豁免也不给,两边口径一致。角色豁免不受影响 —— 转储里从来没有 CREATE ROLE。
+ *
+ * **两端锚定**(第四轮,终结子串匹配这一整类):匹配的是 classifyBlocks 抽出来的**整条主消息**,
+ * 必须从头到尾就是一条"缺对象"诊断。不锚定的话用户行值能借道混进来 —— 表达式索引 `(col::uuid)`
+ * 撞上一行内容恰好是 `relation "auth.users" does not exist` 的数据,主消息就是
+ * `invalid input syntax for type uuid: "relation "auth.users" does not exist"`,子串一匹配,
+ * 一条建失败的唯一索引就被报成了预期跳过。旧的 \bauth\.uid\b / \bauth\.jwt\b 裸子串已删:
+ * 它们唯一对应的真实诊断 `function auth.uid() does not exist` 由 function 分支覆盖。
+ */
+export function sandboxManagedError(dumpedSchemas: string[] = []): RegExp {
+  const schemas = notDumped(MANAGED_SCHEMA_PATTERNS, dumpedSchemas).join("|");
+  const objects = notDumped(MANAGED_OBJECT_SCHEMA_PATTERNS, dumpedSchemas).join("|");
+  const alternatives = [
+    ...(schemas ? [`schema "(${schemas})" does not exist`] : []),
+    ...(objects
+      ? [
+          `relation "(${objects})\\.[^"]+" does not exist`,
+          // 完整签名:auth.can_read(uuid, uuid) / auth.x(character varying) 都带空格
+          `function (${objects})\\.[^(]+\\([^)]*\\) does not exist`,
+        ]
+      : []),
+    `role "(authenticated|anon|service_role|supabase_[a-z_]+)" does not exist`,
+  ];
+  return new RegExp(`^(?:${alternatives.join("|")})$`, "i");
+}
+
+/** 默认形态(什么托管 schema 都没转):兼容层与"只转 public"的托管 worker 路径。 */
+export const SANDBOX_MANAGED_ERROR = sandboxManagedError();
 
 // pre-data 唯一的预期冲突(见文件头注 3)。目标空门/新容器保证没有其他冲突源,
 // 任何别的 "already exists" 都是真冲突,必须失败。同样两端锚定。
@@ -547,6 +569,8 @@ export async function restoreDatabaseArtifact(opts: {
   dumpPath: string;
   connString: string;
   target: RestoreTargetKind;
+  /** manifest.database.schemas:沙箱 allowlist 据此剔掉转储自带的托管 schema(见 sandboxManagedError)。 */
+  dumpedSchemas?: string[];
 }): Promise<EngineResult> {
   const bin = resolvePgRestoreBin();
   // TLS 全链路 verify-full(创始人承诺项):pg_restore 与 pg_dump 同一改写——
@@ -570,7 +594,10 @@ export async function restoreDatabaseArtifact(opts: {
   const postData = finalizePass(
     second.code,
     second.stderr,
-    classifyBlocks(second.stderr, opts.target === "sandbox" ? SANDBOX_MANAGED_ERROR : NEVER_MATCH)
+    classifyBlocks(
+      second.stderr,
+      opts.target === "sandbox" ? sandboxManagedError(opts.dumpedSchemas ?? []) : NEVER_MATCH
+    )
   );
 
   return { preData, postData, ok: postData.failures.length === 0 };
