@@ -94,6 +94,37 @@ function isRetryableDownloadError(error: unknown): boolean {
 
 class NonRetryableDownloadError extends Error {}
 
+/** 最小的文件句柄接口:downloadToFile 只用这两样。测试可以注入假句柄(短写、慢写)。 */
+export interface WritableHandle {
+  write(buffer: Buffer, offset: number, length: number, position: number): Promise<{ bytesWritten: number }>;
+  close(): Promise<void>;
+}
+
+/**
+ * 把一整块写进 position 起的位置,**写满为止**。Node 的 `FileHandle.write` 合约允许一次只写
+ * 一部分(返回 bytesWritten),按整块计数会让校验和给一份少了字节的文件盖章(交叉审查
+ * 2026-09-12 故障注入:写进 3 字节、报了 8 字节、校验和照样"通过")。
+ * 返回真正落盘的字节数;中途抛错时把已确认的字节数挂在错误上,调用方据此对齐哈希与起点。
+ */
+export async function writeFully(fh: WritableHandle, chunk: Buffer, position: number): Promise<number> {
+  let done = 0;
+  while (done < chunk.length) {
+    let bytesWritten: number;
+    try {
+      ({ bytesWritten } = await fh.write(chunk, done, chunk.length - done, position + done));
+    } catch (error) {
+      throw Object.assign(error as Error, { confirmedBytes: done });
+    }
+    if (bytesWritten <= 0) {
+      throw Object.assign(new Error(`write returned ${bytesWritten} bytes at position ${position + done}`), {
+        confirmedBytes: done,
+      });
+    }
+    done += bytesWritten;
+  }
+  return done;
+}
+
 /**
  * 断点续传下载(2026-09-12):一个 12 GB 的 dump 走一条 HTTPS 流要 50 分钟,对端(用户的桶)
  * 在第 10 分钟关掉连接,整次演练就没了 —— 而且此前没有任何续传:一次事故、两封 FAILED
@@ -111,30 +142,35 @@ export async function downloadToFile(
   bucket: string,
   key: string,
   dest: string,
-  opts: { maxAttempts?: number } = {}
+  opts: { maxAttempts?: number; openFile?: (path: string) => Promise<WritableHandle> } = {}
 ): Promise<{ bytes: number; sha256: string }> {
   const maxAttempts = opts.maxAttempts ?? DOWNLOAD_MAX_ATTEMPTS;
   const hash = createHash("sha256");
-  const fh = await open(dest, "w");
+  const fh: WritableHandle = await (opts.openFile ?? ((path) => open(path, "w")))(dest);
   let written = 0; // 已落盘 = 已哈希 = 续传起点
   let total: number | null = null;
   let etag: string | undefined;
+  // 上一块的写还在途时 pipeline 就可能 reject(源先断)。重试前必须等它落定,否则 Range 用的
+  // 是过期的 written,写完成后 written 又往前走,续传起点与磁盘错位(交叉审查 2026-09-12)。
+  let inFlight: Promise<void> = Promise.resolve();
   try {
     for (let attempt = 1; ; attempt++) {
+      await inFlight.catch(() => {});
+      const from = written; // 本次请求的起点在发请求前冻结,后面的判断都用它
       try {
         const res = await s3.send(
           new GetObjectCommand({
             Bucket: bucket,
             Key: key,
-            ...(written > 0 ? { Range: `bytes=${written}-` } : {}),
+            ...(from > 0 ? { Range: `bytes=${from}-` } : {}),
           })
         );
         const body = res.Body as Readable;
         const status = res.$metadata.httpStatusCode;
-        if (written > 0 && status !== 206) {
+        if (from > 0 && status !== 206) {
           body.destroy();
           throw new NonRetryableDownloadError(
-            `resume rejected: expected 206 Partial Content from byte ${written}, got ${status} — refusing to append`
+            `resume rejected: expected 206 Partial Content from byte ${from}, got ${status} — refusing to append`
           );
         }
         if (etag === undefined) {
@@ -149,17 +185,26 @@ export async function downloadToFile(
 
         const sink = new Writable({
           write(chunk: Buffer, _enc, cb) {
-            fh.write(chunk, 0, chunk.length, written).then(
-              () => {
-                hash.update(chunk);
-                written += chunk.length;
+            inFlight = writeFully(fh, chunk, written).then(
+              (n) => {
+                hash.update(chunk.subarray(0, n));
+                written += n;
                 cb();
               },
-              (err: Error) => cb(err)
+              (err: Error & { confirmedBytes?: number }) => {
+                // 半块落盘也要如实计入:哈希与起点永远等于磁盘上真有的字节
+                const n = err.confirmedBytes ?? 0;
+                if (n > 0) {
+                  hash.update(chunk.subarray(0, n));
+                  written += n;
+                }
+                cb(err);
+              }
             );
           },
         });
         await pipeline(body, sink);
+        await inFlight.catch(() => {});
         if (total !== null && written !== total) {
           // 流"正常"结束但字节不够:对端掐断时 Node 有时不报错只是提前 end
           throw new Error(`short body: got ${written} of ${total} bytes`);
