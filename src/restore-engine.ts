@@ -195,11 +195,25 @@ export function spawnPgRestore(
   });
 }
 
-// 演练沙箱是裸 Postgres,Supabase 托管的 schema/角色必然缺席。post-data 里
-// 引用它们的失败是"环境预期",不是备份坏了;其余失败才是演练要抓的。
-// 真实 Supabase 目标不适用:角色/托管 schema 恒在,post-data 全严格。
-export const SANDBOX_MANAGED_ERROR =
-  /schema "(auth|storage|realtime|vault|extensions|graphql[a-z_]*)" does not exist|role "(authenticated|anon|service_role|supabase_[a-z_]+)" does not exist|\bauth\.uid\b|\bauth\.jwt\b/i;
+// 演练沙箱是裸 Postgres,Supabase 托管的 schema/表必然缺席。post-data 里引用它们的
+// 失败是"环境预期",不是备份坏了;其余失败才是演练要抓的。
+// 真实 Supabase 目标不适用:托管 schema/角色恒在,post-data 全严格。
+//
+// 沙箱经 installSandboxShim 预置了 auth schema 的桩函数与三个标准角色(2026-09-11),
+// 所以缺席的形态从 schema/role 级变成了 relation/function 级(FK → auth.users、
+// 调到没桩的 auth.xxx())。旧形态保留:manifest 更老的路径、或 shim 本身没装上时仍会出现。
+const MANAGED_SCHEMAS = "auth|storage|realtime|vault|extensions|graphql[a-z_]*";
+export const SANDBOX_MANAGED_ERROR = new RegExp(
+  [
+    `schema "(${MANAGED_SCHEMAS})" does not exist`,
+    `relation "(${MANAGED_SCHEMAS})\\.[^"]+" does not exist`,
+    `function (${MANAGED_SCHEMAS})\\.[^ ]+ does not exist`,
+    `role "(authenticated|anon|service_role|supabase_[a-z_]+)" does not exist`,
+    "\\bauth\\.uid\\b",
+    "\\bauth\\.jwt\\b",
+  ].join("|"),
+  "i"
+);
 
 // pre-data 唯一的预期冲突(见文件头注 3)。目标空门/新容器保证没有其他冲突源,
 // 任何别的 "already exists" 都是真冲突,必须失败。
@@ -291,6 +305,50 @@ export async function installExtensions(
     await client.end();
   }
   return unavailable;
+}
+
+/**
+ * 沙箱专用:预置 Supabase 的最小运行面,让**引用**它的用户对象能建出来被验证,而不是
+ * 被当作"托管对象跳过"。只装桩,不装数据 —— 演练验证的是用户自己的 schema。
+ *
+ * 触因(2026-09-11,真实用户 105 表 12 GB 库的首次演练):`create function
+ * public.is_admin(p uuid default auth.uid())` —— 函数在 pre-data,参数默认值建函数时
+ * 就要解析,沙箱没有 auth schema 就整遍硬失败。同一根因还会吃掉更常见的
+ * `create table ... (created_by uuid default auth.uid())`:表建不出来、数据也没了,
+ * 演练只能报"缺表"。把 pre-data 的容错放宽不解决后者;补上运行面两者都解决。
+ *
+ * 桩的形状:
+ *   auth.uid() → uuid、auth.jwt() → jsonb、auth.role() → text、auth.email() → text,
+ *   全部返回 null(恢复过程中不会真调它们:COPY 不求值列默认,策略/函数体不执行);
+ *   角色 anon / authenticated / service_role(nologin):RLS 策略的 `to authenticated`
+ *   要它们在场才能建。转储带 --no-privileges,不会有 GRANT 引用这些角色。
+ * 刻意不建 auth.users 之类的表:空的 auth.users 会让 FK 校验在 post-data 真失败,
+ * 比"缺表跳过"更糟。FK → auth.users 仍按 SANDBOX_MANAGED_ERROR 的 relation 形态跳过。
+ *
+ * **绝不对真实 Supabase 目标调用**:那里 auth 是真的,create or replace 会覆盖平台函数。
+ */
+export async function installSandboxShim(connString: string): Promise<void> {
+  const client = await connectPg(connString);
+  try {
+    await client.query(`
+      create schema if not exists auth;
+      create or replace function auth.uid() returns uuid language sql stable as $$ select null::uuid $$;
+      create or replace function auth.jwt() returns jsonb language sql stable as $$ select null::jsonb $$;
+      create or replace function auth.role() returns text language sql stable as $$ select null::text $$;
+      create or replace function auth.email() returns text language sql stable as $$ select null::text $$;
+      do $$
+      declare r text;
+      begin
+        foreach r in array array['anon', 'authenticated', 'service_role'] loop
+          if not exists (select 1 from pg_roles where rolname = r) then
+            execute format('create role %I nologin', r);
+          end if;
+        end loop;
+      end $$;
+    `);
+  } finally {
+    await client.end();
+  }
 }
 
 /**

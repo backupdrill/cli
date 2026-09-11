@@ -45,6 +45,23 @@ test("真实 Supabase 目标的 post-data 零豁免:沙箱 allowlist 不适用",
   assert.equal(supabase.failures.length, 1);
 });
 
+// 沙箱有了 auth 桩之后,缺席的形态从 schema/role 级变成 relation/function 级(2026-09-11)
+test("沙箱 allowlist:shim 之后的新形态(FK → auth.users、没桩的 auth 函数)是预期跳过", () => {
+  const fkToAuthUsers =
+    'pg_restore: error: could not execute query: ERROR:  relation "auth.users" does not exist\nCommand was: ALTER TABLE ONLY public.profile ADD CONSTRAINT profile_user_id_fkey FOREIGN KEY (user_id) REFERENCES auth.users(id);\n';
+  const unstubbedFn =
+    'pg_restore: error: could not execute query: ERROR:  function auth.something(uuid) does not exist\nCommand was: CREATE POLICY p ON t USING (auth.something(id));\n';
+  const r = classifyBlocks(fkToAuthUsers + unstubbedFn, SANDBOX_MANAGED_ERROR);
+  assert.equal(r.expectedSkips, 2);
+  assert.equal(r.failures.length, 0);
+  // 用户自己 schema 里的缺表绝不能被这条规则吞掉
+  const userTable =
+    'pg_restore: error: could not execute query: ERROR:  relation "public.orders" does not exist\nCommand was: ALTER TABLE ONLY public.items ADD CONSTRAINT fk FOREIGN KEY (o) REFERENCES public.orders(id);\n';
+  const u = classifyBlocks(userTable, SANDBOX_MANAGED_ERROR);
+  assert.equal(u.expectedSkips, 0);
+  assert.equal(u.failures.length, 1);
+});
+
 // ── finalizePass:R0 假成功回归钉子(替代已删除的 pgRestoreOutcome 用例)──
 
 test("非零退出且零错误块 → 通用失败(signal kill / 非英文 locale / 空 stderr)", () => {
