@@ -230,8 +230,12 @@ const NEVER_MATCH = /(?!)/;
 
 /**
  * 把 pg_restore 的 stderr 拆成单个错误块并按 allowlist 分类。
- * 只对 ERROR 原因行分类,不看 "Command was:" 之后的语句文本——否则一个恰好
- * 引用 auth.uid 的用户对象因"损坏/语法错误"失败时,会被误判成预期跳过。
+ * **只对 ERROR 那一行分类**:不看 "Command was:" 之后的语句文本,也不看 DETAIL /
+ * CONTEXT / LINE 行。前者的理由:一个恰好引用 auth.uid 的用户对象因"损坏/语法错误"
+ * 失败时,会被误判成预期跳过。后者(交叉审查 2026-09-11 复现):DETAIL 里带的是**行值**
+ * —— `Key (message)=(relation "auth.users" does not exist) already exists` 是用户的数据,
+ * 不是错误原因,拿它匹配等于让用户数据决定演练结论;一条失败的唯一索引就能这样混过去。
+ * Postgres 的主消息恒为单行,且在块的第一行(`pg_restore: error: ... ERROR:  …`)。
  */
 export function classifyBlocks(stderr: string, allow: RegExp): ClassifiedPass {
   const blocks = stderr
@@ -240,7 +244,7 @@ export function classifyBlocks(stderr: string, allow: RegExp): ClassifiedPass {
   let expectedSkips = 0;
   const failures: string[] = [];
   for (const block of blocks) {
-    const cause = block.split(/Command was:/i)[0];
+    const cause = block.split("\n")[0];
     if (allow.test(cause)) {
       expectedSkips += 1;
     } else {

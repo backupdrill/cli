@@ -89,6 +89,27 @@ test("sandboxShimSql:转储带 auth 就只建角色,不带才建 auth 函数桩"
   assert.match(rolesOnly, /'anon', 'authenticated', 'service_role'/);
 });
 
+// DETAIL 行里的是用户行值,不是错误原因:一条唯一索引失败,其 DETAIL 恰好含 allowlist 的
+// 文字,绝不能被吞成跳过(交叉审查 2026-09-11,PG17 复现)
+test("classifyBlocks 只看 ERROR 行:DETAIL/CONTEXT/LINE 里的文字不参与分类", () => {
+  const dupKeyWithPoisonDetail =
+    'pg_restore: error: could not execute query: ERROR:  duplicate key value violates unique constraint "msg_key"\n' +
+    'DETAIL:  Key (message)=(relation "auth.users" does not exist) already exists.\n' +
+    'Command was: CREATE UNIQUE INDEX msg_key ON public.log (message);\n';
+  const r = classifyBlocks(dupKeyWithPoisonDetail, SANDBOX_MANAGED_ERROR);
+  assert.equal(r.expectedSkips, 0);
+  assert.equal(r.failures.length, 1);
+  assert.match(r.failures[0], /duplicate key/);
+  // 反向:真正的托管缺席,原因就在 ERROR 行,照常豁免(LINE 提示行不参与也不影响)
+  const realManaged =
+    'pg_restore: error: could not execute query: ERROR:  relation "auth.users" does not exist\n' +
+    'LINE 1: ...FOREIGN KEY (user_id) REFERENCES auth.users(id)\n' +
+    'Command was: ALTER TABLE ONLY public.profile ADD CONSTRAINT fk FOREIGN KEY (user_id) REFERENCES auth.users(id);\n';
+  const m = classifyBlocks(realManaged, SANDBOX_MANAGED_ERROR);
+  assert.equal(m.expectedSkips, 1);
+  assert.equal(m.failures.length, 0);
+});
+
 // ── finalizePass:R0 假成功回归钉子(替代已删除的 pgRestoreOutcome 用例)──
 
 test("非零退出且零错误块 → 通用失败(signal kill / 非英文 locale / 空 stderr)", () => {
