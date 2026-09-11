@@ -4,6 +4,7 @@ import fs from "node:fs";
 import {
   classifyBlocks,
   finalizePass,
+  sandboxShimSql,
   SANDBOX_MANAGED_ERROR,
   SCHEMA_EXISTS_ERROR,
 } from "../dist/restore-engine.js";
@@ -51,8 +52,13 @@ test("沙箱 allowlist:shim 之后的新形态(FK → auth.users、没桩的 aut
     'pg_restore: error: could not execute query: ERROR:  relation "auth.users" does not exist\nCommand was: ALTER TABLE ONLY public.profile ADD CONSTRAINT profile_user_id_fkey FOREIGN KEY (user_id) REFERENCES auth.users(id);\n';
   const unstubbedFn =
     'pg_restore: error: could not execute query: ERROR:  function auth.something(uuid) does not exist\nCommand was: CREATE POLICY p ON t USING (auth.something(id));\n';
-  const r = classifyBlocks(fkToAuthUsers + unstubbedFn, SANDBOX_MANAGED_ERROR);
-  assert.equal(r.expectedSkips, 2);
+  // 签名带空格:多参数、多词类型(交叉审查复现:[^ ]+ 在第一个空格就断,整条变成真失败)
+  const multiArg =
+    'pg_restore: error: could not execute query: ERROR:  function auth.can_read(uuid, uuid) does not exist\nCommand was: CREATE POLICY p2 ON t USING (auth.can_read(a, b));\n';
+  const multiWordType =
+    'pg_restore: error: could not execute query: ERROR:  function auth.by_name(character varying) does not exist\nCommand was: CREATE POLICY p3 ON t USING (auth.by_name(n));\n';
+  const r = classifyBlocks(fkToAuthUsers + unstubbedFn + multiArg + multiWordType, SANDBOX_MANAGED_ERROR);
+  assert.equal(r.expectedSkips, 4);
   assert.equal(r.failures.length, 0);
   // 用户自己 schema 里的缺表绝不能被这条规则吞掉
   const userTable =
@@ -60,6 +66,18 @@ test("沙箱 allowlist:shim 之后的新形态(FK → auth.users、没桩的 aut
   const u = classifyBlocks(userTable, SANDBOX_MANAGED_ERROR);
   assert.equal(u.expectedSkips, 0);
   assert.equal(u.failures.length, 1);
+});
+
+// 转储自带 auth(BACKUPDRILL_SCHEMAS=public,auth)时不建函数桩,否则 pg_restore 的
+// CREATE FUNCTION auth.uid() 撞 "already exists" 把本来能过的演练弄挂(交叉审查 2026-09-11)
+test("sandboxShimSql:转储带 auth 就只建角色,不带才建 auth 函数桩", () => {
+  const withFns = sandboxShimSql({ authFunctions: true });
+  assert.match(withFns, /create schema if not exists auth/);
+  assert.match(withFns, /function auth\.uid\(\)/);
+  assert.match(withFns, /'anon', 'authenticated', 'service_role'/);
+  const rolesOnly = sandboxShimSql({ authFunctions: false });
+  assert.doesNotMatch(rolesOnly, /auth\.uid|create schema/);
+  assert.match(rolesOnly, /'anon', 'authenticated', 'service_role'/);
 });
 
 // ── finalizePass:R0 假成功回归钉子(替代已删除的 pgRestoreOutcome 用例)──

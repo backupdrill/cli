@@ -207,7 +207,8 @@ export const SANDBOX_MANAGED_ERROR = new RegExp(
   [
     `schema "(${MANAGED_SCHEMAS})" does not exist`,
     `relation "(${MANAGED_SCHEMAS})\\.[^"]+" does not exist`,
-    `function (${MANAGED_SCHEMAS})\\.[^ ]+ does not exist`,
+    // 完整签名:auth.can_read(uuid, uuid) / auth.x(character varying) 都带空格
+    `function (${MANAGED_SCHEMAS})\\.[^(]+\\([^)]*\\) does not exist`,
     `role "(authenticated|anon|service_role|supabase_[a-z_]+)" does not exist`,
     "\\bauth\\.uid\\b",
     "\\bauth\\.jwt\\b",
@@ -325,17 +326,15 @@ export async function installExtensions(
  * 刻意不建 auth.users 之类的表:空的 auth.users 会让 FK 校验在 post-data 真失败,
  * 比"缺表跳过"更糟。FK → auth.users 仍按 SANDBOX_MANAGED_ERROR 的 relation 形态跳过。
  *
+ * 转储自带 auth schema 时(CLI 的 BACKUPDRILL_SCHEMAS=public,auth,自托管场景)**不建函数**:
+ * pg_restore 的 CREATE FUNCTION auth.uid() 会撞我们的桩报 "already exists",而那是 pre-data、
+ * 全严格 → 一次本来能过的演练被 shim 弄挂(交叉审查 2026-09-11)。角色照建:转储里
+ * 从来没有 CREATE ROLE。
+ *
  * **绝不对真实 Supabase 目标调用**:那里 auth 是真的,create or replace 会覆盖平台函数。
  */
-export async function installSandboxShim(connString: string): Promise<void> {
-  const client = await connectPg(connString);
-  try {
-    await client.query(`
-      create schema if not exists auth;
-      create or replace function auth.uid() returns uuid language sql stable as $$ select null::uuid $$;
-      create or replace function auth.jwt() returns jsonb language sql stable as $$ select null::jsonb $$;
-      create or replace function auth.role() returns text language sql stable as $$ select null::text $$;
-      create or replace function auth.email() returns text language sql stable as $$ select null::text $$;
+export function sandboxShimSql(opts: { authFunctions: boolean }): string {
+  const roles = `
       do $$
       declare r text;
       begin
@@ -344,8 +343,24 @@ export async function installSandboxShim(connString: string): Promise<void> {
             execute format('create role %I nologin', r);
           end if;
         end loop;
-      end $$;
-    `);
+      end $$;`;
+  if (!opts.authFunctions) return roles;
+  return `
+      create schema if not exists auth;
+      create or replace function auth.uid() returns uuid language sql stable as $$ select null::uuid $$;
+      create or replace function auth.jwt() returns jsonb language sql stable as $$ select null::jsonb $$;
+      create or replace function auth.role() returns text language sql stable as $$ select null::text $$;
+      create or replace function auth.email() returns text language sql stable as $$ select null::text $$;
+      ${roles}`;
+}
+
+export async function installSandboxShim(
+  connString: string,
+  opts: { authFunctions: boolean }
+): Promise<void> {
+  const client = await connectPg(connString);
+  try {
+    await client.query(sandboxShimSql(opts));
   } finally {
     await client.end();
   }
