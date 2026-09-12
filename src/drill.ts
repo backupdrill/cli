@@ -71,6 +71,8 @@ interface Ephemeral {
   containerId: string;
   port: string;
   connString: string;
+  /** 数据目录的匿名卷名(postgres 镜像 VOLUME);销毁容器后显式删除 */
+  volumeName: string | null;
 }
 
 /**
@@ -83,6 +85,25 @@ function sandboxImage(manifest: Manifest): string {
   const hasVector = (manifest.database.extensions ?? []).some((e) => e.name === "vector");
   return hasVector ? `pgvector/pgvector:pg${major}` : `postgres:${major}-alpine`;
 }
+
+/**
+ * 沙箱 Postgres 的调参(2026-09-12):沙箱一次性、跑完即毁,生产库绝不能开的选项这里全开。
+ * 触因:105 表 / 12 GB dump 的演练跑了 2 小时,COPY 与建索引都在等 fsync、写整页 WAL、
+ * 64 MB 的排序内存反复溢磁盘。关掉持久性保证不影响演练结论(我们验证的是"能不能恢复出来",
+ * 不是"断电后还在不在"),但 COPY / 建索引通常快 2-5 倍,临时盘也少吃一半。
+ * wal_level=minimal 要求 max_wal_senders=0;shared_buffers 按 2 GB 的 worker 机器留余量。
+ */
+const SANDBOX_TUNING = [
+  "fsync=off",
+  "synchronous_commit=off",
+  "full_page_writes=off",
+  "wal_level=minimal",
+  "max_wal_senders=0",
+  "maintenance_work_mem=256MB",
+  "max_wal_size=4GB",
+  "checkpoint_timeout=30min",
+  "shared_buffers=256MB",
+];
 
 async function startEphemeralPostgres(image: string): Promise<Ephemeral> {
   log.step(`Starting ephemeral ${image}…`);
@@ -97,8 +118,20 @@ async function startEphemeralPostgres(image: string): Promise<Ephemeral> {
     "-p",
     "127.0.0.1:0:5432", // 随机主机端口,避免撞端口
     image,
+    "postgres",
+    ...SANDBOX_TUNING.flatMap((kv) => ["-c", kv]),
   ]);
   const containerId = stdout.trim();
+  // postgres 镜像把数据目录声明成 VOLUME → 每次 run 都建一个匿名卷。生产实测 `--rm` **没有**把它
+  // 带走(一次演练遗留 37.6 GB,三次失败把 59 GB 根盘灌满),所以记下卷名,销毁容器后显式删。
+  const volumeName = await execFileAsync("docker", [
+    "inspect",
+    "-f",
+    '{{range .Mounts}}{{if eq .Type "volume"}}{{.Name}}{{end}}{{end}}',
+    containerId,
+  ])
+    .then((r) => r.stdout.trim() || null)
+    .catch(() => null);
 
   try {
     const portOut = await execFileAsync("docker", [
@@ -127,7 +160,7 @@ async function startEphemeralPostgres(image: string): Promise<Ephemeral> {
           "postgres",
           "-q",
         ]);
-        return { containerId, port, connString };
+        return { containerId, port, connString, volumeName };
       } catch {
         await new Promise((r) => setTimeout(r, 500));
       }
@@ -135,6 +168,7 @@ async function startEphemeralPostgres(image: string): Promise<Ephemeral> {
     throw new Error("ephemeral Postgres did not become ready within 30s");
   } catch (error) {
     await execFileAsync("docker", ["rm", "-f", containerId]).catch(() => {});
+    if (volumeName) await execFileAsync("docker", ["volume", "rm", "-f", volumeName]).catch(() => {});
     throw error;
   }
 }
@@ -534,6 +568,8 @@ export async function drillDump(
     } else {
       log.step("Tearing down ephemeral Postgres…");
       await execFileAsync("docker", ["rm", "-f", pg.containerId]).catch(() => {});
+      // 显式删匿名卷(--rm 不可靠,见 startEphemeralPostgres);幂等,已被 --rm 带走也不报错
+      if (pg.volumeName) await execFileAsync("docker", ["volume", "rm", "-f", pg.volumeName]).catch(() => {});
     }
   }
 }

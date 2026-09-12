@@ -120,8 +120,12 @@ test(
     // 2. PASS:好备份应通过;行数 = demo 100 + matview 10 + 分区叶子 100(父表不重复计)
     //    + owned 20 + profile 2。owned 的 20 行是 shim 的直接证据:没有 auth.uid() 桩,
     //    这张表在 pre-data 就建不出来,行数会少 20、表数会少 1。
+    const volumesBefore = (await x("docker", ["volume", "ls", "-q"])).stdout.trim().split("\n").filter(Boolean);
     const good = await drillDump(dumpPath, manifest, "good");
     assert.equal(good.pass, true, "good backup should pass");
+    // 匿名卷泄漏回归(2026-09-12 生产实测一次演练遗留 37.6 GB):销毁后不能多出任何卷
+    const volumesAfter = (await x("docker", ["volume", "ls", "-q"])).stdout.trim().split("\n").filter(Boolean);
+    assert.deepEqual(volumesAfter.filter((v) => !volumesBefore.includes(v)), [], "no docker volume may be left behind");
     assert.equal(good.restoredRowTotal, 232);
     assert.equal(good.restoredTableCount, 7);
     // pre-data 全严格:is_admin(default auth.uid()) 与它的 comment 建不出来会让上面直接失败;
