@@ -1,6 +1,6 @@
 import { execFile, spawn } from "node:child_process";
 import { mkdtemp, rm } from "node:fs/promises";
-import { tmpdir, totalmem } from "node:os";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import { S3Client } from "@aws-sdk/client-s3";
@@ -93,10 +93,15 @@ function sandboxImage(manifest: Manifest): string {
  * 不是"断电后还在不在"),但 COPY / 建索引通常快 2-5 倍,临时盘也少吃一半。
  * wal_level=minimal 要求 max_wal_senders=0。
  *
- * 内存相关的两项按**这台机器的物理内存**推导,不写死:同一份 CLI 既跑在 8 GB 的 worker 上,
+ * 内存相关的两项按**Docker 引擎能用的内存**推导,不写死:同一份 CLI 既跑在 8 GB 的 worker 上,
  * 也跑在用户自己的笔记本上。比例取 Postgres 官方的经验值(shared_buffers 1/4、
  * maintenance_work_mem 1/8),再夹在 [下限, 上限] 之间——下限保证 2 GB 小机器不比调参前差,
  * 上限是因为超过 2 GB 的 shared_buffers 对一次性恢复没有边际收益,白占主机内存。
+ *
+ * 为什么问 Docker 而不是 os.totalmem():Mac / Windows 上的 Docker Desktop 跑在一台内存独立
+ * 配置的虚拟机里,宿主机 32 GB、虚拟机可能只有 2 GB;按宿主机算会把沙箱 Postgres 直接 OOM,
+ * 一份好备份被误判成演练失败(交叉审查 2026-09-12 用 1 GiB 限额复现)。`docker info` 的
+ * MemTotal 在 Linux 上就是宿主机内存,在 Docker Desktop 上是虚拟机内存,两边都是真正的预算。
  */
 const MIB = 1024 * 1024;
 function clampMib(bytes: number, minMib: number, maxMib: number): number {
@@ -107,6 +112,17 @@ export interface SandboxTuning {
   settings: string[];
   /** docker --shm-size 的值;并行建索引走动态共享内存,要跟 maintenance_work_mem 一起长 */
   shmSize: string;
+}
+
+/** Docker 引擎可用内存(字节);问不到就返回 0,让 sandboxTuning 落到下限值,宁慢勿炸。 */
+async function dockerMemoryBudget(): Promise<number> {
+  try {
+    const { stdout } = await execFileAsync("docker", ["info", "--format", "{{.MemTotal}}"]);
+    const bytes = Number.parseInt(stdout.trim(), 10);
+    return Number.isFinite(bytes) && bytes > 0 ? bytes : 0;
+  } catch {
+    return 0;
+  }
 }
 
 export function sandboxTuning(totalMemBytes: number): SandboxTuning {
@@ -133,7 +149,7 @@ export function sandboxTuning(totalMemBytes: number): SandboxTuning {
 
 async function startEphemeralPostgres(image: string): Promise<Ephemeral> {
   log.step(`Starting ephemeral ${image}…`);
-  const tuning = sandboxTuning(totalmem());
+  const tuning = sandboxTuning(await dockerMemoryBudget());
   const { stdout } = await execFileAsync("docker", [
     "run",
     "-d",
