@@ -120,8 +120,16 @@ test(
     // 2. PASS:好备份应通过;行数 = demo 100 + matview 10 + 分区叶子 100(父表不重复计)
     //    + owned 20 + profile 2。owned 的 20 行是 shim 的直接证据:没有 auth.uid() 桩,
     //    这张表在 pre-data 就建不出来,行数会少 20、表数会少 1。
+    // 只看匿名卷(Docker 给镜像 VOLUME 自动建的卷带 com.docker.volume.anonymous 标签):
+    // 并发跑的其他容器若建命名卷,不该让本用例误红
+    const anonVolumes = async () =>
+      (await x("docker", ["volume", "ls", "-q", "-f", "label=com.docker.volume.anonymous"])).stdout.trim().split("\n").filter(Boolean);
+    const volumesBefore = await anonVolumes();
     const good = await drillDump(dumpPath, manifest, "good");
     assert.equal(good.pass, true, "good backup should pass");
+    // 匿名卷泄漏回归(2026-09-12 生产实测一次演练遗留 37.6 GB):销毁后不能多出任何卷
+    const volumesAfter = await anonVolumes();
+    assert.deepEqual(volumesAfter.filter((v) => !volumesBefore.includes(v)), [], "no docker volume may be left behind");
     assert.equal(good.restoredRowTotal, 232);
     assert.equal(good.restoredTableCount, 7);
     // pre-data 全严格:is_admin(default auth.uid()) 与它的 comment 建不出来会让上面直接失败;
@@ -242,6 +250,10 @@ test(
         "exec", id, "psql", "-U", "postgres", "-c",
         "create schema extensions; create extension vector schema extensions; " +
         "create table items(id int primary key, embedding extensions.vector(3)); " +
+        // HNSW 索引 + 够多的行:并行构建要走 /dev/shm,默认 64 MB 会炸(交叉审查 2026-09-12);
+        // 沙箱现在 --shm-size=1g,这个索引必须建得出来、演练必须 PASS
+        "insert into items select g, array[random(), random(), random()]::real[]::extensions.vector from generate_series(3, 20002) g; " +
+        "create index items_embedding_hnsw on items using hnsw (embedding extensions.vector_l2_ops); " +
         "insert into items values (1,'[1,2,3]'),(2,'[4,5,6]');",
       ]);
       const conn = `postgresql://postgres:seed@127.0.0.1:${port}/postgres`;
@@ -261,8 +273,8 @@ test(
       projectName: "test",
       database: {
         serverVersion: "17.4", pgDumpVersion: "test", schemas: ["public"],
-        tableCount: 1, estimatedRowTotal: 2,
-        tables: [{ schema: "public", name: "items", estimatedRows: 2 }],
+        tableCount: 1, estimatedRowTotal: 20002,
+        tables: [{ schema: "public", name: "items", estimatedRows: 20002 }],
         extensions: [{ name: "vector", version: "0.8.5", schema: "extensions" }],
       },
       dump: { key: "seed/dump.pgcustom", format: "custom", bytes, sha256: sha },
@@ -271,7 +283,7 @@ test(
 
     const report = await drillDump(dumpPath, manifest, "vector");
     assert.equal(report.pass, true, "vector-column backup should drill PASS");
-    assert.equal(report.restoredRowTotal, 2);
+    assert.equal(report.restoredRowTotal, 20002) // 2 原始行 + 20000 行 HNSW 夹具;
     const ext = report.checks.find((c) => c.name === "sandbox extensions");
     assert.ok(ext?.pass, "extension pre-install must be reported");
     assert.match(ext.detail, /vector/);
