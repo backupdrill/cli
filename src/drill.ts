@@ -117,6 +117,10 @@ async function startEphemeralPostgres(image: string): Promise<Ephemeral> {
     "POSTGRES_DB=postgres",
     "-p",
     "127.0.0.1:0:5432", // 随机主机端口,避免撞端口
+    // Docker 默认 /dev/shm 只有 64 MB;maintenance_work_mem 调大后并行建索引(pgvector 的 HNSW
+    // 尤其)走动态共享内存,64 MB 会撞 "No space left on device" 把好备份误判失败(交叉审查
+    // 2026-09-12 复现)。pgvector 官方 docker 说明就要求调大 shm。
+    "--shm-size=1g",
     image,
     "postgres",
     ...SANDBOX_TUNING.flatMap((kv) => ["-c", kv]),
