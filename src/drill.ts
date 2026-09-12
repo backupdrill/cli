@@ -1,6 +1,6 @@
 import { execFile, spawn } from "node:child_process";
 import { mkdtemp, rm } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { tmpdir, totalmem } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import { S3Client } from "@aws-sdk/client-s3";
@@ -91,22 +91,49 @@ function sandboxImage(manifest: Manifest): string {
  * 触因:105 表 / 12 GB dump 的演练跑了 2 小时,COPY 与建索引都在等 fsync、写整页 WAL、
  * 64 MB 的排序内存反复溢磁盘。关掉持久性保证不影响演练结论(我们验证的是"能不能恢复出来",
  * 不是"断电后还在不在"),但 COPY / 建索引通常快 2-5 倍,临时盘也少吃一半。
- * wal_level=minimal 要求 max_wal_senders=0;shared_buffers 按 2 GB 的 worker 机器留余量。
+ * wal_level=minimal 要求 max_wal_senders=0。
+ *
+ * 内存相关的两项按**这台机器的物理内存**推导,不写死:同一份 CLI 既跑在 8 GB 的 worker 上,
+ * 也跑在用户自己的笔记本上。比例取 Postgres 官方的经验值(shared_buffers 1/4、
+ * maintenance_work_mem 1/8),再夹在 [下限, 上限] 之间——下限保证 2 GB 小机器不比调参前差,
+ * 上限是因为超过 2 GB 的 shared_buffers 对一次性恢复没有边际收益,白占主机内存。
  */
-const SANDBOX_TUNING = [
-  "fsync=off",
-  "synchronous_commit=off",
-  "full_page_writes=off",
-  "wal_level=minimal",
-  "max_wal_senders=0",
-  "maintenance_work_mem=256MB",
-  "max_wal_size=4GB",
-  "checkpoint_timeout=30min",
-  "shared_buffers=256MB",
-];
+const MIB = 1024 * 1024;
+function clampMib(bytes: number, minMib: number, maxMib: number): number {
+  return Math.min(maxMib, Math.max(minMib, Math.floor(bytes / MIB)));
+}
+
+export interface SandboxTuning {
+  settings: string[];
+  /** docker --shm-size 的值;并行建索引走动态共享内存,要跟 maintenance_work_mem 一起长 */
+  shmSize: string;
+}
+
+export function sandboxTuning(totalMemBytes: number): SandboxTuning {
+  const sharedBuffersMib = clampMib(totalMemBytes / 4, 256, 2048);
+  const maintenanceWorkMemMib = clampMib(totalMemBytes / 8, 256, 1024);
+  return {
+    settings: [
+      "fsync=off",
+      "synchronous_commit=off",
+      "full_page_writes=off",
+      "wal_level=minimal",
+      "max_wal_senders=0",
+      `maintenance_work_mem=${maintenanceWorkMemMib}MB`,
+      "max_wal_size=4GB",
+      "checkpoint_timeout=30min",
+      `shared_buffers=${sharedBuffersMib}MB`,
+    ],
+    // Docker 默认 /dev/shm 只有 64 MB;并行建索引(pgvector 的 HNSW 尤其)走动态共享内存,
+    // 64 MB 会撞 "No space left on device" 把好备份误判失败(交叉审查 2026-09-12 复现)。
+    // 给 maintenance_work_mem 的两倍、至少 1 GB;tmpfs 只按实际用量占内存,给大不吃亏。
+    shmSize: `${Math.max(1024, maintenanceWorkMemMib * 2)}m`,
+  };
+}
 
 async function startEphemeralPostgres(image: string): Promise<Ephemeral> {
   log.step(`Starting ephemeral ${image}…`);
+  const tuning = sandboxTuning(totalmem());
   const { stdout } = await execFileAsync("docker", [
     "run",
     "-d",
@@ -117,13 +144,10 @@ async function startEphemeralPostgres(image: string): Promise<Ephemeral> {
     "POSTGRES_DB=postgres",
     "-p",
     "127.0.0.1:0:5432", // 随机主机端口,避免撞端口
-    // Docker 默认 /dev/shm 只有 64 MB;maintenance_work_mem 调大后并行建索引(pgvector 的 HNSW
-    // 尤其)走动态共享内存,64 MB 会撞 "No space left on device" 把好备份误判失败(交叉审查
-    // 2026-09-12 复现)。pgvector 官方 docker 说明就要求调大 shm。
-    "--shm-size=1g",
+    `--shm-size=${tuning.shmSize}`,
     image,
     "postgres",
-    ...SANDBOX_TUNING.flatMap((kv) => ["-c", kv]),
+    ...tuning.settings.flatMap((kv) => ["-c", kv]),
   ]);
   const containerId = stdout.trim();
   // postgres 镜像把数据目录声明成 VOLUME → 每次 run 都建一个匿名卷。生产实测 `--rm` **没有**把它

@@ -251,7 +251,7 @@ test(
         "create schema extensions; create extension vector schema extensions; " +
         "create table items(id int primary key, embedding extensions.vector(3)); " +
         // HNSW 索引 + 够多的行:并行构建要走 /dev/shm,默认 64 MB 会炸(交叉审查 2026-09-12);
-        // 沙箱现在 --shm-size=1g,这个索引必须建得出来、演练必须 PASS
+        // 沙箱 --shm-size 至少 1 GB(按机器内存推导),这个索引必须建得出来、演练必须 PASS
         "insert into items select g, array[random(), random(), random()]::real[]::extensions.vector from generate_series(3, 20002) g; " +
         "create index items_embedding_hnsw on items using hnsw (embedding extensions.vector_l2_ops); " +
         "insert into items values (1,'[1,2,3]'),(2,'[4,5,6]');",
