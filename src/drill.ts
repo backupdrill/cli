@@ -117,7 +117,10 @@ export interface SandboxTuning {
 /** Docker 引擎可用内存(字节);问不到就返回 0,让 sandboxTuning 落到下限值,宁慢勿炸。 */
 async function dockerMemoryBudget(): Promise<number> {
   try {
-    const { stdout } = await execFileAsync("docker", ["info", "--format", "{{.MemTotal}}"]);
+    // 探测是可选的,绝不能卡住演练:守护进程假死时 5 秒后放弃,落到下限值继续跑
+    const { stdout } = await execFileAsync("docker", ["info", "--format", "{{.MemTotal}}"], {
+      timeout: 5_000,
+    });
     const bytes = Number.parseInt(stdout.trim(), 10);
     return Number.isFinite(bytes) && bytes > 0 ? bytes : 0;
   } catch {
