@@ -48,6 +48,18 @@ export function sampleStorageFiles<T>(files: T[], n: number): T[] {
   return pool.slice(0, n);
 }
 
+/** @internal 托管 worker 专用钩子;事件不携带客户数据或凭据,不属于稳定 CLI 契约。 */
+export type DrillPhase = "download" | "storage" | "sandbox" | "restore" | "verify" | "cleanup";
+export interface DrillSupervision {
+  /** 仅 runDrill 使用:supervisor 独占的空临时目录,由 supervisor 清理。 */
+  workdir: string;
+  /** 每次尝试唯一;即使 docker run 被中断,supervisor 也能按名字清理。 */
+  resourceName: string;
+  /** 非 cleanup 阶段抛错 = 主动中止并清理;上报失败应由调用方自行吞掉,回调须自带超时(托管 worker 另有进程级执行上限)。
+   * cleanup 阶段同步/异步错误均忽略,最多等待 5 秒,绝不阻止 teardown。 */
+  observe: (event: { phase: DrillPhase; dumpBytes?: number }) => Promise<void>;
+}
+
 export interface DrillCheck {
   name: string;
   pass: boolean;
@@ -150,13 +162,48 @@ export function sandboxTuning(totalMemBytes: number): SandboxTuning {
   };
 }
 
-async function startEphemeralPostgres(image: string): Promise<Ephemeral> {
+function validateSupervision(supervision?: DrillSupervision, appCheckCommand?: string, keepSandboxOnFailure?: boolean): void {
+  if (supervision && (appCheckCommand !== undefined || keepSandboxOnFailure)) {
+    throw new Error("Supervised drills cannot execute app commands or keep sandboxes");
+  }
+  if (supervision && !/^bd-drill-[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/.test(supervision.resourceName)) {
+    throw new Error("Invalid supervised drill resource name");
+  }
+}
+
+async function observeCleanup(supervision?: DrillSupervision): Promise<void> {
+  if (!supervision) return;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    await Promise.race([
+      Promise.resolve().then(() => supervision.observe({ phase: "cleanup" })),
+      new Promise<void>(resolve => { timer = setTimeout(resolve, 5_000); }),
+    ]);
+  } catch { /* 清理的优先级高于监控,同步抛错也不能挡住 teardown。 */ }
+  finally { if (timer) clearTimeout(timer); }
+}
+
+export function sandboxDataVolumeTarget(major: number): string {
+  // PG18 将镜像的 VOLUME 上移一层;挂错路径会额外生成无法按名字回收的匿名卷。
+  return major >= 18 ? "/var/lib/postgresql" : "/var/lib/postgresql/data";
+}
+
+async function startEphemeralPostgres(image: string, major: number, resourceName?: string): Promise<Ephemeral> {
+  const dataVolumeTarget = sandboxDataVolumeTarget(major);
+  if (resourceName) {
+    const existing = await execFileAsync("docker", ["volume", "ls", "--format", "{{.Name}}", "--filter", `name=^${resourceName}$`], { timeout: 10_000 });
+    if (existing.stdout.trim().split("\n").includes(resourceName)) {
+      throw new Error("Supervised drill volume already exists; refusing to restore into a reused sandbox");
+    }
+  }
   log.step(`Starting ephemeral ${image}…`);
   const tuning = sandboxTuning(await dockerMemoryBudget());
   const { stdout } = await execFileAsync("docker", [
     "run",
     "-d",
     "--rm",
+    ...(resourceName ? ["--name", resourceName, "--mount",
+      `type=volume,source=${resourceName},target=${dataVolumeTarget}`] : []),
     "-e",
     "POSTGRES_PASSWORD=drill",
     "-e",
@@ -171,7 +218,7 @@ async function startEphemeralPostgres(image: string): Promise<Ephemeral> {
   const containerId = stdout.trim();
   // postgres 镜像把数据目录声明成 VOLUME → 每次 run 都建一个匿名卷。生产实测 `--rm` **没有**把它
   // 带走(一次演练遗留 37.6 GB,三次失败把 59 GB 根盘灌满),所以记下卷名,销毁容器后显式删。
-  const volumeName = await execFileAsync("docker", [
+  const volumeName = resourceName ?? await execFileAsync("docker", [
     "inspect",
     "-f",
     '{{range .Mounts}}{{if eq .Type "volume"}}{{.Name}}{{end}}{{end}}',
@@ -504,10 +551,11 @@ export async function drillDump(
   manifest: Manifest,
   snapshot: string,
   preChecks: DrillCheck[] = [],
-  opts: { appCheckCommand?: string; keepSandboxOnFailure?: boolean } = {}
+  opts: { appCheckCommand?: string; keepSandboxOnFailure?: boolean; supervision?: DrillSupervision } = {}
 ): Promise<DrillReport> {
   // 空/纯空白命令 = 危险的假配置(CI 里变量没展开的典型形态):跑了会以 exit 0
   // 假通过,忽略会让用户以为检查在跑。拒绝,且要在起沙箱之前拒绝。
+  validateSupervision(opts.supervision, opts.appCheckCommand, opts.keepSandboxOnFailure);
   const appCheckCommand = opts.appCheckCommand?.trim();
   if (opts.appCheckCommand !== undefined && !appCheckCommand) {
     throw new Error(
@@ -516,7 +564,8 @@ export async function drillDump(
   }
 
   const checks: DrillCheck[] = [...preChecks];
-  const pg = await startEphemeralPostgres(sandboxImage(manifest));
+  await opts.supervision?.observe({ phase: "sandbox" });
+  const pg = await startEphemeralPostgres(sandboxImage(manifest), parseInt(manifest.database.serverVersion, 10), opts.supervision?.resourceName);
   let pass = false; // 异常路径视为失败,供 finally 决定 --keep 是否保留沙箱
   try {
     // 旧 manifest(≤0.1.1)没有 extensions 字段 → 不装任何扩展,行为与从前一致
@@ -541,6 +590,7 @@ export async function drillDump(
       });
     }
 
+    await opts.supervision?.observe({ phase: "restore" });
     const started = Date.now();
     log.step("Restoring into ephemeral Postgres…");
     let postData: PostDataResult;
@@ -573,6 +623,7 @@ export async function drillDump(
             : "all post-data objects restored",
     });
 
+    await opts.supervision?.observe({ phase: "verify" });
     const verify = await verifyRestored(pg.connString, manifest);
     checks.push(...verify.checks);
 
@@ -613,6 +664,7 @@ export async function drillDump(
           `(remove with: docker rm -f ${pg.containerId.slice(0, 12)})`
       );
     } else {
+      await observeCleanup(opts.supervision);
       log.step("Tearing down ephemeral Postgres…");
       await execFileAsync("docker", ["rm", "-f", pg.containerId]).catch(() => {});
       // 显式删匿名卷(--rm 不可靠,见 startEphemeralPostgres);幂等,已被 --rm 带走也不报错
@@ -630,8 +682,10 @@ export async function runDrill(
     /** CLI 专用。红线:托管 worker 绝不能传入(在 worker 上执行用户命令 = RCE)。 */
     appCheckCommand?: string;
     keepSandboxOnFailure?: boolean;
+    supervision?: DrillSupervision;
   } = {}
 ): Promise<DrillReport> {
+  validateSupervision(opts.supervision, opts.appCheckCommand, opts.keepSandboxOnFailure);
   const s3 = targetClient(config);
   const snapshotPrefix = await resolveSnapshot(s3, config, opts.snapshot);
   const snapshot = snapshotPrefix.replace(/\/$/, "").split("/").pop()!;
@@ -641,9 +695,10 @@ export async function runDrill(
     await getObjectText(s3, config.storage.bucket, `${snapshotPrefix}manifest.json`)
   );
 
-  const workdir = await mkdtemp(join(tmpdir(), "backupdrill-"));
+  const workdir = opts.supervision?.workdir ?? await mkdtemp(join(tmpdir(), "backupdrill-"));
   const dumpPath = join(workdir, "dump.pgcustom");
   try {
+    await opts.supervision?.observe({ phase: "download", dumpBytes: manifest.dump.bytes });
     log.step("Downloading dump…");
     const { sha256: sha } = await downloadToFile(
       s3,
@@ -675,6 +730,7 @@ export async function runDrill(
 
     // Storage 文件完整性(备份含 Storage 时才校验)
     if (manifest.storage && manifest.storage.files.length) {
+      await opts.supervision?.observe({ phase: "storage" });
       log.step("Verifying Storage files…");
       preChecks.push(
         await verifyStorage(s3, config, manifest, opts.verifyAllFiles ?? false)
@@ -684,8 +740,9 @@ export async function runDrill(
     return await drillDump(dumpPath, manifest, snapshot, preChecks, {
       appCheckCommand: opts.appCheckCommand,
       keepSandboxOnFailure: opts.keepSandboxOnFailure,
+      supervision: opts.supervision,
     });
   } finally {
-    await rm(workdir, { recursive: true, force: true }).catch(() => {});
+    if (!opts.supervision) await rm(workdir, { recursive: true, force: true }).catch(() => {});
   }
 }

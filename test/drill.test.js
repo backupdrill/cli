@@ -2,8 +2,8 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { createHash } from "node:crypto";
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { createHash, randomUUID } from "node:crypto";
+import { existsSync, readFileSync, writeFileSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -11,6 +11,7 @@ import {
   classifyPostDataErrors,
   postDataResult,
   sampleStorageFiles,
+  sandboxDataVolumeTarget,
 } from "../dist/drill.js";
 
 const x = promisify(execFile);
@@ -139,6 +140,36 @@ test(
     const pd = good.checks.find((c) => c.name === "post-data objects");
     assert.ok(pd?.pass, "user post-data objects (PK) must restore");
     assert.match(pd.detail, /1 Supabase-managed object\(s\) skipped/, "exactly the auth.users FK is skipped");
+
+    const workdir = mkdtempSync(join(tmpdir(), "bd-supervised-test-"));
+    try {
+      for (const mode of ["pass", "abort-restore", "throw-cleanup", "hang-cleanup"]) {
+        const resourceName = `bd-drill-${randomUUID()}`;
+        const phases = [];
+        const observe = event => {
+          phases.push(event.phase);
+          if (event.phase === "cleanup" && mode === "throw-cleanup") throw new Error("synchronous observer failure");
+          if (event.phase === "cleanup" && mode === "hang-cleanup") return new Promise(() => {});
+          return (async () => {
+            if (event.phase === "restore") {
+              const mounts = JSON.parse((await x("docker", ["inspect", "--format", "{{json .Mounts}}", resourceName])).stdout);
+              const volumes = mounts.filter(m => m.Type === "volume");
+              assert.equal(volumes.length, 1, "no hidden anonymous volume");
+              assert.equal(volumes[0].Name, resourceName);
+              if (mode === "abort-restore") throw new Error("intentional observer abort");
+            }
+          })();
+        };
+        const run = drillDump(dumpPath, manifest, "supervised", [], {
+          supervision: {workdir, resourceName, observe},
+        });
+        if (mode === "abort-restore") await assert.rejects(run, /intentional observer abort/);
+        else assert.equal((await run).pass, true);
+        if (mode === "pass") assert.deepEqual(phases, ["sandbox", "restore", "verify", "cleanup"]);
+        await assert.rejects(x("docker", ["inspect", resourceName]), /no such/i);
+        await assert.rejects(x("docker", ["volume", "inspect", resourceName]), /no such/i);
+      }
+    } finally { rmSync(workdir, {recursive:true, force:true}); }
 
     // 3. FAIL:manifest 谎报一张 dump 里没有的表,演练必须抓到
     const tampered = {
@@ -467,4 +498,38 @@ test("drillDump: empty --check-cmd is rejected before the sandbox starts", async
     () => drillDump("/nonexistent", {}, "x", [], { appCheckCommand: "   " }),
     /--check-cmd is empty/
   );
+});
+
+
+test("supervision rejects unsafe names before emitting a phase or creating resources", async () => {
+  for (const resourceName of ["BD-drill-123", "bd-drill-a,source=other", "bd-drill-------------------------------------"]) {
+    let events=0;
+    await assert.rejects(drillDump("unused", {}, "invalid", [], {supervision:{
+      workdir:"unused", resourceName, observe:async () => {events++;},
+    }}), /Invalid supervised drill resource name/);
+    assert.equal(events,0);
+  }
+});
+
+
+test("supervised mode rejects app commands and kept sandboxes before side effects", async () => {
+  for (const extra of [{appCheckCommand:"echo unsafe"},{keepSandboxOnFailure:true}]) {
+    await assert.rejects(drillDump("unused",{},"invalid",[],{...extra,supervision:{
+      workdir:"unused",resourceName:`bd-drill-${randomUUID()}`,observe:async()=>{throw new Error("must not be called");},
+    }}),/cannot execute app commands or keep sandboxes/);
+  }
+  assert.equal(sandboxDataVolumeTarget(17),"/var/lib/postgresql/data");
+  assert.equal(sandboxDataVolumeTarget(18),"/var/lib/postgresql");
+});
+
+
+test("supervision refuses an existing volume without deleting it", {skip:canRun?false:"requires Docker + pg_dump"}, async()=>{
+  const resourceName=`bd-drill-${randomUUID()}`;
+  await x("docker",["volume","create",resourceName]);
+  try {
+    await assert.rejects(drillDump("unused",{database:{serverVersion:"17"}},"reused",[],{
+      supervision:{workdir:"unused",resourceName,observe:async()=>{}},
+    }),/volume already exists/);
+    await x("docker",["volume","inspect",resourceName]);
+  } finally {await x("docker",["volume","rm",resourceName]);}
 });
