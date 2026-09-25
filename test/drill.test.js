@@ -11,6 +11,7 @@ import {
   classifyPostDataErrors,
   postDataResult,
   sampleStorageFiles,
+  sandboxDataVolumeTarget,
 } from "../dist/drill.js";
 
 const x = promisify(execFile);
@@ -508,4 +509,27 @@ test("supervision rejects unsafe names before emitting a phase or creating resou
     }}), /Invalid supervised drill resource name/);
     assert.equal(events,0);
   }
+});
+
+
+test("supervised mode rejects app commands and kept sandboxes before side effects", async () => {
+  for (const extra of [{appCheckCommand:"echo unsafe"},{keepSandboxOnFailure:true}]) {
+    await assert.rejects(drillDump("unused",{},"invalid",[],{...extra,supervision:{
+      workdir:"unused",resourceName:`bd-drill-${randomUUID()}`,observe:async()=>{throw new Error("must not be called");},
+    }}),/cannot execute app commands or keep sandboxes/);
+  }
+  assert.equal(sandboxDataVolumeTarget(17),"/var/lib/postgresql/data");
+  assert.equal(sandboxDataVolumeTarget(18),"/var/lib/postgresql");
+});
+
+
+test("supervision refuses an existing volume without deleting it", {skip:canRun?false:"requires Docker + pg_dump"}, async()=>{
+  const resourceName=`bd-drill-${randomUUID()}`;
+  await x("docker",["volume","create",resourceName]);
+  try {
+    await assert.rejects(drillDump("unused",{database:{serverVersion:"17"}},"reused",[],{
+      supervision:{workdir:"unused",resourceName,observe:async()=>{}},
+    }),/volume already exists/);
+    await x("docker",["volume","inspect",resourceName]);
+  } finally {await x("docker",["volume","rm",resourceName]);}
 });
