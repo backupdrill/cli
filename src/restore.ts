@@ -30,7 +30,7 @@ import {
   type StorageRestoreTarget,
 } from "./storage-restore.js";
 import { connectPg } from "./supabase-ca.js";
-import { localPgRestoreMajor, restoreToolBreaksOnTarget } from "./pgbin.js";
+import { localPgRestoreMajor, restoreToolTargetBlocker } from "./pgbin.js";
 import { parsePgDumpMajor } from "./backup.js";
 import { log } from "./log.js";
 
@@ -339,12 +339,13 @@ async function dryRunPreflight(
       } else {
         log.ok(`pg_restore tool: local v${toolMajor} ≥ archive requirement v${requiredMajor}`);
       }
-      if (toolMajor !== null && Number.isFinite(targetMajor) && restoreToolBreaksOnTarget(toolMajor, targetMajor)) {
+      const toolTargetBlocker =
+        toolMajor !== null && Number.isFinite(targetMajor)
+          ? restoreToolTargetBlocker(toolMajor, targetMajor, requiredMajor)
+          : null;
+      if (toolTargetBlocker) {
         blockers.push(`local pg_restore v${toolMajor} cannot restore into PostgreSQL ${targetMajor}`);
-        log.error(
-          `pg_restore tool: v${toolMajor} sends SET transaction_timeout, which PostgreSQL ${targetMajor} ` +
-            `rejects — create the target on PostgreSQL 17 or newer`
-        );
+        log.error(`pg_restore tool: ${toolTargetBlocker}`);
       }
       const extensions = db.extensions ?? [];
       if (extensions.length) {
@@ -576,13 +577,8 @@ export async function runRestore(
       }
       // 工具/目标版本闸:pg_restore 17+ 恢复进 ≤16 的目标第一句就失败。在下载与装扩展
       // 之前拦下,别等恢复到一半才炸;旧 pg_restore 又读不了新归档,所以唯一出路是新目标
-      if (restoreToolBreaksOnTarget(toolMajor, targetMajor)) {
-        throw new Error(
-          `local pg_restore is v${toolMajor}, which sends SET transaction_timeout — a setting ` +
-            `PostgreSQL ${targetMajor} does not have, so the restore would fail on its first statement. ` +
-            `Create the target on PostgreSQL 17 or newer.`
-        );
-      }
+      const toolTargetBlocker = restoreToolTargetBlocker(toolMajor, targetMajor, requiredMajor);
+      if (toolTargetBlocker) throw new Error(toolTargetBlocker);
 
       log.step("Downloading dump…");
       const dumpPath = join(workdir, "dump.pgcustom");

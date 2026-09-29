@@ -53,6 +53,28 @@ export function restoreToolBreaksOnTarget(toolMajor: number, targetMajor: number
 }
 
 /**
+ * 恢复前的工具/目标版本闸:返回拒绝理由,可放行时返回 null。dry-run 与正式恢复共用,
+ * 保证两条路径的判定和给用户的出路一字不差。出路有两条:目标升到 17+;或当归档
+ * 本身只需要 ≤16 的 pg_restore(旧版 pg_dump 写的)时,换一个与目标同版本的旧客户端。
+ */
+export function restoreToolTargetBlocker(
+  toolMajor: number,
+  targetMajor: number,
+  requiredMajor: number
+): string | null {
+  if (!restoreToolBreaksOnTarget(toolMajor, targetMajor)) return null;
+  const olderClient =
+    requiredMajor <= targetMajor
+      ? ` or point BACKUPDRILL_PG_RESTORE at a pg_restore ${targetMajor} (this archive only needs v${requiredMajor})`
+      : "";
+  return (
+    `local pg_restore is v${toolMajor}, which sends SET transaction_timeout — a setting PostgreSQL ` +
+    `${targetMajor} does not have, so the restore would fail on its first statement. ` +
+    `Create the target on PostgreSQL 17 or newer${olderClient}.`
+  );
+}
+
+/**
  * 演练沙箱的主版本:源库与本机 pg_restore 取大者。PG15/16 的源库若按源版本起沙箱,
  * 就会撞上 restoreToolBreaksOnTarget;往更新的主版本恢复是官方支持的方向,
  * 所以让沙箱跟着工具升,而不是要求用户装一套和源库同版本的旧工具
