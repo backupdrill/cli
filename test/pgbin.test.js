@@ -62,14 +62,12 @@ test("restoreToolBreaksOnTarget: only pg_restore 17+ into a server older than 17
   assert.equal(restoreToolBreaksOnTarget(16, 15), false);
 });
 
-test("sandboxMajorFor: same major as the source unless the local pg_restore would break on it", async () => {
+test("sandboxMajorFor: never older than the local tools (their output is only promised to load forward)", async () => {
   const { sandboxMajorFor } = await import("../dist/pgbin.js");
   assert.equal(sandboxMajorFor(15, 17), 17);
   assert.equal(sandboxMajorFor(16, 17), 17);
-  assert.equal(sandboxMajorFor(16, 18), 18);
+  assert.equal(sandboxMajorFor(17, 18), 18, "pg_dump 18 can emit syntax PostgreSQL 17 rejects");
   assert.equal(sandboxMajorFor(17, 17), 17);
-  assert.equal(sandboxMajorFor(17, 18), 17, "no upgrade when the tool is fine with the source version");
-  assert.equal(sandboxMajorFor(15, 16), 15, "pg_restore 16 does not send transaction_timeout");
   assert.equal(sandboxMajorFor(17, 16), 17);
   assert.equal(sandboxMajorFor(15, null), 15);
 });
