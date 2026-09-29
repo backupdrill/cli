@@ -13,6 +13,10 @@ import { renderRecoveryDoc } from "./recovery-doc.js";
 import { projectRefOf, refFromStorageEndpoint, assertNoHostOverride } from "./restore-engine.js";
 import { log } from "./log.js";
 import { TOOL_VERSION } from "./version.js";
+import { parsePgDumpMajor } from "./pgbin.js";
+
+// 解析函数搬到了 pgbin(演练与恢复都要读 pg_restore 版本,放这里会成环);保留旧出口
+export { parsePgDumpMajor };
 import { dumpUrlFor, connectPg, isSupabaseHost } from "./supabase-ca.js";
 import { libpqChildEnv, urlSslModeOf } from "./restore-engine.js";
 
@@ -23,19 +27,6 @@ function majorOf(serverVersionNum: number): number {
   return Math.floor(serverVersionNum / 10000);
 }
 
-/**
- * Parse the major version out of `pg_dump --version` output.
- *
- * MUST tolerate a trailing vendor suffix: Homebrew/macOS prints `pg_dump (PostgreSQL) 17.2`, but
- * Debian/PGDG (what the deployed worker image uses) prints
- * `pg_dump (PostgreSQL) 17.10 (Debian 17.10-1.pgdg120+1)`. Anchoring the match to end-of-string
- * therefore breaks in production while passing on a dev Mac. Anchor on the `(PostgreSQL)` marker
- * instead, falling back to the first dotted version token for non-standard builds.
- */
-export function parsePgDumpMajor(raw: string): number | null {
-  const match = raw.match(/\(PostgreSQL\)\s+(\d+)/) ?? raw.match(/(\d+)(?:\.\d+)+/);
-  return match ? Number(match[1]) : null;
-}
 
 async function pgDumpVersion(bin: string): Promise<{ raw: string; major: number }> {
   try {
