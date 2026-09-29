@@ -580,7 +580,8 @@ export async function drillDump(
         pass: true,
         detail:
           `restored into PostgreSQL ${sandboxMajor} (source is ${sourceMajor}): ` +
-          `pg_restore ${toolMajor} cannot restore into an older server; restoring forward is supported`,
+          `pg_restore ${toolMajor} sends SET transaction_timeout, which PostgreSQL 16 and older reject; ` +
+          `restoring into a newer major version is supported`,
       });
     }
     // 旧 manifest(≤0.1.1)没有 extensions 字段 → 不装任何扩展,行为与从前一致

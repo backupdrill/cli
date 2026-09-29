@@ -77,3 +77,22 @@ test("parsePgDumpMajor is still exported from backup.js after the move", async (
   assert.equal(backup.parsePgDumpMajor, pgbin.parsePgDumpMajor);
   assert.equal(backup.parsePgDumpMajor("pg_restore (PostgreSQL) 17.10 (Debian 17.10-1.pgdg120+1)"), 17);
 });
+
+test("restoreToolTargetBlocker: one message for both restore paths, with the older-client way out when the archive allows it", async () => {
+  const { restoreToolTargetBlocker } = await import("../dist/pgbin.js");
+  assert.equal(restoreToolTargetBlocker(17, 17, 17), null);
+  assert.equal(restoreToolTargetBlocker(16, 16, 16), null);
+  const needs17 = restoreToolTargetBlocker(17, 16, 17);
+  assert.match(needs17, /transaction_timeout/);
+  assert.match(needs17, /PostgreSQL 17 or newer\.$/);
+  assert.doesNotMatch(needs17, /BACKUPDRILL_PG_RESTORE/, "a v17 archive cannot be read by pg_restore 16, so do not suggest it");
+  const needs16 = restoreToolTargetBlocker(17, 16, 16);
+  assert.match(needs16, /BACKUPDRILL_PG_RESTORE at a pg_restore 16/);
+});
+
+test("restore.ts: dry-run and the real restore both apply restoreToolTargetBlocker", async () => {
+  const { readFileSync } = await import("node:fs");
+  const source = readFileSync(new URL("../src/restore.ts", import.meta.url), "utf8");
+  const calls = source.match(/restoreToolTargetBlocker\(toolMajor, targetMajor, requiredMajor\)/g) ?? [];
+  assert.equal(calls.length, 2, "both restore paths must call the version gate");
+});
