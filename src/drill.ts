@@ -24,6 +24,7 @@ import {
   installSandboxShim,
 } from "./restore-engine.js";
 import { connectPg } from "./supabase-ca.js";
+import { localPgRestoreMajor, restoreToolBreaksOnTarget, sandboxMajorFor } from "./pgbin.js";
 import { log } from "./log.js";
 
 const execFileAsync = promisify(execFile);
@@ -90,10 +91,10 @@ interface Ephemeral {
 /**
  * 沙箱镜像选择:alpine 镜像只带 contrib 扩展,装不了 pgvector——含 vector 列的
  * 备份在裸镜像里恢复必然硬崩("type vector does not exist")。manifest 记录了
- * vector 时换用 pgvector 官方镜像(同 major),其余维持轻量 alpine。
+ * vector 时换用 pgvector 官方镜像(同 major),其余维持轻量 alpine。major 由调用方给出
+ * (sandboxMajorFor:源库与本机 pg_restore 取大者),不一定等于源库版本。
  */
-function sandboxImage(manifest: Manifest): string {
-  const major = parseInt(manifest.database.serverVersion, 10);
+function sandboxImage(manifest: Manifest, major: number): string {
   const hasVector = (manifest.database.extensions ?? []).some((e) => e.name === "vector");
   return hasVector ? `pgvector/pgvector:pg${major}` : `postgres:${major}-alpine`;
 }
@@ -565,9 +566,26 @@ export async function drillDump(
 
   const checks: DrillCheck[] = [...preChecks];
   await opts.supervision?.observe({ phase: "sandbox" });
-  const pg = await startEphemeralPostgres(sandboxImage(manifest), parseInt(manifest.database.serverVersion, 10), opts.supervision?.resourceName);
+  const sourceMajor = parseInt(manifest.database.serverVersion, 10);
+  const toolMajor = await localPgRestoreMajor();
+  const sandboxMajor = sandboxMajorFor(sourceMajor, toolMajor);
+  const pg = await startEphemeralPostgres(sandboxImage(manifest, sandboxMajor), sandboxMajor, opts.supervision?.resourceName);
   let pass = false; // 异常路径视为失败,供 finally 决定 --keep 是否保留沙箱
   try {
+    if (sandboxMajor !== sourceMajor) {
+      // 报告里写明沙箱比源库新以及原因:读报告的人要知道这次证明的是
+      // "能恢复进 PostgreSQL N",而不是同版本
+      checks.push({
+        name: "sandbox version",
+        pass: true,
+        detail:
+          `restored into PostgreSQL ${sandboxMajor} (source is ${sourceMajor}): ` +
+          (toolMajor !== null && restoreToolBreaksOnTarget(toolMajor, sourceMajor)
+            ? `pg_restore ${toolMajor} sends SET transaction_timeout, which PostgreSQL ${sourceMajor} rejects`
+            : `output of pg_restore ${toolMajor} is only guaranteed to load into PostgreSQL ${toolMajor} or newer`) +
+          `; restoring into a newer major version is supported`,
+      });
+    }
     // 旧 manifest(≤0.1.1)没有 extensions 字段 → 不装任何扩展,行为与从前一致
     const extensions = manifest.database.extensions ?? [];
     const unavailable = await installExtensions(pg.connString, extensions);

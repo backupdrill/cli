@@ -49,3 +49,51 @@ test("directory containing pg_dump in its name falls back conservatively", () =>
 test("no env at all: plain pg_restore from PATH", () => {
   assert.equal(resolvePgRestoreBin(), "pg_restore");
 });
+
+// pg_restore 17 起先发 SET transaction_timeout,恢复进 ≤16 的服务端第一句就失败(上游不修)。
+// 演练沙箱因此跟着工具升版本,恢复预检则在目标 ≤16 时提前拒绝。
+test("restoreToolBreaksOnTarget: only pg_restore 17+ into a server older than 17", async () => {
+  const { restoreToolBreaksOnTarget } = await import("../dist/pgbin.js");
+  assert.equal(restoreToolBreaksOnTarget(17, 15), true);
+  assert.equal(restoreToolBreaksOnTarget(17, 16), true);
+  assert.equal(restoreToolBreaksOnTarget(18, 16), true);
+  assert.equal(restoreToolBreaksOnTarget(17, 17), false);
+  assert.equal(restoreToolBreaksOnTarget(18, 17), false);
+  assert.equal(restoreToolBreaksOnTarget(16, 15), false);
+});
+
+test("sandboxMajorFor: never older than the local tools (their output is only promised to load forward)", async () => {
+  const { sandboxMajorFor } = await import("../dist/pgbin.js");
+  assert.equal(sandboxMajorFor(15, 17), 17);
+  assert.equal(sandboxMajorFor(16, 17), 17);
+  assert.equal(sandboxMajorFor(17, 18), 18, "pg_dump 18 can emit syntax PostgreSQL 17 rejects");
+  assert.equal(sandboxMajorFor(17, 17), 17);
+  assert.equal(sandboxMajorFor(17, 16), 17);
+  assert.equal(sandboxMajorFor(15, null), 15);
+});
+
+test("parsePgDumpMajor is still exported from backup.js after the move", async () => {
+  const backup = await import("../dist/backup.js");
+  const pgbin = await import("../dist/pgbin.js");
+  assert.equal(backup.parsePgDumpMajor, pgbin.parsePgDumpMajor);
+  assert.equal(backup.parsePgDumpMajor("pg_restore (PostgreSQL) 17.10 (Debian 17.10-1.pgdg120+1)"), 17);
+});
+
+test("restoreToolTargetBlocker: one message for both restore paths, with the older-client way out when the archive allows it", async () => {
+  const { restoreToolTargetBlocker } = await import("../dist/pgbin.js");
+  assert.equal(restoreToolTargetBlocker(17, 17, 17), null);
+  assert.equal(restoreToolTargetBlocker(16, 16, 16), null);
+  const needs17 = restoreToolTargetBlocker(17, 16, 17);
+  assert.match(needs17, /transaction_timeout/);
+  assert.match(needs17, /PostgreSQL 17 or newer\.$/);
+  assert.doesNotMatch(needs17, /BACKUPDRILL_PG_RESTORE/, "a v17 archive cannot be read by pg_restore 16, so do not suggest it");
+  const needs16 = restoreToolTargetBlocker(17, 16, 16);
+  assert.match(needs16, /BACKUPDRILL_PG_RESTORE at a pg_restore 16/);
+});
+
+test("restore.ts: dry-run and the real restore both apply restoreToolTargetBlocker", async () => {
+  const { readFileSync } = await import("node:fs");
+  const source = readFileSync(new URL("../src/restore.ts", import.meta.url), "utf8");
+  const calls = source.match(/restoreToolTargetBlocker\(toolMajor, targetMajor, requiredMajor\)/g) ?? [];
+  assert.equal(calls.length, 2, "both restore paths must call the version gate");
+});
