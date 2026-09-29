@@ -75,11 +75,13 @@ export function restoreToolTargetBlocker(
 }
 
 /**
- * 演练沙箱的主版本:默认与源库同版本(最贴近真实恢复);只有本机 pg_restore 会撞上
- * restoreToolBreaksOnTarget 时,才升到工具的版本。往更新的主版本恢复是官方支持的方向,
- * 而反过来要求用户装与源库同版本的旧工具行不通(旧 pg_restore 读不了新 pg_dump 的归档)。
+ * 演练沙箱的主版本:源库与本机 pg_restore 取大者。pg_dump/pg_restore 的输出只保证能进
+ * 与工具同版本或更新的服务端(官方文档原话:不保证能载入更老的主版本)——除了
+ * restoreToolBreaksOnTarget 这条已知的,还有新版 pg_dump 生成旧服务端不认识的语法
+ * (交叉审查实测:pg_dump 18 导 PG17 的继承表)。往更新的主版本恢复是官方支持的方向,
+ * 反过来要求用户装与源库同版本的旧工具行不通(旧 pg_restore 读不了新 pg_dump 的归档)。
  * 拿不到工具版本时退回源版本。
  */
 export function sandboxMajorFor(sourceMajor: number, toolMajor: number | null): number {
-  return toolMajor !== null && restoreToolBreaksOnTarget(toolMajor, sourceMajor) ? toolMajor : sourceMajor;
+  return toolMajor === null ? sourceMajor : Math.max(sourceMajor, toolMajor);
 }

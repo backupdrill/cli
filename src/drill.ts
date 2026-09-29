@@ -24,7 +24,7 @@ import {
   installSandboxShim,
 } from "./restore-engine.js";
 import { connectPg } from "./supabase-ca.js";
-import { localPgRestoreMajor, sandboxMajorFor } from "./pgbin.js";
+import { localPgRestoreMajor, restoreToolBreaksOnTarget, sandboxMajorFor } from "./pgbin.js";
 import { log } from "./log.js";
 
 const execFileAsync = promisify(execFile);
@@ -580,8 +580,10 @@ export async function drillDump(
         pass: true,
         detail:
           `restored into PostgreSQL ${sandboxMajor} (source is ${sourceMajor}): ` +
-          `pg_restore ${toolMajor} sends SET transaction_timeout, which PostgreSQL 16 and older reject; ` +
-          `restoring into a newer major version is supported`,
+          (toolMajor !== null && restoreToolBreaksOnTarget(toolMajor, sourceMajor)
+            ? `pg_restore ${toolMajor} sends SET transaction_timeout, which PostgreSQL ${sourceMajor} rejects`
+            : `output of pg_restore ${toolMajor} is only guaranteed to load into PostgreSQL ${toolMajor} or newer`) +
+          `; restoring into a newer major version is supported`,
       });
     }
     // 旧 manifest(≤0.1.1)没有 extensions 字段 → 不装任何扩展,行为与从前一致
