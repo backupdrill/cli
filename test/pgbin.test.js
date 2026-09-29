@@ -49,3 +49,31 @@ test("directory containing pg_dump in its name falls back conservatively", () =>
 test("no env at all: plain pg_restore from PATH", () => {
   assert.equal(resolvePgRestoreBin(), "pg_restore");
 });
+
+// pg_restore 17 起先发 SET transaction_timeout,恢复进 ≤16 的服务端第一句就失败(上游不修)。
+// 演练沙箱因此跟着工具升版本,恢复预检则在目标 ≤16 时提前拒绝。
+test("restoreToolBreaksOnTarget: only pg_restore 17+ into a server older than 17", async () => {
+  const { restoreToolBreaksOnTarget } = await import("../dist/pgbin.js");
+  assert.equal(restoreToolBreaksOnTarget(17, 15), true);
+  assert.equal(restoreToolBreaksOnTarget(17, 16), true);
+  assert.equal(restoreToolBreaksOnTarget(18, 16), true);
+  assert.equal(restoreToolBreaksOnTarget(17, 17), false);
+  assert.equal(restoreToolBreaksOnTarget(18, 17), false);
+  assert.equal(restoreToolBreaksOnTarget(16, 15), false);
+});
+
+test("sandboxMajorFor: sandbox never older than the local pg_restore; source version when the tool is unknown", async () => {
+  const { sandboxMajorFor } = await import("../dist/pgbin.js");
+  assert.equal(sandboxMajorFor(15, 17), 17);
+  assert.equal(sandboxMajorFor(16, 17), 17);
+  assert.equal(sandboxMajorFor(17, 17), 17);
+  assert.equal(sandboxMajorFor(17, 16), 17);
+  assert.equal(sandboxMajorFor(15, null), 15);
+});
+
+test("parsePgDumpMajor is still exported from backup.js after the move", async () => {
+  const backup = await import("../dist/backup.js");
+  const pgbin = await import("../dist/pgbin.js");
+  assert.equal(backup.parsePgDumpMajor, pgbin.parsePgDumpMajor);
+  assert.equal(backup.parsePgDumpMajor("pg_restore (PostgreSQL) 17.10 (Debian 17.10-1.pgdg120+1)"), 17);
+});

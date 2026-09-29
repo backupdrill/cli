@@ -30,23 +30,9 @@ import {
   type StorageRestoreTarget,
 } from "./storage-restore.js";
 import { connectPg } from "./supabase-ca.js";
-import { resolvePgRestoreBin } from "./pgbin.js";
+import { localPgRestoreMajor, restoreToolBreaksOnTarget } from "./pgbin.js";
 import { parsePgDumpMajor } from "./backup.js";
-import { execFile } from "node:child_process";
-import { promisify } from "node:util";
 import { log } from "./log.js";
-
-const execFileAsync = promisify(execFile);
-
-/** 本地 pg_restore 主版本(拿不到 → null,由引擎自己的报错兜底)。 */
-async function localPgRestoreMajor(): Promise<number | null> {
-  try {
-    const { stdout } = await execFileAsync(resolvePgRestoreBin(), ["--version"]);
-    return parsePgDumpMajor(stdout.trim());
-  } catch {
-    return null;
-  }
-}
 
 /** 归档可读性要求:pg_restore 必须 ≥ max(写入工具版本, 源服务端版本)——格式跟随写入工具。 */
 export function requiredRestoreToolMajor(manifest: Manifest): number {
@@ -353,6 +339,13 @@ async function dryRunPreflight(
       } else {
         log.ok(`pg_restore tool: local v${toolMajor} ≥ archive requirement v${requiredMajor}`);
       }
+      if (toolMajor !== null && Number.isFinite(targetMajor) && restoreToolBreaksOnTarget(toolMajor, targetMajor)) {
+        blockers.push(`local pg_restore v${toolMajor} cannot restore into PostgreSQL ${targetMajor}`);
+        log.error(
+          `pg_restore tool: v${toolMajor} sends SET transaction_timeout, which PostgreSQL ${targetMajor} ` +
+            `rejects — create the target on PostgreSQL 17 or newer`
+        );
+      }
       const extensions = db.extensions ?? [];
       if (extensions.length) {
         const available = await client.query<{ name: string }>(
@@ -579,6 +572,15 @@ export async function runRestore(
           `local pg_restore is v${toolMajor} but this archive needs v${requiredMajor}+ ` +
             `(archive format follows the writing tool). Install postgresql client ${requiredMajor}+ ` +
             `and/or point BACKUPDRILL_PG_RESTORE at it.`
+        );
+      }
+      // 工具/目标版本闸:pg_restore 17+ 恢复进 ≤16 的目标第一句就失败。在下载与装扩展
+      // 之前拦下,别等恢复到一半才炸;旧 pg_restore 又读不了新归档,所以唯一出路是新目标
+      if (restoreToolBreaksOnTarget(toolMajor, targetMajor)) {
+        throw new Error(
+          `local pg_restore is v${toolMajor}, which sends SET transaction_timeout — a setting ` +
+            `PostgreSQL ${targetMajor} does not have, so the restore would fail on its first statement. ` +
+            `Create the target on PostgreSQL 17 or newer.`
         );
       }
 
