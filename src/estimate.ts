@@ -1,3 +1,4 @@
+import type { Client } from "pg";
 import type { BackupConfig } from "./config.js";
 import { measureStorage } from "./storage.js";
 import { log } from "./log.js";
@@ -23,23 +24,29 @@ const SUBSCRIPTION_FLOOR_USD = 19;
 
 const GB = 1024 * 1024 * 1024;
 
+/**
+ * 要转储的 schema 里所有表的磁盘占用。pg_total_relation_size 含索引+TOAST,是 egress
+ * 上界(真实转储经压缩、不含索引,更小)。备份也拿它估转储体积来定分片大小。
+ * 直接传 relid 而不是按名字转 regclass:统计视图读出来之后表被并发删掉,
+ * 按名字转会报错,按 oid 查只会得到 NULL。
+ */
+export async function relationBytes(client: Client, schemas: string[]): Promise<number> {
+  const res = await client.query<{ bytes: string }>(
+    `select coalesce(sum(pg_total_relation_size(relid)), 0)::bigint as bytes
+       from pg_stat_user_tables
+      where schemaname = any($1::text[])`,
+    [schemas]
+  );
+  return Number(res.rows[0].bytes);
+}
+
 async function measureDbBytes(
   databaseUrl: string,
   schemas: string[]
 ): Promise<number> {
   const client = await connectPg(databaseUrl);
   try {
-    // pg_total_relation_size 含索引+TOAST,是 egress 上界(真实转储经压缩、不含索引,更小)
-    const res = await client.query<{ bytes: string }>(
-      `select coalesce(
-                sum(pg_total_relation_size(format('%I.%I', schemaname, relname)::regclass)),
-                0
-              )::bigint as bytes
-         from pg_stat_user_tables
-        where schemaname = any($1::text[])`,
-      [schemas]
-    );
-    return Number(res.rows[0].bytes);
+    return await relationBytes(client, schemas);
   } finally {
     await client.end();
   }

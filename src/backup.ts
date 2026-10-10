@@ -14,6 +14,8 @@ import { projectRefOf, refFromStorageEndpoint, assertNoHostOverride } from "./re
 import { log } from "./log.js";
 import { TOOL_VERSION } from "./version.js";
 import { parsePgDumpMajor } from "./pgbin.js";
+import { relationBytes } from "./estimate.js";
+import { dumpPartSizeFor } from "./part-size.js";
 
 // 解析函数搬到了 pgbin(演练与恢复都要读 pg_restore 版本,放这里会成环);保留旧出口
 export { parsePgDumpMajor };
@@ -52,6 +54,8 @@ interface DbFacts {
   serverVersionNum: number;
   tables: TableStat[];
   extensions: ExtensionInfo[];
+  /** 要转储的表的磁盘占用;量不出来时为 null(只影响分片大小,不影响备份本身) */
+  relationBytes: number | null;
 }
 
 async function inspectDatabase(
@@ -97,6 +101,16 @@ async function inspectDatabase(
         where e.extname <> 'plpgsql'
         order by e.extname`
     );
+    // 量体积失败不该让备份失败:分片退回保底值,200 GiB 以内的转储照常上传
+    let measuredBytes: number | null = null;
+    try {
+      measuredBytes = await relationBytes(client, schemas);
+    } catch (error) {
+      log.warn(
+        `Could not measure database size (${(error as Error).message}); ` +
+          `uploading with the baseline part size, which fits a dump of up to 200 GiB.`
+      );
+    }
     return {
       serverVersion: version.rows[0].server_version,
       serverVersionNum: Number(versionNum.rows[0].server_version_num),
@@ -106,6 +120,7 @@ async function inspectDatabase(
         estimatedRows: Number(r.estimated_rows),
       })),
       extensions: extensions.rows,
+      relationBytes: measuredBytes,
     };
   } finally {
     await client.end();
@@ -117,7 +132,8 @@ async function dumpToS3(
   config: BackupConfig,
   s3: S3Client,
   key: string,
-  pgDumpBin: string
+  pgDumpBin: string,
+  partSize: number
 ): Promise<{ bytes: number; sha256: string }> {
   const hash = createHash("sha256");
   let bytes = 0;
@@ -169,6 +185,7 @@ async function dumpToS3(
 
   const upload = new Upload({
     client: s3,
+    partSize,
     params: {
       Bucket: config.storage.bucket,
       Key: key,
@@ -247,7 +264,13 @@ export async function runBackup(config: BackupConfig): Promise<Manifest> {
   const dumpKey = `${base}/dump.pgcustom`;
 
   log.step(`Dumping → s3://${config.storage.bucket}/${dumpKey}`);
-  const { bytes, sha256 } = await dumpToS3(config, s3, dumpKey, pgDumpBin);
+  const { bytes, sha256 } = await dumpToS3(
+    config,
+    s3,
+    dumpKey,
+    pgDumpBin,
+    dumpPartSizeFor(db.relationBytes)
+  );
   log.ok(`Database dumped (${(bytes / 1024 / 1024).toFixed(1)} MB, sha256 ${sha256.slice(0, 12)}…)`);
 
   // Storage 文件同步(源配置存在才做;否则只备数据库)

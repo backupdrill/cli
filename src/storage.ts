@@ -12,6 +12,7 @@ import { Upload } from "@aws-sdk/lib-storage";
 import type { SupabaseStorageConfig } from "./config.js";
 import type { StorageFile } from "./manifest.js";
 import { log } from "./log.js";
+import { partSizeFor } from "./part-size.js";
 
 /**
  * Supabase Storage 通过 S3 兼容端点访问(endpoint 形如
@@ -135,6 +136,8 @@ export async function syncStorage(
       const copy = pipeline(body, meter);
       const upload = new Upload({
         client: target.client,
+        // Body 是流,lib-storage 不知道长度,会固定按 5 MiB 切;用响应里的长度算分片
+        partSize: partSizeFor(got.ContentLength ?? obj.size),
         params: {
           Bucket: target.bucket,
           Key: `${target.base}/storage/${bucket}/${obj.key}`,
