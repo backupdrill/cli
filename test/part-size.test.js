@@ -5,14 +5,14 @@ import assert from "node:assert/strict";
 import { Readable } from "node:stream";
 import { S3Client, ListObjectsV2Command, GetObjectCommand } from "@aws-sdk/client-s3";
 import { Upload } from "@aws-sdk/lib-storage";
-import { partSizeFor } from "../dist/part-size.js";
+import { partSizeFor, dumpPartSizeFor } from "../dist/part-size.js";
 import { syncStorage } from "../dist/storage.js";
 
 const MIB = 1024 * 1024;
 const GIB = 1024 * MIB;
 const MAX_PARTS = 10_000;
 
-test("小对象和未知体积都用 5 MiB(与 lib-storage 默认一致,小库行为不变)", () => {
+test("小对象和未知体积都用 5 MiB(与 lib-storage 默认一致)", () => {
   assert.equal(partSizeFor(0), 5 * MIB);
   assert.equal(partSizeFor(-1), 5 * MIB);
   assert.equal(partSizeFor(1 * GIB), 5 * MIB);
@@ -36,10 +36,10 @@ test("任何体积都能装进 10,000 片", () => {
 // 接线回归:上面只测算术,把 Upload 的 partSize 删掉也照样绿。这里让源端声称
 // 一个 60 GiB 的文件,看 syncStorage 交给 Upload 的分片是不是按长度放大了。
 // 真发 60 GiB 不现实,所以给 S3 send 和 Upload.done 打桩。
-async function partSizesUsedBySyncStorage(contentLength) {
+async function partSizesUsedBySyncStorage({ listSize, contentLength }) {
   const send = mock.method(S3Client.prototype, "send", async (command) => {
     if (command instanceof ListObjectsV2Command) {
-      return { Contents: [{ Key: "big.bin", Size: 60 * GIB }], IsTruncated: false };
+      return { Contents: [{ Key: "big.bin", Size: listSize }], IsTruncated: false };
     }
     if (command instanceof GetObjectCommand) {
       return { ContentLength: contentLength, Body: Readable.from([Buffer.from("x")]) };
@@ -65,11 +65,32 @@ async function partSizesUsedBySyncStorage(contentLength) {
   return partSizes;
 }
 
-test("Storage 拷贝按 GET 的 Content-Length 放大分片", async () => {
-  assert.deepEqual(await partSizesUsedBySyncStorage(60 * GIB), [partSizeFor(60 * GIB)]);
-  assert.ok(partSizeFor(60 * GIB) > 5 * MIB);
+// 列表和 GET 给不同的大小:列举之后文件可能被覆盖,真正流过来的是 GET 的那份
+test("Storage 拷贝按 GET 的 Content-Length 放大分片,不按列表里的旧 Size", async () => {
+  assert.deepEqual(
+    await partSizesUsedBySyncStorage({ listSize: 1 * GIB, contentLength: 60 * GIB }),
+    [partSizeFor(60 * GIB)]
+  );
+  assert.ok(partSizeFor(60 * GIB) > partSizeFor(1 * GIB));
 });
 
 test("GET 没给长度时退回列表里的 Size", async () => {
-  assert.deepEqual(await partSizesUsedBySyncStorage(undefined), [partSizeFor(60 * GIB)]);
+  assert.deepEqual(
+    await partSizesUsedBySyncStorage({ listSize: 60 * GIB, contentLength: undefined }),
+    [partSizeFor(60 * GIB)]
+  );
+});
+
+test("转储分片:小库和量不出体积都用 200 GiB 保底(21 MiB 一片)", () => {
+  assert.equal(dumpPartSizeFor(null), 21 * MIB);
+  assert.equal(dumpPartSizeFor(0), 21 * MIB);
+  assert.equal(dumpPartSizeFor(1 * GIB), 21 * MIB);
+  // 保底本身就要装得下付费最高档的 100 GB
+  assert.ok(Math.ceil((100 * GIB) / dumpPartSizeFor(null)) <= MAX_PARTS);
+});
+
+test("转储分片:估算 × 2 超过保底时按估算放大", () => {
+  assert.equal(dumpPartSizeFor(100 * GIB), 21 * MIB);
+  assert.equal(dumpPartSizeFor(500 * GIB), partSizeFor(1000 * GIB));
+  assert.ok(dumpPartSizeFor(500 * GIB) > 21 * MIB);
 });
