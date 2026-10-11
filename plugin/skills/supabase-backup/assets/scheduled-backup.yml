@@ -20,6 +20,14 @@
 #   BACKUPDRILL_S3_ENDPOINT           Set for R2/B2/self-hosted; omit for AWS S3.
 #   BACKUPDRILL_S3_REGION             Bucket region ("auto" works for R2).
 #   BACKUPDRILL_PROJECT_NAME          Readable name used in object keys/manifest.
+#   BACKUPDRILL_SCHEMAS               Comma-separated schemas to dump, e.g. public,audit
+#                                     (default: public). Use the same value as your
+#                                     local runs, or scheduled backups miss schemas.
+#   BACKUPDRILL_S3_PREFIX             Key prefix in the bucket (default: backupdrill).
+#                                     Keep it the same as local runs so drills and
+#                                     restores find these snapshots.
+#   BACKUPDRILL_S3_FORCE_PATH_STYLE   "true" for S3-compatible stores that need
+#                                     path-style URLs (e.g. MinIO).
 #
 #   To also back up Supabase Storage FILES (not just the DB), set all four:
 #   BACKUPDRILL_SUPABASE_STORAGE_ENDPOINT
@@ -27,6 +35,8 @@
 #   BACKUPDRILL_SUPABASE_STORAGE_ACCESS_KEY_ID
 #   BACKUPDRILL_SUPABASE_STORAGE_SECRET_ACCESS_KEY
 #   (generate the keys in Dashboard → Storage → Settings → S3 Access Keys)
+#   BACKUPDRILL_SUPABASE_STORAGE_BUCKETS  Optional comma-separated list of Storage
+#                                     buckets to copy (default: all of them).
 #
 # Unset optional secrets resolve to an empty string, which backupdrill treats
 # as "not provided" — so leaving them out simply backs up the database only.
@@ -93,8 +103,12 @@ jobs:
           BACKUPDRILL_S3_ENDPOINT: ${{ secrets.BACKUPDRILL_S3_ENDPOINT }}
           BACKUPDRILL_S3_REGION: ${{ secrets.BACKUPDRILL_S3_REGION }}
           BACKUPDRILL_PROJECT_NAME: ${{ secrets.BACKUPDRILL_PROJECT_NAME }}
+          BACKUPDRILL_SCHEMAS: ${{ secrets.BACKUPDRILL_SCHEMAS }}
+          BACKUPDRILL_S3_PREFIX: ${{ secrets.BACKUPDRILL_S3_PREFIX }}
+          BACKUPDRILL_S3_FORCE_PATH_STYLE: ${{ secrets.BACKUPDRILL_S3_FORCE_PATH_STYLE }}
           # --- optional: also back up Supabase Storage files (set all four) ---
           BACKUPDRILL_SUPABASE_STORAGE_ENDPOINT: ${{ secrets.BACKUPDRILL_SUPABASE_STORAGE_ENDPOINT }}
           BACKUPDRILL_SUPABASE_STORAGE_REGION: ${{ secrets.BACKUPDRILL_SUPABASE_STORAGE_REGION }}
           BACKUPDRILL_SUPABASE_STORAGE_ACCESS_KEY_ID: ${{ secrets.BACKUPDRILL_SUPABASE_STORAGE_ACCESS_KEY_ID }}
           BACKUPDRILL_SUPABASE_STORAGE_SECRET_ACCESS_KEY: ${{ secrets.BACKUPDRILL_SUPABASE_STORAGE_SECRET_ACCESS_KEY }}
+          BACKUPDRILL_SUPABASE_STORAGE_BUCKETS: ${{ secrets.BACKUPDRILL_SUPABASE_STORAGE_BUCKETS }}

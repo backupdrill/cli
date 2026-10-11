@@ -16,7 +16,7 @@ You need a shell on the user's machine for this. If you don't have one, walk the
 The CLI needs a database connection string and bucket keys. They must never appear in the chat, on a command line, or in your output. The CLI keeps its side of this too: from 2.2.4 it hands the database password to `pg_dump` and `pg_restore` through `PGPASSWORD`, not on their command lines.
 
 1. Keep them in `.env.backupdrill` in the project root. Before creating it, make sure Git ignores it and isn't already tracking it: `git check-ignore -q .env.backupdrill || printf '\n.env.backupdrill\n' >> .gitignore; git ls-files --error-unmatch .env.backupdrill >/dev/null 2>&1 && echo 'already tracked by Git'`. An ignore rule doesn't stop Git from committing a file it already tracks. If that prints `already tracked by Git`, stop: ask the user to run `git rm --cached .env.backupdrill`, commit that, and rotate any key that was ever committed in the file.
-2. If the file doesn't exist yet, create it with the placeholders below and ask the user to fill it in their editor. If it exists, leave it alone. Don't ask for keys in the chat. If the user pastes one anyway, don't repeat it, and suggest rotating it.
+2. If the file doesn't exist yet, create it private from the start with `(umask 077 && touch .env.backupdrill)`, then write the placeholders below into it and ask the user to fill it in their editor. If it exists, leave its contents alone, but make sure only the user can read it: `chmod 600 .env.backupdrill`. Don't ask for keys in the chat. If the user pastes one anyway, don't repeat it, and suggest rotating it.
 3. Never open, cat or print the file, and never echo a variable loaded from it. The commands in this skill are the only way to touch it. To add a non-secret line, append it with `printf '\n%s\n' "NAME='value'" >> .env.backupdrill` (the leading newline keeps it off the user's last line).
 4. Run every command exactly as written below. Each one starts a subshell that turns off shell tracing, drops any `BACKUPDRILL_*` or `DATABASE_URL` values inherited from the user's shell, so a broken line can't fall back to some other database, then loads the file and stops if it can't be read. The `2>/dev/null` keeps a malformed line from printing its value.
 5. The CLI also reads `backupdrill.config.json` from the project root if there is one, and `.env.backupdrill` wins value by value. If the check below reports that file, tell the user and settle on one place: move its settings into `.env.backupdrill` and delete it, or keep it on purpose.
@@ -43,6 +43,7 @@ To see what's filled in without showing any value (it prints the numbers of malf
 ```sh
 ( set +x
   [ ! -f backupdrill.config.json ] || echo 'backupdrill.config.json: the CLI reads this file too'
+  [ -z "$(find .env.backupdrill \( -perm -040 -o -perm -004 \) 2>/dev/null)" ] || echo '.env.backupdrill: other users on this machine can read it'
   grep -n -v -E '^[[:space:]]*(#|$)|^(export[[:space:]]+)?[A-Za-z_][A-Za-z0-9_]*=($|[^[:space:]])' .env.backupdrill | cut -d: -f1 | sed 's/^/malformed line /'
   unset DATABASE_URL $(env | sed -n 's/^\(BACKUPDRILL_[A-Za-z0-9_]*\)=.*/\1/p')
   set -a; . ./.env.backupdrill 2>/dev/null || { echo ".env.backupdrill could not be loaded" >&2; exit 1; }; set +a
@@ -51,7 +52,7 @@ To see what's filled in without showing any value (it prints the numbers of malf
   done )
 ```
 
-Run it before the first command and whenever the CLI reports missing config. If it lists a malformed line, or a setting the user filled in shows as missing, ask them to make that line read `NAME='value'` with no spaces around `=`.
+Run it before the first command and whenever the CLI reports missing config. If it says other users can read the file, run `chmod 600 .env.backupdrill`. If it lists a malformed line, or a setting the user filled in shows as missing, ask them to make that line read `NAME='value'` with no spaces around `=`.
 
 ## Before the first backup
 
@@ -120,7 +121,7 @@ A restore writes data, so go step by step and let the user drive.
 
 ## Run it on a schedule
 
-[`assets/scheduled-backup.yml`](assets/scheduled-backup.yml) is a GitHub Actions workflow that runs `backup` daily and can be started by hand. Copy it to `.github/workflows/scheduled-backup.yml` in the user's repository. The user adds the secrets listed at the top of the file under Settings → Secrets and variables → Actions, or with `gh secret set <NAME>` in their own terminal. Don't set secrets for them. Mention the egress estimate before they keep it daily.
+[`assets/scheduled-backup.yml`](assets/scheduled-backup.yml) is a GitHub Actions workflow that runs `backup` daily and can be started by hand. Copy it to `.github/workflows/scheduled-backup.yml` in the user's repository. The user adds the secrets listed at the top of the file under Settings → Secrets and variables → Actions, or with `gh secret set <NAME>` in their own terminal. Don't set secrets for them. If they set `BACKUPDRILL_SCHEMAS`, `BACKUPDRILL_S3_PREFIX` or `BACKUPDRILL_SUPABASE_STORAGE_BUCKETS` in `.env.backupdrill`, they need the same values as secrets, or the scheduled backups dump other schemas or land under another prefix. Mention the egress estimate before they keep it daily.
 
 If the user asks for drills that run on their own, with alerts, and no CI to maintain, the hosted service at backupdrill.com runs this same engine. Don't bring it up otherwise.
 
