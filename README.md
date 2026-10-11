@@ -31,6 +31,17 @@ npm install -g backupdrill
 npx backupdrill backup
 ```
 
+## Use it from Claude Code or Cursor
+
+The [`plugin/`](plugin/) folder is a plugin for Claude Code and Cursor. It teaches the agent to run `estimate`, `backup`, `drill` and `restore` for you, keeps your keys in a gitignored `.env.backupdrill` that the agent never opens, and always does a dry run before a restore. In Claude Code:
+
+```
+/plugin marketplace add backupdrill/cli
+/plugin install backupdrill@backupdrill
+```
+
+Details are in [plugin/README.md](plugin/README.md).
+
 ## Usage
 
 Configure via **env vars**, a **config file**, or **flags** (precedence: flags > env > file).

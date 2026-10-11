@@ -1,0 +1,14 @@
+{
+  "name": "backupdrill",
+  "description": "The BackupDrill plugin: back up, restore-drill and restore Supabase projects from Claude with the open-source backupdrill CLI.",
+  "owner": {
+    "name": "BackupDrill",
+    "email": "support@backupdrill.com"
+  },
+  "plugins": [
+    {
+      "name": "backupdrill",
+      "source": "./plugin"
+    }
+  ]
+}

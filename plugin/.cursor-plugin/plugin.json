@@ -1,0 +1,15 @@
+{
+  "name": "backupdrill",
+  "displayName": "BackupDrill",
+  "version": "1.0.0",
+  "description": "Back up a Supabase project to your own S3, R2 or B2 bucket with the open-source backupdrill CLI (the database, plus Storage files once you add their S3 keys), then run a restore drill to prove the snapshot restores.",
+  "author": {
+    "name": "BackupDrill",
+    "email": "support@backupdrill.com"
+  },
+  "homepage": "https://backupdrill.com",
+  "repository": "https://github.com/backupdrill/cli",
+  "license": "MIT",
+  "keywords": ["supabase", "backup", "postgres", "restore", "disaster-recovery", "s3", "cloudflare-r2"],
+  "logo": "assets/logo.svg"
+}
