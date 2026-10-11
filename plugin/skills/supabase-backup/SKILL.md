@@ -7,15 +7,15 @@ description: Use when the user wants to back up a Supabase project to their own 
 
 backupdrill is an open-source (MIT) command-line tool. `backup` dumps the project's Postgres database with `pg_dump`, copies Storage files too once their S3 keys are set, and writes everything to a bucket the user owns, with a checksummed `manifest.json` and a `RECOVERY.md` in every snapshot. `drill` restores a snapshot into a throwaway Postgres in Docker and checks that it came back. The CLI runs on the user's machine. It talks to their Supabase project, their bucket and the local Docker daemon, and sends nothing to BackupDrill.
 
-Always run it as `npx -y backupdrill@2.2.3 <command>`, so every run uses the same version.
+Always run it as `npx -y backupdrill@2.2.4 <command>`, so every run uses the same version.
 
 You need a shell on the user's machine for this. If you don't have one, walk the user through the same commands instead of running them.
 
 ## Keep credentials out of the conversation
 
-The CLI needs a database connection string and bucket keys. They must never appear in the chat, on a command line, or in your output.
+The CLI needs a database connection string and bucket keys. They must never appear in the chat, on a command line, or in your output. The CLI keeps its side of this too: from 2.2.4 it hands the database password to `pg_dump` and `pg_restore` through `PGPASSWORD`, not on their command lines.
 
-1. Keep them in `.env.backupdrill` in the project root. Before creating it, make sure Git ignores it: `git check-ignore -q .env.backupdrill || printf '\n.env.backupdrill\n' >> .gitignore`.
+1. Keep them in `.env.backupdrill` in the project root. Before creating it, make sure Git ignores it and isn't already tracking it: `git check-ignore -q .env.backupdrill || printf '\n.env.backupdrill\n' >> .gitignore; git ls-files --error-unmatch .env.backupdrill >/dev/null 2>&1 && echo 'already tracked by Git'`. An ignore rule doesn't stop Git from committing a file it already tracks. If that prints `already tracked by Git`, stop: ask the user to run `git rm --cached .env.backupdrill`, commit that, and rotate any key that was ever committed in the file.
 2. If the file doesn't exist yet, create it with the placeholders below and ask the user to fill it in their editor. If it exists, leave it alone. Don't ask for keys in the chat. If the user pastes one anyway, don't repeat it, and suggest rotating it.
 3. Never open, cat or print the file, and never echo a variable loaded from it. The commands in this skill are the only way to touch it. To add a non-secret line, append it with `printf '\n%s\n' "NAME='value'" >> .env.backupdrill` (the leading newline keeps it off the user's last line).
 4. Run every command exactly as written below. Each one starts a subshell that turns off shell tracing, drops any `BACKUPDRILL_*` or `DATABASE_URL` values inherited from the user's shell, so a broken line can't fall back to some other database, then loads the file and stops if it can't be read. The `2>/dev/null` keeps a malformed line from printing its value.
@@ -67,7 +67,7 @@ Every backup reads the whole database, and every configured Storage file, out of
 ```sh
 ( set +x; unset DATABASE_URL $(env | sed -n 's/^\(BACKUPDRILL_[A-Za-z0-9_]*\)=.*/\1/p')
   set -a; . ./.env.backupdrill 2>/dev/null || { echo ".env.backupdrill could not be loaded" >&2; exit 1; }; set +a
-  npx -y backupdrill@2.2.3 estimate --plan pro )
+  npx -y backupdrill@2.2.4 estimate --plan pro )
 ```
 
 Use `--plan free`, `pro` or `team` to match their Supabase plan, and read the projection back before suggesting a daily schedule. On a large database, suggest weekly.
@@ -75,12 +75,13 @@ Use `--plan free`, `pro` or `team` to match their Supabase plan, and read the pr
 ## Back up
 
 ```sh
+report="$(mktemp "${TMPDIR:-/tmp}/backupdrill-backup.XXXXXX")" || exit 1; echo "stdout → $report"
 ( set +x; unset DATABASE_URL $(env | sed -n 's/^\(BACKUPDRILL_[A-Za-z0-9_]*\)=.*/\1/p')
   set -a; . ./.env.backupdrill 2>/dev/null || { echo ".env.backupdrill could not be loaded" >&2; exit 1; }; set +a
-  npx -y backupdrill@2.2.3 backup ) > "${TMPDIR:-/tmp}/backupdrill-backup.json"
+  npx -y backupdrill@2.2.4 backup ) > "$report"
 ```
 
-- The progress lines on stderr show where everything went (`Dumping → s3://…`, `Manifest written → s3://…`) and end with `Backup complete — N tables + M Storage files`. stdout goes to that file: one line of JSON with the whole manifest, which lists every table and Storage file, so read only the fields you need from it.
+- The progress lines on stderr show where everything went (`Dumping → s3://…`, `Manifest written → s3://…`) and end with `Backup complete — N tables + M Storage files`. stdout goes to the file named on the first line, a new one each run that only the user can read: one line of JSON with the whole manifest, which lists every table and Storage file, so read only the fields you need from it.
 - Report the table count, the Storage file count (or that it was database only), and where the snapshot landed: `<prefix>/<project>/<timestamp>/` in their bucket, holding `dump.pgcustom`, `manifest.json`, `RECOVERY.md` and, with Storage keys set, `storage/`.
 - By default only the `public` schema is dumped (add their own schemas with `--schema`), so Supabase-managed schemas such as `auth` and `storage` aren't in it. Grants aren't either.
 - The CLI never deletes anything in the bucket. Old snapshots are cleaned up by the bucket's own lifecycle rules, if the user sets any.
@@ -90,7 +91,7 @@ Use `--plan free`, `pro` or `team` to match their Supabase plan, and read the pr
 ```sh
 ( set +x; unset DATABASE_URL $(env | sed -n 's/^\(BACKUPDRILL_[A-Za-z0-9_]*\)=.*/\1/p')
   set -a; . ./.env.backupdrill 2>/dev/null || { echo ".env.backupdrill could not be loaded" >&2; exit 1; }; set +a
-  npx -y backupdrill@2.2.3 drill )
+  npx -y backupdrill@2.2.4 drill )
 ```
 
 - It reads the latest snapshot from the bucket, restores it into a throwaway Postgres container, runs its checks and removes the container. It doesn't connect to the Supabase project. The first run pulls a Postgres image from Docker Hub.
@@ -109,11 +110,11 @@ A restore writes data, so go step by step and let the user drive.
    ```sh
    ( set +x; unset DATABASE_URL $(env | sed -n 's/^\(BACKUPDRILL_[A-Za-z0-9_]*\)=.*/\1/p')
      set -a; . ./.env.backupdrill 2>/dev/null || { echo ".env.backupdrill could not be loaded" >&2; exit 1; }; set +a
-     npx -y backupdrill@2.2.3 restore --database --target-supabase-url https://<target-ref>.supabase.co --dry-run )
+     npx -y backupdrill@2.2.4 restore --database --target-supabase-url https://<target-ref>.supabase.co --dry-run )
    ```
 
    Leave out `--target-supabase-url` when the snapshot is database only. To write Storage files to a local folder instead of the new project, use `--storage-dir ./recovered`.
-4. Show the dry-run result. It starts with `Dry run for snapshot <timestamp>`; note that timestamp. Run the real restore only after the user asks for it and gives you the target ref. Then replace `--dry-run` with `--snapshot <timestamp> --confirm-target <target-ref>`, using the timestamp from the dry run and exactly the ref they gave, so a backup that lands in between can't change what gets restored. Send stdout to a file as with `backup`: the JSON result can be long. If the user wants an older snapshot, pass `--snapshot` to both runs.
+4. Show the dry-run result. It starts with `Dry run for snapshot <timestamp>`; note that timestamp. Run the real restore only after the user asks for it and gives you the target ref. Then replace `--dry-run` with `--snapshot <timestamp> --confirm-target <target-ref>`, using the timestamp from the dry run and exactly the ref they gave, so a backup that lands in between can't change what gets restored. Send stdout to a new `mktemp` file the same way as `backup` (with `backupdrill-restore.XXXXXX` as the name): the JSON result can be long. If the user wants an older snapshot, pass `--snapshot` to both runs.
 5. Tell them what a restore doesn't bring back: Auth users, secret values, Edge Functions and grants. They need to set those up again. The snapshot's `RECOVERY.md` has a "Not covered" section on this.
 6. Once they're done, suggest they delete the two `TARGET` lines from `.env.backupdrill`.
 

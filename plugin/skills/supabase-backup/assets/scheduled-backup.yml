@@ -82,7 +82,7 @@ jobs:
 
       - name: Run backupdrill
         # Pinned so every run uses the same CLI. Raise it on purpose when you upgrade.
-        run: npx -y backupdrill@2.2.3 backup
+        run: npx -y backupdrill@2.2.4 backup
         env:
           # --- required ---
           BACKUPDRILL_DATABASE_URL: ${{ secrets.BACKUPDRILL_DATABASE_URL }}
