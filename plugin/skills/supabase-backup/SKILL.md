@@ -18,7 +18,7 @@ The CLI needs a database connection string and bucket keys. They must never appe
 1. Keep them in `.env.backupdrill` in the project root. Before creating it, make sure Git ignores it: `git check-ignore -q .env.backupdrill || printf '\n.env.backupdrill\n' >> .gitignore`.
 2. If the file doesn't exist yet, create it with the placeholders below and ask the user to fill it in their editor. If it exists, leave it alone. Don't ask for keys in the chat. If the user pastes one anyway, don't repeat it, and suggest rotating it.
 3. Never open, cat, grep or print the file, and never echo a variable loaded from it. To add a non-secret line, append it with `printf '\n%s\n' "NAME='value'" >> .env.backupdrill` (the leading newline keeps it off the user's last line).
-4. Load the file only inside a subshell for the one command that needs it, exactly as in the commands below. The `2>/dev/null` keeps a malformed line from printing its value.
+4. Run every command exactly as written below. Each one starts a subshell that drops any `BACKUPDRILL_*` or `DATABASE_URL` values inherited from the user's shell, so a broken line can't fall back to some other database, then loads the file and stops if it can't be read. The `2>/dev/null` keeps a malformed line from printing its value.
 
 ```sh
 # Supabase dashboard → Connect (top of the page) → Session pooler, not Direct
@@ -37,16 +37,18 @@ BACKUPDRILL_S3_SECRET_ACCESS_KEY=''
 # BACKUPDRILL_SUPABASE_STORAGE_SECRET_ACCESS_KEY=''
 ```
 
-To see what's filled in without showing any value:
+To see what's filled in without showing any value (it prints the numbers of malformed lines, then which settings are set):
 
 ```sh
-( set -a; . ./.env.backupdrill 2>/dev/null; set +a
+( grep -n -v -E '^[[:space:]]*(#|$)|^(export[[:space:]]+)?[A-Za-z_][A-Za-z0-9_]*=($|[^[:space:]])' .env.backupdrill | cut -d: -f1 | sed 's/^/malformed line /'
+  unset DATABASE_URL $(env | sed -n 's/^\(BACKUPDRILL_[A-Za-z0-9_]*\)=.*/\1/p')
+  set -a; . ./.env.backupdrill 2>/dev/null || { echo ".env.backupdrill could not be loaded" >&2; exit 1; }; set +a
   for name in BACKUPDRILL_DATABASE_URL BACKUPDRILL_S3_BUCKET BACKUPDRILL_S3_ACCESS_KEY_ID BACKUPDRILL_S3_SECRET_ACCESS_KEY; do
     if [ -n "$(printenv "$name")" ]; then echo "$name: set"; else echo "$name: missing"; fi
   done )
 ```
 
-If a name shows as missing after the user filled it in, ask them to check that line reads `NAME='value'` with no spaces around `=`.
+Run it before the first command and whenever the CLI reports missing config. If it lists a malformed line, or a setting the user filled in shows as missing, ask them to make that line read `NAME='value'` with no spaces around `=`.
 
 ## Before the first backup
 
@@ -57,10 +59,12 @@ If a name shows as missing after the user filled it in, ask them to check that l
 
 ## Estimate the egress cost first
 
-Every backup reads the database, and any new Storage files, out of Supabase. That is egress on the user's Supabase bill.
+Every backup reads the whole database, and every configured Storage file, out of Supabase again. Nothing is incremental. That is egress on the user's Supabase bill, each run.
 
 ```sh
-( set -a; . ./.env.backupdrill 2>/dev/null; set +a; npx -y backupdrill@2.2.3 estimate --plan pro )
+( unset DATABASE_URL $(env | sed -n 's/^\(BACKUPDRILL_[A-Za-z0-9_]*\)=.*/\1/p')
+  set -a; . ./.env.backupdrill 2>/dev/null || { echo ".env.backupdrill could not be loaded" >&2; exit 1; }; set +a
+  npx -y backupdrill@2.2.3 estimate --plan pro )
 ```
 
 Use `--plan free`, `pro` or `team` to match their Supabase plan, and read the projection back before suggesting a daily schedule. On a large database, suggest weekly.
@@ -68,7 +72,9 @@ Use `--plan free`, `pro` or `team` to match their Supabase plan, and read the pr
 ## Back up
 
 ```sh
-( set -a; . ./.env.backupdrill 2>/dev/null; set +a; npx -y backupdrill@2.2.3 backup ) > "${TMPDIR:-/tmp}/backupdrill-backup.json"
+( unset DATABASE_URL $(env | sed -n 's/^\(BACKUPDRILL_[A-Za-z0-9_]*\)=.*/\1/p')
+  set -a; . ./.env.backupdrill 2>/dev/null || { echo ".env.backupdrill could not be loaded" >&2; exit 1; }; set +a
+  npx -y backupdrill@2.2.3 backup ) > "${TMPDIR:-/tmp}/backupdrill-backup.json"
 ```
 
 - The progress lines on stderr show where everything went (`Dumping → s3://…`, `Manifest written → s3://…`) and end with `Backup complete — N tables + M Storage files`. stdout goes to that file: one line of JSON with the whole manifest, which lists every table and Storage file, so read only the fields you need from it.
@@ -79,7 +85,9 @@ Use `--plan free`, `pro` or `team` to match their Supabase plan, and read the pr
 ## Prove the backup restores (drill)
 
 ```sh
-( set -a; . ./.env.backupdrill 2>/dev/null; set +a; npx -y backupdrill@2.2.3 drill )
+( unset DATABASE_URL $(env | sed -n 's/^\(BACKUPDRILL_[A-Za-z0-9_]*\)=.*/\1/p')
+  set -a; . ./.env.backupdrill 2>/dev/null || { echo ".env.backupdrill could not be loaded" >&2; exit 1; }; set +a
+  npx -y backupdrill@2.2.3 drill )
 ```
 
 - It reads the latest snapshot from the bucket, restores it into a throwaway Postgres container, runs its checks and removes the container. It doesn't connect to the Supabase project. The first run pulls a Postgres image from Docker Hub.
@@ -96,11 +104,13 @@ A restore writes data, so go step by step and let the user drive.
 3. Do a dry run. It checks everything and writes nothing:
 
    ```sh
-   ( set -a; . ./.env.backupdrill 2>/dev/null; set +a; npx -y backupdrill@2.2.3 restore --database --target-supabase-url https://<target-ref>.supabase.co --dry-run )
+   ( unset DATABASE_URL $(env | sed -n 's/^\(BACKUPDRILL_[A-Za-z0-9_]*\)=.*/\1/p')
+     set -a; . ./.env.backupdrill 2>/dev/null || { echo ".env.backupdrill could not be loaded" >&2; exit 1; }; set +a
+     npx -y backupdrill@2.2.3 restore --database --target-supabase-url https://<target-ref>.supabase.co --dry-run )
    ```
 
    Leave out `--target-supabase-url` when the snapshot is database only. To write Storage files to a local folder instead of the new project, use `--storage-dir ./recovered`.
-4. Show the dry-run result. Run the real restore only after the user asks for it and gives you the target ref. Then replace `--dry-run` with `--confirm-target <target-ref>`, using exactly the ref they gave, and send stdout to a file as with `backup`: the JSON result can be long.
+4. Show the dry-run result. It starts with `Dry run for snapshot <timestamp>`; note that timestamp. Run the real restore only after the user asks for it and gives you the target ref. Then replace `--dry-run` with `--snapshot <timestamp> --confirm-target <target-ref>`, using the timestamp from the dry run and exactly the ref they gave, so a backup that lands in between can't change what gets restored. Send stdout to a file as with `backup`: the JSON result can be long. If the user wants an older snapshot, pass `--snapshot` to both runs.
 5. Tell them what a restore doesn't bring back: Auth users, secret values, Edge Functions and grants. They need to set those up again. The snapshot's `RECOVERY.md` has a "Not covered" section on this.
 6. Once they're done, suggest they delete the two `TARGET` lines from `.env.backupdrill`.
 
