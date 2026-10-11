@@ -17,7 +17,7 @@ The CLI needs a database connection string and bucket keys. They must never appe
 
 1. Keep them in `.env.backupdrill` in the project root. Before creating it, make sure Git ignores it: `git check-ignore -q .env.backupdrill || printf '\n.env.backupdrill\n' >> .gitignore`.
 2. If the file doesn't exist yet, create it with the placeholders below and ask the user to fill it in their editor. If it exists, leave it alone. Don't ask for keys in the chat. If the user pastes one anyway, don't repeat it, and suggest rotating it.
-3. Never open, cat, grep or print the file, and never echo a variable loaded from it. To add a non-secret line, append it with `printf '\n%s\n' "NAME='value'" >> .env.backupdrill` (the leading newline keeps it off the user's last line).
+3. Never open, cat or print the file, and never echo a variable loaded from it. The commands in this skill are the only way to touch it. To add a non-secret line, append it with `printf '\n%s\n' "NAME='value'" >> .env.backupdrill` (the leading newline keeps it off the user's last line).
 4. Run every command exactly as written below. Each one starts a subshell that turns off shell tracing, drops any `BACKUPDRILL_*` or `DATABASE_URL` values inherited from the user's shell, so a broken line can't fall back to some other database, then loads the file and stops if it can't be read. The `2>/dev/null` keeps a malformed line from printing its value.
 5. The CLI also reads `backupdrill.config.json` from the project root if there is one, and `.env.backupdrill` wins value by value. If the check below reports that file, tell the user and settle on one place: move its settings into `.env.backupdrill` and delete it, or keep it on purpose.
 
