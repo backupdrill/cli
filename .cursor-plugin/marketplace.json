@@ -1,0 +1,16 @@
+{
+  "name": "backupdrill",
+  "owner": {
+    "name": "BackupDrill",
+    "email": "support@backupdrill.com"
+  },
+  "metadata": {
+    "description": "The BackupDrill plugin: back up, restore-drill and restore Supabase projects from Cursor with the open-source backupdrill CLI."
+  },
+  "plugins": [
+    {
+      "name": "backupdrill",
+      "source": "./plugin"
+    }
+  ]
+}
