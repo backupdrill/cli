@@ -91,6 +91,32 @@ test("备份:百分号编码的密码解码后进 PGPASSWORD,编码前后都不�
   assert.equal(pgPassword, "p@ss/word");
 });
 
+test("备份:连接串里有字面 # 时,连库之前就拒绝(否则预检连 trusted、pg_dump 连 evil)", async () => {
+  const connect = mock.method(pg.Client.prototype, "connect", async () => {});
+  try {
+    await assert.rejects(
+      runBackup({
+        databaseUrl: "postgresql://u@127.0.0.1:5432/db?password=pw#?host=10.0.0.1",
+        projectName: "credentials-test",
+        schemas: ["public"],
+        storage: {
+          endpoint: "http://127.0.0.1:1",
+          region: "us-east-1",
+          bucket: "target",
+          accessKeyId: "k",
+          secretAccessKey: "s",
+          prefix: "backupdrill",
+          forcePathStyle: true,
+        },
+      }),
+      /literal '#'/
+    );
+    assert.equal(connect.mock.callCount(), 0, "must reject before any connection");
+  } finally {
+    connect.mock.restore();
+  }
+});
+
 test("备份:?password= 查询参数同样剥离,不进 argv", async () => {
   const { argv, pgPassword } = await pgDumpInvocationFor("postgresql://u@127.0.0.1:5432/db?password=q-secret");
   assert.ok(!argv.includes("q-secret"), "query password leaked into argv");

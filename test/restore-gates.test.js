@@ -237,6 +237,16 @@ test("credentialSafeDbArgs:空的 ?password= 也参与比对——和别的密�
   assert.equal(empty.url, "postgresql://u@h:5432/db?sslmode=require");
 });
 
+test("字面 # 一律拒绝:剥掉 ?password= 后 `#?host=` 会被 libpq 读成查询参数、改写连接目标;编码成 %23 照常", async () => {
+  const { credentialSafeDbArgs, assertNoHostOverride } = await import("../dist/restore-engine.js");
+  const crafted = "postgresql://u@trusted.example.com:5432/db?password=pw#?host=evil.example.com";
+  assert.throws(() => assertNoHostOverride(crafted), /literal '#'/);
+  assert.throws(() => credentialSafeDbArgs(crafted), /literal '#'/);
+  const encoded = credentialSafeDbArgs("postgresql://u:p%23w@h:5432/db");
+  assert.equal(encoded.env.PGPASSWORD, "p#w");
+  assert.ok(!encoded.url.includes("#"), "输出里不能留片段");
+});
+
 test("写前净度门:既有桶只许本快照的同尺寸残留,外来对象/尺寸冲突全部列出", () => {
   const files = [{ bucket: "a", key: "x.txt", bytes: 10, sha256: "h" }];
   const clean = new Map([["a", new Map([["x.txt", 10]])]]);
