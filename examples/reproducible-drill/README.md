@@ -27,7 +27,8 @@ A **Supabase-shaped** Postgres 17 source, because the shapes that break restores
 are the platform-specific ones:
 
 - RLS policies granted `TO authenticated` / `TO anon` — roles that do **not**
-  exist in a bare restore sandbox
+  exist in a bare Postgres (the drill sandbox creates stub versions of them, so
+  these policies restore)
 - extensions (`pg_trgm`, `pgcrypto`) installed into their own `extensions`
   schema, with a GIN trigram index that depends on one of them
 - a range-partitioned table, a materialized view, a trigger, and FK graphs
@@ -46,13 +47,16 @@ tables.
 
 ## What we measured
 
+Run on 2026-10-11 with CLI 2.2.3 and the PostgreSQL 17 client tools
+(`pg_dump`/`pg_restore` 17.11), the same major version the hosted service uses.
+
 Backup:
 
 ```
 → Inspecting database…
-✓ Postgres 17.10 — schema(s) public: 13 tables, ~1,495,499 rows
-→ Dumping → s3://acme-backups/backupdrill/acme-prod/2026-07-25T14-07-06-441Z/dump.pgcustom
-✓ Database dumped (21.6 MB, sha256 210958d28579…)
+✓ Postgres 17.6 — schema(s) public: 13 tables, ~1,745,499 rows
+→ Dumping → s3://acme-backups/backupdrill/acme-prod/2026-10-11T09-15-38-493Z/dump.pgcustom
+✓ Database dumped (21.6 MB, sha256 f21e7a064d2c…)
 → Syncing Storage files…
 →   user-uploads: 250 files
 ! Bucket attributes not captured (relation "storage.buckets" does not exist); this manifest will record them as absent — restore will say so instead of guessing.
@@ -65,17 +69,17 @@ Backup:
 Drill:
 
 ```
-✓ archive integrity — sha256 matches (210958d28579…)
+✓ archive integrity — sha256 matches (f21e7a064d2c…)
 ✓ storage file integrity — all 250 files match their manifest checksums
 ✓ sandbox extensions — installed pg_trgm, pgcrypto
-✓ pg_restore — completed in 2.3s
-✓ post-data objects — user objects restored; 5 Supabase-managed object(s) skipped
+✓ pg_restore — completed in 2.2s
+✓ post-data objects — all post-data objects restored
 ✓ table count — restored 13, manifest 13
 ✓ no missing tables — all manifest tables present
 ✓ populated tables came back — no populated table restored empty
 ✓ app checks — command exited 0 in 0.1s
 
-✓ Drill PASSED — 13 tables / 1,495,250 rows restored in 2.3s
+✓ Drill PASSED — snapshot 2026-10-11T09-15-38-493Z, 13 tables / 1,495,250 rows restored in 2.2s
 ```
 
 `check-invariants.mjs` is what `--check-cmd` runs. It runs on your machine, not
@@ -97,12 +101,12 @@ revenue orders vs matview: 25099150000 vs 25099150000
 
 ## What is and isn't identical when you rerun this
 
-We ran it three times. Worth knowing before you compare:
+We ran it three times in July 2026 and again in October. Worth knowing before you compare:
 
 | Value | Stable across runs? | Why |
 |---|---|---|
 | Measured rows restored (1,495,250), table count, per-file sha256, the invariant numbers above | **Yes** | The drill counts rows in the restored database, and every value these figures depend on is deterministic |
-| Manifest's `estimatedRows` — the `~1,495,499` in the backup line | **No** — we saw 1,495,250 / 1,745,499 / 1,495,499 | It is `n_live_tup`, a planner estimate the collector can inflate right after a bulk load |
+| Manifest's `estimatedRows` — the `~1,745,499` in the backup line | **No** — we saw 1,495,250 / 1,745,499 / 1,495,499 in July, 1,745,499 in October | It is `n_live_tup`, a planner estimate the collector can inflate right after a bulk load |
 | Dump sha256 | **No** | Two reasons: the random uuid keys and `now()` stamps above mean the bytes genuinely differ, and `pg_dump` writes a creation timestamp into the archive header, so even identical data would not hash the same |
 | `pg_restore` seconds | **No** | Hardware |
 
@@ -112,7 +116,7 @@ database actually held, and the drill's count was right anyway. The manifest's
 row counts are estimates, which is exactly why the check is "every table that
 had rows came back non-empty" rather than "the row counts match".
 
-**Restore time is hardware, not a product claim.** 2.3 s is a 21.6 MB dump
+**Restore time is hardware, not a product claim.** 2.2 s is a 21.6 MB dump
 restored into a container on the same laptop. Your number depends on dump size,
 disk, and network — which is the point of measuring it on a schedule instead of
 guessing.
@@ -122,10 +126,9 @@ guessing.
 1. The source is a local Postgres, not a hosted Supabase project, so the backup
    cannot read `storage.buckets` and records bucket attributes as **absent**
    rather than inventing them. Against a real project they are captured.
-2. `5 Supabase-managed object(s) skipped` reads as though the skipped objects
-   belong to the platform. They do not: they are **your own RLS policies**,
-   skipped because they reference Supabase-managed roles (`authenticated`,
-   `anon`) that do not exist in a bare sandbox. The drill records them as
-   expected skips and does **not** claim your RLS rules were restored or
-   verified. Verifying RLS behavior takes an authenticated client stack
-   with real JWTs, which no restore sandbox can fake.
+2. Your RLS policies are **restored, not tested**. The sandbox creates stub
+   `authenticated` / `anon` roles and `auth.uid()`-style functions so the
+   policies can be created (CLI 2.1.0, which produced the July report, listed
+   them as five expected skips instead), but nothing exercises them. Verifying
+   RLS behavior takes an authenticated client stack with real JWTs, which no
+   restore sandbox can fake.
