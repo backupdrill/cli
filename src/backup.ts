@@ -20,7 +20,7 @@ import { dumpPartSizeFor } from "./part-size.js";
 // 解析函数搬到了 pgbin(演练与恢复都要读 pg_restore 版本,放这里会成环);保留旧出口
 export { parsePgDumpMajor };
 import { dumpUrlFor, connectPg, isSupabaseHost } from "./supabase-ca.js";
-import { libpqChildEnv, urlSslModeOf } from "./restore-engine.js";
+import { credentialSafeDbArgs, libpqChildEnv, urlSslModeOf } from "./restore-engine.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -147,7 +147,9 @@ async function dumpToS3(
 
   const schemaArgs = config.schemas.map((s) => `--schema=${s}`);
   // pg_dump(libpq):Supabase 主机才改写成 sslmode=verify-full + sslrootcert=<打包CA临时文件>
-  const dumpDbUrl = dumpUrlFor(config.databaseUrl);
+  // 凭据不进 argv(D6):argv 对同机任何进程的 `ps` 可见。与恢复路径同一个函数——
+  // 先改写 SSL 再拆密码,密码经 PGPASSWORD 交给 libpq
+  const { url: dumpDbUrl, env: credentialEnv } = credentialSafeDbArgs(dumpUrlFor(config.databaseUrl));
   const dump = spawn(
     pgDumpBin,
     [
@@ -161,7 +163,7 @@ async function dumpToS3(
     // 环境剔除改写目标/身份的 PG* 变量:pg_dump 只认 --dbname 里的 URL(TLS 策略等保留)
     {
       stdio: ["ignore", "pipe", "pipe"],
-      env: libpqChildEnv({}, process.env, {
+      env: libpqChildEnv(credentialEnv, process.env, {
         supabaseHost: isSupabaseHost(config.databaseUrl),
         urlSslMode: urlSslModeOf(dumpDbUrl),
       }),

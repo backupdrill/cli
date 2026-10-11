@@ -440,6 +440,12 @@ export function credentialSafeDbArgs(connString: string): { url: string; env: No
     }
     return { url: connString, env: {} };
   }
+  // 兜底(入口的 assertNoHostOverride 已拒字面 #):片段留在输出里,libpq 会把 `#?host=…` 当查询参数
+  if (url.hash) {
+    throw new Error(
+      "connection string contains a literal '#' — percent-encode it as %23 (for example inside the password)."
+    );
+  }
   let password = "";
   if (url.password) {
     try {
@@ -472,8 +478,9 @@ export function credentialSafeDbArgs(connString: string): { url: string; env: No
       if (/^password$/i.test(key)) {
         const rawValue = eq === -1 ? "" : part.slice(eq + 1);
         try {
-          const value = decodeURIComponent(rawValue.replace(/\+/g, "%20"));
-          if (value) queryPasswords.push(value);
+          // 空值也要记:libpq 取最后一个(空 = 回落 .pgpass),只记非空会把前面的旧值
+          // 当成密码——?password=stale&password= 预检走 .pgpass、pg_dump 却用 stale
+          queryPasswords.push(decodeURIComponent(rawValue.replace(/\+/g, "%20")));
         } catch {
           throw new Error(
             "the connection string ?password= value contains malformed percent-encoding — " +
@@ -515,6 +522,14 @@ export function assertNoHostOverride(connString: string): void {
   // libpq 稍后也会拒,但驱动侧先发出的启动包已经到了 pooler——在任何连接之前就拒
   if (containsNul(connString)) {
     throw new Error("connection string contains a NUL byte — use a plain connection string.");
+  }
+  // 字面 # 同样在解析前拒:WHATWG URL 把 # 之后当片段,这里看到的主机干净;libpq 不认片段,
+  // 剥掉 ?password= 后剩下的 `#?host=…` 会被它读成查询参数,改写连接目标(交叉审查)。
+  // 合法的 # 只会出现在密码等值里,写成 %23 即可
+  if (connString.includes("#")) {
+    throw new Error(
+      "connection string contains a literal '#' — percent-encode it as %23 (for example inside the password)."
+    );
   }
   // 解析不了的连接串直接拒:曾经"放行让 pg 自己报错",但 pg 的解析器比 WHATWG URL 宽
   // (`postgresql://user@/db?host=…` 这类串 pg 接受、这里解析失败),放行 = 身份判定为空却照样连接
