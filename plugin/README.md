@@ -13,7 +13,7 @@ The agent runs every command as `npx -y backupdrill@2.2.3`, so the CLI version s
 
 - A shell the agent can use, such as Claude Code. In a chat with no terminal, the agent can explain the commands but not run them.
 - Node.js 20 or newer.
-- `pg_dump` and `pg_restore` with a major version at least as high as your project's Postgres (Supabase runs 15 to 17). On macOS: `brew install libpq`.
+- `pg_dump` and `pg_restore` version 17, which handle Supabase's Postgres 15 to 17. On macOS: `brew install libpq@17` (plain `libpq` is now 18, whose dumps can contain SQL that Postgres 17 rejects).
 - Docker, for `drill`.
 - A bucket on AWS S3, Cloudflare R2 or Backblaze B2, with a key that can list, read and write objects in it.
 
@@ -58,7 +58,7 @@ What the agent reads while it works, such as command output with table names, ro
 ## Troubleshooting
 
 - `Missing required config`: the message names the missing setting. Fill that line in `.env.backupdrill`.
-- A `pg_dump` version error: install a newer PostgreSQL client and set `BACKUPDRILL_PG_DUMP` to its `pg_dump`.
+- A `pg_dump` version error: install the version 17 PostgreSQL client and set `BACKUPDRILL_PG_DUMP` to its `pg_dump`.
 - Can't connect to the database: use the Session pooler string from the Connect button in the Supabase dashboard, not the Direct one. Resume the project if it's paused.
 - `drill` can't start a container: start Docker.
 

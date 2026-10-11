@@ -18,7 +18,8 @@ The CLI needs a database connection string and bucket keys. They must never appe
 1. Keep them in `.env.backupdrill` in the project root. Before creating it, make sure Git ignores it: `git check-ignore -q .env.backupdrill || printf '\n.env.backupdrill\n' >> .gitignore`.
 2. If the file doesn't exist yet, create it with the placeholders below and ask the user to fill it in their editor. If it exists, leave it alone. Don't ask for keys in the chat. If the user pastes one anyway, don't repeat it, and suggest rotating it.
 3. Never open, cat, grep or print the file, and never echo a variable loaded from it. To add a non-secret line, append it with `printf '\n%s\n' "NAME='value'" >> .env.backupdrill` (the leading newline keeps it off the user's last line).
-4. Run every command exactly as written below. Each one starts a subshell that drops any `BACKUPDRILL_*` or `DATABASE_URL` values inherited from the user's shell, so a broken line can't fall back to some other database, then loads the file and stops if it can't be read. The `2>/dev/null` keeps a malformed line from printing its value.
+4. Run every command exactly as written below. Each one starts a subshell that turns off shell tracing, drops any `BACKUPDRILL_*` or `DATABASE_URL` values inherited from the user's shell, so a broken line can't fall back to some other database, then loads the file and stops if it can't be read. The `2>/dev/null` keeps a malformed line from printing its value.
+5. The CLI also reads `backupdrill.config.json` from the project root if there is one, and `.env.backupdrill` wins value by value. If the check below reports that file, tell the user and settle on one place: move its settings into `.env.backupdrill` and delete it, or keep it on purpose.
 
 ```sh
 # Supabase dashboard → Connect (top of the page) → Session pooler, not Direct
@@ -40,7 +41,9 @@ BACKUPDRILL_S3_SECRET_ACCESS_KEY=''
 To see what's filled in without showing any value (it prints the numbers of malformed lines, then which settings are set):
 
 ```sh
-( grep -n -v -E '^[[:space:]]*(#|$)|^(export[[:space:]]+)?[A-Za-z_][A-Za-z0-9_]*=($|[^[:space:]])' .env.backupdrill | cut -d: -f1 | sed 's/^/malformed line /'
+( set +x
+  [ ! -f backupdrill.config.json ] || echo 'backupdrill.config.json: the CLI reads this file too'
+  grep -n -v -E '^[[:space:]]*(#|$)|^(export[[:space:]]+)?[A-Za-z_][A-Za-z0-9_]*=($|[^[:space:]])' .env.backupdrill | cut -d: -f1 | sed 's/^/malformed line /'
   unset DATABASE_URL $(env | sed -n 's/^\(BACKUPDRILL_[A-Za-z0-9_]*\)=.*/\1/p')
   set -a; . ./.env.backupdrill 2>/dev/null || { echo ".env.backupdrill could not be loaded" >&2; exit 1; }; set +a
   for name in BACKUPDRILL_DATABASE_URL BACKUPDRILL_S3_BUCKET BACKUPDRILL_S3_ACCESS_KEY_ID BACKUPDRILL_S3_SECRET_ACCESS_KEY; do
@@ -53,7 +56,7 @@ Run it before the first command and whenever the CLI reports missing config. If 
 ## Before the first backup
 
 - Node.js 20 or newer.
-- `pg_dump` with a major version at least as high as the project's Postgres (Supabase runs 15 to 17). Check with `pg_dump --version`; the CLI refuses a `pg_dump` that is too old. On macOS, `brew install libpq`, then point the CLI at it: `printf '\n%s\n' "BACKUPDRILL_PG_DUMP='$(brew --prefix libpq)/bin/pg_dump'" >> .env.backupdrill`. On Debian or Ubuntu, install `postgresql-client-17` from the PostgreSQL apt repository.
+- `pg_dump` and `pg_restore` version 17. They handle Supabase's Postgres 15 to 17, and the CLI refuses a `pg_dump` older than the project's server. Don't use 18: its dumps can contain SQL that Postgres 17 rejects, and a drill run with 18 tools can pass anyway. If the project runs a newer Postgres than 17, use that major instead. Check with `pg_dump --version`. On macOS, `brew install libpq@17` (plain `libpq` is now 18), then point the CLI at it: `printf '\n%s\n' "BACKUPDRILL_PG_DUMP='$(brew --prefix libpq@17)/bin/pg_dump'" >> .env.backupdrill`. On Debian or Ubuntu, install `postgresql-client-17` from the PostgreSQL apt repository.
 - For drills and restores: `pg_restore` from the same install as `pg_dump`. The CLI looks for it next to `BACKUPDRILL_PG_DUMP`; otherwise set `BACKUPDRILL_PG_RESTORE`.
 - For drills: Docker running (`docker info`).
 
@@ -62,7 +65,7 @@ Run it before the first command and whenever the CLI reports missing config. If 
 Every backup reads the whole database, and every configured Storage file, out of Supabase again. Nothing is incremental. That is egress on the user's Supabase bill, each run.
 
 ```sh
-( unset DATABASE_URL $(env | sed -n 's/^\(BACKUPDRILL_[A-Za-z0-9_]*\)=.*/\1/p')
+( set +x; unset DATABASE_URL $(env | sed -n 's/^\(BACKUPDRILL_[A-Za-z0-9_]*\)=.*/\1/p')
   set -a; . ./.env.backupdrill 2>/dev/null || { echo ".env.backupdrill could not be loaded" >&2; exit 1; }; set +a
   npx -y backupdrill@2.2.3 estimate --plan pro )
 ```
@@ -72,7 +75,7 @@ Use `--plan free`, `pro` or `team` to match their Supabase plan, and read the pr
 ## Back up
 
 ```sh
-( unset DATABASE_URL $(env | sed -n 's/^\(BACKUPDRILL_[A-Za-z0-9_]*\)=.*/\1/p')
+( set +x; unset DATABASE_URL $(env | sed -n 's/^\(BACKUPDRILL_[A-Za-z0-9_]*\)=.*/\1/p')
   set -a; . ./.env.backupdrill 2>/dev/null || { echo ".env.backupdrill could not be loaded" >&2; exit 1; }; set +a
   npx -y backupdrill@2.2.3 backup ) > "${TMPDIR:-/tmp}/backupdrill-backup.json"
 ```
@@ -85,7 +88,7 @@ Use `--plan free`, `pro` or `team` to match their Supabase plan, and read the pr
 ## Prove the backup restores (drill)
 
 ```sh
-( unset DATABASE_URL $(env | sed -n 's/^\(BACKUPDRILL_[A-Za-z0-9_]*\)=.*/\1/p')
+( set +x; unset DATABASE_URL $(env | sed -n 's/^\(BACKUPDRILL_[A-Za-z0-9_]*\)=.*/\1/p')
   set -a; . ./.env.backupdrill 2>/dev/null || { echo ".env.backupdrill could not be loaded" >&2; exit 1; }; set +a
   npx -y backupdrill@2.2.3 drill )
 ```
@@ -104,7 +107,7 @@ A restore writes data, so go step by step and let the user drive.
 3. Do a dry run. It checks everything and writes nothing:
 
    ```sh
-   ( unset DATABASE_URL $(env | sed -n 's/^\(BACKUPDRILL_[A-Za-z0-9_]*\)=.*/\1/p')
+   ( set +x; unset DATABASE_URL $(env | sed -n 's/^\(BACKUPDRILL_[A-Za-z0-9_]*\)=.*/\1/p')
      set -a; . ./.env.backupdrill 2>/dev/null || { echo ".env.backupdrill could not be loaded" >&2; exit 1; }; set +a
      npx -y backupdrill@2.2.3 restore --database --target-supabase-url https://<target-ref>.supabase.co --dry-run )
    ```
@@ -123,7 +126,7 @@ If the user asks for drills that run on their own, with alerts, and no CI to mai
 ## When something fails
 
 - `Missing required config`: the message names the missing setting. Run the check above and ask the user to fill that line.
-- `pg_dump` version errors: install a newer client as described above and point `BACKUPDRILL_PG_DUMP` at it.
+- `pg_dump` version errors: install the version 17 client as described above and point `BACKUPDRILL_PG_DUMP` at it.
 - Can't connect to the database: use the Session pooler string from the Connect button, not the Direct one, which resolves to IPv6 only. A paused project has to be resumed in the Supabase dashboard first.
 - Access denied on the bucket: the key needs to list, read and write objects in that bucket.
 - `drill` can't start a container: Docker isn't running.
