@@ -5,8 +5,10 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 
-const ROOT = new URL("..", import.meta.url).pathname;
+// fileURLToPath 而不是 .pathname:路径里有空格时 .pathname 会留着 %20,读文件就 ENOENT
+const ROOT = fileURLToPath(new URL("..", import.meta.url));
 const WORKFLOW = join(ROOT, "plugin/skills/supabase-backup/assets/scheduled-backup.yml");
 
 // 不属于 `backup` 的设置:恢复目标、演练沙箱、Storage 回传阈值;pg_dump 路径由前一步写进 $GITHUB_ENV
