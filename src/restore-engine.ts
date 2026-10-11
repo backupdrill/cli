@@ -155,7 +155,14 @@ export function libpqChildEnv(
     env[key] = value;
   }
   if (noVerify) env.PGSSLROOTCERT = NO_VERIFY_ROOTCERT_SENTINEL;
-  return { ...env, ...extraEnv };
+  // 消息语言钉成 C:恢复的成败判定按英文前缀 `pg_restore: error:` 切块(classifyBlocks)。带翻译
+  // (NLS)的客户端在非英文系统上写的是 "pg_restore: 错误:" / "Fehler:",一个预期冲突都认不出来,
+  // 健康的备份被判失败(2026-10-11 在中文 macOS 上用 Homebrew postgresql@17 复现)。macOS 的
+  // gettext 在 LANG 未设时还会去读系统首选语言,所以必须显式给 LC_ALL,extraEnv 也不许覆盖;
+  // LANGUAGE 在 C locale 下本就被 gettext 忽略,一并去掉免得歧义。只影响消息语言:pg_dump /
+  // pg_restore 的客户端编码取自数据库 / 归档本身,与 locale 无关。
+  delete env.LANGUAGE;
+  return { ...env, ...extraEnv, LC_ALL: "C" };
 }
 
 /** 见 libpqChildEnv:一个绝不存在的根证书路径 = 让 libpq 的 require 既不验证也不去找默认 root.crt。 */

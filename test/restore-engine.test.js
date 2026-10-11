@@ -356,6 +356,40 @@ test("pg_restore 的连接串经 dumpUrlFor:Supabase 主机 verify-full+CA,沙�
   assert.ok(!sandbox.url.includes("sslrootcert"), "非 Supabase 主机不套 CA");
 });
 
+test("libpqChildEnv:子进程消息语言钉成 C——翻译版 pg_restore 在非英文系统上也写英文前缀", async () => {
+  const { libpqChildEnv } = await import("../dist/restore-engine.js");
+  const localized = {
+    PATH: "/usr/bin",
+    LANG: "zh_CN.UTF-8",
+    LC_ALL: "de_DE.UTF-8",
+    LC_MESSAGES: "fr_FR.UTF-8",
+    LANGUAGE: "pt_BR:pt",
+  };
+  const env = libpqChildEnv({}, localized);
+  assert.equal(env.LC_ALL, "C", "LC_ALL 压过 LANG / LC_MESSAGES,gettext 只认它");
+  assert.equal(env.LANGUAGE, undefined);
+  assert.equal(env.PATH, "/usr/bin", "其余环境照常透传");
+  // 什么都没设时(macOS gettext 会退回系统首选语言)同样要显式给
+  assert.equal(libpqChildEnv({}, { PATH: "/usr/bin" }).LC_ALL, "C");
+  // 调用方传进来的 extraEnv 也不能把它改回去
+  assert.equal(libpqChildEnv({ LC_ALL: "zh_CN.UTF-8" }, {}).LC_ALL, "C");
+});
+
+test("classifyBlocks 只认英文前缀——这正是子进程必须用 C locale 的原因", () => {
+  // 中文 locale 下翻译版 pg_restore 的原样输出(2026-10-11 复现):切不出任何块,预期冲突认不出来
+  const zh = `pg_restore: 错误: could not execute query: ERROR:  schema "public" already exists
+命令是: CREATE SCHEMA public;
+pg_restore: 警告: 恢复中忽略错误: 1
+`;
+  const localized = classifyBlocks(zh, SCHEMA_EXISTS_ERROR);
+  assert.equal(localized.expectedSkips, 0);
+  assert.equal(finalizePass(1, "", localized).failures.length, 1, "退出码 1 又没认出任何块 → 判失败");
+  // 同一件事的英文输出:认成一次预期跳过,不判失败
+  const english = classifyBlocks(SCHEMA_CONFLICT, SCHEMA_EXISTS_ERROR);
+  assert.equal(english.expectedSkips, 1);
+  assert.deepEqual(english.failures, []);
+});
+
 test("libpqChildEnv:只剔除改写目标/身份的 PG* 变量;TLS 策略、超时、PGPASSWORD 保留;PGOPTIONS 只在 Supabase 主机剔除", async () => {
   const { libpqChildEnv } = await import("../dist/restore-engine.js");
   const base = {
