@@ -472,8 +472,9 @@ export function credentialSafeDbArgs(connString: string): { url: string; env: No
       if (/^password$/i.test(key)) {
         const rawValue = eq === -1 ? "" : part.slice(eq + 1);
         try {
-          const value = decodeURIComponent(rawValue.replace(/\+/g, "%20"));
-          if (value) queryPasswords.push(value);
+          // 空值也要记:libpq 取最后一个(空 = 回落 .pgpass),只记非空会把前面的旧值
+          // 当成密码——?password=stale&password= 预检走 .pgpass、pg_dump 却用 stale
+          queryPasswords.push(decodeURIComponent(rawValue.replace(/\+/g, "%20")));
         } catch {
           throw new Error(
             "the connection string ?password= value contains malformed percent-encoding — " +
