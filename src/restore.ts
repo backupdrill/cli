@@ -223,13 +223,38 @@ export function assertConfirmedTarget(
 }
 
 /**
+ * 空目标门的拒绝文案。"只重试 Storage"那句只对同时恢复 Storage 的运行有意义:库已写完、
+ * Storage 中途断了,重跑时才会在这道门上被拦。纯数据库恢复(托管恢复只做数据库)带上它,
+ * 用户会以为自己漏了一步,其实只需要换一个空项目。
+ */
+export function nonEmptyTargetMessage(
+  schemas: string[],
+  objectCount: number,
+  alsoRestoringStorage: boolean
+): string {
+  const message =
+    `target schema(s) ${schemas.join(", ")} contain ${objectCount} existing object(s) — ` +
+    `restore only writes into an empty target. Create a fresh Supabase project ` +
+    `(or empty these schemas) and retry.`;
+  if (!alsoRestoringStorage) return message;
+  return (
+    `${message} If a previous run already restored the database and only Storage was ` +
+    `interrupted, re-run WITHOUT the database target to retry Storage alone.`
+  );
+}
+
+/**
  * 空目标门(PRD §5.3.3 / 决策 D5):目标 schema 里存在任何用户对象即拒绝写入。
  * "空"的定义来自 R0 spike:不是"schema 不存在"(Supabase 恒有 public),而是
  * schema 内零用户对象——关系、函数/过程、独立类型(enum/domain/range/composite)
  * 全部计入:只查关系时,"目标里只有函数"会放行,然后在 pre-data 中途撞冲突,
  * 留下半截目标(评审第 7 轮)。
  */
-async function assertEmptyTarget(targetUrl: string, schemas: string[]): Promise<void> {
+async function assertEmptyTarget(
+  targetUrl: string,
+  schemas: string[],
+  alsoRestoringStorage: boolean
+): Promise<void> {
   const client = await connectPg(targetUrl);
   try {
     const res = await client.query<{ n: string }>(
@@ -245,13 +270,7 @@ async function assertEmptyTarget(targetUrl: string, schemas: string[]): Promise<
     );
     const objectCount = Number(res.rows[0].n);
     if (objectCount > 0) {
-      throw new Error(
-        `target schema(s) ${schemas.join(", ")} contain ${objectCount} existing object(s) — ` +
-          `restore only writes into an empty target. Create a fresh Supabase project ` +
-          `(or empty these schemas) and retry. If a previous run already restored the ` +
-          `database and only Storage was interrupted, re-run WITHOUT the database target ` +
-          `to retry Storage alone.`
-      );
+      throw new Error(nonEmptyTargetMessage(schemas, objectCount, alsoRestoringStorage));
     }
   } finally {
     await client.end();
@@ -266,7 +285,8 @@ async function dryRunPreflight(
   config: BackupConfig,
   manifest: Manifest,
   targetUrl: string | undefined,
-  storageTarget: StorageRestoreTarget | null
+  storageTarget: StorageRestoreTarget | null,
+  alsoRestoringStorage: boolean
 ): Promise<void> {
   const blockers: string[] = [];
   const db = manifest.database;
@@ -304,7 +324,7 @@ async function dryRunPreflight(
       log.ok("target identity: distinct from source");
     }
     try {
-      await assertEmptyTarget(targetUrl, db.schemas);
+      await assertEmptyTarget(targetUrl, db.schemas, alsoRestoringStorage);
       log.ok(`target schemas (${db.schemas.join(", ")}) are empty`);
     } catch (error) {
       blockers.push((error as Error).message);
@@ -492,11 +512,14 @@ export async function runRestore(
   };
 
   assertRequestApplies(manifest, !!opts.targetDatabaseUrl, !!storageTarget);
+  // 这次运行会不会碰 Storage(回传到目标,或下载到本地)。只有会碰时,空目标门才该
+  // 提示"库已恢复、只重试 Storage";skipStorage 的纯数据库运行(托管恢复)不该看到这句。
+  const alsoRestoringStorage = !!manifest.storage && !opts.skipStorage;
 
   // dry-run:只读预检后直接返回,零写入(PRD §5.3.2)
   if (opts.dryRun) {
     log.step(`Dry run for snapshot ${snapshot} — nothing will be written`);
-    await dryRunPreflight(config, manifest, opts.targetDatabaseUrl, storageTarget);
+    await dryRunPreflight(config, manifest, opts.targetDatabaseUrl, storageTarget, alsoRestoringStorage);
     result.dryRun = true;
     return result;
   }
@@ -533,7 +556,7 @@ export async function runRestore(
       }
 
       log.step("Checking target is empty…");
-      await assertEmptyTarget(targetUrl, manifest.database.schemas);
+      await assertEmptyTarget(targetUrl, manifest.database.schemas, alsoRestoringStorage);
 
       // 版本预检不只属于 dry-run:跳过 dry-run 直接执行时,目标比源旧照样会
       // 半途炸掉或部分恢复(评审第 8 轮)——写入前必须拦住

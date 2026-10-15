@@ -281,3 +281,14 @@ test("no-op 恢复拒绝:请求与快照内容必须相交", async () => {
   assert.doesNotThrow(() => assertRequestApplies(dbOnly, true, false));
   assert.doesNotThrow(() => assertRequestApplies(withStorage, false, false)); // 本地下载模式
 });
+
+test("空目标门文案:只重试 Storage 的提示只给同时恢复 Storage 的运行;纯数据库恢复只说换空项目", async () => {
+  const { nonEmptyTargetMessage } = await import("../dist/restore.js");
+  const dbOnly = nonEmptyTargetMessage(["public"], 19, false);
+  assert.match(dbOnly, /public contain 19 existing object\(s\)/);
+  assert.match(dbOnly, /Create a fresh Supabase project \(or empty these schemas\) and retry\.$/);
+  assert.doesNotMatch(dbOnly, /Storage/);
+  const withStorage = nonEmptyTargetMessage(["public", "app"], 3, true);
+  assert.match(withStorage, /public, app contain 3 existing object\(s\)/);
+  assert.match(withStorage, /re-run WITHOUT the database target to retry Storage alone\.$/);
+});
