@@ -285,7 +285,8 @@ async function dryRunPreflight(
   config: BackupConfig,
   manifest: Manifest,
   targetUrl: string | undefined,
-  storageTarget: StorageRestoreTarget | null
+  storageTarget: StorageRestoreTarget | null,
+  alsoRestoringStorage: boolean
 ): Promise<void> {
   const blockers: string[] = [];
   const db = manifest.database;
@@ -323,7 +324,7 @@ async function dryRunPreflight(
       log.ok("target identity: distinct from source");
     }
     try {
-      await assertEmptyTarget(targetUrl, db.schemas, storageTarget !== null);
+      await assertEmptyTarget(targetUrl, db.schemas, alsoRestoringStorage);
       log.ok(`target schemas (${db.schemas.join(", ")}) are empty`);
     } catch (error) {
       blockers.push((error as Error).message);
@@ -511,11 +512,14 @@ export async function runRestore(
   };
 
   assertRequestApplies(manifest, !!opts.targetDatabaseUrl, !!storageTarget);
+  // 这次运行会不会碰 Storage(回传到目标,或下载到本地)。只有会碰时,空目标门才该
+  // 提示"库已恢复、只重试 Storage";skipStorage 的纯数据库运行(托管恢复)不该看到这句。
+  const alsoRestoringStorage = !!manifest.storage && !opts.skipStorage;
 
   // dry-run:只读预检后直接返回,零写入(PRD §5.3.2)
   if (opts.dryRun) {
     log.step(`Dry run for snapshot ${snapshot} — nothing will be written`);
-    await dryRunPreflight(config, manifest, opts.targetDatabaseUrl, storageTarget);
+    await dryRunPreflight(config, manifest, opts.targetDatabaseUrl, storageTarget, alsoRestoringStorage);
     result.dryRun = true;
     return result;
   }
@@ -552,7 +556,7 @@ export async function runRestore(
       }
 
       log.step("Checking target is empty…");
-      await assertEmptyTarget(targetUrl, manifest.database.schemas, storageTarget !== null);
+      await assertEmptyTarget(targetUrl, manifest.database.schemas, alsoRestoringStorage);
 
       // 版本预检不只属于 dry-run:跳过 dry-run 直接执行时,目标比源旧照样会
       // 半途炸掉或部分恢复(评审第 8 轮)——写入前必须拦住
