@@ -30,6 +30,7 @@ export type {
 
 export type {
   BackupConfig,
+  LoadedBackupConfig,
   StorageConfig,
   SupabaseStorageConfig,
 } from "./config.js";

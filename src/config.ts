@@ -38,6 +38,9 @@ export interface BackupConfig {
   supabaseStorage?: SupabaseStorageConfig; // 备份读取源(Supabase Storage 文件)
 }
 
+/** CLI 读出来的配置一定带桶:loadConfig 缺了桶直接报错,所以返回类型里 storage 是必填 */
+export type LoadedBackupConfig = BackupConfig & { storage: StorageConfig };
+
 /** 需要桶的地方先过这一道:没配桶时给一句能看懂的报错,而不是读 undefined 的属性。 */
 export function requireBucket(config: BackupConfig): StorageConfig {
   if (!config.storage) {
@@ -115,7 +118,7 @@ function definedOnly<T extends object>(obj: T | undefined): Partial<T> {
 export async function loadConfig(opts: {
   configPath: string;
   overrides: RawConfig;
-}): Promise<BackupConfig> {
+}): Promise<LoadedBackupConfig> {
   const file = await fromFile(opts.configPath);
   const env = fromEnv();
   const o = opts.overrides;

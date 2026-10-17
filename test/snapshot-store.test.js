@@ -4,7 +4,7 @@
 import { test, mock } from "node:test";
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -50,12 +50,14 @@ function memoryStore({ canHoldStorage = true } = {}) {
   return store;
 }
 
-async function withFakeDatabase(run) {
+const FAKE_DUMP = 'printf "PGDMP-fake"';
+
+async function withFakeDatabase(run, dumpScript = FAKE_DUMP) {
   const dir = mkdtempSync(join(tmpdir(), "bd-fake-pgdump-"));
   const fakePgDump = join(dir, "pg_dump");
   writeFileSync(
     fakePgDump,
-    '#!/bin/sh\nif [ "$1" = "--version" ]; then echo "pg_dump (PostgreSQL) 17.2"; exit 0; fi\nprintf "PGDMP-fake"\n'
+    `#!/bin/sh\nif [ "$1" = "--version" ]; then echo "pg_dump (PostgreSQL) 17.2"; exit 0; fi\n${dumpScript.replaceAll("$DIR", dir)}\n`
   );
   chmodSync(fakePgDump, 0o755);
   const previousPgDump = process.env.BACKUPDRILL_PG_DUMP;
@@ -72,7 +74,7 @@ async function withFakeDatabase(run) {
     mock.method(console, "error", () => {}),
   ];
   try {
-    return await run();
+    return await run(dir);
   } finally {
     for (const m of mocks) m.mock.restore();
     if (previousPgDump === undefined) delete process.env.BACKUPDRILL_PG_DUMP;
@@ -118,6 +120,27 @@ test("runBackup:目标放不了 Storage 文件却配了 Storage → 转储之前
   );
   assert.equal(store.uploadCalls, 0);
   assert.equal(store.writes.length, 0);
+});
+
+test("store 在开始上传时就同步抛错:runBackup 失败,已经在跑的 pg_dump 被杀掉", async () => {
+  const store = memoryStore();
+  const createSnapshot = store.createSnapshot;
+  store.createSnapshot = async (name) => ({
+    ...(await createSnapshot(name)),
+    uploadDump() {
+      throw new Error("adapter could not start the upload");
+    },
+  });
+  // 假 pg_dump 一秒后留个记号:被杀掉就留不下。不靠 pid 文件,因为正确的实现可能在
+  // 脚本跑到第一行之前就把它杀了
+  await withFakeDatabase(async (dir) => {
+    await assert.rejects(
+      runBackup({ databaseUrl: DATABASE_URL, projectName: "p", schemas: ["public"] }, { store }),
+      /adapter could not start the upload/
+    );
+    await new Promise((resolve) => setTimeout(resolve, 1500));
+    assert.equal(existsSync(join(dir, "survived")), false);
+  }, 'sleep 1; touch "$DIR/survived"');
 });
 
 test("没有 config.storage 也没传 store:报没配桶,而不是读 undefined", async () => {

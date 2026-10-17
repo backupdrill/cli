@@ -3,7 +3,7 @@ import { createHash } from "node:crypto";
 import { Transform } from "node:stream";
 import { promisify } from "node:util";
 import type { BackupConfig } from "./config.js";
-import { s3SnapshotStore, type SnapshotStore, type SnapshotWriter } from "./snapshot-store.js";
+import { s3SnapshotStore, type DumpUpload, type SnapshotStore, type SnapshotWriter } from "./snapshot-store.js";
 import { MANIFEST_SCHEMA_VERSION } from "./manifest.js";
 import type { BucketAttrs, ExtensionInfo, Manifest, TableStat } from "./manifest.js";
 import { syncStorage } from "./storage.js";
@@ -181,19 +181,20 @@ async function dumpToSnapshot(
     );
   });
 
-  const upload = writer.uploadDump(meter, dumpRelationBytes);
-  const uploadDone = upload.done;
-
   // 失败双向联动:dump 失败要中止上传(绝不把半截转储当成功);上传失败也必须
   // 杀掉 pg_dump —— 否则上传侧停止消费后,背压会让 pg_dump 永远阻塞在 stdout
   // 写入上,调用方(worker 的串行队列)随之永久挂起。Promise.all 会订阅两侧,
   // 先失败的一方抛出后,另一方稍后的 rejection 也已被视为 handled。
+  // 开始上传也放进 try:实现可能在建上传时就同步抛错,那时 pg_dump 已经在跑,同样要杀掉。
+  let upload: DumpUpload | null = null;
   try {
-    await Promise.all([dumpDone, uploadDone]);
+    upload = writer.uploadDump(meter, dumpRelationBytes);
+    await Promise.all([dumpDone, upload.done]);
   } catch (error) {
+    dumpDone.catch(() => {}); // 没走到 Promise.all 时,被杀的 pg_dump 的退出也得有人接住
     dump.kill("SIGKILL");
     meter.destroy();
-    await upload.abort().catch(() => {});
+    await upload?.abort().catch(() => {});
     throw error;
   }
 
