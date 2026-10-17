@@ -8,6 +8,9 @@ import {
   sandboxShimSql,
   SANDBOX_MANAGED_ERROR,
   SCHEMA_EXISTS_ERROR,
+  splitPostDataList,
+  failedTocEntries,
+  ignoredErrorTotal,
 } from "../dist/restore-engine.js";
 import { sameDatabaseTarget } from "../dist/restore.js";
 
@@ -198,6 +201,102 @@ test("被信号杀死时,已有 expectedSkips 也不能抵扣 → 仍然失败",
   const killed = finalizePass(null, "…partial…", { expectedSkips: 1, failures: [] });
   assert.equal(killed.failures.length, 1);
   assert.match(killed.failures[0], /killed by a signal/);
+});
+
+// ── 并行遍(规则 3):stderr 会交错,只信 pg_restore 自己的错误总数 ──
+
+// pg_restore 17.11 -j2 实录:pre-data 在主进程单独跑,唯一的错误是 schema 冲突
+const PARALLEL_PREDATA_ONLY = `${SCHEMA_CONFLICT}
+
+pg_restore: warning: errors ignored on restore: 1
+`;
+
+test("并行遍:错误全部出在 fork 之前、总数等于预期跳过数 → 通过", () => {
+  const pass = finalizePass(1, PARALLEL_PREDATA_ONLY, classifyBlocks(PARALLEL_PREDATA_ONLY, SCHEMA_EXISTS_ERROR), {
+    parallel: true,
+  });
+  assert.equal(pass.expectedSkips, 1);
+  assert.deepEqual(pass.failures, []);
+});
+
+test("并行遍:worker 的报错前缀被交错拆散、切块只看到预期跳过 → 按总数判失败", () => {
+  // 两个 worker 同时写:A 只写出了 "pg_restore:",B 的整条预期跳过插进来,A 的正文挂在 B 的块里
+  const interleaved =
+    "pg_restore:pg_restore: error: could not execute query: ERROR:  schema \"public\" already exists\n" +
+    " error: could not execute query: ERROR:  could not create unique index \"orders_pkey\"\n" +
+    "pg_restore: warning: errors ignored on restore: 4\n";
+  const classified = classifyBlocks(interleaved, SCHEMA_EXISTS_ERROR);
+  assert.deepEqual(classified, { expectedSkips: 1, failures: [] }, "切块确实被骗过了");
+  const pass = finalizePass(1, interleaved, classified, { parallel: true });
+  assert.equal(pass.failures.length, 1);
+  assert.match(pass.failures[0], /reported 4 error\(s\), but only 1/);
+  // 同样的输出在单连接遍里不会出现(没有第二个进程),规则 3 只对并行遍生效
+  assert.deepEqual(finalizePass(1, interleaved, classified).failures, []);
+});
+
+test("并行遍:非零退出却没有汇总行 = 中途致命退出 → 失败", () => {
+  const fatal = `${SCHEMA_CONFLICT}pg_restore: error: a worker process died unexpectedly\n`;
+  // 致命那条能切出来时本来就是失败;这里模拟它被交错吞掉、只剩预期跳过
+  const pass = finalizePass(1, fatal, { expectedSkips: 1, failures: [] }, { parallel: true });
+  assert.match(pass.failures[0], /unknown number of error/);
+});
+
+test("并行遍:汇总数取最后一行,前面用户 SQL 里的同样字样骗不到", () => {
+  const spoofed =
+    `${SCHEMA_CONFLICT}Command was: COMMENT ON TABLE public.t IS 'errors ignored on restore: 1';\n` +
+    "pg_restore: warning: errors ignored on restore: 3\n";
+  const pass = finalizePass(1, spoofed, { expectedSkips: 1, failures: [] }, { parallel: true });
+  assert.match(pass.failures[0], /reported 3 error/);
+});
+
+test("ignoredErrorTotal:只认最后一行完整的汇总,用户 SQL 里的同样字样冒充不了", () => {
+  assert.equal(ignoredErrorTotal(PARALLEL_PREDATA_ONLY), 1);
+  // 致命退出:没有真的汇总行,前面 Command was 里的假汇总不能让这一遍算"跑完"
+  const fatal =
+    "pg_restore: error: could not execute query: ERROR:  boom 1\n" +
+    "Command was: CREATE INDEX x ON public.t USING btree (v) WHERE (note <> '\n" +
+    "pg_restore: warning: errors ignored on restore: 1\n" +
+    "');\n" +
+    "pg_restore: error: a worker process died unexpectedly\n";
+  assert.equal(ignoredErrorTotal(fatal), null);
+  assert.equal(ignoredErrorTotal(""), null);
+});
+
+test("failedTocEntries:前缀被交错拆开也能认出出错条目", () => {
+  // --verbose -j2 的形态:"from TOC entry" 正文是一次写完的,前缀和别的 worker 的输出搅在一起
+  const stderr =
+    "pg_restore: launching item 3313 INDEX items_boom1\n" +
+    "pg_restore:pg_restore: from TOC entry 3314; 1259 16409 INDEX public items_boom2 postgres\n" +
+    " from TOC entry 3317; 1259 16407 INDEX public items_norm postgres\n" +
+    "pg_restore: error: could not execute query: ERROR:  boom 1\n" +
+    "pg_restore: warning: errors ignored on restore: 4\n";
+  assert.deepEqual([...failedTocEntries(stderr)].sort(), ["3314", "3317"]);
+});
+
+test("splitPostDataList:建索引的进并行清单,外键/触发器/策略/INDEX ATTACH 留单连接", () => {
+  // pg_restore 17.11 --list --section=post-data 实录(多补了几种类型)
+  const listing = `;
+; Archive created at 2026-10-17 19:40:00 CST
+;
+; Selected TOC Entries:
+;
+3302; 2606 16434 CONSTRAINT public big big_pkey postgres
+3303; 1259 16440 INDEX public big_v postgres
+3310; 0 0 INDEX ATTACH public measurement_y2026_pkey postgres
+3309; 2606 16435 FK CONSTRAINT public big big_t1_fkey postgres
+3311; 2620 16450 TRIGGER public big set_updated_at postgres
+3312; 3256 16451 POLICY public big own_rows postgres
+3313; 0 0 COMMENT public INDEX big_v postgres
+`;
+  const { indexBuilds, rest } = splitPostDataList(listing);
+  assert.deepEqual(
+    indexBuilds.map((line) => line.split(" ")[0]),
+    ["3302;", "3303;"]
+  );
+  assert.deepEqual(
+    rest.map((line) => line.split(" ")[0]),
+    ["3310;", "3309;", "3311;", "3312;", "3313;"]
+  );
 });
 
 // ── 同源阻断(纯函数)──────────────────────────────────────────────

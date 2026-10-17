@@ -533,3 +533,97 @@ test("supervision refuses an existing volume without deleting it", {skip:canRun?
     await x("docker",["volume","inspect",resourceName]);
   } finally {await x("docker",["volume","rm",resourceName]);}
 });
+
+// ── 并行恢复:同一份备份,jobs=1 和 jobs=2 必须得出同一结论(交叉审查 2026-10-17)──
+// 索引引用托管 schema 里的函数(公共转储不带它)在单连接时记为预期跳过;并行时如果建索引那遍
+// 零容忍,同一份备份就会因为机器核数不同而判失败。另放两条真坏的索引,确认失败照样报出来;
+// 一条和沙箱预装扩展的视图撞名的索引(单连接时是真失败,并行重跑不能把它当"已存在"放过);
+// 一条名字里带双引号的索引(并行时建好了,不能因为认不出名字被重跑成失败)。
+const { restoreDatabaseArtifact, installSandboxShim } = await import("../dist/restore-engine.js");
+
+async function startPostgres(password) {
+  const { stdout } = await x("docker", [
+    "run", "-d", "--rm", "-e", `POSTGRES_PASSWORD=${password}`, "-p", "127.0.0.1:0:5432", "postgres:17-alpine",
+  ]);
+  const id = stdout.trim();
+  const { stdout: portOut } = await x("docker", ["port", id, "5432/tcp"]);
+  const port = portOut.trim().split(":").pop().trim();
+  for (let i = 0; i < 60; i++) {
+    try {
+      await x("docker", ["exec", id, "pg_isready", "-h", "127.0.0.1", "-U", "postgres", "-q"]);
+      break;
+    } catch {
+      await new Promise((r) => setTimeout(r, 500));
+    }
+  }
+  return { id, url: `postgresql://postgres:${password}@127.0.0.1:${port}/postgres` };
+}
+
+test(
+  "parallel restore reaches the same verdict as a single connection",
+  { skip: canRun ? false : "requires Docker + pg_dump" },
+  async () => {
+    const dumpPath = join(tmpdir(), `bd-parallel-${randomUUID().slice(0, 8)}.pgcustom`);
+    const source = await startPostgres("seed");
+    try {
+      await x("docker", [
+        "exec", source.id, "psql", "-U", "postgres", "-v", "ON_ERROR_STOP=1", "-c",
+        "create schema auth; create table auth.users(id uuid primary key); " +
+        "create function auth.normalize_key(t text) returns text language sql immutable as $$ select lower(t) $$; " +
+        "create function public.boom(x int) returns int language plpgsql immutable as " +
+        "$$ begin if current_setting('app.ok', true) is distinct from 'yes' then raise exception 'boom %', x; end if; return x; end $$; " +
+        "set app.ok = 'yes'; " +
+        "create table items(id int primary key, k text unique, owner uuid references auth.users(id)); " +
+        "insert into items select g, 'k' || g, null from generate_series(1, 5000) g; " +
+        "create index items_k on items (k); " +
+        "create index \"odd\"\"index\" on items (k, id); " +
+        "create index pg_stat_statements on items (id, k); " +
+        "create index items_norm on items (auth.normalize_key(k)); " +
+        "create index items_boom1 on items (public.boom(id)); " +
+        "create index items_boom2 on items (public.boom(id + 1));",
+      ]);
+      await x(pgDump, [
+        "--format=custom", "--no-owner", "--no-privileges", "--schema=public",
+        "--dbname", source.url, "-f", dumpPath,
+      ]);
+    } finally {
+      await x("docker", ["rm", "-f", "-v", source.id]).catch(() => {});
+    }
+
+    const verdicts = [];
+    try {
+      for (const jobs of [1, 2]) {
+        const target = await startPostgres("drill");
+        try {
+          await installSandboxShim(target.url, { authFunctions: true });
+          // 演练会按 manifest 预装扩展;pg_stat_statements 装进 public 后,它的视图占了这个名字
+          await x("docker", ["exec", target.id, "psql", "-U", "postgres", "-c", "create extension pg_stat_statements"]);
+          const result = await restoreDatabaseArtifact({
+            dumpPath, connString: target.url, target: "sandbox", dumpedSchemas: ["public"], jobs,
+          });
+          verdicts.push({
+            jobs,
+            ok: result.ok,
+            preDataFailures: result.preData.failures.length,
+            skips: result.postData.expectedSkips,
+            failures: result.postData.failures.length,
+            boom: result.postData.failures.filter((f) => /boom/.test(f)).length,
+            collision: result.postData.failures.filter((f) => /relation "pg_stat_statements" already exists/.test(f)).length,
+          });
+        } finally {
+          // -v:镜像的数据卷是匿名卷,rm -f 不带 -v 会留下来
+          await x("docker", ["rm", "-f", "-v", target.id]).catch(() => {});
+        }
+      }
+    } finally {
+      rmSync(dumpPath, { force: true });
+    }
+    // 预期跳过 2 个:items_norm(auth.normalize_key 不在沙箱)和指向 auth.users 的外键;
+    // 失败 3 个:两条 boom 索引、撞名的 pg_stat_statements。主键、唯一约束、items_k、odd"index 都恢复了
+    const expected = { ok: false, preDataFailures: 0, skips: 2, failures: 3, boom: 2, collision: 1 };
+    for (const verdict of verdicts) {
+      const { jobs, ...rest } = verdict;
+      assert.deepEqual(rest, expected, `jobs=${jobs}`);
+    }
+  }
+);

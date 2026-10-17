@@ -161,6 +161,8 @@ backupdrill drill --verify-all-files # also checksum every Storage file, not jus
 
 Backups record your installed Postgres extensions in the manifest, and the drill pre-installs them in the sandbox before restoring — including switching to a pgvector-enabled sandbox image when your database uses `vector` columns.
 
+The sandbox restore runs up to 4 parallel `pg_restore` jobs, sized from the CPUs and memory Docker reports, so a 2 vCPU / 8 GB machine gets 2. Table data and index builds run in parallel. Foreign keys, triggers and policies run on a single connection to keep their error messages separate, including errors about Supabase-managed objects such as `auth.users`. `backupdrill restore` into a real Supabase project stays on a single connection.
+
 ### Run your own checks against the restored copy
 
 The drill's structural checks (tables, rows, checksums) can't know what "working" means for *your* app — business invariants only have answers in your code. `--check-cmd` hands you the restored sandbox before it's destroyed:

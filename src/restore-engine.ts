@@ -9,6 +9,9 @@
 //  3. dump 自带 CREATE SCHEMA,而目标(新容器或 Supabase)恒有同名 schema →
 //     pre-data 阶段的 schema "already exists" 是两类目标共同的预期冲突。
 import { spawn } from "node:child_process";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import type { ExtensionInfo } from "./manifest.js";
 import { resolvePgRestoreBin } from "./pgbin.js";
 import { dumpUrlFor, connectPg, isSupabaseHost } from "./supabase-ca.js";
@@ -300,11 +303,21 @@ export function classifyBlocks(stderr: string, allow: RegExp): ClassifiedPass {
  *    的半截恢复就会被报成功(评审第 7 轮抓出的假成功路径)。
  * 2. 非零退出且零错误块(归档器致命错、非英文 locale…)同样不能谎报成功。
  *    非零退出但每个错误都已分类 = pg_restore 对被忽略错误的正常退出形态,通过。
+ * 3. 并行遍(`parallel`)不能只信切块:多个 worker 进程共用一个 stderr,而 PostgreSQL 一条
+ *    报错分好几次 write(`pg_restore:`、` `、`error: `、正文,见 src/common/logging.c),
+ *    两条同时写会交错,一条真错误的前缀可能被拆散、正文挂到另一条预期跳过的块里——切块
+ *    看不到它,演练照样 PASS。所以并行遍只在两种情况下通过:退出码 0(一个错误都没有),
+ *    或 pg_restore 最后打印的 "errors ignored on restore: N" 恰好等于预期跳过数。
+ *    worker 里出的错 PostgreSQL 会多算一次(17 实测 4 个错报 8,mark_restore_job_done
+ *    又 +1),所以只要 worker 出过错 N 就一定大于预期跳过数——这条规则只放行"所有错误都出在
+ *    fork 之前的单进程阶段"的那种并行遍,调用方要据此安排哪些对象放进并行遍。
+ *    没有这行汇总的非零退出 = 中途致命退出,同样失败。
  */
 export function finalizePass(
   code: number | null,
   stderr: string,
-  classified: ClassifiedPass
+  classified: ClassifiedPass,
+  opts: { parallel?: boolean } = {}
 ): ClassifiedPass {
   const detail = stderr.trim().replace(/\s+/g, " ").slice(0, 200) || "(no stderr)";
   if (code === null) {
@@ -316,7 +329,30 @@ export function finalizePass(
   if (code !== 0 && classified.expectedSkips === 0 && classified.failures.length === 0) {
     return { ...classified, failures: [`pg_restore exited with code ${code}: ${detail}`] };
   }
+  if (opts.parallel && code !== 0 && classified.failures.length === 0) {
+    const reported = ignoredErrorTotal(stderr);
+    if (reported === null || reported !== classified.expectedSkips) {
+      return {
+        ...classified,
+        failures: [
+          `parallel pg_restore reported ${reported ?? "an unknown number of"} error(s), ` +
+            `but only ${classified.expectedSkips} could be attributed to expected skips: ${detail}`,
+        ],
+      };
+    }
+  }
   return classified;
+}
+
+/**
+ * pg_restore 正常跑完时打印的错误总数;没跑完(致命退出)或认不出时返回 null。
+ * 只认 stderr 的最后一个非空行、且整行就是这句汇总:这行在所有 worker 退出之后由主进程打印,
+ * 不会和别的输出交错;前面 "Command was:" 里的用户 SQL 就算含同样字样也冒充不了它。
+ */
+export function ignoredErrorTotal(stderr: string): number | null {
+  const lastLine = stderr.trimEnd().split("\n").pop() ?? "";
+  const match = /^pg_restore: warning: errors ignored on restore: (\d+)$/.exec(lastLine);
+  return match ? Number(match[1]) : null;
 }
 
 /** 标识符转义(内嵌引号翻倍)。导出:任何把目录里读到的名字拼进 SQL 的地方都必须用它。 */
@@ -587,12 +623,88 @@ export function assertNoHostOverride(connString: string): void {
   }
 }
 
+/**
+ * 把 `pg_restore --list --section=post-data` 的目录拆成两份 -L 清单:
+ * - `indexBuilds`:INDEX 和 CONSTRAINT(主键/唯一/排除约束,本质也是建索引)。恢复里最慢的就是
+ *   它们(2026-10-17 实测 post-data 占 pg_restore 时间的 67–77%,大头是建索引)。并行跑;
+ *   出过错的条目再单连接重跑一遍定结论(见 restoreDatabaseArtifact)。
+ * - `rest`:FK CONSTRAINT、TRIGGER、POLICY、INDEX ATTACH、COMMENT 等。指向 auth.users 的外键
+ *   这类预期跳过全在这里,并行时 worker 报错会交错、计数也不准(见 finalizePass 规则 3),
+ *   所以这份始终单连接跑,保留逐块分类。外键依赖主键/唯一约束,也必须排在 indexBuilds 之后。
+ * 注释行(`;` 开头)和空行丢掉:-L 只按行首的 dumpId 认条目。
+ */
+export function splitPostDataList(listing: string): { indexBuilds: string[]; rest: string[] } {
+  const indexBuilds: string[] = [];
+  const rest: string[] = [];
+  for (const line of listing.split("\n")) {
+    if (!/^\d+;/.test(line)) continue;
+    // 格式:`<dumpId>; <tableoid> <oid> <类型> <schema> <名字> <属主>`,类型可含空格
+    // (FK CONSTRAINT、INDEX ATTACH),所以按类型开头匹配并单独排除 INDEX ATTACH
+    if (/^\d+; \d+ \d+ (INDEX|CONSTRAINT) /.test(line) && !/^\d+; \d+ \d+ INDEX ATTACH /.test(line)) {
+      indexBuilds.push(line);
+    } else {
+      rest.push(line);
+    }
+  }
+  return { indexBuilds, rest };
+}
+
+function listPostData(bin: string, dumpPath: string): Promise<{ code: number | null; stdout: string; stderr: string }> {
+  return new Promise((resolve, reject) => {
+    // 只读归档、不连库,但同样钉 C locale,和恢复子进程一致
+    const proc = spawn(bin, ["--list", "--section=post-data", dumpPath], {
+      stdio: ["ignore", "pipe", "pipe"],
+      env: libpqChildEnv(),
+    });
+    let stdout = "";
+    let stderr = "";
+    proc.stdout.on("data", (d: Buffer) => (stdout += d.toString()));
+    proc.stderr.on("data", (d: Buffer) => (stderr += d.toString()));
+    proc.on("error", (error) =>
+      reject(new Error(`${bin} failed to start: ${(error as NodeJS.ErrnoException).code ?? error.message}`))
+    );
+    proc.on("close", (code) => resolve({ code, stdout, stderr }));
+  });
+}
+
+/**
+ * 并行建索引那遍(带 --verbose)里出过错的条目 dumpId。pg_restore 对每个出错条目先打一行
+ * `from TOC entry <dumpId>; …`(warn_or_exit_horribly,只在 verbose 下输出)。这行正文是一次
+ * write 写完的:并行时它的 `pg_restore: ` 前缀可能被别的 worker 拆开,正文本身不会,
+ * 所以按子串找、不按行首找。
+ */
+export function failedTocEntries(stderr: string): Set<string> {
+  return new Set([...stderr.matchAll(/from TOC entry (\d+);/g)].map((match) => match[1]));
+}
+
+function mergePasses(passes: ClassifiedPass[]): ClassifiedPass {
+  return {
+    expectedSkips: passes.reduce((sum, pass) => sum + pass.expectedSkips, 0),
+    failures: passes.flatMap((pass) => pass.failures),
+  };
+}
+
+/**
+ * 两遍恢复(形状见 credentialSafeDbArgs 上方那段"两遍恢复"注释),`jobs` > 1 时按下面的方式并行(2026-10-17 实测:2 核机器上同一份
+ * dump,原生 -j2 比 -j1 在 5 GB 快 14%、10 GB 快 12%):
+ * 1. pre-data+data 一遍加 --jobs。pg_restore 并行时先在主进程里单独跑完 pre-data,fork 之后
+ *    才并行灌数据,所以唯一的预期冲突(schema 已存在)一定出在单进程阶段,finalizePass
+ *    规则 3 的计数核对成立。同一遍里建表再灌数据,pg_restore 才会用 TRUNCATE+COPY,
+ *    wal_level=minimal 的沙箱因此不写这部分 WAL——拆成两遍就没了这个加速。
+ * 2. post-data 拆成两份清单(splitPostDataList):建索引那份并行,退出码 0 即通过,报过错
+ *    的条目单连接重跑定结论;其余单连接、照旧按目标类型分类。
+ *    两遍下来,同一份备份不管几路并行,结论都和 jobs=1 一样。
+ * 真实 Supabase 目标(restore.ts)不传 jobs:每一路都是一条 pooler 连接,小规格项目的连接数
+ * 和算力都紧,并行没测过,保持原来的单连接两遍。
+ */
 export async function restoreDatabaseArtifact(opts: {
   dumpPath: string;
   connString: string;
   target: RestoreTargetKind;
   /** manifest.database.schemas:沙箱 allowlist 据此剔掉转储自带的托管 schema(见 sandboxManagedError)。 */
   dumpedSchemas?: string[];
+  /** pg_restore 并行路数;不传或 ≤1 = 单连接两遍。 */
+  jobs?: number;
 }): Promise<EngineResult> {
   const bin = resolvePgRestoreBin();
   // TLS 全链路 verify-full(创始人承诺项):pg_restore 与 pg_dump 同一改写——
@@ -601,26 +713,92 @@ export async function restoreDatabaseArtifact(opts: {
   const { url, env } = credentialSafeDbArgs(dumpUrlFor(opts.connString));
   const common = ["--no-owner", "--no-privileges", "--dbname", url, opts.dumpPath];
   const childOpts = { supabaseHost: isSupabaseHost(opts.connString), urlSslMode: urlSslModeOf(url) };
+  const jobs = Math.max(1, Math.floor(opts.jobs ?? 1));
+  const parallel = jobs > 1;
+  const jobsArg = parallel ? [`--jobs=${jobs}`] : [];
 
-  const first = await spawnPgRestore(bin, ["--section=pre-data", "--section=data", ...common], env, childOpts);
+  const first = await spawnPgRestore(
+    bin,
+    ["--section=pre-data", "--section=data", ...jobsArg, ...common],
+    env,
+    childOpts
+  );
   const preData = finalizePass(
     first.code,
     first.stderr,
-    classifyBlocks(first.stderr, SCHEMA_EXISTS_ERROR)
+    classifyBlocks(first.stderr, SCHEMA_EXISTS_ERROR),
+    { parallel }
   );
   if (preData.failures.length) {
     return { preData, postData: { expectedSkips: 0, failures: [] }, ok: false };
   }
 
-  const second = await spawnPgRestore(bin, ["--section=post-data", ...common], env, childOpts);
-  const postData = finalizePass(
-    second.code,
-    second.stderr,
-    classifyBlocks(
-      second.stderr,
-      opts.target === "sandbox" ? sandboxManagedError(opts.dumpedSchemas ?? []) : NEVER_MATCH
-    )
-  );
+  const postDataAllow = opts.target === "sandbox" ? sandboxManagedError(opts.dumpedSchemas ?? []) : NEVER_MATCH;
+  if (!parallel) {
+    const second = await spawnPgRestore(bin, ["--section=post-data", ...common], env, childOpts);
+    const postData = finalizePass(second.code, second.stderr, classifyBlocks(second.stderr, postDataAllow));
+    return { preData, postData, ok: postData.failures.length === 0 };
+  }
 
-  return { preData, postData, ok: postData.failures.length === 0 };
+  const listing = await listPostData(bin, opts.dumpPath);
+  if (listing.code !== 0) {
+    const detail = listing.stderr.trim().replace(/\s+/g, " ").slice(0, 200) || "(no stderr)";
+    const postData = { expectedSkips: 0, failures: [`pg_restore --list exited with code ${listing.code}: ${detail}`] };
+    return { preData, postData, ok: false };
+  }
+  const { indexBuilds, rest } = splitPostDataList(listing.stdout);
+  const listDir = await mkdtemp(join(tmpdir(), "backupdrill-restore-"));
+  try {
+    const passes: ClassifiedPass[] = [];
+    if (indexBuilds.length) {
+      const listFile = join(listDir, "index-builds.list");
+      await writeFile(listFile, indexBuilds.join("\n") + "\n");
+      const run = await spawnPgRestore(
+        bin,
+        ["--section=post-data", `--use-list=${listFile}`, "--verbose", ...jobsArg, ...common],
+        env,
+        childOpts
+      );
+      // 退出码 0 = 一个错都没有。出过错时不读交错的报错正文,只取出错条目的 dumpId,把这些条目
+      // 单连接重跑、照单连接的规则分类:一条 CREATE INDEX / ADD CONSTRAINT 失败不留半成品,
+      // 重跑得到的就是 jobs=1 时的结论(交叉审查:引用托管 schema 函数的索引在单连接时是预期
+      // 跳过,并行时不能因此判失败;也不能靠忽略"已存在"去猜哪些建好了,沙箱里预装的扩展
+      // 对象会和用户索引撞名)。资源原因偶发失败的条目,重跑成功即通过,和单连接本来一样。
+      if (run.code !== 0) {
+        const failedIds = failedTocEntries(run.stderr);
+        const failed = indexBuilds.filter((line) => failedIds.has(line.slice(0, line.indexOf(";"))));
+        // 被信号杀死、没有汇总行(中途致命退出,后面的条目根本没跑)、或认不出任何出错条目:
+        // 都说明这一遍没走完或没法归因,直接失败,不重跑
+        // 出错条目的编号即使被用户 SQL 冒充,也只会多重跑一条、让它报"已存在"而判失败,不会漏掉真错误
+        const finished = run.code !== null && ignoredErrorTotal(run.stderr) !== null && failed.length > 0;
+        if (!finished) {
+          const detail = run.stderr.trim().replace(/\s+/g, " ").slice(-200) || "(no stderr)";
+          passes.push({
+            expectedSkips: 0,
+            failures: [`parallel index builds did not finish cleanly (exit ${run.code ?? "signal"}): ${detail}`],
+          });
+        } else {
+          const rerunFile = join(listDir, "index-builds-rerun.list");
+          await writeFile(rerunFile, failed.join("\n") + "\n");
+          const rerun = await spawnPgRestore(
+            bin,
+            ["--section=post-data", `--use-list=${rerunFile}`, ...common],
+            env,
+            childOpts
+          );
+          passes.push(finalizePass(rerun.code, rerun.stderr, classifyBlocks(rerun.stderr, postDataAllow)));
+        }
+      }
+    }
+    if (rest.length) {
+      const listFile = join(listDir, "rest.list");
+      await writeFile(listFile, rest.join("\n") + "\n");
+      const run = await spawnPgRestore(bin, ["--section=post-data", `--use-list=${listFile}`, ...common], env, childOpts);
+      passes.push(finalizePass(run.code, run.stderr, classifyBlocks(run.stderr, postDataAllow)));
+    }
+    const postData = mergePasses(passes);
+    return { preData, postData, ok: postData.failures.length === 0 };
+  } finally {
+    await rm(listDir, { recursive: true, force: true });
+  }
 }
