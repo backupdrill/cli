@@ -536,8 +536,9 @@ test("supervision refuses an existing volume without deleting it", {skip:canRun?
 
 // ── 并行恢复:同一份备份,jobs=1 和 jobs=2 必须得出同一结论(交叉审查 2026-10-17)──
 // 索引引用托管 schema 里的函数(公共转储不带它)在单连接时记为预期跳过;并行时如果建索引那遍
-// 零容忍,同一份备份就会因为机器核数不同而判失败。另放两条真坏的索引,确认失败照样报出来,
-// 也让并行那遍出错、走单连接重跑,验证已建好的主键/唯一约束/索引报的"已存在"不被算成失败。
+// 零容忍,同一份备份就会因为机器核数不同而判失败。另放两条真坏的索引,确认失败照样报出来;
+// 一条和沙箱预装扩展的视图撞名的索引(单连接时是真失败,并行重跑不能把它当"已存在"放过);
+// 一条名字里带双引号的索引(并行时建好了,不能因为认不出名字被重跑成失败)。
 const { restoreDatabaseArtifact, installSandboxShim } = await import("../dist/restore-engine.js");
 
 async function startPostgres(password) {
@@ -575,6 +576,8 @@ test(
         "create table items(id int primary key, k text unique, owner uuid references auth.users(id)); " +
         "insert into items select g, 'k' || g, null from generate_series(1, 5000) g; " +
         "create index items_k on items (k); " +
+        "create index \"odd\"\"index\" on items (k, id); " +
+        "create index pg_stat_statements on items (id, k); " +
         "create index items_norm on items (auth.normalize_key(k)); " +
         "create index items_boom1 on items (public.boom(id)); " +
         "create index items_boom2 on items (public.boom(id + 1));",
@@ -593,6 +596,8 @@ test(
         const target = await startPostgres("drill");
         try {
           await installSandboxShim(target.url, { authFunctions: true });
+          // 演练会按 manifest 预装扩展;pg_stat_statements 装进 public 后,它的视图占了这个名字
+          await x("docker", ["exec", target.id, "psql", "-U", "postgres", "-c", "create extension pg_stat_statements"]);
           const result = await restoreDatabaseArtifact({
             dumpPath, connString: target.url, target: "sandbox", dumpedSchemas: ["public"], jobs,
           });
@@ -602,7 +607,8 @@ test(
             preDataFailures: result.preData.failures.length,
             skips: result.postData.expectedSkips,
             failures: result.postData.failures.length,
-            boom: result.postData.failures.every((f) => /boom/.test(f)),
+            boom: result.postData.failures.filter((f) => /boom/.test(f)).length,
+            collision: result.postData.failures.filter((f) => /relation "pg_stat_statements" already exists/.test(f)).length,
           });
         } finally {
           // -v:镜像的数据卷是匿名卷,rm -f 不带 -v 会留下来
@@ -613,8 +619,8 @@ test(
       rmSync(dumpPath, { force: true });
     }
     // 预期跳过 2 个:items_norm(auth.normalize_key 不在沙箱)和指向 auth.users 的外键;
-    // 失败 2 个:两条 boom 索引。主键、唯一约束、items_k 都恢复了,单连接重跑时的"已存在"不计数
-    const expected = { ok: false, preDataFailures: 0, skips: 2, failures: 2, boom: true };
+    // 失败 3 个:两条 boom 索引、撞名的 pg_stat_statements。主键、唯一约束、items_k、odd"index 都恢复了
+    const expected = { ok: false, preDataFailures: 0, skips: 2, failures: 3, boom: 2, collision: 1 };
     for (const verdict of verdicts) {
       const { jobs, ...rest } = verdict;
       assert.deepEqual(rest, expected, `jobs=${jobs}`);

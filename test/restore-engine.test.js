@@ -9,6 +9,7 @@ import {
   SANDBOX_MANAGED_ERROR,
   SCHEMA_EXISTS_ERROR,
   splitPostDataList,
+  failedTocEntries,
 } from "../dist/restore-engine.js";
 import { sameDatabaseTarget } from "../dist/restore.js";
 
@@ -245,6 +246,17 @@ test("并行遍:汇总数取最后一行,前面用户 SQL 里的同样字样骗�
     "pg_restore: warning: errors ignored on restore: 3\n";
   const pass = finalizePass(1, spoofed, { expectedSkips: 1, failures: [] }, { parallel: true });
   assert.match(pass.failures[0], /reported 3 error/);
+});
+
+test("failedTocEntries:前缀被交错拆开也能认出出错条目", () => {
+  // --verbose -j2 的形态:"from TOC entry" 正文是一次写完的,前缀和别的 worker 的输出搅在一起
+  const stderr =
+    "pg_restore: launching item 3313 INDEX items_boom1\n" +
+    "pg_restore:pg_restore: from TOC entry 3314; 1259 16409 INDEX public items_boom2 postgres\n" +
+    " from TOC entry 3317; 1259 16407 INDEX public items_norm postgres\n" +
+    "pg_restore: error: could not execute query: ERROR:  boom 1\n" +
+    "pg_restore: warning: errors ignored on restore: 4\n";
+  assert.deepEqual([...failedTocEntries(stderr)].sort(), ["3314", "3317"]);
 });
 
 test("splitPostDataList:建索引的进并行清单,外键/触发器/策略/INDEX ATTACH 留单连接", () => {
