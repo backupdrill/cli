@@ -616,8 +616,8 @@ export function assertNoHostOverride(connString: string): void {
 /**
  * 把 `pg_restore --list --section=post-data` 的目录拆成两份 -L 清单:
  * - `indexBuilds`:INDEX 和 CONSTRAINT(主键/唯一/排除约束,本质也是建索引)。恢复里最慢的就是
- *   它们(2026-10-17 实测占 pg_restore 时间的 67–77%),而且只作用于用户自己的表,
- *   沙箱 allowlist 里的"托管对象缺席"在这里不会出现——可以并行、零容忍。
+ *   它们(2026-10-17 实测 post-data 占 pg_restore 时间的 67–77%,大头是建索引)。并行跑;
+ *   报过错就整份单连接重跑一遍定结论(见 classifyIndexRerun)。
  * - `rest`:FK CONSTRAINT、TRIGGER、POLICY、INDEX ATTACH、COMMENT 等。指向 auth.users 的外键
  *   这类预期跳过全在这里,并行时 worker 报错会交错、计数也不准(见 finalizePass 规则 3),
  *   所以这份始终单连接跑,保留逐块分类。外键依赖主键/唯一约束,也必须排在 indexBuilds 之后。
@@ -657,6 +657,29 @@ function listPostData(bin: string, dumpPath: string): Promise<{ code: number | n
   });
 }
 
+// 建索引那份清单单连接重跑时,并行那遍已经建好的对象报的错。只有这三种形态:
+// CREATE INDEX / ADD CONSTRAINT UNIQUE|EXCLUDE 撞同名 relation,ADD PRIMARY KEY 撞已有主键,
+// 以及按名字撞上已有约束。新沙箱里单连接恢复不会出现它们(同一 schema 下没有重名对象),
+// 所以忽略它们不会改变 jobs=1 时的结论。同样两端锚定。
+const ALREADY_RESTORED =
+  /^(?:relation "[^"]+" already exists|multiple primary keys for table "[^"]+" are not allowed|constraint "[^"]+" for relation "[^"]+" already exists)$/i;
+
+/**
+ * 并行建索引那遍报过错(非零退出)时的裁决:同一份清单单连接再跑一遍。并行时成功的对象
+ * 这次报"已存在",不计数;失败的对象重新执行(一条 CREATE INDEX / ADD CONSTRAINT 失败不留
+ * 半成品),报错按单连接的规则逐块分类。这样结论与 jobs=1 完全一致——包括引用托管 schema
+ * 函数的索引照样记为预期跳过(交叉审查:否则同一份备份 2 核判失败、1 核判通过)——也不需要
+ * 去读并行时交错的 stderr。并行那遍因内存等资源原因偶发失败的对象,重跑成功即通过,
+ * 和单连接恢复本来的结果一样。
+ */
+function classifyIndexRerun(code: number | null, stderr: string, allow: RegExp): ClassifiedPass {
+  const alreadyRestored = classifyBlocks(stderr, ALREADY_RESTORED).expectedSkips;
+  const allowOrRestored = new RegExp(`${ALREADY_RESTORED.source}|${allow.source}`, "i");
+  // "已存在"先算进 expectedSkips,finalizePass 的"非零退出却零错误块"规则才不会误报;算完再减掉
+  const classified = finalizePass(code, stderr, classifyBlocks(stderr, allowOrRestored));
+  return { expectedSkips: classified.expectedSkips - alreadyRestored, failures: classified.failures };
+}
+
 function mergePasses(passes: ClassifiedPass[]): ClassifiedPass {
   return {
     expectedSkips: passes.reduce((sum, pass) => sum + pass.expectedSkips, 0),
@@ -671,8 +694,9 @@ function mergePasses(passes: ClassifiedPass[]): ClassifiedPass {
  *    才并行灌数据,所以唯一的预期冲突(schema 已存在)一定出在单进程阶段,finalizePass
  *    规则 3 的计数核对成立。同一遍里建表再灌数据,pg_restore 才会用 TRUNCATE+COPY,
  *    wal_level=minimal 的沙箱因此不写这部分 WAL——拆成两遍就没了这个加速。
- * 2. post-data 拆成两份清单(splitPostDataList):建索引那份并行、零容忍;其余单连接、
- *    照旧按目标类型分类。
+ * 2. post-data 拆成两份清单(splitPostDataList):建索引那份并行,退出码 0 即通过,报过错
+ *    就单连接重跑定结论(classifyIndexRerun);其余单连接、照旧按目标类型分类。
+ *    两遍下来,同一份备份不管几路并行,结论都和 jobs=1 一样。
  * 真实 Supabase 目标(restore.ts)不传 jobs:每一路都是一条 pooler 连接,小规格项目的连接数
  * 和算力都紧,并行没测过,保持原来的单连接两遍。
  */
@@ -732,13 +756,15 @@ export async function restoreDatabaseArtifact(opts: {
     if (indexBuilds.length) {
       const listFile = join(listDir, "index-builds.list");
       await writeFile(listFile, indexBuilds.join("\n") + "\n");
-      const run = await spawnPgRestore(
-        bin,
-        ["--section=post-data", `--use-list=${listFile}`, ...jobsArg, ...common],
-        env,
-        childOpts
-      );
-      passes.push(finalizePass(run.code, run.stderr, classifyBlocks(run.stderr, NEVER_MATCH), { parallel }));
+      const useList = ["--section=post-data", `--use-list=${listFile}`];
+      const run = await spawnPgRestore(bin, [...useList, ...jobsArg, ...common], env, childOpts);
+      if (run.code === null) {
+        // 被信号杀死:无条件失败(finalizePass 规则 1),不再重跑
+        passes.push(finalizePass(run.code, run.stderr, classifyBlocks(run.stderr, NEVER_MATCH)));
+      } else if (run.code !== 0) {
+        const rerun = await spawnPgRestore(bin, [...useList, ...common], env, childOpts);
+        passes.push(classifyIndexRerun(rerun.code, rerun.stderr, postDataAllow));
+      }
     }
     if (rest.length) {
       const listFile = join(listDir, "rest.list");
