@@ -86,6 +86,8 @@ interface Ephemeral {
   connString: string;
   /** 数据目录的匿名卷名(postgres 镜像 VOLUME);销毁容器后显式删除 */
   volumeName: string | null;
+  /** pg_restore 并行路数,随调参一起按 Docker 的内存和 CPU 定(见 sandboxTuning) */
+  restoreJobs: number;
 }
 
 /**
@@ -125,25 +127,35 @@ export interface SandboxTuning {
   settings: string[];
   /** docker --shm-size 的值;并行建索引走动态共享内存,要跟 maintenance_work_mem 一起长 */
   shmSize: string;
+  /** pg_restore --jobs;1 = 单连接 */
+  restoreJobs: number;
 }
 
-/** Docker 引擎可用内存(字节);问不到就返回 0,让 sandboxTuning 落到下限值,宁慢勿炸。 */
-async function dockerMemoryBudget(): Promise<number> {
+/** Docker 引擎可用内存(字节)和 CPU 数;问不到就返回 0,让 sandboxTuning 落到下限值、单连接,宁慢勿炸。 */
+async function dockerResources(): Promise<{ memoryBytes: number; cpus: number }> {
   try {
     // 探测是可选的,绝不能卡住演练:守护进程假死时 5 秒后放弃,落到下限值继续跑
-    const { stdout } = await execFileAsync("docker", ["info", "--format", "{{.MemTotal}}"], {
+    const { stdout } = await execFileAsync("docker", ["info", "--format", "{{.MemTotal}} {{.NCPU}}"], {
       timeout: 5_000,
     });
-    const bytes = Number.parseInt(stdout.trim(), 10);
-    return Number.isFinite(bytes) && bytes > 0 ? bytes : 0;
+    const [memoryBytes, cpus] = stdout.trim().split(/\s+/).map((value) => Number.parseInt(value, 10));
+    const positive = (value: number | undefined) => (value !== undefined && Number.isFinite(value) && value > 0 ? value : 0);
+    return { memoryBytes: positive(memoryBytes), cpus: positive(cpus) };
   } catch {
-    return 0;
+    return { memoryBytes: 0, cpus: 0 };
   }
 }
 
-export function sandboxTuning(totalMemBytes: number): SandboxTuning {
+export function sandboxTuning(totalMemBytes: number, cpus = 1): SandboxTuning {
+  const budgetMib = Math.floor(totalMemBytes / MIB);
   const sharedBuffersMib = clampMib(totalMemBytes / 4, 256, 2048);
   const maintenanceWorkMemMib = clampMib(totalMemBytes / 8, 256, 1024);
+  // 并行恢复时每一路都可能同时在建索引,各自吃满 maintenance_work_mem:路数 × maintenance_work_mem
+  // 加上 shared_buffers 不超过预算的一半,另一半留给 pg_restore、Docker 和同机的其他任务
+  // (8 GB 的 worker 正好 2 路,2026-10-17 在它上面实测 -j2 没出内存问题)。
+  // 再封顶 4 路:pg_restore 的并行度受表和索引个数限制,再多收益很小,演练还常跑在用户自己的电脑上。
+  const memoryBoundJobs = Math.floor((budgetMib / 2 - sharedBuffersMib) / maintenanceWorkMemMib);
+  const restoreJobs = Math.max(1, Math.min(cpus, memoryBoundJobs, 4));
   return {
     settings: [
       "fsync=off",
@@ -158,8 +170,9 @@ export function sandboxTuning(totalMemBytes: number): SandboxTuning {
     ],
     // Docker 默认 /dev/shm 只有 64 MB;并行建索引(pgvector 的 HNSW 尤其)走动态共享内存,
     // 64 MB 会撞 "No space left on device" 把好备份误判失败(交叉审查 2026-09-12 复现)。
-    // 给 maintenance_work_mem 的两倍、至少 1 GB;tmpfs 只按实际用量占内存,给大不吃亏。
-    shmSize: `${Math.max(1024, maintenanceWorkMemMib * 2)}m`,
+    // 每一路并行恢复给 maintenance_work_mem 的两倍、至少 1 GB;tmpfs 只按实际用量占内存,给大不吃亏。
+    shmSize: `${Math.max(1024, maintenanceWorkMemMib * 2 * restoreJobs)}m`,
+    restoreJobs,
   };
 }
 
@@ -198,7 +211,8 @@ async function startEphemeralPostgres(image: string, major: number, resourceName
     }
   }
   log.step(`Starting ephemeral ${image}…`);
-  const tuning = sandboxTuning(await dockerMemoryBudget());
+  const resources = await dockerResources();
+  const tuning = sandboxTuning(resources.memoryBytes, resources.cpus);
   const { stdout } = await execFileAsync("docker", [
     "run",
     "-d",
@@ -255,7 +269,7 @@ async function startEphemeralPostgres(image: string, major: number, resourceName
           "postgres",
           "-q",
         ]);
-        return { containerId, port, connString, volumeName };
+        return { containerId, port, connString, volumeName, restoreJobs: tuning.restoreJobs };
       } catch {
         await new Promise((r) => setTimeout(r, 500));
       }
@@ -304,9 +318,10 @@ export function postDataResult(code: number | null, stderr: string): PostDataRes
 async function pgRestore(
   dumpPath: string,
   connString: string,
-  dumpedSchemas: string[]
+  dumpedSchemas: string[],
+  jobs: number
 ): Promise<PostDataResult> {
-  const result = await restoreDatabaseArtifact({ dumpPath, connString, target: "sandbox", dumpedSchemas });
+  const result = await restoreDatabaseArtifact({ dumpPath, connString, target: "sandbox", dumpedSchemas, jobs });
   if (result.preData.failures.length) {
     throw new Error(`pg_restore failed: ${result.preData.failures.join(" | ")}`);
   }
@@ -613,7 +628,7 @@ export async function drillDump(
     log.step("Restoring into ephemeral Postgres…");
     let postData: PostDataResult;
     try {
-      postData = await pgRestore(dumpPath, pg.connString, manifest.database.schemas);
+      postData = await pgRestore(dumpPath, pg.connString, manifest.database.schemas, pg.restoreJobs);
     } catch (error) {
       // 沙箱装不上扩展 + 错误特征命中"缺类型/schema/扩展" → 假设式归因到沙箱环境
       // (不对备份健康下断言);其余失败与扩展无关,必须原样抛出
@@ -627,7 +642,11 @@ export async function drillDump(
       throw error;
     }
     const restoreSeconds = Math.round((Date.now() - started) / 100) / 10;
-    checks.push({ name: "pg_restore", pass: true, detail: `completed in ${restoreSeconds}s` });
+    checks.push({
+      name: "pg_restore",
+      pass: true,
+      detail: `completed in ${restoreSeconds}s` + (pg.restoreJobs > 1 ? ` (${pg.restoreJobs} parallel jobs)` : ""),
+    });
     // 用户自己的 post-data 对象(索引/约束/触发器)必须全部恢复;Supabase 托管对象
     // 的沙箱预期跳过如实写进报告(演练不假装它们恢复了)。
     checks.push({
