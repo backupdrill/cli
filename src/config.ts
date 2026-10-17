@@ -32,8 +32,18 @@ export interface BackupConfig {
   // 默认只备 public(用户数据):平台托管 schema(auth/storage/realtime/vault)
   // 既超出最小权限 backup_reader 角色的读取范围,还原进新项目也会与平台冲突。
   schemas: string[];
-  storage: StorageConfig; // 备份写入目标(用户自己的桶)
+  // 备份写入目标(用户自己的桶)。CLI 的 loadConfig 总会给出;库调用方给备份、演练、
+  // 恢复传入自己的 SnapshotStore(如托管服务的 Google Drive 目标)时可以省略
+  storage?: StorageConfig;
   supabaseStorage?: SupabaseStorageConfig; // 备份读取源(Supabase Storage 文件)
+}
+
+/** 需要桶的地方先过这一道:没配桶时给一句能看懂的报错,而不是读 undefined 的属性。 */
+export function requireBucket(config: BackupConfig): StorageConfig {
+  if (!config.storage) {
+    throw new Error("No S3-compatible bucket configured (storage) — set storage.bucket and its keys.");
+  }
+  return config.storage;
 }
 
 interface RawConfig {
