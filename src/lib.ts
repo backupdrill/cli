@@ -10,7 +10,7 @@ export { runRestore } from "./restore.js";
 export { projectRefOf, assertNoHostOverride, libpqChildEnv } from "./restore-engine.js";
 export { sameDatabaseTarget } from "./restore.js";
 export { runEstimate, project } from "./estimate.js";
-export { loadConfig } from "./config.js";
+export { loadConfig, requireBucket } from "./config.js";
 export {
   targetClient,
   resolveSnapshot,
@@ -18,9 +18,19 @@ export {
   downloadToFile,
   hashObject,
 } from "./snapshots.js";
+// 快照位置接口:备份、演练、恢复都可以传入自己的实现(托管 worker 的 Google Drive 目标)
+export { s3SnapshotStore } from "./snapshot-store.js";
+export type {
+  SnapshotStore,
+  SnapshotWriter,
+  SnapshotReader,
+  DumpUpload,
+  StorageFilesLocation,
+} from "./snapshot-store.js";
 
 export type {
   BackupConfig,
+  LoadedBackupConfig,
   StorageConfig,
   SupabaseStorageConfig,
 } from "./config.js";
