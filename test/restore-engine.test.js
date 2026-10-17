@@ -10,6 +10,7 @@ import {
   SCHEMA_EXISTS_ERROR,
   splitPostDataList,
   failedTocEntries,
+  ignoredErrorTotal,
 } from "../dist/restore-engine.js";
 import { sameDatabaseTarget } from "../dist/restore.js";
 
@@ -246,6 +247,19 @@ test("并行遍:汇总数取最后一行,前面用户 SQL 里的同样字样骗�
     "pg_restore: warning: errors ignored on restore: 3\n";
   const pass = finalizePass(1, spoofed, { expectedSkips: 1, failures: [] }, { parallel: true });
   assert.match(pass.failures[0], /reported 3 error/);
+});
+
+test("ignoredErrorTotal:只认最后一行完整的汇总,用户 SQL 里的同样字样冒充不了", () => {
+  assert.equal(ignoredErrorTotal(PARALLEL_PREDATA_ONLY), 1);
+  // 致命退出:没有真的汇总行,前面 Command was 里的假汇总不能让这一遍算"跑完"
+  const fatal =
+    "pg_restore: error: could not execute query: ERROR:  boom 1\n" +
+    "Command was: CREATE INDEX x ON public.t USING btree (v) WHERE (note <> '\n" +
+    "pg_restore: warning: errors ignored on restore: 1\n" +
+    "');\n" +
+    "pg_restore: error: a worker process died unexpectedly\n";
+  assert.equal(ignoredErrorTotal(fatal), null);
+  assert.equal(ignoredErrorTotal(""), null);
 });
 
 test("failedTocEntries:前缀被交错拆开也能认出出错条目", () => {

@@ -330,19 +330,29 @@ export function finalizePass(
     return { ...classified, failures: [`pg_restore exited with code ${code}: ${detail}`] };
   }
   if (opts.parallel && code !== 0 && classified.failures.length === 0) {
-    // 取最后一个:汇总行在结尾,前面 "Command was:" 里的用户 SQL 碰巧含同样字样也骗不到
-    const reported = [...stderr.matchAll(/errors ignored on restore: (\d+)/g)].pop();
-    if (!reported || Number(reported[1]) !== classified.expectedSkips) {
+    const reported = ignoredErrorTotal(stderr);
+    if (reported === null || reported !== classified.expectedSkips) {
       return {
         ...classified,
         failures: [
-          `parallel pg_restore reported ${reported ? reported[1] : "an unknown number of"} error(s), ` +
+          `parallel pg_restore reported ${reported ?? "an unknown number of"} error(s), ` +
             `but only ${classified.expectedSkips} could be attributed to expected skips: ${detail}`,
         ],
       };
     }
   }
   return classified;
+}
+
+/**
+ * pg_restore 正常跑完时打印的错误总数;没跑完(致命退出)或认不出时返回 null。
+ * 只认 stderr 的最后一个非空行、且整行就是这句汇总:这行在所有 worker 退出之后由主进程打印,
+ * 不会和别的输出交错;前面 "Command was:" 里的用户 SQL 就算含同样字样也冒充不了它。
+ */
+export function ignoredErrorTotal(stderr: string): number | null {
+  const lastLine = stderr.trimEnd().split("\n").pop() ?? "";
+  const match = /^pg_restore: warning: errors ignored on restore: (\d+)$/.exec(lastLine);
+  return match ? Number(match[1]) : null;
 }
 
 /** 标识符转义(内嵌引号翻倍)。导出:任何把目录里读到的名字拼进 SQL 的地方都必须用它。 */
@@ -759,8 +769,8 @@ export async function restoreDatabaseArtifact(opts: {
         const failed = indexBuilds.filter((line) => failedIds.has(line.slice(0, line.indexOf(";"))));
         // 被信号杀死、没有汇总行(中途致命退出,后面的条目根本没跑)、或认不出任何出错条目:
         // 都说明这一遍没走完或没法归因,直接失败,不重跑
-        const finished =
-          run.code !== null && /errors ignored on restore: \d+/.test(run.stderr) && failed.length > 0;
+        // 出错条目的编号即使被用户 SQL 冒充,也只会多重跑一条、让它报"已存在"而判失败,不会漏掉真错误
+        const finished = run.code !== null && ignoredErrorTotal(run.stderr) !== null && failed.length > 0;
         if (!finished) {
           const detail = run.stderr.trim().replace(/\s+/g, " ").slice(-200) || "(no stderr)";
           passes.push({
