@@ -3,17 +3,11 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
-import { S3Client } from "@aws-sdk/client-s3";
 import type { BackupConfig } from "./config.js";
 import { parseManifest } from "./manifest.js";
 import type { Manifest } from "./manifest.js";
-import {
-  targetClient,
-  resolveSnapshot,
-  getObjectText,
-  downloadToFile,
-  hashObject,
-} from "./snapshots.js";
+import { hashObject } from "./snapshots.js";
+import { s3SnapshotStore, type SnapshotStore, type StorageFilesLocation } from "./snapshot-store.js";
 import {
   SANDBOX_MANAGED_ERROR,
   classifyBlocks,
@@ -445,20 +439,18 @@ export async function verifyRestored(
  * 证明备份的文件副本真实存在且未损坏。文件多时抽样(默认上限),避免大量 egress。
  */
 async function verifyStorage(
-  s3: S3Client,
-  config: BackupConfig,
+  location: StorageFilesLocation,
   manifest: Manifest,
   verifyAll: boolean
 ): Promise<DrillCheck> {
   const files = manifest.storage!.files;
   const sample = verifyAll ? files : sampleStorageFiles(files, STORAGE_SAMPLE_CAP);
-  // 备份写入时的键:<snapshot base>/storage/<bucket>/<key>,base 从 dump.key 反推
-  const base = manifest.dump.key.replace(/\/dump\.pgcustom$/, "");
+  // 备份写入时的键:<snapshot base>/storage/<bucket>/<key>
   const mismatches: string[] = [];
   for (const f of sample) {
-    const objectKey = `${base}/storage/${f.bucket}/${f.key}`;
+    const objectKey = `${location.base}/storage/${f.bucket}/${f.key}`;
     try {
-      const { sha256 } = await hashObject(s3, config.storage.bucket, objectKey);
+      const { sha256 } = await hashObject(location.s3, location.bucket, objectKey);
       if (sha256 !== f.sha256) mismatches.push(`${f.bucket}/${f.key}`);
     } catch {
       mismatches.push(`${f.bucket}/${f.key} (unreadable)`);
@@ -720,29 +712,24 @@ export async function runDrill(
     appCheckCommand?: string;
     keepSandboxOnFailure?: boolean;
     supervision?: DrillSupervision;
+    /** 快照从哪读;省略 = config.storage 指的 S3 兼容桶 */
+    store?: SnapshotStore;
   } = {}
 ): Promise<DrillReport> {
   validateSupervision(opts.supervision, opts.appCheckCommand, opts.keepSandboxOnFailure);
-  const s3 = targetClient(config);
-  const snapshotPrefix = await resolveSnapshot(s3, config, opts.snapshot);
-  const snapshot = snapshotPrefix.replace(/\/$/, "").split("/").pop()!;
+  const store = opts.store ?? s3SnapshotStore(config);
+  const reader = await store.openSnapshot(opts.snapshot);
+  const snapshot = reader.name;
   log.step(`Drilling snapshot ${snapshot}`);
 
-  const manifest = parseManifest(
-    await getObjectText(s3, config.storage.bucket, `${snapshotPrefix}manifest.json`)
-  );
+  const manifest = parseManifest(await reader.readManifest());
 
   const workdir = opts.supervision?.workdir ?? await mkdtemp(join(tmpdir(), "backupdrill-"));
   const dumpPath = join(workdir, "dump.pgcustom");
   try {
     await opts.supervision?.observe({ phase: "download", dumpBytes: manifest.dump.bytes });
     log.step("Downloading dump…");
-    const { sha256: sha } = await downloadToFile(
-      s3,
-      config.storage.bucket,
-      manifest.dump.key,
-      dumpPath
-    );
+    const { sha256: sha } = await reader.downloadDump(manifest, dumpPath);
     const integrityPass = sha === manifest.dump.sha256;
     const preChecks: DrillCheck[] = [
       {
@@ -769,8 +756,15 @@ export async function runDrill(
     if (manifest.storage && manifest.storage.files.length) {
       await opts.supervision?.observe({ phase: "storage" });
       log.step("Verifying Storage files…");
+      const location = reader.storageFiles(manifest);
       preChecks.push(
-        await verifyStorage(s3, config, manifest, opts.verifyAllFiles ?? false)
+        location
+          ? await verifyStorage(location, manifest, opts.verifyAllFiles ?? false)
+          : {
+              name: "storage file integrity",
+              pass: false,
+              detail: "the manifest lists Storage files, but this snapshot location cannot hold them",
+            }
       );
     }
 

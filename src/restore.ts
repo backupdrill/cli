@@ -8,12 +8,7 @@ import { GetObjectCommand } from "@aws-sdk/client-s3";
 import type { BackupConfig } from "./config.js";
 import { parseManifest } from "./manifest.js";
 import type { Manifest } from "./manifest.js";
-import {
-  targetClient,
-  resolveSnapshot,
-  getObjectText,
-  downloadToFile,
-} from "./snapshots.js";
+import { s3SnapshotStore, type SnapshotStore } from "./snapshot-store.js";
 import {
   restoreDatabaseArtifact,
   installExtensions,
@@ -438,6 +433,8 @@ export async function runRestore(
     skipStorage?: boolean;
     snapshot?: string;
     storageDir?: string;
+    /** 快照从哪读;省略 = config.storage 指的 S3 兼容桶 */
+    store?: SnapshotStore;
   }
 ): Promise<RestoreResult> {
   // 任何 I/O 之前先把源与目标的连接串过一遍覆盖/别名守卫:源串带集群别名或租户覆盖时
@@ -448,13 +445,10 @@ export async function runRestore(
   if (hasRemoteTarget && config.databaseUrl !== NO_SOURCE_DATABASE) assertNoHostOverride(config.databaseUrl);
   if (opts.targetDatabaseUrl) assertNoHostOverride(opts.targetDatabaseUrl);
 
-  const s3 = targetClient(config);
-  const snapshotPrefix = await resolveSnapshot(s3, config, opts.snapshot);
-  const snapshot = snapshotPrefix.replace(/\/$/, "").split("/").pop()!;
-  const manifest = parseManifest(
-    await getObjectText(s3, config.storage.bucket, `${snapshotPrefix}manifest.json`)
-  );
-  const base = manifest.dump.key.replace(/\/dump\.pgcustom$/, "");
+  const store = opts.store ?? s3SnapshotStore(config);
+  const reader = await store.openSnapshot(opts.snapshot);
+  const snapshot = reader.name;
+  const manifest = parseManifest(await reader.readManifest());
 
   // Storage 目标构造即校验(https + 恰为 <ref>.supabase.co):service key 只发往
   // 已验证的 Supabase 项目源;目标库连接串拒绝 host 覆盖(身份判定=实际写入目标)
@@ -515,6 +509,13 @@ export async function runRestore(
   // 这次运行会不会碰 Storage(回传到目标,或下载到本地)。只有会碰时,空目标门才该
   // 提示"库已恢复、只重试 Storage";skipStorage 的纯数据库运行(托管恢复)不该看到这句。
   const alsoRestoringStorage = !!manifest.storage && !opts.skipStorage;
+  const storageSource = manifest.storage ? reader.storageFiles(manifest) : null;
+  if (alsoRestoringStorage && !storageSource) {
+    throw new Error(
+      "the manifest lists Storage files, but this snapshot location cannot hold them — " +
+        "restore the database only (skip Storage)."
+    );
+  }
 
   // dry-run:只读预检后直接返回,零写入(PRD §5.3.2)
   if (opts.dryRun) {
@@ -605,7 +606,7 @@ export async function runRestore(
 
       log.step("Downloading dump…");
       const dumpPath = join(workdir, "dump.pgcustom");
-      const { sha256 } = await downloadToFile(s3, config.storage.bucket, manifest.dump.key, dumpPath);
+      const { sha256 } = await reader.downloadDump(manifest, dumpPath);
       // 归档完整性是恢复的前提:哈希不符还继续,只会把"备份坏了"变成一堆误导性
       // 恢复错误(演练侧同一裁决:integrity FAIL 即短路)
       if (sha256 !== manifest.dump.sha256) {
@@ -657,11 +658,7 @@ export async function runRestore(
     if (opts.skipStorage) {
       // DB-only 阶段(hosted 检查点重试):既不回传也不本地下载,Storage 单独一段跑
     } else if (manifest.storage && storageTarget) {
-      const summary = await restoreStorage(
-        { s3, bucket: config.storage.bucket, base },
-        storageTarget,
-        manifest
-      );
+      const summary = await restoreStorage(storageSource!, storageTarget, manifest);
       result.storageSummary = summary;
       result.storageFilesWritten = summary.filesUploaded;
       log.ok(
@@ -732,10 +729,10 @@ export async function runRestore(
           throw new Error(`unsafe storage path escapes output directory: ${f.bucket}/${f.key}`);
         }
         await mkdir(dirname(dest), { recursive: true });
-        const res = await s3.send(
+        const res = await storageSource!.s3.send(
           new GetObjectCommand({
-            Bucket: config.storage.bucket,
-            Key: `${base}/storage/${f.bucket}/${f.key}`,
+            Bucket: storageSource!.bucket,
+            Key: `${storageSource!.base}/storage/${f.bucket}/${f.key}`,
           })
         );
         await pipeline(res.Body as Readable, createWriteStream(dest));

@@ -2,20 +2,17 @@ import { spawn, execFile } from "node:child_process";
 import { createHash } from "node:crypto";
 import { Transform } from "node:stream";
 import { promisify } from "node:util";
-import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
-import { Upload } from "@aws-sdk/lib-storage";
 import type { BackupConfig } from "./config.js";
+import { s3SnapshotStore, type DumpUpload, type SnapshotStore, type SnapshotWriter } from "./snapshot-store.js";
 import { MANIFEST_SCHEMA_VERSION } from "./manifest.js";
 import type { BucketAttrs, ExtensionInfo, Manifest, TableStat } from "./manifest.js";
 import { syncStorage } from "./storage.js";
 import { inspectBucketAttrs } from "./storage-catalog.js";
-import { renderRecoveryDoc } from "./recovery-doc.js";
 import { projectRefOf, refFromStorageEndpoint, assertNoHostOverride } from "./restore-engine.js";
 import { log } from "./log.js";
 import { TOOL_VERSION } from "./version.js";
 import { parsePgDumpMajor } from "./pgbin.js";
 import { relationBytes } from "./estimate.js";
-import { dumpPartSizeFor } from "./part-size.js";
 
 // 解析函数搬到了 pgbin(演练与恢复都要读 pg_restore 版本,放这里会成环);保留旧出口
 export { parsePgDumpMajor };
@@ -127,13 +124,12 @@ async function inspectDatabase(
   }
 }
 
-/** 流式跑 pg_dump,边写 S3 边算 sha256 与字节数。返回校验和与大小。 */
-async function dumpToS3(
+/** 流式跑 pg_dump,边写快照边算 sha256 与字节数。返回校验和与大小。 */
+async function dumpToSnapshot(
   config: BackupConfig,
-  s3: S3Client,
-  key: string,
+  writer: SnapshotWriter,
   pgDumpBin: string,
-  partSize: number
+  dumpRelationBytes: number | null
 ): Promise<{ bytes: number; sha256: string }> {
   const hash = createHash("sha256");
   let bytes = 0;
@@ -185,35 +181,33 @@ async function dumpToS3(
     );
   });
 
-  const upload = new Upload({
-    client: s3,
-    partSize,
-    params: {
-      Bucket: config.storage.bucket,
-      Key: key,
-      Body: meter,
-      ContentType: "application/octet-stream",
-    },
-  });
-  const uploadDone = upload.done();
-
   // 失败双向联动:dump 失败要中止上传(绝不把半截转储当成功);上传失败也必须
   // 杀掉 pg_dump —— 否则上传侧停止消费后,背压会让 pg_dump 永远阻塞在 stdout
   // 写入上,调用方(worker 的串行队列)随之永久挂起。Promise.all 会订阅两侧,
   // 先失败的一方抛出后,另一方稍后的 rejection 也已被视为 handled。
+  // 开始上传也放进 try:实现可能在建上传时就同步抛错,那时 pg_dump 已经在跑,同样要杀掉。
+  let upload: DumpUpload | null = null;
   try {
-    await Promise.all([dumpDone, uploadDone]);
+    upload = writer.uploadDump(meter, dumpRelationBytes);
+    await Promise.all([dumpDone, upload.done]);
   } catch (error) {
+    dumpDone.catch(() => {}); // 没走到 Promise.all 时,被杀的 pg_dump 的退出也得有人接住
     dump.kill("SIGKILL");
     meter.destroy();
-    await upload.abort().catch(() => {});
+    await upload?.abort().catch(() => {});
     throw error;
   }
 
   return { bytes, sha256: hash.digest("hex") };
 }
 
-export async function runBackup(config: BackupConfig): Promise<Manifest> {
+export async function runBackup(
+  config: BackupConfig,
+  opts: {
+    /** 快照写到哪;省略 = config.storage 指的 S3 兼容桶 */
+    store?: SnapshotStore;
+  } = {}
+): Promise<Manifest> {
   // 源身份先于一切传输(评审第 12 轮):①连接串不许带 ?host=/user= 覆盖——否则
   // 快照记的 ref 与实际读取对象脱节,恢复端的同源保护随之失真;②库与 Storage
   // 跨项目 = 配置错误,全量 dump+同步之后才发现会白烧 egress 还留下半截快照前缀
@@ -251,38 +245,30 @@ export async function runBackup(config: BackupConfig): Promise<Manifest> {
     );
   }
 
-  const s3 = new S3Client({
-    region: config.storage.region,
-    endpoint: config.storage.endpoint,
-    forcePathStyle: config.storage.forcePathStyle,
-    credentials: {
-      accessKeyId: config.storage.accessKeyId,
-      secretAccessKey: config.storage.secretAccessKey,
-    },
-  });
-
+  const store = opts.store ?? s3SnapshotStore(config);
   const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
-  const base = `${config.storage.prefix}/${config.projectName}/${timestamp}`;
-  const dumpKey = `${base}/dump.pgcustom`;
+  const writer = await store.createSnapshot(timestamp);
+  const storageFiles = writer.storageFiles;
+  // 在转储之前拦下:目标放不了 Storage 文件却配了 Storage,转储完才发现等于白跑一遍
+  if (config.supabaseStorage && !storageFiles) {
+    throw new Error(
+      "Storage file backup needs an S3-compatible bucket; this backup destination only holds the database."
+    );
+  }
+  const dumpKey = writer.dumpKey;
 
-  log.step(`Dumping → s3://${config.storage.bucket}/${dumpKey}`);
-  const { bytes, sha256 } = await dumpToS3(
-    config,
-    s3,
-    dumpKey,
-    pgDumpBin,
-    dumpPartSizeFor(db.relationBytes)
-  );
+  log.step(`Dumping → ${writer.describe("dump.pgcustom")}`);
+  const { bytes, sha256 } = await dumpToSnapshot(config, writer, pgDumpBin, db.relationBytes);
   log.ok(`Database dumped (${(bytes / 1024 / 1024).toFixed(1)} MB, sha256 ${sha256.slice(0, 12)}…)`);
 
   // Storage 文件同步(源配置存在才做;否则只备数据库)
   let storageResult: Manifest["storage"] = null;
-  if (config.supabaseStorage) {
+  if (config.supabaseStorage && storageFiles) {
     log.step("Syncing Storage files…");
     const synced = await syncStorage(config.supabaseStorage, {
-      client: s3,
-      bucket: config.storage.bucket,
-      base, // syncStorage 内部会加 /storage/<bucket>/<key>
+      client: storageFiles.s3,
+      bucket: storageFiles.bucket,
+      base: storageFiles.base, // syncStorage 内部会加 /storage/<bucket>/<key>
     });
     // v2 bucket 属性采集,通道 = 已有的只读库连接(per-file 元数据已随 GetObject
     // 响应在 syncStorage 内原子捕获)。失败只降级不报错:storage schema 读不到
@@ -332,32 +318,11 @@ export async function runBackup(config: BackupConfig): Promise<Manifest> {
   // RECOVERY.md(PRD §5.9.2.1)先于 manifest 落桶:manifest 是快照的"完成标记"
   // (演练/恢复按它找快照)——先写手册再写标记,"快照完成"就蕴含"手册在场";
   // 手册写失败 = 备份失败(同桶同权限,与 manifest 自身的写入风险一致)。
-  await s3.send(
-    new PutObjectCommand({
-      Bucket: config.storage.bucket,
-      Key: `${base}/RECOVERY.md`,
-      Body: renderRecoveryDoc(manifest, {
-        snapshot: timestamp,
-        bucket: config.storage.bucket,
-        endpoint: config.storage.endpoint,
-        region: config.storage.region,
-        prefix: config.storage.prefix,
-        projectName: config.projectName,
-      }),
-      ContentType: "text/markdown",
-    })
-  );
-  log.ok(`Recovery runbook written → s3://${config.storage.bucket}/${base}/RECOVERY.md`);
+  await writer.writeRecoveryDoc(manifest);
+  log.ok(`Recovery runbook written → ${writer.describe("RECOVERY.md")}`);
 
-  await s3.send(
-    new PutObjectCommand({
-      Bucket: config.storage.bucket,
-      Key: `${base}/manifest.json`,
-      Body: JSON.stringify(manifest, null, 2),
-      ContentType: "application/json",
-    })
-  );
-  log.ok(`Manifest written → s3://${config.storage.bucket}/${base}/manifest.json`);
+  await writer.writeManifest(manifest);
+  log.ok(`Manifest written → ${writer.describe("manifest.json")}`);
 
   return manifest;
 }

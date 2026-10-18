@@ -8,17 +8,18 @@ import {
   ListObjectsV2Command,
   GetObjectCommand,
 } from "@aws-sdk/client-s3";
-import type { BackupConfig } from "./config.js";
+import { requireBucket, type BackupConfig } from "./config.js";
 
 /** 读备份桶(用户自己的桶)的 S3 客户端。drill/restore 共用。 */
 export function targetClient(config: BackupConfig): S3Client {
+  const storage = requireBucket(config);
   return new S3Client({
-    region: config.storage.region,
-    endpoint: config.storage.endpoint,
-    forcePathStyle: config.storage.forcePathStyle,
+    region: storage.region,
+    endpoint: storage.endpoint,
+    forcePathStyle: storage.forcePathStyle,
     credentials: {
-      accessKeyId: config.storage.accessKeyId,
-      secretAccessKey: config.storage.secretAccessKey,
+      accessKeyId: storage.accessKeyId,
+      secretAccessKey: storage.secretAccessKey,
     },
   });
 }
@@ -29,7 +30,8 @@ export async function resolveSnapshot(
   config: BackupConfig,
   explicit?: string
 ): Promise<string> {
-  const root = `${config.storage.prefix}/${config.projectName}/`;
+  const storage = requireBucket(config);
+  const root = `${storage.prefix}/${config.projectName}/`;
   if (explicit) return `${root}${explicit}/`;
 
   const prefixes: string[] = [];
@@ -37,7 +39,7 @@ export async function resolveSnapshot(
   do {
     const res = await s3.send(
       new ListObjectsV2Command({
-        Bucket: config.storage.bucket,
+        Bucket: storage.bucket,
         Prefix: root,
         Delimiter: "/",
         ContinuationToken: token,
@@ -51,7 +53,7 @@ export async function resolveSnapshot(
 
   if (!prefixes.length) {
     throw new Error(
-      `No snapshots found under s3://${config.storage.bucket}/${root}. Run a backup first.`
+      `No snapshots found under s3://${storage.bucket}/${root}. Run a backup first.`
     );
   }
   prefixes.sort();
