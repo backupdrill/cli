@@ -55,6 +55,7 @@ interface RawConfig {
   schemas?: string[];
   storage?: Partial<StorageConfig>;
   supabaseStorage?: Partial<SupabaseStorageConfig>;
+  pingUrl?: string;
 }
 
 function fromEnv(): RawConfig {
@@ -101,8 +102,35 @@ async function fromFile(path: string): Promise<RawConfig> {
     return JSON.parse(await readFile(path, "utf8")) as RawConfig;
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return {};
-    throw new Error(`Could not read config file ${path}: ${(error as Error).message}`);
+    // JSON.parse 的报错会引用出错位置附近的原文,里面可能正好是密钥。本机日志里留着它方便排错;
+    // 发给监控(Healthchecks 会把它放进告警邮件)的只用 pingMessage 这句不带原文的
+    throw Object.assign(
+      new Error(`Could not read config file ${path}: ${(error as Error).message}`),
+      { pingMessage: `Could not read config file ${path}. The job's log has the details.` }
+    );
   }
+}
+
+/**
+ * 监控 ping 网址(Healthchecks.io 那种):flag > 环境变量 > 配置文件,空串算没配
+ * (GitHub Actions 里没设的 secret 展开就是空串)。不放进 loadConfig:配置缺项时
+ * loadConfig 直接抛错,而这恰恰是要报 /fail 的情况,所以网址得先单独读出来。
+ */
+export async function resolvePingUrl(opts: {
+  flag?: string;
+  configPath: string;
+}): Promise<string | undefined> {
+  let file: RawConfig = {};
+  try {
+    file = await fromFile(opts.configPath);
+  } catch {
+    // 配置文件读不了时由 loadConfig 报错,这里只是拿不到文件里的网址
+  }
+  // 文件内容可能是 null、数组这类非对象的合法 JSON:那是 loadConfig 要报的错,这里只是拿不到网址
+  const filePingUrl = file && typeof file === "object" ? file.pingUrl : undefined;
+  return [opts.flag, process.env.BACKUPDRILL_PING_URL, filePingUrl]
+    .map((value) => (typeof value === "string" ? value.trim() : undefined))
+    .find(Boolean);
 }
 
 // spread 里显式的 undefined 会覆盖前一层的值(CLI 未传的 flag 正是 undefined),

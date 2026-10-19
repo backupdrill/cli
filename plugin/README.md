@@ -7,7 +7,7 @@ Back up a Supabase project to a bucket you own and prove the backup restores, by
 - `drill` restores a snapshot into a throwaway Postgres in Docker, checks that the tables and their data came back, and checksums a sample of the Storage files.
 - `restore` puts a snapshot into a new, empty Supabase project, after a dry run and only once you confirm the target.
 
-The agent runs every command as `npx -y backupdrill@2.2.4`, so the CLI version stays fixed.
+The agent runs every command as `npx -y backupdrill@2.5.0`, so the CLI version stays fixed.
 
 ## What you need
 
@@ -30,6 +30,12 @@ Or from a terminal:
 
 ```sh
 claude plugin install backupdrill --marketplace backupdrill/cli
+```
+
+In Pi, the same skill comes with the npm package:
+
+```sh
+pi install npm:backupdrill
 ```
 
 ## Things to ask

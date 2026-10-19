@@ -20,6 +20,9 @@
 #   BACKUPDRILL_S3_ENDPOINT           Set for R2/B2/self-hosted; omit for AWS S3.
 #   BACKUPDRILL_S3_REGION             Bucket region ("auto" works for R2).
 #   BACKUPDRILL_PROJECT_NAME          Readable name used in object keys/manifest.
+#   BACKUPDRILL_PING_URL              A Healthchecks.io check's ping URL. The backup
+#                                     pings it when it starts, finishes or fails, so
+#                                     you hear about a failed or skipped run.
 #   BACKUPDRILL_SCHEMAS               Comma-separated schemas to dump, e.g. public,audit
 #                                     (default: public). Use the same value as your
 #                                     local runs, or scheduled backups miss schemas.
@@ -92,7 +95,7 @@ jobs:
 
       - name: Run backupdrill
         # Pinned so every run uses the same CLI. Raise it on purpose when you upgrade.
-        run: npx -y backupdrill@2.2.4 backup
+        run: npx -y backupdrill@2.5.0 backup
         env:
           # --- required ---
           BACKUPDRILL_DATABASE_URL: ${{ secrets.BACKUPDRILL_DATABASE_URL }}
@@ -112,3 +115,5 @@ jobs:
           BACKUPDRILL_SUPABASE_STORAGE_ACCESS_KEY_ID: ${{ secrets.BACKUPDRILL_SUPABASE_STORAGE_ACCESS_KEY_ID }}
           BACKUPDRILL_SUPABASE_STORAGE_SECRET_ACCESS_KEY: ${{ secrets.BACKUPDRILL_SUPABASE_STORAGE_SECRET_ACCESS_KEY }}
           BACKUPDRILL_SUPABASE_STORAGE_BUCKETS: ${{ secrets.BACKUPDRILL_SUPABASE_STORAGE_BUCKETS }}
+          # --- optional: Healthchecks.io monitoring ---
+          BACKUPDRILL_PING_URL: ${{ secrets.BACKUPDRILL_PING_URL }}

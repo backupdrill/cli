@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import { Command } from "commander";
-import { loadConfig } from "./config.js";
+import { loadConfig, resolvePingUrl, type LoadedBackupConfig } from "./config.js";
+import { backupSummary, createPinger, drillOutcome, pingMessageOf, sensitiveValuesOf } from "./ping.js";
 import { runBackup } from "./backup.js";
 import { runEstimate, type EgressPricing } from "./estimate.js";
 import { runDrill } from "./drill.js";
@@ -40,6 +41,12 @@ const EGRESS_PRICING: Record<"free" | "pro" | "team", EgressPricing> = {
   team: { planLabel: "Team", includedGb: 250, pricePerGb: 0.09, hardCap: false },
 };
 
+// backup 和 drill 共用:按 Healthchecks.io 的约定报告开始、成功、失败
+const PING_FLAG = "--ping-url <url>";
+const PING_HELP =
+  "Healthchecks.io ping URL (or BACKUPDRILL_PING_URL): pings <url>/start, then <url> on " +
+  "success or <url>/fail on failure. A ping that fails only prints a warning";
+
 const program = new Command();
 
 program
@@ -65,9 +72,13 @@ program
   .option("--endpoint <url>", "S3-compatible endpoint (required for R2/B2; omit for AWS S3)")
   .option("--region <region>", "bucket region (default: auto)")
   .option("--prefix <prefix>", "key prefix inside the bucket (default: backupdrill)")
+  .option(PING_FLAG, PING_HELP)
   .action(async (opts) => {
+    const ping = createPinger(await resolvePingUrl({ flag: opts.pingUrl, configPath: opts.config }));
+    await ping.start();
+    let config: LoadedBackupConfig | undefined;
     try {
-      const config = await loadConfig({
+      config = await loadConfig({
         configPath: opts.config,
         overrides: {
           databaseUrl: opts.databaseUrl,
@@ -91,9 +102,15 @@ program
       );
       // stdout 输出机器可读结果,便于在 CI / GitHub Action 里消费
       process.stdout.write(JSON.stringify({ ok: true, manifest }) + "\n");
+      await ping.success(backupSummary(manifest));
     } catch (error) {
-      log.error((error as Error).message);
+      const message = (error as Error).message;
+      log.error(message);
       process.exitCode = 1;
+      await ping.fail(
+        `backupdrill ${TOOL_VERSION}: backup failed. ${pingMessageOf(error)}`,
+        sensitiveValuesOf(config, opts.databaseUrl)
+      );
     }
   });
 
@@ -118,7 +135,11 @@ program
       "verify data and business invariants here, not RLS behavior"
   )
   .option("--keep", "if the drill fails, keep the sandbox container running for inspection")
+  .option(PING_FLAG, PING_HELP)
   .action(async (opts) => {
+    const ping = createPinger(await resolvePingUrl({ flag: opts.pingUrl, configPath: opts.config }));
+    await ping.start();
+    let config: LoadedBackupConfig | undefined;
     try {
       if (opts.checkCmd !== undefined && !String(opts.checkCmd).trim()) {
         throw new Error(
@@ -126,7 +147,7 @@ program
             "that would report a check that never executes"
         );
       }
-      const config = await loadConfig({
+      config = await loadConfig({
         configPath: opts.config,
         overrides: {
           projectName: opts.projectName,
@@ -157,10 +178,21 @@ program
           `restored in ${report.restoreSeconds}s`
       );
       process.stdout.write(JSON.stringify({ ok: report.pass, report }) + "\n");
-      if (!report.pass) process.exitCode = 1;
+      const outcome = drillOutcome(report);
+      if (outcome.pass) {
+        await ping.success(outcome.text);
+      } else {
+        process.exitCode = 1;
+        await ping.fail(outcome.text, sensitiveValuesOf(config));
+      }
     } catch (error) {
-      log.error((error as Error).message);
+      const message = (error as Error).message;
+      log.error(message);
       process.exitCode = 1;
+      await ping.fail(
+        `backupdrill ${TOOL_VERSION}: drill failed. ${pingMessageOf(error)}`,
+        sensitiveValuesOf(config)
+      );
     }
   });
 

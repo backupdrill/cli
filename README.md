@@ -42,6 +42,16 @@ The [`plugin/`](plugin/) folder is a plugin for Claude Code and Cursor. It teach
 
 Details are in [plugin/README.md](plugin/README.md).
 
+## Use it from Pi
+
+This npm package is also a Pi package. Installing it gives Pi the same skill the Claude Code plugin uses:
+
+```sh
+pi install npm:backupdrill
+```
+
+Start a new Pi session and ask it to back up your Supabase project or run a restore drill. The skill runs the CLI through `npx`, so Node.js 20 or newer has to be on your `PATH`. Everything else it needs, and where your keys go, is in [plugin/README.md](plugin/README.md).
+
 ## Usage
 
 Configure via **env vars**, a **config file**, or **flags** (precedence: flags > env > file).
@@ -76,6 +86,7 @@ All recognized variables:
 | `BACKUPDRILL_SUPABASE_STORAGE_*` | Storage-file source (endpoint/region/keys/buckets) — see [Backing up Storage files](#backing-up-storage-files-too) | — |
 | `BACKUPDRILL_PG_DUMP` | Path to the `pg_dump` binary to use | `pg_dump` on `PATH` |
 | `BACKUPDRILL_PG_RESTORE` | Path to `pg_restore` (used by `drill` and `restore`) | next to `BACKUPDRILL_PG_DUMP`, else `pg_restore` on `PATH` |
+| `BACKUPDRILL_PING_URL` | Healthchecks.io ping URL for `backup` and `drill` — see [Alerts with Healthchecks.io](#alerts-with-healthchecksio) | — |
 
 ### Config file
 
@@ -224,9 +235,31 @@ Want this running on a schedule without paying for a server? Run it in GitHub Ac
 2. Add these repo secrets (Settings → Secrets and variables → Actions):
    - **Required:** `BACKUPDRILL_DATABASE_URL`, `BACKUPDRILL_S3_BUCKET`, `BACKUPDRILL_S3_ACCESS_KEY_ID`, `BACKUPDRILL_S3_SECRET_ACCESS_KEY`
    - **Optional (destination):** `BACKUPDRILL_S3_ENDPOINT` (for R2/B2), `BACKUPDRILL_S3_REGION`, `BACKUPDRILL_PROJECT_NAME`
+   - **Optional (alerts):** `BACKUPDRILL_PING_URL` — see [Alerts with Healthchecks.io](#alerts-with-healthchecksio)
    - **Optional (Storage files):** set all four of `BACKUPDRILL_SUPABASE_STORAGE_ENDPOINT`, `BACKUPDRILL_SUPABASE_STORAGE_REGION`, `BACKUPDRILL_SUPABASE_STORAGE_ACCESS_KEY_ID`, `BACKUPDRILL_SUPABASE_STORAGE_SECRET_ACCESS_KEY` to also back up Storage files; leave them unset to back up the database only.
 
 Before switching to a **daily** schedule, read the egress-cost section above — every run is egress on your Supabase bill.
+
+## Alerts with Healthchecks.io
+
+A scheduled backup can fail quietly, or not run at all: a cron entry that never fires, a runner that dies, a workflow GitHub disabled. `backup` and `drill` can report every run to a [Healthchecks.io](https://healthchecks.io) check (a self-hosted Healthchecks works the same), and Healthchecks alerts you when a run fails or a success ping doesn't arrive on time.
+
+Create a check whose schedule and grace time match your job, copy its ping URL, then:
+
+```bash
+export BACKUPDRILL_PING_URL="https://hc-ping.com/<uuid>"
+backupdrill backup
+```
+
+`--ping-url <url>` and a `"pingUrl"` key in the config file work too (same precedence as everything else). Each run sends a start ping, then either a success or a failure ping:
+
+- `<url>/start` before it begins, so Healthchecks shows how long the run took and alerts if it runs past the grace time;
+- `<url>` when it succeeds, with a one-line summary in the body (tables, Storage files and the snapshot name; for `drill`, rows restored and restore time);
+- `<url>/fail` when it fails, with the error in the body. For a drill that ran but didn't pass, that's the failed checks. Before it's sent, the CLI filters out the connection strings, passwords, hostnames, IP addresses, project refs and bucket keys it can recognise, plus the parts of Postgres errors that usually quote row values or SQL (`DETAIL`, `CONTEXT`, `Command was`). It's a filter, not a guarantee: a sensitive value it doesn't recognise can still reach Healthchecks. The full error stays in the job's own output.
+
+Both pings of a run carry the same `rid`, so Healthchecks pairs them even if two runs overlap. If you schedule both `backup` and `drill`, give each its own check: on a shared check, the daily backup's success pings would keep it up while a weekly drill that stopped running went unnoticed.
+
+A ping never changes the result of a run. Each request times out after 10 seconds and is retried twice on network errors and 5xx responses; if it still fails, the CLI prints a warning and carries on, with the same exit code it would have had without a ping URL.
 
 ## Roadmap
 
