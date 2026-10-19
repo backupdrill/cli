@@ -54,7 +54,8 @@ const stampOf = (iso) => iso.replace(/[:.]/g, "-");
 
 /** 照 drill --record 的样子放一份演练记录:文件名 = 结束时间 + 结论 */
 function putDrill(fake, finishedAt, pass, over = {}) {
-  const key = `${DRILLS}${stampOf(finishedAt)}-${pass ? "passed" : "failed"}.json`;
+  const tag = Math.floor(Math.random() * 0xffffffff).toString(16).padStart(8, "0");
+  const key = `${DRILLS}${stampOf(finishedAt)}-${pass ? "passed" : "failed"}-${tag}.json`;
   fake.objects.set(key, drillRecord({ finishedAt, pass, ...over }));
   return key;
 }
@@ -203,7 +204,7 @@ test("演练记录的时间在将来(机器时钟快了或被改过):跳过并�
       assert.equal(m.backupdrill_up, 1);
       assert.equal(m.backupdrill_drill_last_run_passed, 1);
       assert.equal(m.backupdrill_drill_last_run_timestamp_seconds, Date.parse("2026-01-20T04:00:00.000Z") / 1000);
-      assert.match(warnings.join("\n"), /failed\.json: it is dated more than 10 minutes in the future/);
+      assert.match(warnings.join("\n"), /failed-[0-9a-f]{8}\.json: it is dated more than 10 minutes in the future/);
     });
   } finally {
     await fake.close();
@@ -248,6 +249,26 @@ test("manifest 没变:第二次抓取带 If-None-Match,拿到 304 不传正文,�
     const third = parseMetrics(renderMetrics(await read(AbortSignal.timeout(5000)), 0));
     assert.equal(third.backupdrill_latest_snapshot_dump_bytes, 3000);
     assert.equal(fake.requests.find((r) => r.key.endsWith(`${NEW}/manifest.json`)).ifNoneMatch, null);
+  } finally {
+    await fake.close();
+  }
+});
+
+test("缓存的 manifest 没变(304),本机时钟被校正回来后照样判断是不是在将来", async () => {
+  const fake = await startFakeS3();
+  try {
+    const realNow = Date.now();
+    putSnapshot(fake, NEW, new Date(realNow + 5 * 60_000).toISOString()); // 5 分钟内:可以接受
+    const read = createBucketReader(fake.s3, CONFIG(fake.bucket));
+    assert.equal(parseMetrics(renderMetrics(await read(AbortSignal.timeout(5000)), 0)).backupdrill_up, 1);
+    // 时钟往回拨 1 小时,manifest 没变(走 304 和缓存),这时它已经在 10 分钟以外的将来
+    const clock = mock.method(Date, "now", () => realNow - 60 * 60_000);
+    try {
+      await assert.rejects(read(AbortSignal.timeout(5000)), /createdAt .* in the future/);
+      assert.ok(fake.requests.some((r) => r.key.endsWith("manifest.json") && r.ifNoneMatch));
+    } finally {
+      clock.mock.restore();
+    }
   } finally {
     await fake.close();
   }
@@ -310,12 +331,12 @@ for (const [name, setup, expectedWarning] of [
   [
     "通过的演练记录内容和文件名对不上",
     (fake) => putDrill(fake, "2026-01-20T04:00:00.000Z", true, { pass: false }),
-    /passed\.json is malformed: its content does not match its name/,
+    /passed-[0-9a-f]{8}\.json is malformed: its content does not match its name/,
   ],
   [
     "通过的演练记录结构不对",
     (fake) => putDrill(fake, "2026-01-20T04:00:00.000Z", true, { restoreSeconds: "fast" }),
-    /passed\.json is malformed: restoreSeconds/,
+    /passed-[0-9a-f]{8}\.json is malformed: restoreSeconds/,
   ],
   [
     "演练记录是更新的 CLI 写的",

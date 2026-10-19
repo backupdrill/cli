@@ -217,6 +217,8 @@ export function createBucketReader(
       const read = await readObject(s3, storage.bucket, key, abortSignal, known?.etag);
       if (read.status === "missing") continue;
       if (read.status === "not-modified" && known) {
+        // 内容没变,但"是不是在将来"取决于现在几点:本机时钟被校正回来之后要重新判断
+        assertNotInFuture(known.summary.createdAt, key, "createdAt");
         latest = known.summary;
       } else if (read.status === "ok") {
         latest = summarize(read.text, key);

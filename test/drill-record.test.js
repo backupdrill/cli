@@ -83,17 +83,29 @@ test("中途抛错、没有报告:记一次没通过,不带快照名", () => {
   assert.equal(record.restoreSeconds, undefined);
 });
 
-test("文件名:结束时间 + 结论,能原样读回;别的名字不认", () => {
-  const name = drillRecordName(buildDrillRecord(PASSED_REPORT, FINISHED));
-  assert.equal(name, "2026-01-20T04-00-00-000Z-passed.json");
+test("文件名:结束时间 + 结论 + 随机段,能原样读回;别的名字不认", () => {
+  const name = drillRecordName(buildDrillRecord(PASSED_REPORT, FINISHED), "0a1b2c3d");
+  assert.equal(name, "2026-01-20T04-00-00-000Z-passed-0a1b2c3d.json");
   assert.deepEqual(parseDrillRecordName(name), { finishedAt: FINISHED.getTime(), pass: true });
-  assert.deepEqual(parseDrillRecordName("2026-01-20T04-00-00-000Z-failed.json"), {
+  assert.deepEqual(parseDrillRecordName("2026-01-20T04-00-00-000Z-failed-ffffffff.json"), {
     finishedAt: FINISHED.getTime(),
     pass: false,
   });
-  for (const other of ["notes.txt", "2026-01-20T04-00-00Z-passed.json", "2026-13-40T99-00-00-000Z-passed.json", "x2026-01-20T04-00-00-000Z-passed.json"]) {
+  for (const other of [
+    "notes.txt",
+    "2026-01-20T04-00-00-000Z-passed.json",
+    "2026-01-20T04-00-00Z-passed-0a1b2c3d.json",
+    "2026-13-40T99-00-00-000Z-passed-0a1b2c3d.json",
+    "x2026-01-20T04-00-00-000Z-passed-0a1b2c3d.json",
+  ]) {
     assert.equal(parseDrillRecordName(other), null, other);
   }
+});
+
+test("同一毫秒结束、结论相同的两次演练不撞名", () => {
+  const record = buildDrillRecord(PASSED_REPORT, FINISHED);
+  const names = new Set(Array.from({ length: 50 }, () => drillRecordName(record)));
+  assert.equal(names.size, 50);
 });
 
 test("写到哪:每次一个新对象,在 <project>.drills/ 下;不读桶,也不覆盖之前的", async () => {
@@ -102,13 +114,12 @@ test("写到哪:每次一个新对象,在 <project>.drills/ 下;不读桶,也不
     const config = CONFIG(fake.bucket);
     await writeDrillRecord(fake.s3, config, buildDrillRecord(PASSED_REPORT, FINISHED));
     await writeDrillRecord(fake.s3, config, buildDrillRecord(FAILED_REPORT, new Date("2026-01-27T04:00:00.000Z")));
-    assert.deepEqual([...fake.objects.keys()].sort(), [
-      "backupdrill/my-app.drills/2026-01-20T04-00-00-000Z-passed.json",
-      "backupdrill/my-app.drills/2026-01-27T04-00-00-000Z-failed.json",
-    ]);
+    const keys = [...fake.objects.keys()].sort();
+    assert.equal(keys.length, 2);
+    assert.match(keys[0], /^backupdrill\/my-app\.drills\/2026-01-20T04-00-00-000Z-passed-[0-9a-f]{8}\.json$/);
+    assert.match(keys[1], /^backupdrill\/my-app\.drills\/2026-01-27T04-00-00-000Z-failed-[0-9a-f]{8}\.json$/);
     assert.deepEqual(fake.requests.map((r) => r.method), ["PUT", "PUT"]);
-    const passed = JSON.parse(fake.objects.get("backupdrill/my-app.drills/2026-01-20T04-00-00-000Z-passed.json"));
-    assert.equal(passed.restoreSeconds, 41);
+    assert.equal(JSON.parse(fake.objects.get(keys[0])).restoreSeconds, 41);
   } finally {
     await fake.close();
   }
@@ -222,9 +233,9 @@ test("CLI:drill --record 在桶里没快照时记一次没通过;不加 --record
 
     const recorded = await runCli(["drill", "--record"], env);
     assert.equal(recorded.code, 1);
-    assert.match(recorded.stderr, /Drill result recorded → s3:\/\/backups\/backupdrill\/my-app\.drills\/.*-failed\.json/);
+    assert.match(recorded.stderr, /Drill result recorded → s3:\/\/backups\/backupdrill\/my-app\.drills\/.*-failed-[0-9a-f]{8}\.json/);
     const [key] = [...fake.objects.keys()];
-    assert.match(key, /^backupdrill\/my-app\.drills\/\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-\d{3}Z-failed\.json$/);
+    assert.match(key, /^backupdrill\/my-app\.drills\/\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-\d{3}Z-failed-[0-9a-f]{8}\.json$/);
     const record = JSON.parse(fake.objects.get(key));
     assert.equal(record.pass, false);
     assert.equal(record.snapshot, undefined);

@@ -160,7 +160,7 @@ backupdrill estimate --plan pro   # measures your DB + Storage, prints the proje
   ├── storage/<bucket>/<key>     # your Storage files (if configured)
   ├── RECOVERY.md                # how to restore this snapshot
   └── manifest.json              # schemas, tables, row counts, file list, sizes + sha256
-<prefix>/<project>.drills/<finished-at>-<passed|failed>.json  # only with drill --record: one file per drill
+<prefix>/<project>.drills/<finished-at>-<passed|failed>-<tag>.json  # only with drill --record: one file per drill
 ```
 
 ## Restoring & drilling
@@ -275,13 +275,13 @@ backupdrill exporter --host 0.0.0.0   # when Prometheus runs on another machine
 
 It listens on `127.0.0.1` unless you pass `--host`, because every scrape costs a few requests against your bucket and the port shouldn't end up open to the internet by accident. `--port` changes the port.
 
-Drill results only show up if the drill leaves them in the bucket. Add `--record` to your drill job: when the drill finishes, it writes one small JSON file to `<prefix>/<project>.drills/`, named after the time it finished and whether it passed (`2026-10-20T04-12-09-311Z-passed.json`). Files are never overwritten, so two drills that overlap can't replace each other's result. Only the outcome, the time, the snapshot name and the restore time are stored, never the check details. A drill that stops early (Docker isn't running, the bucket is empty) is recorded as not passed. `--record` needs write access to the bucket; if the write fails, the drill prints a warning and its own result and exit code stay the same. Without `--record`, `drill` only reads the bucket, as before.
+Drill results only show up if the drill leaves them in the bucket. Add `--record` to your drill job: when the drill finishes, it writes one small JSON file to `<prefix>/<project>.drills/`, named after the time it finished, whether it passed and a random tag (`2026-10-20T04-12-09-311Z-passed-3f9a1c07.json`). Each drill writes a file under its own name instead of updating a shared one, so the order in which two overlapping drills finish writing doesn't matter. Only the outcome, the time, the snapshot name and the restore time are stored, never the check details. A drill that stops early (Docker isn't running, the bucket is empty) is recorded as not passed. `--record` needs write access to the bucket; if the write fails, the drill prints a warning and its own result and exit code stay the same. Without `--record`, `drill` only reads the bucket, as before.
 
 ```bash
 backupdrill drill --record
 ```
 
-Point Prometheus at it. One exporter watches one project. The metrics carry no labels of their own, so name the project in the scrape config:
+Point Prometheus at it. One exporter watches one project. The exporter doesn't add a project label, so set one in the scrape config:
 
 ```yaml
 scrape_configs:

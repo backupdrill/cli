@@ -1,3 +1,4 @@
+import { randomBytes } from "node:crypto";
 import { PutObjectCommand, type S3Client } from "@aws-sdk/client-s3";
 import { requireBucket, type BackupConfig } from "./config.js";
 import { isTimeout, withDeadline } from "./deadline.js";
@@ -10,7 +11,7 @@ import { TOOL_VERSION } from "./version.js";
  * `drill --record` 写进桶里的演练结论。`exporter` 只读桶,演练结果不落桶它就无从得知。
  *
  * 每次演练写一个新对象,从不覆盖:
- *   <prefix>/<project>.drills/<结束时间>-<passed|failed>.json
+ *   <prefix>/<project>.drills/<结束时间>-<passed|failed>-<8 位随机>.json
  * 为什么不是一份可覆盖的"最近一次":两次演练重叠时,先结束的那次可能后写进桶,把更新的
  * "没通过"盖成更早的"通过",失败告警就没了;先读后写也挡不住(不是原子的),而各家
  * S3 兼容存储对条件写入的支持参差不齐。每次一个对象,"哪次最新"留给读的一方按名字判断,
@@ -46,11 +47,17 @@ export function drillRecordsPrefix(config: BackupConfig): string {
   return `${storage.prefix}/${config.projectName}.drills/`;
 }
 
-/** 时间戳写法同快照目录名(把 ISO 里的 : 和 . 换成 -),定长,按名字排序就是按时间排序 */
-const RECORD_NAME = /^(\d{4}-\d{2}-\d{2})T(\d{2})-(\d{2})-(\d{2})-(\d{3})Z-(passed|failed)\.json$/;
+/**
+ * 时间戳写法同快照目录名(把 ISO 里的 : 和 . 换成 -),定长,按名字排序就是按时间排序。
+ * 末尾的随机段:两次演练在同一毫秒结束、结论又相同时,只靠时间和结论会撞名、后写的覆盖先写的
+ */
+const RECORD_NAME = /^(\d{4}-\d{2}-\d{2})T(\d{2})-(\d{2})-(\d{2})-(\d{3})Z-(passed|failed)-[0-9a-f]{8}\.json$/;
 
-export function drillRecordName(record: Pick<DrillRecord, "finishedAt" | "pass">): string {
-  return `${record.finishedAt.replace(/[:.]/g, "-")}-${record.pass ? "passed" : "failed"}.json`;
+export function drillRecordName(
+  record: Pick<DrillRecord, "finishedAt" | "pass">,
+  unique: string = randomBytes(4).toString("hex")
+): string {
+  return `${record.finishedAt.replace(/[:.]/g, "-")}-${record.pass ? "passed" : "failed"}-${unique}.json`;
 }
 
 /** 从文件名读出结束时间(毫秒)和结论;不是记录文件的名字返回 null */
