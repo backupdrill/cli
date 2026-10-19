@@ -251,13 +251,13 @@ export BACKUPDRILL_PING_URL="https://hc-ping.com/<uuid>"
 backupdrill backup
 ```
 
-`--ping-url <url>` and a `"pingUrl"` key in the config file work too (same precedence as everything else). Each run sends:
+`--ping-url <url>` and a `"pingUrl"` key in the config file work too (same precedence as everything else). Each run sends a start ping, then either a success or a failure ping:
 
 - `<url>/start` before it begins, so Healthchecks shows how long the run took and alerts if it runs past the grace time;
-- `<url>` when it succeeds, with a one-line summary in the body (tables, Storage files, snapshot time; for `drill`, rows restored and restore time);
-- `<url>/fail` when it fails, with the error in the body. For a drill that ran but didn't pass, that's the failed checks. Connection strings, passwords, hostnames, IP addresses, project refs and bucket keys are removed before it's sent.
+- `<url>` when it succeeds, with a one-line summary in the body (tables, Storage files and the snapshot name; for `drill`, rows restored and restore time);
+- `<url>/fail` when it fails, with the error in the body. For a drill that ran but didn't pass, that's the failed checks. Before it's sent, the CLI removes connection strings, passwords, hostnames, IP addresses, project refs and bucket keys, and drops the parts of Postgres errors that quote row values or SQL (`DETAIL`, `CONTEXT`, `Command was`). The full error stays in the job's own output.
 
-All three carry the same `rid`, so Healthchecks pairs them even if two runs overlap. If you schedule both `backup` and `drill`, give each its own check: they run on different schedules.
+Both pings of a run carry the same `rid`, so Healthchecks pairs them even if two runs overlap. If you schedule both `backup` and `drill`, give each its own check: on a shared check, the daily backup's success pings would keep it up while a weekly drill that stopped running went unnoticed.
 
 A ping never changes the result of a run. Each request times out after 10 seconds and is retried twice on network errors and 5xx responses; if it still fails, the CLI prints a warning and carries on, with the same exit code it would have had without a ping URL.
 

@@ -1,5 +1,7 @@
 import { randomUUID } from "node:crypto";
 import type { BackupConfig } from "./config.js";
+import type { DrillReport } from "./drill.js";
+import type { Manifest } from "./manifest.js";
 import { log } from "./log.js";
 import { projectRefOf, refFromStorageEndpoint } from "./restore-engine.js";
 import { TOOL_VERSION } from "./version.js";
@@ -131,6 +133,28 @@ function truncate(text: string): string {
   return text.length > BODY_LIMIT ? `${text.slice(0, BODY_LIMIT - 1)}…` : text;
 }
 
+/** backup 成功时发给监控的一行。快照名取对象键里的目录名(和 drill --snapshot 认的是同一个) */
+export function backupSummary(manifest: Manifest): string {
+  return (
+    `backupdrill ${TOOL_VERSION}: backup complete, ${manifest.database.tableCount} tables` +
+    (manifest.storage ? ` + ${manifest.storage.fileCount} Storage files` : " (database only)") +
+    `, snapshot ${manifest.dump.key.split("/").at(-2) ?? manifest.createdAt}`
+  );
+}
+
+/** drill 跑完(没抛错)后发哪种 ping、带什么:通过 = 成功;没通过 = 失败,列出没过的检查 */
+export function drillOutcome(report: DrillReport): { pass: boolean; text: string } {
+  const outcome =
+    `snapshot ${report.snapshot}, ${report.restoredTableCount} tables / ` +
+    `${report.restoredRowTotal.toLocaleString()} rows restored in ${report.restoreSeconds}s`;
+  if (report.pass) return { pass: true, text: `backupdrill ${TOOL_VERSION}: drill passed, ${outcome}` };
+  const failed = report.checks.filter((c) => !c.pass).map((c) => `${c.name}: ${c.detail}`);
+  return {
+    pass: false,
+    text: `backupdrill ${TOOL_VERSION}: drill failed, ${outcome}. Failed checks:\n${failed.join("\n")}`,
+  };
+}
+
 /** 报错可以自带一句发给监控用的说法(pingMessage),比如不能复述配置文件原文的那种 */
 export function pingMessageOf(error: unknown): string {
   const err = error as Error & { pingMessage?: unknown };
@@ -149,6 +173,13 @@ export function scrubForPing(text: string, sensitive: string[]): string {
     if (value.length >= 4) out = out.split(value).join("[redacted]");
   }
   return out
+    // Postgres 把具体的值放在 DETAIL / CONTEXT 这类附加字段里(唯一键冲突的键值、COPY 出错的整行),
+    // pg_restore 还会回显出错的 SQL。这些整段去掉,只留主报错;到换行或 " | "(多条报错的拼接符)为止。
+    // 引擎上报的恢复错误块已经压成一行,所以按行截就够;custom 格式的数据走 COPY,回显的 SQL 是 DDL
+    .replace(/\b(DETAIL|CONTEXT|HINT|QUERY|STATEMENT|LINE \d+|Command was):[^\n]*?(?=\s\|\s|\n|$)/g, "$1: [removed]")
+    // 主报错里偶尔也带值:键值对 (col)=(value),以及 invalid input syntax for type x: "value"
+    .replace(/\(([^()]*)\)=\((?:[^()]|\([^()]*\))*\)/g, "($1)=([removed])")
+    .replace(/(invalid input (?:syntax|value) for [^:"\n]*: )"[^"\n]*"/gi, '$1"[removed]"')
     .replace(/[a-z][a-z0-9+.-]*:\/\/[^\s"'<>`]+/gi, "[url]")
     .replace(/[^\s"'<>`/@]*:[^\s"'<>`/@]*@/g, "[redacted]@")
     // Supabase pooler 的用户名是 postgres.<项目 ref>

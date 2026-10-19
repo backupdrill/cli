@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { Command } from "commander";
 import { loadConfig, resolvePingUrl, type LoadedBackupConfig } from "./config.js";
-import { createPinger, pingMessageOf, sensitiveValuesOf } from "./ping.js";
+import { backupSummary, createPinger, drillOutcome, pingMessageOf, sensitiveValuesOf } from "./ping.js";
 import { runBackup } from "./backup.js";
 import { runEstimate, type EgressPricing } from "./estimate.js";
 import { runDrill } from "./drill.js";
@@ -102,12 +102,7 @@ program
       );
       // stdout 输出机器可读结果,便于在 CI / GitHub Action 里消费
       process.stdout.write(JSON.stringify({ ok: true, manifest }) + "\n");
-      await ping.success(
-        `backupdrill ${TOOL_VERSION}: backup complete, ${manifest.database.tableCount} tables` +
-          (manifest.storage ? ` + ${manifest.storage.fileCount} Storage files` : " (database only)") +
-          // 快照名取对象键里的目录名(和 drill --snapshot 认的是同一个),不用 createdAt
-          `, snapshot ${manifest.dump.key.split("/").at(-2) ?? manifest.createdAt}`
-      );
+      await ping.success(backupSummary(manifest));
     } catch (error) {
       const message = (error as Error).message;
       log.error(message);
@@ -183,18 +178,12 @@ program
           `restored in ${report.restoreSeconds}s`
       );
       process.stdout.write(JSON.stringify({ ok: report.pass, report }) + "\n");
-      const outcome =
-        `snapshot ${report.snapshot}, ${report.restoredTableCount} tables / ` +
-        `${report.restoredRowTotal.toLocaleString()} rows restored in ${report.restoreSeconds}s`;
-      if (report.pass) {
-        await ping.success(`backupdrill ${TOOL_VERSION}: drill passed, ${outcome}`);
+      const outcome = drillOutcome(report);
+      if (outcome.pass) {
+        await ping.success(outcome.text);
       } else {
         process.exitCode = 1;
-        const failed = report.checks.filter((c) => !c.pass).map((c) => `${c.name}: ${c.detail}`);
-        await ping.fail(
-          `backupdrill ${TOOL_VERSION}: drill failed, ${outcome}. Failed checks:\n${failed.join("\n")}`,
-          sensitiveValuesOf(config)
-        );
+        await ping.fail(outcome.text, sensitiveValuesOf(config));
       }
     } catch (error) {
       const message = (error as Error).message;

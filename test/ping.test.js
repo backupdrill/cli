@@ -8,7 +8,7 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { createPinger, scrubForPing, sensitiveValuesOf } from "../dist/ping.js";
+import { backupSummary, createPinger, drillOutcome, scrubForPing, sensitiveValuesOf } from "../dist/ping.js";
 import { resolvePingUrl } from "../dist/config.js";
 
 const CLI = fileURLToPath(new URL("../dist/index.js", import.meta.url));
@@ -192,6 +192,55 @@ test("scrubForPing:按值抹,再按形状兜底", () => {
   }
   assert.match(out, /backupdrill\.config\.json/, "文件名不该被当成主机名抹掉");
   assert.match(out, /03:00:00/, "时间不该被当成 IPv6 抹掉");
+});
+
+test("scrubForPing:Postgres 的 DETAIL / CONTEXT / 回显 SQL 里的值不外发", () => {
+  // post-data 失败块(空白已压成一行)和 pre-data 用 " | " 拼起来的多条报错
+  const postData =
+    'pg_restore: error: could not execute query: ERROR: could not create unique index "t_api_key_key" ' +
+    "DETAIL: Key (api_key)=(demo-live-token-123456) is duplicated. Command was: CREATE UNIQUE INDEX t_api_key_key ON public.t USING btree (api_key);";
+  const preData =
+    'pg_restore failed: ERROR: null value in column "email" violates not-null constraint DETAIL: Failing row contains (7, null, s3cr3t-note). ' +
+    'CONTEXT: COPY users, line 1: "7\t\\N\ts3cr3t-note" | ERROR: invalid input syntax for type integer: "hunter2-value"';
+  const multiLine =
+    'pg_restore: error: could not execute query: ERROR: duplicate key value violates unique constraint "orders_pkey"\n' +
+    "DETAIL: Key (id)=(42) already exists.\nCommand was: INSERT INTO public.orders VALUES (42, 'card-4242');\n" +
+    "pg_restore: warning: errors ignored on restore: 1";
+  const out = scrubForPing([postData, preData, multiLine].join("\n"), []);
+  for (const leak of ["demo-live-token-123456", "s3cr3t-note", "hunter2-value", "card-4242", "(42)"]) {
+    assert.ok(!out.includes(leak), `still contains ${leak}:\n${out}`);
+  }
+  // 主报错留着,读告警的人还知道是哪类错
+  assert.match(out, /could not create unique index/);
+  assert.match(out, /violates not-null constraint/);
+  assert.match(out, /errors ignored on restore/);
+});
+
+test("drillOutcome:通过发 success,没通过发 fail 并列出没过的检查;backupSummary 用快照目录名", () => {
+  const base = { snapshot: "2026-10-19T03-00-00-000Z", restoreSeconds: 1.5, restoredTableCount: 3, restoredRowTotal: 1200 };
+  const passed = drillOutcome({ ...base, pass: true, checks: [{ name: "table count", pass: true, detail: "restored 3, manifest 3" }] });
+  assert.equal(passed.pass, true);
+  assert.match(passed.text, /drill passed, snapshot 2026-10-19T03-00-00-000Z, 3 tables \/ 1,200 rows restored in 1.5s/);
+  const failed = drillOutcome({
+    ...base,
+    pass: false,
+    checks: [
+      { name: "table count", pass: true, detail: "restored 3, manifest 3" },
+      { name: "archive integrity", pass: false, detail: "sha256 MISMATCH" },
+    ],
+  });
+  assert.equal(failed.pass, false);
+  assert.match(failed.text, /drill failed/);
+  assert.match(failed.text, /archive integrity: sha256 MISMATCH/);
+  assert.ok(!failed.text.includes("table count"), "通过的检查不该列进失败原因");
+
+  const summary = backupSummary({
+    createdAt: "2026-10-19T03:00:00.123Z",
+    database: { tableCount: 42 },
+    storage: { fileCount: 318 },
+    dump: { key: "backupdrill/my-app/2026-10-19T03-00-00-111Z/dump.pgcustom" },
+  });
+  assert.match(summary, /backup complete, 42 tables \+ 318 Storage files, snapshot 2026-10-19T03-00-00-111Z$/);
 });
 
 test("sensitiveValuesOf 收集连接串的密码、主机、项目 ref 和各处密钥", () => {
