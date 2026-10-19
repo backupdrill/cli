@@ -24,6 +24,36 @@ export function targetClient(config: BackupConfig): S3Client {
   });
 }
 
+/**
+ * 列出 root(带尾斜杠)下的全部快照目录,返回带尾斜杠的前缀,未排序。只看 CommonPrefixes,
+ * root 下直接放的对象不算快照。
+ */
+export async function listSnapshotPrefixes(
+  s3: S3Client,
+  bucket: string,
+  root: string,
+  abortSignal?: AbortSignal
+): Promise<string[]> {
+  const prefixes: string[] = [];
+  let token: string | undefined;
+  do {
+    const res = await s3.send(
+      new ListObjectsV2Command({
+        Bucket: bucket,
+        Prefix: root,
+        Delimiter: "/",
+        ContinuationToken: token,
+      }),
+      { abortSignal }
+    );
+    for (const cp of res.CommonPrefixes ?? []) {
+      if (cp.Prefix) prefixes.push(cp.Prefix);
+    }
+    token = res.IsTruncated ? res.NextContinuationToken : undefined;
+  } while (token);
+  return prefixes;
+}
+
 /** 定位快照:显式指定,否则取字典序最大(时间戳格式天然可排序)。返回带尾斜杠的前缀。 */
 export async function resolveSnapshot(
   s3: S3Client,
@@ -34,22 +64,7 @@ export async function resolveSnapshot(
   const root = `${storage.prefix}/${config.projectName}/`;
   if (explicit) return `${root}${explicit}/`;
 
-  const prefixes: string[] = [];
-  let token: string | undefined;
-  do {
-    const res = await s3.send(
-      new ListObjectsV2Command({
-        Bucket: storage.bucket,
-        Prefix: root,
-        Delimiter: "/",
-        ContinuationToken: token,
-      })
-    );
-    for (const cp of res.CommonPrefixes ?? []) {
-      if (cp.Prefix) prefixes.push(cp.Prefix);
-    }
-    token = res.IsTruncated ? res.NextContinuationToken : undefined;
-  } while (token);
+  const prefixes = await listSnapshotPrefixes(s3, storage.bucket, root);
 
   if (!prefixes.length) {
     throw new Error(

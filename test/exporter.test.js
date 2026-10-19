@@ -1,0 +1,570 @@
+// backupdrill exporter:每次抓取现读桶,按 Prometheus 文本格式报备份和演练的状态。
+// 用内存假桶 + 真 SDK 走真 HTTP,钉住:选哪份快照、演练记录怎么读、读不了桶时只报 up=0、
+// manifest 没变时不重新下载、超时、HTTP 路由。
+import { test, mock } from "node:test";
+import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
+import net from "node:net";
+import { S3Client } from "@aws-sdk/client-s3";
+import { fileURLToPath } from "node:url";
+import { createBucketReader, createExporterServer, renderMetrics, scrapeTimeoutMs } from "../dist/exporter.js";
+import { TOOL_VERSION } from "../dist/version.js";
+import { startFakeS3, manifestJson } from "./fake-s3.js";
+
+const CONFIG = (bucket) => ({
+  databaseUrl: "postgresql://unused",
+  projectName: "my-app",
+  schemas: ["public"],
+  storage: {
+    region: "us-east-1",
+    bucket,
+    accessKeyId: "test",
+    secretAccessKey: "test",
+    prefix: "backupdrill",
+    forcePathStyle: true,
+  },
+});
+
+const ROOT = "backupdrill/my-app/";
+const OLD = "2026-10-18T03-00-00-000Z";
+const NEW = "2026-10-19T03-00-00-000Z";
+const RUNNING = "2026-10-20T03-00-00-000Z";
+
+function putSnapshot(fake, snapshot, createdAt, extra = {}) {
+  fake.objects.set(`${ROOT}${snapshot}/dump.pgcustom`, Buffer.from("PGDMP"));
+  fake.objects.set(
+    `${ROOT}${snapshot}/manifest.json`,
+    Buffer.from(manifestJson({ snapshot, createdAt, ...extra }))
+  );
+}
+
+function drillRecord(over) {
+  return Buffer.from(
+    JSON.stringify({
+      schemaVersion: 1,
+      tool: "backupdrill-cli",
+      toolVersion: "2.6.0",
+      ...over,
+    })
+  );
+}
+
+const DRILLS = "backupdrill/my-app.drills/";
+const stampOf = (iso) => iso.replace(/[:.]/g, "-");
+
+/** 照 drill --record 的样子放一份演练记录:文件名 = 结束时间 + 结论 */
+function putDrill(fake, finishedAt, pass, over = {}) {
+  const tag = Math.floor(Math.random() * 0xffffffff).toString(16).padStart(8, "0");
+  const key = `${DRILLS}${stampOf(finishedAt)}-${pass ? "passed" : "failed"}-${tag}.json`;
+  fake.objects.set(key, drillRecord({ finishedAt, pass, ...over }));
+  return key;
+}
+
+/** 文本格式解析成 { name -> value };带标签的样本用完整的 name{labels} 作键 */
+function parseMetrics(text) {
+  const values = {};
+  for (const line of text.trim().split("\n")) {
+    if (line.startsWith("#")) continue;
+    const at = line.lastIndexOf(" ");
+    values[line.slice(0, at)] = Number(line.slice(at + 1));
+  }
+  return values;
+}
+
+async function withQuietLog(run) {
+  const warnings = [];
+  const m = mock.method(console, "error", (...args) => warnings.push(args.join(" ")));
+  try {
+    return await run(warnings);
+  } finally {
+    m.mock.restore();
+  }
+}
+
+test("最新一份完整快照:跳过还没写 manifest 的目录,快照数含它", async () => {
+  const fake = await startFakeS3();
+  try {
+    putSnapshot(fake, OLD, "2026-10-18T03:04:00.000Z", { dumpBytes: 1000 });
+    putSnapshot(fake, NEW, "2026-10-19T03:05:30.500Z", {
+      dumpBytes: 2048,
+      rows: 900,
+      storage: {
+        fileCount: 2,
+        totalBytes: 30,
+        files: [
+          { bucket: "avatars", key: "a.png", bytes: 10, sha256: "a".repeat(64) },
+          { bucket: "avatars", key: "b.png", bytes: 20, sha256: "b".repeat(64) },
+        ],
+      },
+    });
+    // 正在跑的备份:dump 已上传,manifest 还没写
+    fake.objects.set(`${ROOT}${RUNNING}/dump.pgcustom`, Buffer.from("PGDMP"));
+
+    const read = createBucketReader(fake.s3, CONFIG(fake.bucket));
+    const m = parseMetrics(renderMetrics(await read(AbortSignal.timeout(5000)), 0.1));
+    assert.equal(m.backupdrill_up, 1);
+    assert.equal(m.backupdrill_snapshots, 3);
+    assert.equal(m.backupdrill_backup_last_success_timestamp_seconds, Date.parse("2026-10-19T03:05:30.500Z") / 1000);
+    assert.equal(m.backupdrill_latest_snapshot_dump_bytes, 2048);
+    assert.equal(m.backupdrill_latest_snapshot_storage_files, 2);
+    assert.equal(m.backupdrill_latest_snapshot_storage_bytes, 30);
+    assert.equal(m.backupdrill_latest_snapshot_tables, 2);
+    assert.equal(m.backupdrill_latest_snapshot_estimated_rows, 900);
+  } finally {
+    await fake.close();
+  }
+});
+
+test("只备数据库的快照:Storage 两项是 0", async () => {
+  const fake = await startFakeS3();
+  try {
+    putSnapshot(fake, NEW, "2026-10-19T03:05:00.000Z");
+    const m = parseMetrics(
+      renderMetrics(await createBucketReader(fake.s3, CONFIG(fake.bucket))(AbortSignal.timeout(5000)), 0)
+    );
+    assert.equal(m.backupdrill_latest_snapshot_storage_files, 0);
+    assert.equal(m.backupdrill_latest_snapshot_storage_bytes, 0);
+  } finally {
+    await fake.close();
+  }
+});
+
+test("桶里还没有快照、没有演练记录:up=1,两个时间是 0,其余不出", async () => {
+  const fake = await startFakeS3();
+  try {
+    const text = renderMetrics(await createBucketReader(fake.s3, CONFIG(fake.bucket))(AbortSignal.timeout(5000)), 0);
+    const m = parseMetrics(text);
+    assert.equal(m.backupdrill_up, 1);
+    assert.equal(m.backupdrill_snapshots, 0);
+    assert.equal(m.backupdrill_backup_last_success_timestamp_seconds, 0);
+    assert.equal(m.backupdrill_drill_last_run_timestamp_seconds, 0);
+    assert.equal(m.backupdrill_drill_last_success_timestamp_seconds, 0);
+    for (const absent of [
+      "backupdrill_latest_snapshot_dump_bytes",
+      "backupdrill_drill_last_run_passed",
+      "backupdrill_drill_last_success_restore_duration_seconds",
+    ]) {
+      assert.ok(!text.includes(absent), `${absent} should be absent`);
+    }
+  } finally {
+    await fake.close();
+  }
+});
+
+test("演练记录:最近一次没通过时,上一次通过的时间和恢复用时还在", async () => {
+  const fake = await startFakeS3();
+  try {
+    putSnapshot(fake, NEW, "2026-10-19T03:05:00.000Z");
+    putDrill(fake, "2026-01-06T04:00:00.000Z", true, { snapshot: OLD, restoreSeconds: 30 });
+    putDrill(fake, "2026-01-13T04:00:00.000Z", true, { snapshot: OLD, restoreSeconds: 42.5 });
+    putDrill(fake, "2026-01-20T04:00:00.000Z", false, { snapshot: NEW });
+    // 不是记录文件名的对象不理
+    fake.objects.set(`${DRILLS}notes.txt`, Buffer.from("hello"));
+    const m = parseMetrics(
+      renderMetrics(await createBucketReader(fake.s3, CONFIG(fake.bucket))(AbortSignal.timeout(5000)), 0)
+    );
+    assert.equal(m.backupdrill_drill_last_run_timestamp_seconds, Date.parse("2026-01-20T04:00:00.000Z") / 1000);
+    assert.equal(m.backupdrill_drill_last_run_passed, 0);
+    assert.equal(m.backupdrill_drill_last_success_timestamp_seconds, Date.parse("2026-01-13T04:00:00.000Z") / 1000);
+    assert.equal(m.backupdrill_drill_last_success_restore_duration_seconds, 42.5);
+    // 演练记录在 <project>.drills/,不在快照目录旁边,不能算进快照
+    assert.equal(m.backupdrill_snapshots, 1);
+  } finally {
+    await fake.close();
+  }
+});
+
+test("演练记录的写入顺序无所谓:晚写进桶的旧结论不会盖过更新的结论", async () => {
+  const fake = await startFakeS3();
+  try {
+    putSnapshot(fake, NEW, "2026-10-19T03:05:00.000Z");
+    // 更新的"没通过"先进桶,更早的"通过"后进桶(两次演练重叠时可能这样)
+    putDrill(fake, "2026-01-20T05:00:00.000Z", false);
+    putDrill(fake, "2026-01-20T04:00:00.000Z", true, { restoreSeconds: 12 });
+    const m = parseMetrics(
+      renderMetrics(await createBucketReader(fake.s3, CONFIG(fake.bucket))(AbortSignal.timeout(5000)), 0)
+    );
+    assert.equal(m.backupdrill_drill_last_run_passed, 0);
+    assert.equal(m.backupdrill_drill_last_run_timestamp_seconds, Date.parse("2026-01-20T05:00:00.000Z") / 1000);
+  } finally {
+    await fake.close();
+  }
+});
+
+test("演练记录的时间在将来(机器时钟快了或被改过):跳过并警告,不影响其余指标", async () => {
+  const fake = await startFakeS3();
+  try {
+    putSnapshot(fake, NEW, "2026-10-19T03:05:00.000Z");
+    putDrill(fake, "2026-01-20T04:00:00.000Z", true, { restoreSeconds: 12 });
+    putDrill(fake, new Date(Date.now() + 365 * 86400_000).toISOString(), false);
+    await withQuietLog(async (warnings) => {
+      const m = parseMetrics(
+        renderMetrics(await createBucketReader(fake.s3, CONFIG(fake.bucket))(AbortSignal.timeout(5000)), 0)
+      );
+      assert.equal(m.backupdrill_up, 1);
+      assert.equal(m.backupdrill_drill_last_run_passed, 1);
+      assert.equal(m.backupdrill_drill_last_run_timestamp_seconds, Date.parse("2026-01-20T04:00:00.000Z") / 1000);
+      assert.match(warnings.join("\n"), /failed-[0-9a-f]{8}\.json: it is dated more than 10 minutes in the future/);
+    });
+  } finally {
+    await fake.close();
+  }
+});
+
+test("演练记录多过一页:分页列完", async () => {
+  const fake = await startFakeS3({ pageSize: 2 });
+  try {
+    for (let day = 10; day <= 15; day++) putDrill(fake, `2026-01-${day}T04:00:00.000Z`, day % 2 === 0, { restoreSeconds: day });
+    const m = parseMetrics(
+      renderMetrics(await createBucketReader(fake.s3, CONFIG(fake.bucket))(AbortSignal.timeout(5000)), 0)
+    );
+    assert.equal(m.backupdrill_drill_last_run_timestamp_seconds, Date.parse("2026-01-15T04:00:00.000Z") / 1000);
+    assert.equal(m.backupdrill_drill_last_run_passed, 0);
+    assert.equal(m.backupdrill_drill_last_success_restore_duration_seconds, 14);
+  } finally {
+    await fake.close();
+  }
+});
+
+test("manifest 没变:第二次抓取带 If-None-Match,拿到 304 不传正文,数值不变;换了新快照就读新的", async () => {
+  const fake = await startFakeS3();
+  try {
+    putSnapshot(fake, OLD, "2026-10-18T03:04:00.000Z", { dumpBytes: 1000 });
+    const read = createBucketReader(fake.s3, CONFIG(fake.bucket));
+    const first = parseMetrics(renderMetrics(await read(AbortSignal.timeout(5000)), 0));
+
+    fake.requests.length = 0;
+    const second = parseMetrics(renderMetrics(await read(AbortSignal.timeout(5000)), 0));
+    const manifestGets = fake.requests.filter((r) => r.key.endsWith("manifest.json"));
+    assert.equal(manifestGets.length, 1);
+    assert.ok(manifestGets[0].ifNoneMatch, "second read should send If-None-Match");
+    assert.equal(second.backupdrill_latest_snapshot_dump_bytes, first.backupdrill_latest_snapshot_dump_bytes);
+    assert.equal(
+      second.backupdrill_backup_last_success_timestamp_seconds,
+      first.backupdrill_backup_last_success_timestamp_seconds
+    );
+
+    putSnapshot(fake, NEW, "2026-10-19T03:05:00.000Z", { dumpBytes: 3000 });
+    fake.requests.length = 0;
+    const third = parseMetrics(renderMetrics(await read(AbortSignal.timeout(5000)), 0));
+    assert.equal(third.backupdrill_latest_snapshot_dump_bytes, 3000);
+    assert.equal(fake.requests.find((r) => r.key.endsWith(`${NEW}/manifest.json`)).ifNoneMatch, null);
+  } finally {
+    await fake.close();
+  }
+});
+
+test("缓存的 manifest 没变(304),本机时钟被校正回来后照样判断是不是在将来", async () => {
+  const fake = await startFakeS3();
+  try {
+    const realNow = Date.now();
+    putSnapshot(fake, NEW, new Date(realNow + 5 * 60_000).toISOString()); // 5 分钟内:可以接受
+    const read = createBucketReader(fake.s3, CONFIG(fake.bucket));
+    assert.equal(parseMetrics(renderMetrics(await read(AbortSignal.timeout(5000)), 0)).backupdrill_up, 1);
+    // 时钟往回拨 1 小时,manifest 没变(走 304 和缓存),这时它已经在 10 分钟以外的将来
+    const clock = mock.method(Date, "now", () => realNow - 60 * 60_000);
+    try {
+      await assert.rejects(read(AbortSignal.timeout(5000)), /createdAt .* in the future/);
+      assert.ok(fake.requests.some((r) => r.key.endsWith("manifest.json") && r.ifNoneMatch));
+    } finally {
+      clock.mock.restore();
+    }
+  } finally {
+    await fake.close();
+  }
+});
+
+test("快照目录多过一页:分页列完", async () => {
+  const fake = await startFakeS3({ pageSize: 2 });
+  try {
+    for (let day = 10; day <= 14; day++) {
+      putSnapshot(fake, `2026-10-${day}T03-00-00-000Z`, `2026-10-${day}T03:05:00.000Z`);
+    }
+    const m = parseMetrics(
+      renderMetrics(await createBucketReader(fake.s3, CONFIG(fake.bucket))(AbortSignal.timeout(5000)), 0)
+    );
+    assert.equal(m.backupdrill_snapshots, 5);
+    assert.equal(m.backupdrill_backup_last_success_timestamp_seconds, Date.parse("2026-10-14T03:05:00.000Z") / 1000);
+  } finally {
+    await fake.close();
+  }
+});
+
+for (const [name, setup, expectedWarning] of [
+  [
+    "桶拒绝访问",
+    (fake) => fake.fail(() => ({ status: 403, code: "AccessDenied" })),
+    /AccessDenied/,
+  ],
+  [
+    "manifest 坏了",
+    (fake) => fake.objects.set(`${ROOT}${NEW}/manifest.json`, Buffer.from("{not json")),
+    /manifest\.json is not valid JSON/,
+  ],
+  [
+    "manifest 没有可读的 createdAt",
+    (fake) =>
+      fake.objects.set(
+        `${ROOT}${NEW}/manifest.json`,
+        Buffer.from(manifestJson({ snapshot: NEW, createdAt: "yesterday" }))
+      ),
+    /createdAt/,
+  ],
+  [
+    "manifest 的 createdAt 在一年以后",
+    (fake) =>
+      fake.objects.set(
+        `${ROOT}${NEW}/manifest.json`,
+        Buffer.from(manifestJson({ snapshot: NEW, createdAt: new Date(Date.now() + 365 * 86400_000).toISOString() }))
+      ),
+    /createdAt .* in the future/,
+  ],
+  [
+    "manifest 的行数不是数字",
+    (fake) => {
+      const m = JSON.parse(manifestJson({ snapshot: NEW, createdAt: "2026-10-19T03:05:00.000Z" }));
+      m.database.estimatedRowTotal = "broken\nbackupdrill_up 1";
+      fake.objects.set(`${ROOT}${NEW}/manifest.json`, Buffer.from(JSON.stringify(m)));
+    },
+    /estimatedRows is not a non-negative number/,
+  ],
+  [
+    "通过的演练记录内容和文件名对不上",
+    (fake) => putDrill(fake, "2026-01-20T04:00:00.000Z", true, { pass: false }),
+    /passed-[0-9a-f]{8}\.json is malformed: its content does not match its name/,
+  ],
+  [
+    "通过的演练记录结构不对",
+    (fake) => putDrill(fake, "2026-01-20T04:00:00.000Z", true, { restoreSeconds: "fast" }),
+    /passed-[0-9a-f]{8}\.json is malformed: restoreSeconds/,
+  ],
+  [
+    "演练记录是更新的 CLI 写的",
+    (fake) => putDrill(fake, "2026-01-20T04:00:00.000Z", true, { schemaVersion: 2 }),
+    /Upgrade the CLI/,
+  ],
+]) {
+  test(`读不成桶(${name}):回 200,只有 up=0、抓取用时和版本,日志写原因`, async () => {
+    const fake = await startFakeS3();
+    try {
+      putSnapshot(fake, OLD, "2026-10-18T03:04:00.000Z");
+      setup(fake);
+      const server = createExporterServer(createBucketReader(fake.s3, CONFIG(fake.bucket)));
+      await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+      try {
+        await withQuietLog(async (warnings) => {
+          const res = await fetch(`http://127.0.0.1:${server.address().port}/metrics`);
+          assert.equal(res.status, 200);
+          const m = parseMetrics(await res.text());
+          assert.deepEqual(Object.keys(m).sort(), [
+            `backupdrill_build_info{version="${TOOL_VERSION}"}`,
+            "backupdrill_scrape_duration_seconds",
+            "backupdrill_up",
+          ]);
+          assert.equal(m.backupdrill_up, 0);
+          assert.match(warnings.join("\n"), expectedWarning);
+        });
+      } finally {
+        await new Promise((resolve) => server.close(resolve));
+      }
+    } finally {
+      await fake.close();
+    }
+  });
+}
+
+test("桶不回应:按 Prometheus 给的超时放弃,报 up=0,不拖过抓取时限", async () => {
+  const fake = await startFakeS3();
+  try {
+    fake.fail(() => "hang");
+    const server = createExporterServer(createBucketReader(fake.s3, CONFIG(fake.bucket)));
+    await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+    try {
+      await withQuietLog(async (warnings) => {
+        const started = Date.now();
+        const res = await fetch(`http://127.0.0.1:${server.address().port}/metrics`, {
+          headers: { "X-Prometheus-Scrape-Timeout-Seconds": "1" },
+        });
+        const elapsed = Date.now() - started;
+        assert.equal(parseMetrics(await res.text()).backupdrill_up, 0);
+        assert.ok(elapsed < 1000, `took ${elapsed}ms, Prometheus would have given up at 1000ms`);
+        assert.match(warnings.join("\n"), /timed out after 0\.5s/);
+      });
+    } finally {
+      await new Promise((resolve) => server.close(resolve));
+    }
+  } finally {
+    await fake.close();
+  }
+});
+
+test("桶回 503 + Retry-After:SDK 按默认重试在睡,也要按时回 up=0", async () => {
+  const fake = await startFakeS3();
+  try {
+    fake.fail(() => ({ status: 503, code: "SlowDown", headers: { "retry-after": "2" } }));
+    // 用默认重试设置的客户端(假桶自带的那个关了重试)
+    const s3 = new S3Client({
+      region: "us-east-1",
+      endpoint: fake.endpoint,
+      forcePathStyle: true,
+      credentials: { accessKeyId: "test", secretAccessKey: "test" },
+    });
+    const server = createExporterServer(createBucketReader(s3, CONFIG(fake.bucket)));
+    await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+    try {
+      await withQuietLog(async () => {
+        const started = Date.now();
+        const res = await fetch(`http://127.0.0.1:${server.address().port}/metrics`, {
+          headers: { "X-Prometheus-Scrape-Timeout-Seconds": "1" },
+        });
+        const elapsed = Date.now() - started;
+        assert.equal(parseMetrics(await res.text()).backupdrill_up, 0);
+        assert.ok(elapsed < 1000, `took ${elapsed}ms, Prometheus would have given up at 1000ms`);
+      });
+    } finally {
+      await new Promise((resolve) => server.close(resolve));
+    }
+  } finally {
+    await fake.close();
+  }
+});
+
+test("抓取时限:跟着 Prometheus 的请求头走,留余量;没有头时 10 秒", () => {
+  assert.equal(scrapeTimeoutMs("10"), 9500);
+  assert.equal(scrapeTimeoutMs("1"), 500);
+  assert.equal(scrapeTimeoutMs(undefined), 10_000);
+  assert.equal(scrapeTimeoutMs("abc"), 10_000);
+  assert.equal(scrapeTimeoutMs("0"), 10_000);
+  // AbortSignal.timeout 只收整数毫秒:1.1 秒不能算成 600.0000000000001
+  assert.equal(scrapeTimeoutMs("1.1"), 600);
+  assert.ok(Number.isInteger(scrapeTimeoutMs("7.3")));
+  assert.equal(scrapeTimeoutMs("100000"), 300_000);
+});
+
+test("怪请求行(GET // HTTP/1.1)不能把 exporter 进程带走", async () => {
+  const server = createExporterServer(async () => ({ snapshots: 0, latest: null, lastDrill: null, lastPassedDrill: null }));
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const { port } = server.address();
+  try {
+    const raw = await new Promise((resolve, reject) => {
+      const socket = net.connect(port, "127.0.0.1", () => {
+        socket.write("GET // HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+      });
+      let data = "";
+      socket.on("data", (c) => (data += c));
+      socket.on("end", () => resolve(data));
+      socket.on("error", reject);
+    });
+    assert.match(raw, /^HTTP\/1\.1 404/);
+    // 进程还活着、还在服务
+    assert.equal((await fetch(`http://127.0.0.1:${port}/metrics`)).status, 200);
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+  }
+});
+
+test("HTTP:/metrics 的 Content-Type、首页链到 /metrics、其他路径 404、非 GET 405", async () => {
+  const server = createExporterServer(async () => ({ snapshots: 0, latest: null, lastDrill: null, lastPassedDrill: null }));
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const base = `http://127.0.0.1:${server.address().port}`;
+  try {
+    const metrics = await fetch(`${base}/metrics`);
+    assert.equal(metrics.headers.get("content-type"), "text/plain; version=0.0.4; charset=utf-8");
+    const landing = await fetch(`${base}/`);
+    assert.equal(landing.status, 200);
+    assert.match(await landing.text(), /<a href="\/metrics">/);
+    assert.equal((await fetch(`${base}/nope`)).status, 404);
+    assert.equal((await fetch(`${base}/metrics`, { method: "POST" })).status, 405);
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+  }
+});
+
+test("文本格式:每个指标先 HELP 后 TYPE gauge,名字合规,只有 build_info 带标签", () => {
+  const text = renderMetrics(
+    {
+      snapshots: 3,
+      latest: {
+        createdAt: Date.parse("2026-10-19T03:05:00Z"),
+        dumpBytes: 1,
+        storageFiles: 0,
+        storageBytes: 0,
+        tables: 1,
+        estimatedRows: 1,
+      },
+      lastDrill: { finishedAt: Date.parse("2026-01-20T00:00:00Z"), pass: true },
+      lastPassedDrill: { finishedAt: Date.parse("2026-01-20T00:00:00Z"), restoreSeconds: 3 },
+    },
+    0.25
+  );
+  const lines = text.trim().split("\n");
+  const names = [];
+  for (let i = 0; i < lines.length; ) {
+    const help = /^# HELP (\S+) .+$/.exec(lines[i]);
+    assert.ok(help, `expected HELP at line ${i}: ${lines[i]}`);
+    const name = help[1];
+    assert.match(name, /^backupdrill_[a-z_]+$/);
+    assert.equal(lines[i + 1], `# TYPE ${name} gauge`);
+    i += 2;
+    while (i < lines.length && !lines[i].startsWith("#")) {
+      assert.ok(lines[i].startsWith(name), `sample ${lines[i]} under ${name}`);
+      if (name !== "backupdrill_build_info") assert.ok(!lines[i].includes("{"), `unexpected label: ${lines[i]}`);
+      assert.ok(Number.isFinite(Number(lines[i].split(" ").pop())), `value must be a number: ${lines[i]}`);
+      i++;
+    }
+    names.push(name);
+  }
+  assert.equal(new Set(names).size, names.length, "metric names must be unique");
+  assert.equal(names.length, 14);
+});
+
+test("CLI:exporter 子命令起服务、读环境变量里的桶、--port 校验", async () => {
+  const fake = await startFakeS3();
+  const cli = fileURLToPath(new URL("../dist/index.js", import.meta.url));
+  const env = {
+    PATH: process.env.PATH,
+    NO_COLOR: "1",
+    BACKUPDRILL_S3_ENDPOINT: fake.endpoint,
+    BACKUPDRILL_S3_REGION: "us-east-1",
+    BACKUPDRILL_S3_BUCKET: fake.bucket,
+    BACKUPDRILL_S3_ACCESS_KEY_ID: "test",
+    BACKUPDRILL_S3_SECRET_ACCESS_KEY: "test",
+    BACKUPDRILL_PROJECT_NAME: "my-app",
+  };
+  try {
+    putSnapshot(fake, NEW, "2026-10-19T03:05:00.000Z");
+    const bad = spawn(process.execPath, [cli, "exporter", "--port", "70000"], { env, cwd: "/" });
+    let badErr = "";
+    bad.stderr.on("data", (c) => (badErr += c));
+    assert.equal(await new Promise((resolve) => bad.on("exit", resolve)), 1);
+    assert.match(badErr, /--port must be a whole number from 1 to 65535/);
+
+    // 先占一个空闲端口再放掉,交给子进程用
+    const probe = net.createServer();
+    await new Promise((resolve) => probe.listen(0, "127.0.0.1", resolve));
+    const port = probe.address().port;
+    await new Promise((resolve) => probe.close(resolve));
+
+    const child = spawn(process.execPath, [cli, "exporter", "--port", String(port)], { env, cwd: "/" });
+    try {
+      // 从启动日志里读出地址,顺带确认日志报的是实际端口
+      const url = await new Promise((resolve, reject) => {
+        let err = "";
+        child.stderr.on("data", (c) => {
+          err += c;
+          const hit = /at (http:\/\/127\.0\.0\.1:\d+\/metrics)/.exec(err);
+          if (hit) resolve(hit[1]);
+        });
+        child.on("exit", () => reject(new Error(`exporter exited: ${err}`)));
+      });
+      assert.equal(url, `http://127.0.0.1:${port}/metrics`);
+      const m = parseMetrics(await (await fetch(url)).text());
+      assert.equal(m.backupdrill_up, 1);
+      assert.equal(m.backupdrill_snapshots, 1);
+    } finally {
+      child.kill();
+    }
+  } finally {
+    await fake.close();
+  }
+});

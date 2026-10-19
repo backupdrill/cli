@@ -8,6 +8,8 @@ import { runDrill } from "./drill.js";
 import { createInterface } from "node:readline/promises";
 import { Writable } from "node:stream";
 import { runRestore, NO_SOURCE_DATABASE } from "./restore.js";
+import { recordDrillOutcome } from "./drill-record.js";
+import { DEFAULT_EXPORTER_PORT, startExporter } from "./exporter.js";
 
 /** 隐藏式秘密输入(PRD §5.3.1):终端不回显;无 TTY(CI/脚本)时明确要求走环境变量。 */
 async function promptSecret(label: string): Promise<string> {
@@ -136,9 +138,15 @@ program
   )
   .option("--keep", "if the drill fails, keep the sandbox container running for inspection")
   .option(PING_FLAG, PING_HELP)
+  .option(
+    "--record",
+    "write the outcome as a small JSON file in <prefix>/<project>.drills/, where " +
+      "`backupdrill exporter` reads it. Needs write access to the bucket"
+  )
   .action(async (opts) => {
     const ping = createPinger(await resolvePingUrl({ flag: opts.pingUrl, configPath: opts.config }));
     await ping.start();
+    // config 放在 try 外面:出错时 /fail 要用它抹敏感值,--record 要用它记一笔"没通过"
     let config: LoadedBackupConfig | undefined;
     try {
       if (opts.checkCmd !== undefined && !String(opts.checkCmd).trim()) {
@@ -178,6 +186,7 @@ program
           `restored in ${report.restoreSeconds}s`
       );
       process.stdout.write(JSON.stringify({ ok: report.pass, report }) + "\n");
+      if (opts.record) await recordDrillOutcome(config, report);
       const outcome = drillOutcome(report);
       if (outcome.pass) {
         await ping.success(outcome.text);
@@ -189,6 +198,8 @@ program
       const message = (error as Error).message;
       log.error(message);
       process.exitCode = 1;
+      // 没装 Docker、桶里没快照这类中途失败也算一次没通过的演练;配置都没读成就无处可记
+      if (opts.record && config) await recordDrillOutcome(config, null);
       await ping.fail(
         `backupdrill ${TOOL_VERSION}: drill failed. ${pingMessageOf(error)}`,
         sensitiveValuesOf(config)
@@ -329,6 +340,50 @@ program
       const pricing = EGRESS_PRICING[opts.plan as keyof typeof EGRESS_PRICING];
       if (!pricing) throw new Error(`Unknown plan "${opts.plan}". Use free | pro | team.`);
       await runEstimate(config, pricing);
+    } catch (error) {
+      log.error((error as Error).message);
+      process.exitCode = 1;
+    }
+  });
+
+program
+  .command("exporter")
+  .description(
+    "Serve Prometheus metrics about the backups (and drills run with --record) in your bucket"
+  )
+  .option("-c, --config <path>", "path to a JSON config file", "backupdrill.config.json")
+  .option("--bucket <name>", "bucket the backups live in")
+  .option("--endpoint <url>", "S3-compatible endpoint (for R2/B2)")
+  .option("--region <region>", "bucket region")
+  .option("--prefix <prefix>", "key prefix inside the bucket (default: backupdrill)")
+  .option("--project-name <name>", "project name used in the object key")
+  .option(
+    "--host <address>",
+    "address to listen on; use 0.0.0.0 when Prometheus runs on another machine",
+    "127.0.0.1"
+  )
+  .option("--port <port>", "port to listen on", String(DEFAULT_EXPORTER_PORT))
+  .action(async (opts) => {
+    try {
+      const port = Number(opts.port);
+      if (!Number.isInteger(port) || port < 1 || port > 65535) {
+        throw new Error(`--port must be a whole number from 1 to 65535, got "${opts.port}"`);
+      }
+      const config = await loadConfig({
+        configPath: opts.config,
+        overrides: {
+          projectName: opts.projectName,
+          // exporter 只读桶,不连源库;给 databaseUrl 占位以通过校验
+          databaseUrl: "postgresql://unused",
+          storage: {
+            bucket: opts.bucket,
+            endpoint: opts.endpoint,
+            region: opts.region,
+            prefix: opts.prefix,
+          },
+        },
+      });
+      await startExporter(config, { host: opts.host, port });
     } catch (error) {
       log.error((error as Error).message);
       process.exitCode = 1;
