@@ -1,4 +1,4 @@
-import { PutObjectCommand, type S3Client } from "@aws-sdk/client-s3";
+import { GetObjectCommand, PutObjectCommand, type S3Client } from "@aws-sdk/client-s3";
 import { requireBucket, type BackupConfig } from "./config.js";
 import type { DrillReport } from "./drill.js";
 import { log } from "./log.js";
@@ -54,24 +54,66 @@ export function buildDrillRecord(report: DrillReport | null, finishedAt: Date): 
   };
 }
 
+/** 桶里已有的那份比 record 新时返回它的 finishedAt;没有、读不懂或更旧时返回 null。 */
+async function newerExisting(
+  s3: S3Client,
+  bucket: string,
+  key: string,
+  record: DrillRecord,
+  abortSignal?: AbortSignal
+): Promise<string | null> {
+  let text: string;
+  try {
+    const res = await s3.send(new GetObjectCommand({ Bucket: bucket, Key: key }), { abortSignal });
+    text = await res.Body!.transformToString();
+  } catch (error) {
+    const status = (error as { $metadata?: { httpStatusCode?: number } }).$metadata?.httpStatusCode;
+    if (status === 404 || (error as Error).name === "NoSuchKey") return null;
+    throw error;
+  }
+  try {
+    const existing = parseDrillRecord(text, key);
+    return Date.parse(existing.finishedAt) > Date.parse(record.finishedAt) ? existing.finishedAt : null;
+  } catch {
+    return null; // 坏掉的旧记录直接覆盖
+  }
+}
+
+/**
+ * 两次演练同时跑(cron 重叠)时,先结束的那次可能后写到桶里,把更新的结论盖掉:
+ * 一次更早的"通过"盖住更新的"没通过",失败告警就没了。所以写之前先读一下,桶里那份更新就不写。
+ * 读和写之间还有一个很短的窗口,不是原子的;各家 S3 兼容存储对条件写入(If-Match)的支持
+ * 参差不齐,为这个罕见情形不值得引入。
+ */
 export async function writeDrillRecord(
   s3: S3Client,
   config: BackupConfig,
-  record: DrillRecord
+  record: DrillRecord,
+  abortSignal?: AbortSignal
 ): Promise<void> {
   const bucket = requireBucket(config).bucket;
   const files = record.pass ? [LAST_DRILL_FILE, LAST_PASSED_DRILL_FILE] : [LAST_DRILL_FILE];
   for (const file of files) {
+    const key = drillRecordKey(config, file);
+    const newer = await newerExisting(s3, bucket, key, record, abortSignal);
+    if (newer) {
+      log.warn(`${file} already holds a newer drill (finished ${newer}); left it as it is.`);
+      continue;
+    }
     await s3.send(
       new PutObjectCommand({
         Bucket: bucket,
-        Key: drillRecordKey(config, file),
+        Key: key,
         Body: JSON.stringify(record, null, 2),
         ContentType: "application/json",
-      })
+      }),
+      { abortSignal }
     );
   }
 }
+
+/** 记一笔最多等这么久:桶接了请求却不回应时,演练不能卡在这里,后面还要退出、发监控 ping */
+const RECORD_TIMEOUT_MS = 30_000;
 
 /**
  * CLI 的 `drill --record`:写不进去只警告,演练本身的结论和退出码不变。
@@ -80,15 +122,21 @@ export async function writeDrillRecord(
 export async function recordDrillOutcome(
   config: BackupConfig,
   report: DrillReport | null,
-  s3: S3Client = targetClient(config)
+  s3: S3Client = targetClient(config),
+  timeoutMs: number = RECORD_TIMEOUT_MS
 ): Promise<void> {
   const record = buildDrillRecord(report, new Date());
   try {
-    await writeDrillRecord(s3, config, record);
+    await writeDrillRecord(s3, config, record, AbortSignal.timeout(timeoutMs));
     log.ok(`Drill result recorded → s3://${requireBucket(config).bucket}/${drillRecordKey(config, LAST_DRILL_FILE)}`);
   } catch (error) {
+    const e = error as Error;
+    const reason =
+      e.name === "TimeoutError" || e.name === "AbortError"
+        ? `no answer from the bucket within ${timeoutMs / 1000}s`
+        : e.message;
     log.warn(
-      `Could not record the drill result (${(error as Error).message}). ` +
+      `Could not record the drill result (${reason}). ` +
         `--record needs write access to the bucket. The drill's own result is unchanged.`
     );
   }

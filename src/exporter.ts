@@ -1,4 +1,4 @@
-import { createServer, type Server } from "node:http";
+import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
 import { performance } from "node:perf_hooks";
 import { GetObjectCommand, type S3Client } from "@aws-sdk/client-s3";
@@ -29,6 +29,7 @@ export const DEFAULT_EXPORTER_PORT = 10059;
 
 /** 没有 Prometheus 超时头时(手动 curl)给读桶留的时间,与 Prometheus 默认 scrape_timeout 一致 */
 const DEFAULT_SCRAPE_TIMEOUT_MS = 10_000;
+const MAX_SCRAPE_TIMEOUT_MS = 5 * 60_000;
 
 /** 最新一份完整快照里 exporter 要用的数,不留整份 manifest(Storage 文件多时 manifest 很大) */
 export interface SnapshotSummary {
@@ -270,7 +271,9 @@ export function renderMetrics(state: BucketState | null, scrapeSeconds: number):
 export function scrapeTimeoutMs(header: string | string[] | undefined): number {
   const value = Number(Array.isArray(header) ? header[0] : header);
   if (!Number.isFinite(value) || value <= 0) return DEFAULT_SCRAPE_TIMEOUT_MS;
-  return Math.max(value - 0.5, value / 2) * 1000;
+  // AbortSignal.timeout 只收整数毫秒(1.1 秒算出来是 600.0000000000001,直接抛错);
+  // 上限防一个离谱的头把读桶拖成几小时
+  return Math.min(Math.max(1, Math.floor(Math.max(value - 0.5, value / 2) * 1000)), MAX_SCRAPE_TIMEOUT_MS);
 }
 
 const LANDING_PAGE = `<!doctype html>
@@ -287,42 +290,57 @@ const LANDING_PAGE = `<!doctype html>
 export function createExporterServer(
   read: (abortSignal: AbortSignal) => Promise<BucketState>
 ): Server {
-  return createServer(async (req, res) => {
-    const path = new URL(req.url ?? "/", "http://localhost").pathname;
-    if (req.method !== "GET") {
-      res.writeHead(405, { Allow: "GET", "Content-Type": "text/plain; charset=utf-8" });
-      res.end("Method Not Allowed\n");
-      return;
-    }
-    if (path === "/") {
-      res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
-      res.end(LANDING_PAGE);
-      return;
-    }
-    if (path !== "/metrics") {
-      res.writeHead(404, { "Content-Type": "text/plain; charset=utf-8" });
-      res.end("Not Found\n");
-      return;
-    }
-
-    const started = performance.now();
-    const timeoutMs = scrapeTimeoutMs(req.headers["x-prometheus-scrape-timeout-seconds"]);
-    let state: BucketState | null = null;
-    try {
-      state = await read(AbortSignal.timeout(timeoutMs));
-    } catch (error) {
-      const e = error as Error;
-      const reason =
-        e.name === "TimeoutError" || e.name === "AbortError"
-          ? `timed out after ${(timeoutMs / 1000).toFixed(1)}s`
-          : e.message;
-      log.warn(`Could not read the backup bucket: ${reason}`);
-    }
-    // 微秒够用,免得样本里出现 0.021267749999999978 这种浮点尾巴
-    const body = renderMetrics(state, Number(((performance.now() - started) / 1000).toFixed(6)));
-    res.writeHead(200, { "Content-Type": "text/plain; version=0.0.4; charset=utf-8" });
-    res.end(body);
+  return createServer((req, res) => {
+    // 处理函数是 async:里面任何没接住的异常都会变成未处理的 rejection,把整个进程带走。
+    // 端口对 Prometheus 开着,一个怪请求不能让 exporter 停掉
+    handle(req, res, read).catch((error) => {
+      log.warn(`Request failed: ${(error as Error).message}`);
+      if (!res.headersSent) res.writeHead(500, { "Content-Type": "text/plain; charset=utf-8" });
+      res.end();
+    });
   });
+}
+
+async function handle(
+  req: IncomingMessage,
+  res: ServerResponse,
+  read: (abortSignal: AbortSignal) => Promise<BucketState>
+): Promise<void> {
+  // 只要路径,不用 new URL:"GET // HTTP/1.1" 这种请求行会让它抛 Invalid URL
+  const path = (req.url ?? "/").split("?")[0];
+  if (req.method !== "GET") {
+    res.writeHead(405, { Allow: "GET", "Content-Type": "text/plain; charset=utf-8" });
+    res.end("Method Not Allowed\n");
+    return;
+  }
+  if (path === "/") {
+    res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+    res.end(LANDING_PAGE);
+    return;
+  }
+  if (path !== "/metrics") {
+    res.writeHead(404, { "Content-Type": "text/plain; charset=utf-8" });
+    res.end("Not Found\n");
+    return;
+  }
+
+  const started = performance.now();
+  const timeoutMs = scrapeTimeoutMs(req.headers["x-prometheus-scrape-timeout-seconds"]);
+  let state: BucketState | null = null;
+  try {
+    state = await read(AbortSignal.timeout(timeoutMs));
+  } catch (error) {
+    const e = error as Error;
+    const reason =
+      e.name === "TimeoutError" || e.name === "AbortError"
+        ? `timed out after ${(timeoutMs / 1000).toFixed(1)}s`
+        : e.message;
+    log.warn(`Could not read the backup bucket: ${reason}`);
+  }
+  // 微秒够用,免得样本里出现 0.021267749999999978 这种浮点尾巴
+  const body = renderMetrics(state, Number(((performance.now() - started) / 1000).toFixed(6)));
+  res.writeHead(200, { "Content-Type": "text/plain; version=0.0.4; charset=utf-8" });
+  res.end(body);
 }
 
 /** CLI 的 `backupdrill exporter`:起 HTTP 服务,直到进程被停掉。 */

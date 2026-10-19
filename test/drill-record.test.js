@@ -108,6 +108,44 @@ test("写不进去(只读 key):只警告,不抛错", async () => {
   }
 });
 
+test("两次演练重叠:晚写进桶的旧结论不盖掉更新的结论", async () => {
+  const fake = await startFakeS3();
+  const warnings = [];
+  const m = mock.method(console, "error", (...args) => warnings.push(args.join(" ")));
+  try {
+    const config = CONFIG(fake.bucket);
+    const newerFailure = buildDrillRecord(FAILED_REPORT, new Date("2026-10-20T05:00:00.000Z"));
+    const olderSuccess = buildDrillRecord(PASSED_REPORT, new Date("2026-10-20T04:00:00.000Z"));
+    await writeDrillRecord(fake.s3, config, newerFailure);
+    await writeDrillRecord(fake.s3, config, olderSuccess);
+    const last = JSON.parse(fake.objects.get("backupdrill/my-app/last-drill.json"));
+    assert.equal(last.pass, false, "the newer failure must survive");
+    assert.equal(last.finishedAt, "2026-10-20T05:00:00.000Z");
+    // last-passed-drill.json 里还没有更新的,旧的通过照常写进去
+    assert.equal(JSON.parse(fake.objects.get("backupdrill/my-app/last-passed-drill.json")).finishedAt, "2026-10-20T04:00:00.000Z");
+    assert.match(warnings.join("\n"), /last-drill\.json already holds a newer drill/);
+  } finally {
+    m.mock.restore();
+    await fake.close();
+  }
+});
+
+test("桶接了请求不回应:记一笔有时限,演练不会卡住", async () => {
+  const fake = await startFakeS3();
+  const warnings = [];
+  const m = mock.method(console, "error", (...args) => warnings.push(args.join(" ")));
+  try {
+    fake.fail((req) => (req.method === "PUT" ? "hang" : null));
+    const started = Date.now();
+    await recordDrillOutcome(CONFIG(fake.bucket), PASSED_REPORT, fake.s3, 300);
+    assert.ok(Date.now() - started < 2000, "should give up after the deadline");
+    assert.match(warnings.join("\n"), /no answer from the bucket within 0\.3s/);
+  } finally {
+    m.mock.restore();
+    await fake.close();
+  }
+});
+
 test("记录文件在 <project>/ 下,resolveSnapshot 照样选最新的快照目录", async () => {
   const fake = await startFakeS3();
   try {

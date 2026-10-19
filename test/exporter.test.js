@@ -304,6 +304,32 @@ test("抓取时限:跟着 Prometheus 的请求头走,留余量;没有头时 10 �
   assert.equal(scrapeTimeoutMs(undefined), 10_000);
   assert.equal(scrapeTimeoutMs("abc"), 10_000);
   assert.equal(scrapeTimeoutMs("0"), 10_000);
+  // AbortSignal.timeout 只收整数毫秒:1.1 秒不能算成 600.0000000000001
+  assert.equal(scrapeTimeoutMs("1.1"), 600);
+  assert.ok(Number.isInteger(scrapeTimeoutMs("7.3")));
+  assert.equal(scrapeTimeoutMs("100000"), 300_000);
+});
+
+test("怪请求行(GET // HTTP/1.1)不能把 exporter 进程带走", async () => {
+  const server = createExporterServer(async () => ({ snapshots: 0, latest: null, lastDrill: null, lastPassedDrill: null }));
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const { port } = server.address();
+  try {
+    const raw = await new Promise((resolve, reject) => {
+      const socket = net.connect(port, "127.0.0.1", () => {
+        socket.write("GET // HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+      });
+      let data = "";
+      socket.on("data", (c) => (data += c));
+      socket.on("end", () => resolve(data));
+      socket.on("error", reject);
+    });
+    assert.match(raw, /^HTTP\/1\.1 404/);
+    // 进程还活着、还在服务
+    assert.equal((await fetch(`http://127.0.0.1:${port}/metrics`)).status, 200);
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+  }
 });
 
 test("HTTP:/metrics 的 Content-Type、首页链到 /metrics、其他路径 404、非 GET 405", async () => {
