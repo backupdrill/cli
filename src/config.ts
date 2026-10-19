@@ -102,7 +102,12 @@ async function fromFile(path: string): Promise<RawConfig> {
     return JSON.parse(await readFile(path, "utf8")) as RawConfig;
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return {};
-    throw new Error(`Could not read config file ${path}: ${(error as Error).message}`);
+    // JSON.parse 的报错会引用出错位置附近的原文,里面可能正好是密钥。本机日志里留着它方便排错;
+    // 发给监控(Healthchecks 会把它放进告警邮件)的只用 pingMessage 这句不带原文的
+    throw Object.assign(
+      new Error(`Could not read config file ${path}: ${(error as Error).message}`),
+      { pingMessage: `Could not read config file ${path}. The job's log has the details.` }
+    );
   }
 }
 
@@ -121,7 +126,9 @@ export async function resolvePingUrl(opts: {
   } catch {
     // 配置文件读不了时由 loadConfig 报错,这里只是拿不到文件里的网址
   }
-  return [opts.flag, process.env.BACKUPDRILL_PING_URL, file.pingUrl]
+  // 文件内容可能是 null、数组这类非对象的合法 JSON:那是 loadConfig 要报的错,这里只是拿不到网址
+  const filePingUrl = file && typeof file === "object" ? file.pingUrl : undefined;
+  return [opts.flag, process.env.BACKUPDRILL_PING_URL, filePingUrl]
     .map((value) => (typeof value === "string" ? value.trim() : undefined))
     .find(Boolean);
 }

@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { Command } from "commander";
 import { loadConfig, resolvePingUrl, type LoadedBackupConfig } from "./config.js";
-import { createPinger, sensitiveValuesOf } from "./ping.js";
+import { createPinger, pingMessageOf, sensitiveValuesOf } from "./ping.js";
 import { runBackup } from "./backup.js";
 import { runEstimate, type EgressPricing } from "./estimate.js";
 import { runDrill } from "./drill.js";
@@ -113,7 +113,7 @@ program
       log.error(message);
       process.exitCode = 1;
       await ping.fail(
-        `backupdrill ${TOOL_VERSION}: backup failed. ${message}`,
+        `backupdrill ${TOOL_VERSION}: backup failed. ${pingMessageOf(error)}`,
         sensitiveValuesOf(config, opts.databaseUrl)
       );
     }
@@ -200,7 +200,10 @@ program
       const message = (error as Error).message;
       log.error(message);
       process.exitCode = 1;
-      await ping.fail(`backupdrill ${TOOL_VERSION}: drill failed. ${message}`, sensitiveValuesOf(config));
+      await ping.fail(
+        `backupdrill ${TOOL_VERSION}: drill failed. ${pingMessageOf(error)}`,
+        sensitiveValuesOf(config)
+      );
     }
   });
 

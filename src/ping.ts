@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import type { BackupConfig } from "./config.js";
 import { log } from "./log.js";
-import { projectRefOf } from "./restore-engine.js";
+import { projectRefOf, refFromStorageEndpoint } from "./restore-engine.js";
 import { TOOL_VERSION } from "./version.js";
 
 // 按 Healthchecks.io 的 ping 约定报告一次 backup / drill(https://healthchecks.io/docs/http_api/):
@@ -44,6 +44,11 @@ export function createPinger(
     log.warn("The ping URL is not a valid http(s) URL, so no pings will be sent. The run carries on.");
     return NO_PING;
   }
+  // fetch 拒绝带用户名密码的网址,而且拒绝时的报错里有整条网址;在这里先拦下,警告里不复述它
+  if (base.username || base.password) {
+    log.warn("The ping URL contains a username or password, which pings can't send, so no pings will be sent. The run carries on.");
+    return NO_PING;
+  }
   const timeoutMs = opts.timeoutMs ?? TIMEOUT_MS;
   const attempts = opts.attempts ?? ATTEMPTS;
   const retryDelayMs = opts.retryDelayMs ?? RETRY_DELAY_MS;
@@ -71,16 +76,25 @@ export function createPinger(
           },
           signal: AbortSignal.timeout(timeoutMs),
         });
-        await res.body?.cancel();
-        if (res.ok) return;
+        const answer = await readStart(res);
+        if (res.ok) {
+          // Healthchecks.io 对查无此检查、超频的 ping 也回 200,正文是 "OK (not found)" /
+          // "OK (rate limited)"(https://healthchecks.io/docs/http_api/);这类 ping 没记上,要提醒
+          if (!/^OK \(/.test(answer)) return;
+          lastProblem = `Healthchecks answered "${answer.replace(/[^\x20-\x7e]/g, "").slice(0, 60)}"`;
+          break;
+        }
         lastProblem = `HTTP ${res.status}`;
         if (res.status < 500) break;
       } catch (error) {
-        const err = error as Error & { cause?: { code?: string; message?: string } };
+        // 只报超时或错误码,不报原始报错:有些报错会把整条网址带出来
+        const err = error as Error & { cause?: { code?: unknown } };
         lastProblem =
           err.name === "TimeoutError"
             ? `no response within ${Math.round(timeoutMs / 1000)}s`
-            : err.cause?.code ?? err.cause?.message ?? err.message;
+            : typeof err.cause?.code === "string"
+              ? err.cause.code
+              : "network error";
       }
       if (attempt < attempts) await new Promise((r) => setTimeout(r, retryDelayMs * attempt));
     }
@@ -94,8 +108,33 @@ export function createPinger(
   };
 }
 
+/** 只读响应开头一小段:Healthchecks 的回答就几个字节,网址填错指到大页面时也不整页下载 */
+async function readStart(res: Response, limit = 256): Promise<string> {
+  if (!res.body) return "";
+  const reader = res.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let size = 0;
+  try {
+    while (size < limit) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      chunks.push(value);
+      size += value.length;
+    }
+  } finally {
+    await reader.cancel().catch(() => {});
+  }
+  return Buffer.concat(chunks).subarray(0, limit).toString("utf8").trim();
+}
+
 function truncate(text: string): string {
   return text.length > BODY_LIMIT ? `${text.slice(0, BODY_LIMIT - 1)}…` : text;
+}
+
+/** 报错可以自带一句发给监控用的说法(pingMessage),比如不能复述配置文件原文的那种 */
+export function pingMessageOf(error: unknown): string {
+  const err = error as Error & { pingMessage?: unknown };
+  return typeof err?.pingMessage === "string" ? err.pingMessage : String(err?.message ?? error);
 }
 
 /**
@@ -124,6 +163,11 @@ export function scrubForPing(text: string, sensitive: string[]): string {
 export function sensitiveValuesOf(config: BackupConfig | undefined, extraDatabaseUrl?: string): string[] {
   const env = process.env;
   const values: (string | undefined)[] = [
+    // Storage 端点里有项目 ref(<ref>.storage.supabase.co),库与 Storage 不是同一项目的报错会带出它
+    ...[config?.supabaseStorage?.endpoint, env.BACKUPDRILL_SUPABASE_STORAGE_ENDPOINT].flatMap((endpoint) =>
+      endpoint ? [refFromStorageEndpoint(endpoint) ?? undefined, hostOf(endpoint)] : []
+    ),
+    ...[config?.storage?.endpoint, env.BACKUPDRILL_S3_ENDPOINT].map(hostOf),
     env.BACKUPDRILL_S3_ACCESS_KEY_ID,
     env.BACKUPDRILL_S3_SECRET_ACCESS_KEY,
     env.BACKUPDRILL_SUPABASE_STORAGE_ACCESS_KEY_ID,
@@ -146,4 +190,13 @@ export function sensitiveValuesOf(config: BackupConfig | undefined, extraDatabas
     }
   }
   return values.filter((v): v is string => Boolean(v));
+}
+
+function hostOf(endpoint: string | undefined): string | undefined {
+  if (!endpoint) return undefined;
+  try {
+    return new URL(endpoint).hostname;
+  } catch {
+    return undefined;
+  }
 }

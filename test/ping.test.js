@@ -26,10 +26,12 @@ before(async () => {
     req.on("end", () => {
       const url = new URL(req.url, "http://x");
       requests.push({ method: req.method, path: url.pathname, query: url.searchParams, body, ua: req.headers["user-agent"] });
-      const status = behavior(requests.length);
-      if (status === "hang") return; // 不回,逼出超时
+      const answer = behavior(requests.length);
+      if (answer === "hang") return; // 不回,逼出超时
+      // 数字 = 状态码;字符串 = 200 加这段正文(Healthchecks.io 的 "OK (not found)" 那种)
+      const status = typeof answer === "number" ? answer : 200;
       res.writeHead(status, { "content-type": "text/plain" });
-      res.end(status === 200 ? "OK" : "nope");
+      res.end(typeof answer === "string" ? answer : status === 200 ? "OK" : "nope");
     });
   });
   await new Promise((r) => server.listen(0, "127.0.0.1", r));
@@ -110,6 +112,44 @@ test("5xx 重试,4xx 不重试,都只打警告不抛错", async () => {
   assert.equal(requests.length, 1, "404 重试也没用");
   assert.match(warn.lines.join("\n"), /Could not send the start ping \(HTTP 404\)/);
   assert.ok(!warn.lines.join("\n").includes(UUID), "警告里不该出现 ping 网址");
+});
+
+test("200 但正文是 OK (not found) / OK (rate limited):没记上,要警告,不重试", async () => {
+  for (const answer of ["OK (not found)", "OK (rate limited)"]) {
+    requests = [];
+    behavior = () => answer;
+    const warn = captureWarnings();
+    try {
+      await createPinger(`${base}/${UUID}`, FAST).success("x");
+    } finally {
+      warn.restore();
+    }
+    assert.equal(requests.length, 1, `${answer} 不该重试`);
+    assert.ok(warn.lines.join("\n").includes(`Healthchecks answered "${answer}"`), warn.lines.join("\n"));
+  }
+  // 自动建检查时回 201 Created,算成功
+  requests = [];
+  behavior = () => 201;
+  const warn = captureWarnings();
+  try {
+    await createPinger(`${base}/${UUID}`, FAST).start();
+  } finally {
+    warn.restore();
+  }
+  assert.equal(warn.lines.length, 0);
+});
+
+test("网址带用户名密码:不发 ping,警告里也不复述它", async () => {
+  const warn = captureWarnings();
+  try {
+    await createPinger(`http://hcuser:hcPassw0rd@127.0.0.1:${new URL(base).port}/${UUID}`, FAST).start();
+  } finally {
+    warn.restore();
+  }
+  assert.equal(requests.length, 0);
+  const text = warn.lines.join("\n");
+  assert.match(text, /contains a username or password/);
+  assert.ok(!text.includes("hcPassw0rd") && !text.includes(UUID), text);
 });
 
 test("服务不回话时按超时放弃,不会卡住", async () => {
@@ -198,7 +238,12 @@ test("resolvePingUrl 的优先级和空串", async () => {
   // 配置文件坏了不在这里报错(loadConfig 会报),只是拿不到文件里的网址
   writeFileSync(configPath, "{ not json");
   assert.equal(await resolvePingUrl({ configPath }), undefined);
+  // 合法但不是对象的 JSON(null)也不能让这里抛错,否则 /start 和 /fail 都发不出去
+  writeFileSync(configPath, "null");
+  assert.equal(await resolvePingUrl({ configPath }), undefined);
   assert.equal(await resolvePingUrl({ configPath: join(dir, "missing.json") }), undefined);
+  process.env.BACKUPDRILL_PING_URL = "https://hc.example/env";
+  assert.equal(await resolvePingUrl({ configPath }), "https://hc.example/env");
 });
 
 // ── 端到端:真跑 CLI ───────────────────────────────────────────────────────
@@ -246,6 +291,35 @@ test("配置不全也报 /fail(网址来自 --ping-url)", async () => {
   assert.match(result.stderr, /Missing required config/);
   assert.deepEqual(requests.map((r) => r.path), [`/${UUID}/start`, `/${UUID}/fail`]);
   assert.match(requests[1].body, /Missing required config/);
+});
+
+test("配置文件不是合法 JSON:/fail 里不带文件原文(原文里可能就是密钥)", async () => {
+  writeFileSync(join(dir, "backupdrill.config.json"), '{"storage":{"secretAccessKey":FAKESECRETKEY123}}');
+  const result = await runCli(["backup"], { BACKUPDRILL_PING_URL: `${base}/${UUID}` });
+  assert.equal(result.code, 1);
+  assert.match(result.stderr, /Could not read config file/);
+  assert.deepEqual(requests.map((r) => r.path), [`/${UUID}/start`, `/${UUID}/fail`]);
+  assert.match(requests[1].body, /Could not read config file backupdrill\.config\.json\. The job's log has the details\./);
+  assert.ok(!requests[1].body.includes("FAKESECRET"), requests[1].body);
+});
+
+test("库和 Storage 指向不同项目:两个项目 ref 都不进 /fail", async () => {
+  const result = await runCli(["backup"], {
+    BACKUPDRILL_PING_URL: `${base}/${UUID}`,
+    BACKUPDRILL_DATABASE_URL: "postgresql://postgres.aaaaaaaaaaaaaaaaaaaa:pw@aws-0-us-east-1.pooler.supabase.com:5432/postgres",
+    BACKUPDRILL_SUPABASE_STORAGE_ENDPOINT: "https://bbbbbbbbbbbbbbbbbbbb.storage.supabase.co/storage/v1/s3",
+    BACKUPDRILL_SUPABASE_STORAGE_REGION: "us-east-1",
+    BACKUPDRILL_SUPABASE_STORAGE_ACCESS_KEY_ID: "storagekeyid",
+    BACKUPDRILL_SUPABASE_STORAGE_SECRET_ACCESS_KEY: "storagesecret",
+    ...BUCKET_ENV,
+  });
+  assert.equal(result.code, 1);
+  assert.match(result.stderr, /database points at Supabase project/);
+  const body = requests[1].body;
+  assert.match(body, /database points at Supabase project/);
+  for (const leak of ["aaaaaaaaaaaaaaaaaaaa", "bbbbbbbbbbbbbbbbbbbb"]) {
+    assert.ok(!body.includes(leak), `fail body leaks ${leak}: ${body}`);
+  }
 });
 
 test("ping 服务挂了:backup 的结果和报错跟没配 ping 时一样,只多警告", async () => {
