@@ -312,7 +312,7 @@ For a second project, run a second exporter with `--project-name` and a differen
 
 A snapshot counts as complete once its `manifest.json` exists, because the backup writes it last. While there is no complete snapshot, the `latest_snapshot` metrics are left out. `backupdrill_drill_last_run_passed` appears once a drill has been recorded, and the restore duration once a recorded drill has passed. A manifest dated more than 10 minutes in the future counts as a failed read (`backupdrill_up 0`), and a drill file named with such a time is skipped with a warning in the log: either would hold back the alerts that work out an age from that timestamp. Check the clock on the machine that wrote it.
 
-Alert rules to start from (`promtool check rules` passes on them):
+Alert rules to start from. Save them as `backupdrill-alerts.yml`, list that file under `rule_files` in `prometheus.yml` and reload Prometheus; `promtool check rules` passes on them:
 
 ```yaml
 groups:
