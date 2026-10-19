@@ -255,7 +255,7 @@ backupdrill backup
 
 - `<url>/start` before it begins, so Healthchecks shows how long the run took and alerts if it runs past the grace time;
 - `<url>` when it succeeds, with a one-line summary in the body (tables, Storage files and the snapshot name; for `drill`, rows restored and restore time);
-- `<url>/fail` when it fails, with the error in the body. For a drill that ran but didn't pass, that's the failed checks. Before it's sent, the CLI removes connection strings, passwords, hostnames, IP addresses, project refs and bucket keys, and drops the parts of Postgres errors that quote row values or SQL (`DETAIL`, `CONTEXT`, `Command was`). The full error stays in the job's own output.
+- `<url>/fail` when it fails, with the error in the body. For a drill that ran but didn't pass, that's the failed checks. Before it's sent, the CLI filters out the connection strings, passwords, hostnames, IP addresses, project refs and bucket keys it can recognise, plus the parts of Postgres errors that usually quote row values or SQL (`DETAIL`, `CONTEXT`, `Command was`). It's a filter, not a guarantee: a sensitive value it doesn't recognise can still reach Healthchecks. The full error stays in the job's own output.
 
 Both pings of a run carry the same `rid`, so Healthchecks pairs them even if two runs overlap. If you schedule both `backup` and `drill`, give each its own check: on a shared check, the daily backup's success pings would keep it up while a weekly drill that stopped running went unnoticed.
 
