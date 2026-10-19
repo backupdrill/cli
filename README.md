@@ -311,7 +311,7 @@ For a second project, run a second exporter with `--project-name` and a differen
 | `backupdrill_drill_last_success_timestamp_seconds` | When the last recorded drill that passed finished; 0 if none |
 | `backupdrill_drill_last_success_restore_duration_seconds` | How long the database restore took in that drill |
 
-A snapshot counts as complete once its `manifest.json` exists, because the backup writes it last. While there is no complete snapshot, the `latest_snapshot` metrics are left out. `backupdrill_drill_last_run_passed` appears once a drill has been recorded, and the restore duration once a recorded drill has passed.
+A snapshot counts as complete once its `manifest.json` exists, because the backup writes it last. While there is no complete snapshot, the `latest_snapshot` metrics are left out. `backupdrill_drill_last_run_passed` appears once a drill has been recorded, and the restore duration once a recorded drill has passed. A manifest or drill record dated more than 10 minutes in the future counts as a failed read (`backupdrill_up 0`), because it would keep every age-based alert quiet; check the clock on the machine that wrote it.
 
 Alert rules to start from (`promtool check rules` passes on them):
 

@@ -20,6 +20,12 @@ import { TOOL_VERSION } from "./version.js";
 export const LAST_DRILL_FILE = "last-drill.json";
 export const LAST_PASSED_DRILL_FILE = "last-passed-drill.json";
 
+/**
+ * 记录里的时间最多可以比读它的这台机器的时钟快多少。备份、演练、exporter 可能在不同机器上跑,
+ * 几分钟的时钟差是正常的;再多就当这份记录不可信(见 newerExisting 和 exporter 的 summarize)。
+ */
+export const CLOCK_SKEW_TOLERANCE_MS = 10 * 60_000;
+
 /** 版本规则同 manifest:缺省不接受,更高的版本明确报错让用户升级,不按旧结构硬读。 */
 export const DRILL_RECORD_SCHEMA_VERSION = 1;
 
@@ -71,12 +77,21 @@ async function newerExisting(
     if (status === 404 || (error as Error).name === "NoSuchKey") return null;
     throw error;
   }
+  let existing: DrillRecord;
   try {
-    const existing = parseDrillRecord(text, key);
-    return Date.parse(existing.finishedAt) > Date.parse(record.finishedAt) ? existing.finishedAt : null;
+    existing = parseDrillRecord(text, key);
   } catch {
     return null; // 坏掉的旧记录直接覆盖
   }
+  const existingAt = Date.parse(existing.finishedAt);
+  // 时间在将来的记录(被改过,或写它的机器时钟快了)要是被当成"更新的",以后每次演练都会被
+  // 它挡住、指标永远停在那里。当坏记录覆盖,并说出来
+  // 和"现在"比,不和本次记录的时间比:本次记录本来就可能是延迟写进来的那份
+  if (existingAt > Date.now() + CLOCK_SKEW_TOLERANCE_MS) {
+    log.warn(`${key} says it finished at ${existing.finishedAt}, which is in the future; overwriting it.`);
+    return null;
+  }
+  return existingAt > Date.parse(record.finishedAt) ? existing.finishedAt : null;
 }
 
 /**

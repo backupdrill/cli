@@ -28,7 +28,7 @@ const CONFIG = (bucket) => ({
   },
 });
 
-const FINISHED = new Date("2026-10-20T04:00:00.000Z");
+const FINISHED = new Date("2026-01-20T04:00:00.000Z");
 const PASSED_REPORT = {
   snapshot: "2026-10-19T03-00-00-000Z",
   pass: true,
@@ -50,7 +50,7 @@ test("通过的演练:记快照名和恢复用时,不记检查明细", () => {
     schemaVersion: 1,
     tool: "backupdrill-cli",
     toolVersion: TOOL_VERSION,
-    finishedAt: "2026-10-20T04:00:00.000Z",
+    finishedAt: "2026-01-20T04:00:00.000Z",
     pass: true,
     snapshot: "2026-10-19T03-00-00-000Z",
     restoreSeconds: 41,
@@ -81,7 +81,7 @@ test("写到哪:通过时写 last-drill.json 和 last-passed-drill.json,没通�
       "backupdrill/my-app/last-passed-drill.json",
     ]);
 
-    const later = new Date("2026-10-27T04:00:00.000Z");
+    const later = new Date("2026-01-27T04:00:00.000Z");
     await writeDrillRecord(fake.s3, config, buildDrillRecord(FAILED_REPORT, later));
     const last = JSON.parse(fake.objects.get("backupdrill/my-app/last-drill.json"));
     const lastPassed = JSON.parse(fake.objects.get("backupdrill/my-app/last-passed-drill.json"));
@@ -114,16 +114,42 @@ test("两次演练重叠:晚写进桶的旧结论不盖掉更新的结论", asyn
   const m = mock.method(console, "error", (...args) => warnings.push(args.join(" ")));
   try {
     const config = CONFIG(fake.bucket);
-    const newerFailure = buildDrillRecord(FAILED_REPORT, new Date("2026-10-20T05:00:00.000Z"));
-    const olderSuccess = buildDrillRecord(PASSED_REPORT, new Date("2026-10-20T04:00:00.000Z"));
+    const newerFailure = buildDrillRecord(FAILED_REPORT, new Date("2026-01-20T05:00:00.000Z"));
+    const olderSuccess = buildDrillRecord(PASSED_REPORT, new Date("2026-01-20T04:00:00.000Z"));
     await writeDrillRecord(fake.s3, config, newerFailure);
     await writeDrillRecord(fake.s3, config, olderSuccess);
     const last = JSON.parse(fake.objects.get("backupdrill/my-app/last-drill.json"));
     assert.equal(last.pass, false, "the newer failure must survive");
-    assert.equal(last.finishedAt, "2026-10-20T05:00:00.000Z");
+    assert.equal(last.finishedAt, "2026-01-20T05:00:00.000Z");
     // last-passed-drill.json 里还没有更新的,旧的通过照常写进去
-    assert.equal(JSON.parse(fake.objects.get("backupdrill/my-app/last-passed-drill.json")).finishedAt, "2026-10-20T04:00:00.000Z");
+    assert.equal(JSON.parse(fake.objects.get("backupdrill/my-app/last-passed-drill.json")).finishedAt, "2026-01-20T04:00:00.000Z");
     assert.match(warnings.join("\n"), /last-drill\.json already holds a newer drill/);
+  } finally {
+    m.mock.restore();
+    await fake.close();
+  }
+});
+
+test("桶里的记录时间在将来(被改过或时钟快了):不让它挡住新结论,覆盖并警告", async () => {
+  const fake = await startFakeS3();
+  const warnings = [];
+  const m = mock.method(console, "error", (...args) => warnings.push(args.join(" ")));
+  try {
+    const config = CONFIG(fake.bucket);
+    const future = new Date(Date.now() + 365 * 86400_000);
+    await writeDrillRecord(fake.s3, config, buildDrillRecord(PASSED_REPORT, future));
+    const now = new Date();
+    await writeDrillRecord(fake.s3, config, buildDrillRecord(FAILED_REPORT, now));
+    const last = JSON.parse(fake.objects.get("backupdrill/my-app/last-drill.json"));
+    assert.equal(last.pass, false);
+    assert.equal(last.finishedAt, now.toISOString());
+    assert.match(warnings.join("\n"), /in the future; overwriting it/);
+
+    // 几分钟的时钟差不算:比自己晚 5 分钟的记录照样当成更新的
+    const slightlyAhead = new Date(now.getTime() + 5 * 60_000);
+    await writeDrillRecord(fake.s3, config, buildDrillRecord(PASSED_REPORT, slightlyAhead));
+    await writeDrillRecord(fake.s3, config, buildDrillRecord(FAILED_REPORT, now));
+    assert.equal(JSON.parse(fake.objects.get("backupdrill/my-app/last-drill.json")).finishedAt, slightlyAhead.toISOString());
   } finally {
     m.mock.restore();
     await fake.close();

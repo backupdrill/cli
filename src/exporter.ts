@@ -4,6 +4,7 @@ import { performance } from "node:perf_hooks";
 import { GetObjectCommand, type S3Client } from "@aws-sdk/client-s3";
 import { requireBucket, type BackupConfig } from "./config.js";
 import {
+  CLOCK_SKEW_TOLERANCE_MS,
   LAST_DRILL_FILE,
   LAST_PASSED_DRILL_FILE,
   drillRecordKey,
@@ -87,6 +88,7 @@ function summarize(text: string, key: string): SnapshotSummary {
   if (!Number.isFinite(createdAt)) {
     throw new Error(`${key} is malformed: createdAt`);
   }
+  assertNotInFuture(createdAt, key, "createdAt");
   return {
     createdAt,
     dumpBytes: manifest.dump.bytes,
@@ -97,6 +99,19 @@ function summarize(text: string, key: string): SnapshotSummary {
   };
 }
 
+/**
+ * 时间在将来的记录会让"距今多久"的告警永远不响(time() - 将来的时间是负数)。
+ * 报成读桶失败(up=0),让人去看是记录被改了还是哪台机器的时钟不对。
+ */
+function assertNotInFuture(at: number, key: string, field: string): void {
+  if (at > Date.now() + CLOCK_SKEW_TOLERANCE_MS) {
+    throw new Error(
+      `${key} has ${field} ${new Date(at).toISOString()}, more than 10 minutes in the future ` +
+        `(check the clock on the machine that wrote it)`
+    );
+  }
+}
+
 async function readDrillRecord(
   s3: S3Client,
   config: BackupConfig,
@@ -105,7 +120,10 @@ async function readDrillRecord(
 ): Promise<DrillRecord | null> {
   const key = drillRecordKey(config, file);
   const read = await readObject(s3, requireBucket(config).bucket, key, abortSignal);
-  return read.status === "ok" ? parseDrillRecord(read.text, file) : null;
+  if (read.status !== "ok") return null;
+  const record = parseDrillRecord(read.text, file);
+  assertNotInFuture(Date.parse(record.finishedAt), file, "finishedAt");
+  return record;
 }
 
 /**

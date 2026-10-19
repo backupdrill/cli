@@ -145,18 +145,18 @@ test("演练记录:最近一次没通过时,上一次通过的时间和恢复用
     putSnapshot(fake, NEW, "2026-10-19T03:05:00.000Z");
     fake.objects.set(
       `${ROOT}last-drill.json`,
-      drillRecord({ finishedAt: "2026-10-20T04:00:00.000Z", pass: false, snapshot: NEW })
+      drillRecord({ finishedAt: "2026-01-20T04:00:00.000Z", pass: false, snapshot: NEW })
     );
     fake.objects.set(
       `${ROOT}last-passed-drill.json`,
-      drillRecord({ finishedAt: "2026-10-13T04:00:00.000Z", pass: true, snapshot: OLD, restoreSeconds: 42.5 })
+      drillRecord({ finishedAt: "2026-01-13T04:00:00.000Z", pass: true, snapshot: OLD, restoreSeconds: 42.5 })
     );
     const m = parseMetrics(
       renderMetrics(await createBucketReader(fake.s3, CONFIG(fake.bucket))(AbortSignal.timeout(5000)), 0)
     );
-    assert.equal(m.backupdrill_drill_last_run_timestamp_seconds, Date.parse("2026-10-20T04:00:00.000Z") / 1000);
+    assert.equal(m.backupdrill_drill_last_run_timestamp_seconds, Date.parse("2026-01-20T04:00:00.000Z") / 1000);
     assert.equal(m.backupdrill_drill_last_run_passed, 0);
-    assert.equal(m.backupdrill_drill_last_success_timestamp_seconds, Date.parse("2026-10-13T04:00:00.000Z") / 1000);
+    assert.equal(m.backupdrill_drill_last_success_timestamp_seconds, Date.parse("2026-01-13T04:00:00.000Z") / 1000);
     assert.equal(m.backupdrill_drill_last_success_restore_duration_seconds, 42.5);
     // 演练记录是 <project>/ 下的对象,不是目录,不能算进快照
     assert.equal(m.backupdrill_snapshots, 1);
@@ -230,8 +230,26 @@ for (const [name, setup, expectedWarning] of [
     /createdAt/,
   ],
   [
+    "manifest 的 createdAt 在一年以后",
+    (fake) =>
+      fake.objects.set(
+        `${ROOT}${NEW}/manifest.json`,
+        Buffer.from(manifestJson({ snapshot: NEW, createdAt: new Date(Date.now() + 365 * 86400_000).toISOString() }))
+      ),
+    /createdAt .* in the future/,
+  ],
+  [
+    "演练记录的时间在一年以后",
+    (fake) =>
+      fake.objects.set(
+        `${ROOT}last-passed-drill.json`,
+        drillRecord({ finishedAt: new Date(Date.now() + 365 * 86400_000).toISOString(), pass: true })
+      ),
+    /last-passed-drill\.json has finishedAt .* in the future/,
+  ],
+  [
     "演练记录结构不对",
-    (fake) => fake.objects.set(`${ROOT}last-drill.json`, drillRecord({ finishedAt: "2026-10-20T04:00:00Z", pass: "yes" })),
+    (fake) => fake.objects.set(`${ROOT}last-drill.json`, drillRecord({ finishedAt: "2026-01-20T04:00:00Z", pass: "yes" })),
     /last-drill\.json is malformed: pass/,
   ],
   [
@@ -239,7 +257,7 @@ for (const [name, setup, expectedWarning] of [
     (fake) =>
       fake.objects.set(
         `${ROOT}last-passed-drill.json`,
-        drillRecord({ schemaVersion: 2, finishedAt: "2026-10-20T04:00:00Z", pass: true })
+        drillRecord({ schemaVersion: 2, finishedAt: "2026-01-20T04:00:00Z", pass: true })
       ),
     /Upgrade the CLI/,
   ],
@@ -361,8 +379,8 @@ test("文本格式:每个指标先 HELP 后 TYPE gauge,名字合规,只有 build
         tables: 1,
         estimatedRows: 1,
       },
-      lastDrill: { schemaVersion: 1, tool: "backupdrill-cli", toolVersion: "x", finishedAt: "2026-10-20T00:00:00Z", pass: true, restoreSeconds: 3 },
-      lastPassedDrill: { schemaVersion: 1, tool: "backupdrill-cli", toolVersion: "x", finishedAt: "2026-10-20T00:00:00Z", pass: true, restoreSeconds: 3 },
+      lastDrill: { schemaVersion: 1, tool: "backupdrill-cli", toolVersion: "x", finishedAt: "2026-01-20T00:00:00Z", pass: true, restoreSeconds: 3 },
+      lastPassedDrill: { schemaVersion: 1, tool: "backupdrill-cli", toolVersion: "x", finishedAt: "2026-01-20T00:00:00Z", pass: true, restoreSeconds: 3 },
     },
     0.25
   );
