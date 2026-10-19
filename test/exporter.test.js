@@ -5,6 +5,7 @@ import { test, mock } from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import net from "node:net";
+import { S3Client } from "@aws-sdk/client-s3";
 import { fileURLToPath } from "node:url";
 import { createBucketReader, createExporterServer, renderMetrics, scrapeTimeoutMs } from "../dist/exporter.js";
 import { TOOL_VERSION } from "../dist/version.js";
@@ -248,6 +249,15 @@ for (const [name, setup, expectedWarning] of [
     /last-passed-drill\.json has finishedAt .* in the future/,
   ],
   [
+    "manifest 的行数不是数字",
+    (fake) => {
+      const m = JSON.parse(manifestJson({ snapshot: NEW, createdAt: "2026-10-19T03:05:00.000Z" }));
+      m.database.estimatedRowTotal = "broken\nbackupdrill_up 1";
+      fake.objects.set(`${ROOT}${NEW}/manifest.json`, Buffer.from(JSON.stringify(m)));
+    },
+    /estimatedRows is not a non-negative number/,
+  ],
+  [
     "演练记录结构不对",
     (fake) => fake.objects.set(`${ROOT}last-drill.json`, drillRecord({ finishedAt: "2026-01-20T04:00:00Z", pass: "yes" })),
     /last-drill\.json is malformed: pass/,
@@ -307,6 +317,37 @@ test("桶不回应:按 Prometheus 给的超时放弃,报 up=0,不拖过抓取时
         assert.equal(parseMetrics(await res.text()).backupdrill_up, 0);
         assert.ok(elapsed < 1000, `took ${elapsed}ms, Prometheus would have given up at 1000ms`);
         assert.match(warnings.join("\n"), /timed out after 0\.5s/);
+      });
+    } finally {
+      await new Promise((resolve) => server.close(resolve));
+    }
+  } finally {
+    await fake.close();
+  }
+});
+
+test("桶回 503 + Retry-After:SDK 按默认重试在睡,也要按时回 up=0", async () => {
+  const fake = await startFakeS3();
+  try {
+    fake.fail(() => ({ status: 503, code: "SlowDown", headers: { "retry-after": "2" } }));
+    // 用默认重试设置的客户端(假桶自带的那个关了重试)
+    const s3 = new S3Client({
+      region: "us-east-1",
+      endpoint: fake.endpoint,
+      forcePathStyle: true,
+      credentials: { accessKeyId: "test", secretAccessKey: "test" },
+    });
+    const server = createExporterServer(createBucketReader(s3, CONFIG(fake.bucket)));
+    await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+    try {
+      await withQuietLog(async () => {
+        const started = Date.now();
+        const res = await fetch(`http://127.0.0.1:${server.address().port}/metrics`, {
+          headers: { "X-Prometheus-Scrape-Timeout-Seconds": "1" },
+        });
+        const elapsed = Date.now() - started;
+        assert.equal(parseMetrics(await res.text()).backupdrill_up, 0);
+        assert.ok(elapsed < 1000, `took ${elapsed}ms, Prometheus would have given up at 1000ms`);
       });
     } finally {
       await new Promise((resolve) => server.close(resolve));

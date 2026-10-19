@@ -39,7 +39,7 @@ export async function startFakeS3({ bucket = "backups", pageSize = 1000 } = {}) 
       const injected = failWith?.(record);
       if (injected === "hang") return; // 不回应,等客户端自己放弃
       if (injected) {
-        res.writeHead(injected.status, { "content-type": "application/xml" });
+        res.writeHead(injected.status, { "content-type": "application/xml", ...(injected.headers ?? {}) });
         res.end(`<Error><Code>${injected.code}</Code><Message>${injected.code}</Message></Error>`);
         return;
       }

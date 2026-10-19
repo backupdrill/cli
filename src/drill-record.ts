@@ -80,7 +80,9 @@ async function newerExisting(
   let existing: DrillRecord;
   try {
     existing = parseDrillRecord(text, key);
-  } catch {
+  } catch (error) {
+    // 更新的 CLI 写的:不覆盖,报出去(recordDrillOutcome 打警告,提示升级)
+    if (error instanceof UnsupportedDrillRecordVersion) throw error;
     return null; // 坏掉的旧记录直接覆盖
   }
   const existingAt = Date.parse(existing.finishedAt);
@@ -157,6 +159,9 @@ export async function recordDrillOutcome(
   }
 }
 
+/** 更新的 CLI 写的记录:读不懂,但也不能当坏记录覆盖掉(那等于用旧格式把新信息抹了) */
+export class UnsupportedDrillRecordVersion extends Error {}
+
 function malformed(file: string, what: string): never {
   throw new Error(`${file} is malformed: ${what}`);
 }
@@ -177,7 +182,7 @@ export function parseDrillRecord(json: string, file: string): DrillRecord {
     malformed(file, `schemaVersion ${JSON.stringify(r.schemaVersion)}`);
   }
   if (r.schemaVersion > DRILL_RECORD_SCHEMA_VERSION) {
-    throw new Error(
+    throw new UnsupportedDrillRecordVersion(
       `${file} uses schema version ${r.schemaVersion}, but this BackupDrill understands up to ` +
         `${DRILL_RECORD_SCHEMA_VERSION}. Upgrade the CLI (npm i -g backupdrill@latest) to read it.`
     );

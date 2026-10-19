@@ -89,7 +89,7 @@ function summarize(text: string, key: string): SnapshotSummary {
     throw new Error(`${key} is malformed: createdAt`);
   }
   assertNotInFuture(createdAt, key, "createdAt");
-  return {
+  const summary = {
     createdAt,
     dumpBytes: manifest.dump.bytes,
     storageFiles: manifest.storage?.fileCount ?? 0,
@@ -97,6 +97,14 @@ function summarize(text: string, key: string): SnapshotSummary {
     tables: manifest.database.tableCount,
     estimatedRows: manifest.database.estimatedRowTotal,
   };
+  // 这些数会原样写进指标文本。parseManifest 只管演练和恢复要用的字段(estimatedRowTotal 就不查),
+  // 一个字符串或带换行的值能让整次抓取在 Prometheus 那边解析失败,甚至塞进假样本
+  for (const [field, value] of Object.entries(summary)) {
+    if (typeof value !== "number" || !Number.isFinite(value) || value < 0) {
+      throw new Error(`${key} is malformed: ${field} is not a non-negative number`);
+    }
+  }
+  return summary;
 }
 
 /**
@@ -294,6 +302,29 @@ export function scrapeTimeoutMs(header: string | string[] | undefined): number {
   return Math.min(Math.max(1, Math.floor(Math.max(value - 0.5, value / 2) * 1000)), MAX_SCRAPE_TIMEOUT_MS);
 }
 
+/**
+ * 到点就放弃,不管 read 停没停。只把 AbortSignal 交给 SDK 不够:它在两次重试之间按
+ * Retry-After 睡觉时不看 signal,503 带 Retry-After: 2 就能把 1 秒的抓取拖到 2 秒多。
+ * signal 仍然传下去,让还在跑的请求尽快收手。
+ */
+async function withDeadline<T>(run: (signal: AbortSignal) => Promise<T>, ms: number): Promise<T> {
+  const controller = new AbortController();
+  let timer: NodeJS.Timeout | undefined;
+  const deadline = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => {
+      const error = new Error(`timed out after ${ms}ms`);
+      error.name = "TimeoutError";
+      controller.abort(error);
+      reject(error);
+    }, ms);
+  });
+  try {
+    return await Promise.race([run(controller.signal), deadline]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 const LANDING_PAGE = `<!doctype html>
 <html lang="en">
 <head><meta charset="utf-8"><title>backupdrill exporter</title></head>
@@ -346,7 +377,7 @@ async function handle(
   const timeoutMs = scrapeTimeoutMs(req.headers["x-prometheus-scrape-timeout-seconds"]);
   let state: BucketState | null = null;
   try {
-    state = await read(AbortSignal.timeout(timeoutMs));
+    state = await withDeadline(read, timeoutMs);
   } catch (error) {
     const e = error as Error;
     const reason =

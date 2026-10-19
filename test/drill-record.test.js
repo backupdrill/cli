@@ -156,6 +156,23 @@ test("桶里的记录时间在将来(被改过或时钟快了):不让它挡住�
   }
 });
 
+test("桶里是更新的 CLI 写的记录(schemaVersion 2):不覆盖,警告里提示升级", async () => {
+  const fake = await startFakeS3();
+  const warnings = [];
+  const m = mock.method(console, "error", (...args) => warnings.push(args.join(" ")));
+  try {
+    const v2 = Buffer.from(JSON.stringify({ schemaVersion: 2, finishedAt: "2026-01-19T00:00:00.000Z", pass: true }));
+    fake.objects.set("backupdrill/my-app/last-drill.json", v2);
+    await recordDrillOutcome(CONFIG(fake.bucket), FAILED_REPORT, fake.s3);
+    assert.equal(fake.requests.filter((r) => r.method === "PUT").length, 0);
+    assert.deepEqual(fake.objects.get("backupdrill/my-app/last-drill.json"), v2);
+    assert.match(warnings.join("\n"), /Could not record the drill result.*Upgrade the CLI/s);
+  } finally {
+    m.mock.restore();
+    await fake.close();
+  }
+});
+
 test("桶接了请求不回应:记一笔有时限,演练不会卡住", async () => {
   const fake = await startFakeS3();
   const warnings = [];
