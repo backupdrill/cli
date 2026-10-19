@@ -158,7 +158,10 @@ backupdrill estimate --plan pro   # measures your DB + Storage, prints the proje
 <prefix>/<project>/<timestamp>/
   ├── dump.pgcustom              # pg_dump --format=custom (public schema by default)
   ├── storage/<bucket>/<key>     # your Storage files (if configured)
+  ├── RECOVERY.md                # how to restore this snapshot
   └── manifest.json              # schemas, tables, row counts, file list, sizes + sha256
+<prefix>/<project>/last-drill.json         # only with drill --record: the last drill's outcome
+<prefix>/<project>/last-passed-drill.json  # only with drill --record: the last drill that passed
 ```
 
 ## Restoring & drilling
@@ -261,6 +264,80 @@ Both pings of a run carry the same `rid`, so Healthchecks pairs them even if two
 
 A ping never changes the result of a run. Each request times out after 10 seconds and is retried twice on network errors and 5xx responses; if it still fails, the CLI prints a warning and carries on, with the same exit code it would have had without a ping URL.
 
+## Prometheus metrics
+
+`backupdrill exporter` serves [Prometheus](https://prometheus.io) metrics about the backups in your bucket, and about the restore drills you run with `--record`. It reads the bucket each time Prometheus scrapes it and never writes, so a key with read-only access to the bucket is enough.
+
+```bash
+# reads the same BACKUPDRILL_S3_* and BACKUPDRILL_PROJECT_NAME settings as backup and drill
+backupdrill exporter                  # http://127.0.0.1:10059/metrics
+backupdrill exporter --host 0.0.0.0   # when Prometheus runs on another machine
+```
+
+It listens on `127.0.0.1` unless you pass `--host`, because every scrape costs a few requests against your bucket and the port shouldn't end up open to the internet by accident. `--port` changes the port.
+
+Drill results only show up if the drill leaves them in the bucket. Add `--record` to your drill job: when the drill finishes, it writes the outcome to `<prefix>/<project>/last-drill.json`, and also to `last-passed-drill.json` when it passed. Only the outcome, the time, the snapshot name and the restore time are stored, never the check details. A drill that stops early (Docker isn't running, the bucket is empty) is recorded as not passed. `--record` needs write access to the bucket; if the write fails, the drill prints a warning and its own result and exit code stay the same. Without `--record`, `drill` only reads the bucket, as before.
+
+```bash
+backupdrill drill --record
+```
+
+Point Prometheus at it. One exporter watches one project. The metrics carry no labels of their own, so name the project in the scrape config:
+
+```yaml
+scrape_configs:
+  - job_name: backupdrill
+    scrape_interval: 1m
+    static_configs:
+      - targets: ["backup-host:10059"]
+        labels:
+          project: my-app
+```
+
+For a second project, run a second exporter with `--project-name` and a different `--port`.
+
+| Metric | Meaning |
+|---|---|
+| `backupdrill_up` | 1 if the bucket was read, 0 if not (the reason goes to the exporter's log) |
+| `backupdrill_scrape_duration_seconds` | How long reading the bucket took |
+| `backupdrill_build_info{version}` | CLI version, always 1 |
+| `backupdrill_snapshots` | Snapshot folders for the project, complete or not |
+| `backupdrill_backup_last_success_timestamp_seconds` | When the newest complete snapshot finished (`createdAt` in its `manifest.json`); 0 if there is none |
+| `backupdrill_latest_snapshot_dump_bytes` | Size of the database dump in that snapshot |
+| `backupdrill_latest_snapshot_storage_files`, `_storage_bytes` | Storage files in that snapshot and their total size; 0 for a database-only backup |
+| `backupdrill_latest_snapshot_tables`, `_estimated_rows` | Tables captured, and the row count Postgres estimated at backup time |
+| `backupdrill_drill_last_run_timestamp_seconds` | When the last recorded drill finished, passed or not; 0 if none |
+| `backupdrill_drill_last_run_passed` | 1 if that drill passed, 0 if not |
+| `backupdrill_drill_last_success_timestamp_seconds` | When the last recorded drill that passed finished; 0 if none |
+| `backupdrill_drill_last_success_restore_duration_seconds` | How long the database restore took in that drill |
+
+A snapshot counts as complete once its `manifest.json` exists, because the backup writes it last. While there is no complete snapshot, the `latest_snapshot` metrics are left out. `backupdrill_drill_last_run_passed` appears once a drill has been recorded, and the restore duration once a recorded drill has passed.
+
+Alert rules to start from (`promtool check rules` passes on them):
+
+```yaml
+groups:
+  - name: backupdrill
+    rules:
+      - alert: BackupdrillBucketUnreadable
+        expr: backupdrill_up == 0
+        for: 15m
+      - alert: SupabaseBackupMissing
+        # daily backups; use 8 * 86400 for weekly
+        expr: time() - backupdrill_backup_last_success_timestamp_seconds > 26 * 3600
+        for: 15m
+      - alert: SupabaseBackupShrank
+        expr: backupdrill_latest_snapshot_dump_bytes < 0.7 * max_over_time(backupdrill_latest_snapshot_dump_bytes[7d])
+      - alert: SupabaseRestoreDrillFailed
+        expr: backupdrill_drill_last_run_passed == 0
+      - alert: SupabaseRestoreDrillMissing
+        # weekly drills
+        expr: time() - backupdrill_drill_last_success_timestamp_seconds > 8 * 86400
+        for: 1h
+```
+
+What a scrape costs: one list request per 1,000 snapshot folders, plus reads of the newest `manifest.json` and the two drill files. The manifest is fetched with `If-None-Match`, so when it hasn't changed the bucket answers `304 Not Modified` and nothing is downloaded. That matters once you back up Storage files, since the manifest lists every file. At a one-minute interval this comes to about 43,000 list requests and 130,000 small reads a month; check your storage provider's request pricing. Each read of the bucket stops half a second before Prometheus's scrape timeout (10 seconds if there's no Prometheus header), so a slow bucket shows up as `backupdrill_up 0` instead of a failed scrape.
+
 ## Roadmap
 
 - [x] Database backup → your bucket, with checksummed manifest
@@ -270,6 +347,7 @@ A ping never changes the result of a run. Each request times out after 10 second
 - [x] Storage-file integrity check inside the drill (checksums, sampled by default)
 - [x] `restore` — recover a snapshot into a fresh Supabase project: database through the drill-grade engine with verification, Storage uploaded back with per-file reconciliation (local download remains an option)
 - [x] GitHub Action wrapper
+- [x] `exporter` — Prometheus metrics for backups and recorded drills
 
 For scheduling, automated restore drills, and alerting, use the hosted service at [backupdrill.com](https://backupdrill.com).
 
@@ -278,9 +356,10 @@ For scheduling, automated restore drills, and alerting, use the hosted service a
 `backupdrill` follows [semantic versioning](https://semver.org/). From **1.0.0** onwards the
 following is the stable public surface — breaking it requires a major version bump:
 
-- the commands (`backup`, `drill`, `restore`, `estimate`) and their flags
+- the commands (`backup`, `drill`, `restore`, `estimate`, `exporter`) and their flags
 - the `BACKUPDRILL_*` environment variables and the config-file keys
-- the layout written to your bucket, and the shape of `manifest.json`
+- the layout written to your bucket, and the shape of `manifest.json` and the drill record files
+- the names and meaning of the metrics `exporter` serves
 
 `manifest.json` carries a `schemaVersion` so the format can evolve safely. A snapshot written by
 a newer release is **refused with a clear message** rather than parsed on a best-effort basis —
