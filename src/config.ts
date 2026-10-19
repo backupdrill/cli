@@ -55,6 +55,7 @@ interface RawConfig {
   schemas?: string[];
   storage?: Partial<StorageConfig>;
   supabaseStorage?: Partial<SupabaseStorageConfig>;
+  pingUrl?: string;
 }
 
 function fromEnv(): RawConfig {
@@ -103,6 +104,26 @@ async function fromFile(path: string): Promise<RawConfig> {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return {};
     throw new Error(`Could not read config file ${path}: ${(error as Error).message}`);
   }
+}
+
+/**
+ * 监控 ping 网址(Healthchecks.io 那种):flag > 环境变量 > 配置文件,空串算没配
+ * (GitHub Actions 里没设的 secret 展开就是空串)。不放进 loadConfig:配置缺项时
+ * loadConfig 直接抛错,而这恰恰是要报 /fail 的情况,所以网址得先单独读出来。
+ */
+export async function resolvePingUrl(opts: {
+  flag?: string;
+  configPath: string;
+}): Promise<string | undefined> {
+  let file: RawConfig = {};
+  try {
+    file = await fromFile(opts.configPath);
+  } catch {
+    // 配置文件读不了时由 loadConfig 报错,这里只是拿不到文件里的网址
+  }
+  return [opts.flag, process.env.BACKUPDRILL_PING_URL, file.pingUrl]
+    .map((value) => (typeof value === "string" ? value.trim() : undefined))
+    .find(Boolean);
 }
 
 // spread 里显式的 undefined 会覆盖前一层的值(CLI 未传的 flag 正是 undefined),

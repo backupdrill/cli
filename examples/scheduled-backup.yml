@@ -20,6 +20,9 @@
 #   BACKUPDRILL_S3_ENDPOINT           Set for R2/B2/self-hosted; omit for AWS S3.
 #   BACKUPDRILL_S3_REGION             Bucket region ("auto" works for R2).
 #   BACKUPDRILL_PROJECT_NAME          Readable name used in object keys/manifest.
+#   BACKUPDRILL_PING_URL              A Healthchecks.io check's ping URL. The backup
+#                                     pings it when it starts, finishes or fails, so
+#                                     you hear about a failed or skipped run.
 #
 #   To also back up Supabase Storage FILES (not just the DB), set all four:
 #   BACKUPDRILL_SUPABASE_STORAGE_ENDPOINT
@@ -97,3 +100,5 @@ jobs:
           BACKUPDRILL_SUPABASE_STORAGE_REGION: ${{ secrets.BACKUPDRILL_SUPABASE_STORAGE_REGION }}
           BACKUPDRILL_SUPABASE_STORAGE_ACCESS_KEY_ID: ${{ secrets.BACKUPDRILL_SUPABASE_STORAGE_ACCESS_KEY_ID }}
           BACKUPDRILL_SUPABASE_STORAGE_SECRET_ACCESS_KEY: ${{ secrets.BACKUPDRILL_SUPABASE_STORAGE_SECRET_ACCESS_KEY }}
+          # --- optional: Healthchecks.io monitoring ---
+          BACKUPDRILL_PING_URL: ${{ secrets.BACKUPDRILL_PING_URL }}
