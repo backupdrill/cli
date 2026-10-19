@@ -1,16 +1,10 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
 import { performance } from "node:perf_hooks";
-import { GetObjectCommand, type S3Client } from "@aws-sdk/client-s3";
+import { GetObjectCommand, ListObjectsV2Command, type S3Client } from "@aws-sdk/client-s3";
 import { requireBucket, type BackupConfig } from "./config.js";
-import {
-  CLOCK_SKEW_TOLERANCE_MS,
-  LAST_DRILL_FILE,
-  LAST_PASSED_DRILL_FILE,
-  drillRecordKey,
-  parseDrillRecord,
-  type DrillRecord,
-} from "./drill-record.js";
+import { isTimeout, withDeadline } from "./deadline.js";
+import { drillRecordsPrefix, parseDrillRecord, parseDrillRecordName } from "./drill-record.js";
 import { log } from "./log.js";
 import { parseManifest } from "./manifest.js";
 import { listSnapshotPrefixes, targetClient } from "./snapshots.js";
@@ -47,9 +41,17 @@ export interface BucketState {
   snapshots: number;
   /** 最新一份有 manifest.json 的快照;一份都没有时为 null */
   latest: SnapshotSummary | null;
-  lastDrill: DrillRecord | null;
-  lastPassedDrill: DrillRecord | null;
+  /** 最近一次记下的演练(drill --record);没有时为 null */
+  lastDrill: { finishedAt: number; pass: boolean } | null;
+  /** 最近一次通过的演练;restoreSeconds 来自它的记录内容 */
+  lastPassedDrill: { finishedAt: number; restoreSeconds?: number } | null;
 }
+
+/**
+ * 记录里的时间最多可以比这台机器的时钟快多少。备份、演练、exporter 可能在不同机器上跑,
+ * 几分钟的时钟差是正常的;再多就不可信。
+ */
+const CLOCK_SKEW_TOLERANCE_MS = 10 * 60_000;
 
 type ObjectRead =
   | { status: "missing" }
@@ -120,18 +122,72 @@ function assertNotInFuture(at: number, key: string, field: string): void {
   }
 }
 
-async function readDrillRecord(
+/** <prefix>/<project>.drills/ 下的对象名,分页列完 */
+async function listDrillRecordNames(
+  s3: S3Client,
+  bucket: string,
+  prefix: string,
+  abortSignal: AbortSignal
+): Promise<string[]> {
+  const names: string[] = [];
+  let token: string | undefined;
+  do {
+    const res = await s3.send(
+      new ListObjectsV2Command({ Bucket: bucket, Prefix: prefix, Delimiter: "/", ContinuationToken: token }),
+      { abortSignal }
+    );
+    for (const object of res.Contents ?? []) {
+      if (object.Key) names.push(object.Key.slice(prefix.length));
+    }
+    token = res.IsTruncated ? res.NextContinuationToken : undefined;
+  } while (token);
+  return names;
+}
+
+/**
+ * 最近一次演练和最近一次通过的演练。结束时间和结论都在文件名里,列一下目录就够;
+ * 只为了恢复用时读一次通过的那份。时间在将来的记录(写它的机器时钟快了,或被改过)跳过并警告:
+ * 它会一直排在最前面,让"距今多久"的告警算出负数。记录从不删除,所以不能让它把读桶整个弄成失败。
+ */
+async function readDrills(
   s3: S3Client,
   config: BackupConfig,
-  file: string,
   abortSignal: AbortSignal
-): Promise<DrillRecord | null> {
-  const key = drillRecordKey(config, file);
-  const read = await readObject(s3, requireBucket(config).bucket, key, abortSignal);
-  if (read.status !== "ok") return null;
-  const record = parseDrillRecord(read.text, file);
-  assertNotInFuture(Date.parse(record.finishedAt), file, "finishedAt");
-  return record;
+): Promise<Pick<BucketState, "lastDrill" | "lastPassedDrill">> {
+  const bucket = requireBucket(config).bucket;
+  const prefix = drillRecordsPrefix(config);
+  const now = Date.now();
+  let lastDrill: { finishedAt: number; pass: boolean; name: string } | null = null;
+  let lastPassed: { finishedAt: number; name: string } | null = null;
+  for (const name of await listDrillRecordNames(s3, bucket, prefix, abortSignal)) {
+    const parsed = parseDrillRecordName(name);
+    if (!parsed) continue;
+    if (parsed.finishedAt > now + CLOCK_SKEW_TOLERANCE_MS) {
+      log.warn(`Ignoring ${prefix}${name}: it is dated more than 10 minutes in the future (check the clock on the machine that ran the drill).`);
+      continue;
+    }
+    if (!lastDrill || parsed.finishedAt > lastDrill.finishedAt) lastDrill = { ...parsed, name };
+    if (parsed.pass && (!lastPassed || parsed.finishedAt > lastPassed.finishedAt)) {
+      lastPassed = { finishedAt: parsed.finishedAt, name };
+    }
+  }
+
+  let lastPassedDrill: BucketState["lastPassedDrill"] = null;
+  if (lastPassed) {
+    const key = prefix + lastPassed.name;
+    const read = await readObject(s3, bucket, key, abortSignal);
+    // 刚列出来就不见了:生命周期规则正好删了它,或者有人手动删了。按读失败处理,下次抓取再看
+    if (read.status !== "ok") throw new Error(`${key} disappeared while it was being read`);
+    const record = parseDrillRecord(read.text, key);
+    if (!record.pass || Date.parse(record.finishedAt) !== lastPassed.finishedAt) {
+      throw new Error(`${key} is malformed: its content does not match its name`);
+    }
+    lastPassedDrill = { finishedAt: lastPassed.finishedAt, restoreSeconds: record.restoreSeconds };
+  }
+  return {
+    lastDrill: lastDrill ? { finishedAt: lastDrill.finishedAt, pass: lastDrill.pass } : null,
+    lastPassedDrill,
+  };
 }
 
 /**
@@ -172,11 +228,8 @@ export function createBucketReader(
       break;
     }
 
-    const [lastDrill, lastPassedDrill] = await Promise.all([
-      readDrillRecord(s3, config, LAST_DRILL_FILE, abortSignal),
-      readDrillRecord(s3, config, LAST_PASSED_DRILL_FILE, abortSignal),
-    ]);
-    return { snapshots: prefixes.length, latest, lastDrill, lastPassedDrill };
+    const drills = await readDrills(s3, config, abortSignal);
+    return { snapshots: prefixes.length, latest, ...drills };
   };
 }
 
@@ -254,7 +307,7 @@ export function renderMetrics(state: BucketState | null, scrapeSeconds: number):
       gauge(
         "backupdrill_drill_last_run_timestamp_seconds",
         "When the last drill recorded with --record finished, passed or not, as a Unix timestamp. 0 if none is recorded.",
-        lastDrill ? seconds(Date.parse(lastDrill.finishedAt)) : 0
+        lastDrill ? seconds(lastDrill.finishedAt) : 0
       ),
       gauge(
         "backupdrill_drill_last_run_passed",
@@ -264,7 +317,7 @@ export function renderMetrics(state: BucketState | null, scrapeSeconds: number):
       gauge(
         "backupdrill_drill_last_success_timestamp_seconds",
         "When the last passing drill recorded with --record finished, as a Unix timestamp. 0 if none is recorded.",
-        lastPassed ? seconds(Date.parse(lastPassed.finishedAt)) : 0
+        lastPassed ? seconds(lastPassed.finishedAt) : 0
       ),
       gauge(
         "backupdrill_drill_last_success_restore_duration_seconds",
@@ -300,29 +353,6 @@ export function scrapeTimeoutMs(header: string | string[] | undefined): number {
   // AbortSignal.timeout 只收整数毫秒(1.1 秒算出来是 600.0000000000001,直接抛错);
   // 上限防一个离谱的头把读桶拖成几小时
   return Math.min(Math.max(1, Math.floor(Math.max(value - 0.5, value / 2) * 1000)), MAX_SCRAPE_TIMEOUT_MS);
-}
-
-/**
- * 到点就放弃,不管 read 停没停。只把 AbortSignal 交给 SDK 不够:它在两次重试之间按
- * Retry-After 睡觉时不看 signal,503 带 Retry-After: 2 就能把 1 秒的抓取拖到 2 秒多。
- * signal 仍然传下去,让还在跑的请求尽快收手。
- */
-async function withDeadline<T>(run: (signal: AbortSignal) => Promise<T>, ms: number): Promise<T> {
-  const controller = new AbortController();
-  let timer: NodeJS.Timeout | undefined;
-  const deadline = new Promise<never>((_, reject) => {
-    timer = setTimeout(() => {
-      const error = new Error(`timed out after ${ms}ms`);
-      error.name = "TimeoutError";
-      controller.abort(error);
-      reject(error);
-    }, ms);
-  });
-  try {
-    return await Promise.race([run(controller.signal), deadline]);
-  } finally {
-    clearTimeout(timer);
-  }
 }
 
 const LANDING_PAGE = `<!doctype html>

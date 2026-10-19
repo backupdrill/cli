@@ -160,8 +160,7 @@ backupdrill estimate --plan pro   # measures your DB + Storage, prints the proje
   ├── storage/<bucket>/<key>     # your Storage files (if configured)
   ├── RECOVERY.md                # how to restore this snapshot
   └── manifest.json              # schemas, tables, row counts, file list, sizes + sha256
-<prefix>/<project>/last-drill.json         # only with drill --record: the last drill's outcome
-<prefix>/<project>/last-passed-drill.json  # only with drill --record: the last drill that passed
+<prefix>/<project>.drills/<finished-at>-<passed|failed>.json  # only with drill --record: one file per drill
 ```
 
 ## Restoring & drilling
@@ -276,7 +275,7 @@ backupdrill exporter --host 0.0.0.0   # when Prometheus runs on another machine
 
 It listens on `127.0.0.1` unless you pass `--host`, because every scrape costs a few requests against your bucket and the port shouldn't end up open to the internet by accident. `--port` changes the port.
 
-Drill results only show up if the drill leaves them in the bucket. Add `--record` to your drill job: when the drill finishes, it writes the outcome to `<prefix>/<project>/last-drill.json`, and also to `last-passed-drill.json` when it passed. Only the outcome, the time, the snapshot name and the restore time are stored, never the check details. A drill that stops early (Docker isn't running, the bucket is empty) is recorded as not passed. `--record` needs write access to the bucket; if the write fails, the drill prints a warning and its own result and exit code stay the same. Without `--record`, `drill` only reads the bucket, as before.
+Drill results only show up if the drill leaves them in the bucket. Add `--record` to your drill job: when the drill finishes, it writes one small JSON file to `<prefix>/<project>.drills/`, named after the time it finished and whether it passed (`2026-10-20T04-12-09-311Z-passed.json`). Files are never overwritten, so two drills that overlap can't replace each other's result. Only the outcome, the time, the snapshot name and the restore time are stored, never the check details. A drill that stops early (Docker isn't running, the bucket is empty) is recorded as not passed. `--record` needs write access to the bucket; if the write fails, the drill prints a warning and its own result and exit code stay the same. Without `--record`, `drill` only reads the bucket, as before.
 
 ```bash
 backupdrill drill --record
@@ -311,7 +310,7 @@ For a second project, run a second exporter with `--project-name` and a differen
 | `backupdrill_drill_last_success_timestamp_seconds` | When the last recorded drill that passed finished; 0 if none |
 | `backupdrill_drill_last_success_restore_duration_seconds` | How long the database restore took in that drill |
 
-A snapshot counts as complete once its `manifest.json` exists, because the backup writes it last. While there is no complete snapshot, the `latest_snapshot` metrics are left out. `backupdrill_drill_last_run_passed` appears once a drill has been recorded, and the restore duration once a recorded drill has passed. A manifest or drill record dated more than 10 minutes in the future counts as a failed read (`backupdrill_up 0`), because it would keep every age-based alert quiet; check the clock on the machine that wrote it.
+A snapshot counts as complete once its `manifest.json` exists, because the backup writes it last. While there is no complete snapshot, the `latest_snapshot` metrics are left out. `backupdrill_drill_last_run_passed` appears once a drill has been recorded, and the restore duration once a recorded drill has passed. A manifest dated more than 10 minutes in the future counts as a failed read (`backupdrill_up 0`), and a drill file named with such a time is skipped with a warning in the log: either would hold back the alerts that work out an age from that timestamp. Check the clock on the machine that wrote it.
 
 Alert rules to start from (`promtool check rules` passes on them):
 
@@ -336,7 +335,7 @@ groups:
         for: 1h
 ```
 
-What a scrape costs: one list request per 1,000 snapshot folders, plus reads of the newest `manifest.json` and the two drill files. The manifest is fetched with `If-None-Match`, so when it hasn't changed the bucket answers `304 Not Modified` and nothing is downloaded. That matters once you back up Storage files, since the manifest lists every file. At a one-minute interval this comes to about 43,000 list requests and 130,000 small reads a month; check your storage provider's request pricing. Each read of the bucket stops half a second before Prometheus's scrape timeout (10 seconds if there's no Prometheus header), so a slow bucket shows up as `backupdrill_up 0` instead of a failed scrape.
+What a scrape costs: one list request per 1,000 snapshot folders and one per 1,000 drill files, plus reads of the newest `manifest.json` and the newest passing drill file. The manifest is fetched with `If-None-Match`, so when it hasn't changed the bucket answers `304 Not Modified` and nothing is downloaded. That matters once you back up Storage files, since the manifest lists every file. At a one-minute interval this comes to about 86,000 list requests and 86,000 small reads a month; check your storage provider's request pricing. Each read of the bucket stops half a second before Prometheus's scrape timeout (10 seconds if there's no Prometheus header), so a slow bucket shows up as `backupdrill_up 0` instead of a failed scrape.
 
 ## Roadmap
 

@@ -1,12 +1,15 @@
-// drill --record:演练结论写进桶,给 exporter 读。钉住记什么、不记什么、写到哪、写不进去时
-// 不改演练结论,以及记录文件放在 <project>/ 下不会被当成快照。
+// drill --record:每次演练在桶里写一个新对象,给 exporter 读。钉住记什么、不记什么、写到哪、
+// 写不进去或桶不回应时不改演练结论,以及记录不在 <project>/ 里、不会被当成快照。
 import { test, mock } from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
+import { S3Client } from "@aws-sdk/client-s3";
 import {
   buildDrillRecord,
+  drillRecordName,
   parseDrillRecord,
+  parseDrillRecordName,
   recordDrillOutcome,
   writeDrillRecord,
 } from "../dist/drill-record.js";
@@ -30,7 +33,7 @@ const CONFIG = (bucket) => ({
 
 const FINISHED = new Date("2026-01-20T04:00:00.000Z");
 const PASSED_REPORT = {
-  snapshot: "2026-10-19T03-00-00-000Z",
+  snapshot: "2026-01-19T03-00-00-000Z",
   pass: true,
   checks: [{ name: "archive integrity", pass: true, detail: "sha256 matches" }],
   restoreSeconds: 41,
@@ -44,15 +47,24 @@ const FAILED_REPORT = {
   restoreSeconds: 7,
 };
 
+async function quietly(run) {
+  const warnings = [];
+  const m = mock.method(console, "error", (...args) => warnings.push(args.join(" ")));
+  try {
+    return await run(warnings);
+  } finally {
+    m.mock.restore();
+  }
+}
+
 test("通过的演练:记快照名和恢复用时,不记检查明细", () => {
-  const record = buildDrillRecord(PASSED_REPORT, FINISHED);
-  assert.deepEqual(record, {
+  assert.deepEqual(buildDrillRecord(PASSED_REPORT, FINISHED), {
     schemaVersion: 1,
     tool: "backupdrill-cli",
     toolVersion: TOOL_VERSION,
     finishedAt: "2026-01-20T04:00:00.000Z",
     pass: true,
-    snapshot: "2026-10-19T03-00-00-000Z",
+    snapshot: "2026-01-19T03-00-00-000Z",
     restoreSeconds: 41,
   });
 });
@@ -71,23 +83,32 @@ test("中途抛错、没有报告:记一次没通过,不带快照名", () => {
   assert.equal(record.restoreSeconds, undefined);
 });
 
-test("写到哪:通过时写 last-drill.json 和 last-passed-drill.json,没通过只写 last-drill.json", async () => {
+test("文件名:结束时间 + 结论,能原样读回;别的名字不认", () => {
+  const name = drillRecordName(buildDrillRecord(PASSED_REPORT, FINISHED));
+  assert.equal(name, "2026-01-20T04-00-00-000Z-passed.json");
+  assert.deepEqual(parseDrillRecordName(name), { finishedAt: FINISHED.getTime(), pass: true });
+  assert.deepEqual(parseDrillRecordName("2026-01-20T04-00-00-000Z-failed.json"), {
+    finishedAt: FINISHED.getTime(),
+    pass: false,
+  });
+  for (const other of ["notes.txt", "2026-01-20T04-00-00Z-passed.json", "2026-13-40T99-00-00-000Z-passed.json", "x2026-01-20T04-00-00-000Z-passed.json"]) {
+    assert.equal(parseDrillRecordName(other), null, other);
+  }
+});
+
+test("写到哪:每次一个新对象,在 <project>.drills/ 下;不读桶,也不覆盖之前的", async () => {
   const fake = await startFakeS3();
   try {
     const config = CONFIG(fake.bucket);
     await writeDrillRecord(fake.s3, config, buildDrillRecord(PASSED_REPORT, FINISHED));
+    await writeDrillRecord(fake.s3, config, buildDrillRecord(FAILED_REPORT, new Date("2026-01-27T04:00:00.000Z")));
     assert.deepEqual([...fake.objects.keys()].sort(), [
-      "backupdrill/my-app/last-drill.json",
-      "backupdrill/my-app/last-passed-drill.json",
+      "backupdrill/my-app.drills/2026-01-20T04-00-00-000Z-passed.json",
+      "backupdrill/my-app.drills/2026-01-27T04-00-00-000Z-failed.json",
     ]);
-
-    const later = new Date("2026-01-27T04:00:00.000Z");
-    await writeDrillRecord(fake.s3, config, buildDrillRecord(FAILED_REPORT, later));
-    const last = JSON.parse(fake.objects.get("backupdrill/my-app/last-drill.json"));
-    const lastPassed = JSON.parse(fake.objects.get("backupdrill/my-app/last-passed-drill.json"));
-    assert.equal(last.pass, false);
-    assert.equal(last.finishedAt, later.toISOString());
-    assert.equal(lastPassed.finishedAt, FINISHED.toISOString());
+    assert.deepEqual(fake.requests.map((r) => r.method), ["PUT", "PUT"]);
+    const passed = JSON.parse(fake.objects.get("backupdrill/my-app.drills/2026-01-20T04-00-00-000Z-passed.json"));
+    assert.equal(passed.restoreSeconds, 41);
   } finally {
     await fake.close();
   }
@@ -95,111 +116,62 @@ test("写到哪:通过时写 last-drill.json 和 last-passed-drill.json,没通�
 
 test("写不进去(只读 key):只警告,不抛错", async () => {
   const fake = await startFakeS3();
-  const warnings = [];
-  const m = mock.method(console, "error", (...args) => warnings.push(args.join(" ")));
   try {
     fake.fail((req) => (req.method === "PUT" ? { status: 403, code: "AccessDenied" } : null));
-    await recordDrillOutcome(CONFIG(fake.bucket), PASSED_REPORT, fake.s3);
-    assert.match(warnings.join("\n"), /Could not record the drill result.*--record needs write access/s);
+    await quietly(async (warnings) => {
+      await recordDrillOutcome(CONFIG(fake.bucket), PASSED_REPORT, fake.s3);
+      assert.match(warnings.join("\n"), /Could not record the drill result.*--record needs write access/s);
+    });
     assert.equal(fake.objects.size, 0);
   } finally {
-    m.mock.restore();
-    await fake.close();
-  }
-});
-
-test("两次演练重叠:晚写进桶的旧结论不盖掉更新的结论", async () => {
-  const fake = await startFakeS3();
-  const warnings = [];
-  const m = mock.method(console, "error", (...args) => warnings.push(args.join(" ")));
-  try {
-    const config = CONFIG(fake.bucket);
-    const newerFailure = buildDrillRecord(FAILED_REPORT, new Date("2026-01-20T05:00:00.000Z"));
-    const olderSuccess = buildDrillRecord(PASSED_REPORT, new Date("2026-01-20T04:00:00.000Z"));
-    await writeDrillRecord(fake.s3, config, newerFailure);
-    await writeDrillRecord(fake.s3, config, olderSuccess);
-    const last = JSON.parse(fake.objects.get("backupdrill/my-app/last-drill.json"));
-    assert.equal(last.pass, false, "the newer failure must survive");
-    assert.equal(last.finishedAt, "2026-01-20T05:00:00.000Z");
-    // last-passed-drill.json 里还没有更新的,旧的通过照常写进去
-    assert.equal(JSON.parse(fake.objects.get("backupdrill/my-app/last-passed-drill.json")).finishedAt, "2026-01-20T04:00:00.000Z");
-    assert.match(warnings.join("\n"), /last-drill\.json already holds a newer drill/);
-  } finally {
-    m.mock.restore();
-    await fake.close();
-  }
-});
-
-test("桶里的记录时间在将来(被改过或时钟快了):不让它挡住新结论,覆盖并警告", async () => {
-  const fake = await startFakeS3();
-  const warnings = [];
-  const m = mock.method(console, "error", (...args) => warnings.push(args.join(" ")));
-  try {
-    const config = CONFIG(fake.bucket);
-    const future = new Date(Date.now() + 365 * 86400_000);
-    await writeDrillRecord(fake.s3, config, buildDrillRecord(PASSED_REPORT, future));
-    const now = new Date();
-    await writeDrillRecord(fake.s3, config, buildDrillRecord(FAILED_REPORT, now));
-    const last = JSON.parse(fake.objects.get("backupdrill/my-app/last-drill.json"));
-    assert.equal(last.pass, false);
-    assert.equal(last.finishedAt, now.toISOString());
-    assert.match(warnings.join("\n"), /in the future; overwriting it/);
-
-    // 几分钟的时钟差不算:比自己晚 5 分钟的记录照样当成更新的
-    const slightlyAhead = new Date(now.getTime() + 5 * 60_000);
-    await writeDrillRecord(fake.s3, config, buildDrillRecord(PASSED_REPORT, slightlyAhead));
-    await writeDrillRecord(fake.s3, config, buildDrillRecord(FAILED_REPORT, now));
-    assert.equal(JSON.parse(fake.objects.get("backupdrill/my-app/last-drill.json")).finishedAt, slightlyAhead.toISOString());
-  } finally {
-    m.mock.restore();
-    await fake.close();
-  }
-});
-
-test("桶里是更新的 CLI 写的记录(schemaVersion 2):不覆盖,警告里提示升级", async () => {
-  const fake = await startFakeS3();
-  const warnings = [];
-  const m = mock.method(console, "error", (...args) => warnings.push(args.join(" ")));
-  try {
-    const v2 = Buffer.from(JSON.stringify({ schemaVersion: 2, finishedAt: "2026-01-19T00:00:00.000Z", pass: true }));
-    fake.objects.set("backupdrill/my-app/last-drill.json", v2);
-    await recordDrillOutcome(CONFIG(fake.bucket), FAILED_REPORT, fake.s3);
-    assert.equal(fake.requests.filter((r) => r.method === "PUT").length, 0);
-    assert.deepEqual(fake.objects.get("backupdrill/my-app/last-drill.json"), v2);
-    assert.match(warnings.join("\n"), /Could not record the drill result.*Upgrade the CLI/s);
-  } finally {
-    m.mock.restore();
     await fake.close();
   }
 });
 
 test("桶接了请求不回应:记一笔有时限,演练不会卡住", async () => {
   const fake = await startFakeS3();
-  const warnings = [];
-  const m = mock.method(console, "error", (...args) => warnings.push(args.join(" ")));
   try {
     fake.fail((req) => (req.method === "PUT" ? "hang" : null));
-    const started = Date.now();
-    await recordDrillOutcome(CONFIG(fake.bucket), PASSED_REPORT, fake.s3, 300);
-    assert.ok(Date.now() - started < 2000, "should give up after the deadline");
-    assert.match(warnings.join("\n"), /no answer from the bucket within 0\.3s/);
+    await quietly(async (warnings) => {
+      const started = Date.now();
+      await recordDrillOutcome(CONFIG(fake.bucket), PASSED_REPORT, fake.s3, 300);
+      assert.ok(Date.now() - started < 2000, "should give up after the deadline");
+      assert.match(warnings.join("\n"), /no answer from the bucket within 0\.3s/);
+    });
   } finally {
-    m.mock.restore();
     await fake.close();
   }
 });
 
-test("记录文件在 <project>/ 下,resolveSnapshot 照样选最新的快照目录", async () => {
+test("桶回 503 + Retry-After:SDK 按默认设置重试在睡,时限照样算数", async () => {
+  const fake = await startFakeS3();
+  try {
+    fake.fail(() => ({ status: 503, code: "SlowDown", headers: { "retry-after": "2" } }));
+    const s3 = new S3Client({
+      region: "us-east-1",
+      endpoint: fake.endpoint,
+      forcePathStyle: true,
+      credentials: { accessKeyId: "test", secretAccessKey: "test" },
+    });
+    await quietly(async (warnings) => {
+      const started = Date.now();
+      await recordDrillOutcome(CONFIG(fake.bucket), PASSED_REPORT, s3, 300);
+      const elapsed = Date.now() - started;
+      assert.ok(elapsed < 1000, `took ${elapsed}ms with a 300ms limit`);
+      assert.match(warnings.join("\n"), /no answer from the bucket within 0\.3s/);
+    });
+  } finally {
+    await fake.close();
+  }
+});
+
+test("记录不在 <project>/ 里,resolveSnapshot 照样选最新的快照目录", async () => {
   const fake = await startFakeS3();
   try {
     const config = CONFIG(fake.bucket);
-    fake.objects.set("backupdrill/my-app/2026-10-19T03-00-00-000Z/manifest.json", Buffer.from("{}"));
+    fake.objects.set("backupdrill/my-app/2026-01-19T03-00-00-000Z/manifest.json", Buffer.from("{}"));
     await writeDrillRecord(fake.s3, config, buildDrillRecord(PASSED_REPORT, FINISHED));
-    // "last-..." 按字典序排在时间戳后面;要是被当成目录,这里会选错
-    assert.equal(
-      await resolveSnapshot(fake.s3, config),
-      "backupdrill/my-app/2026-10-19T03-00-00-000Z/"
-    );
+    assert.equal(await resolveSnapshot(fake.s3, config), "backupdrill/my-app/2026-01-19T03-00-00-000Z/");
   } finally {
     await fake.close();
   }
@@ -207,7 +179,7 @@ test("记录文件在 <project>/ 下,resolveSnapshot 照样选最新的快照目
 
 test("parseDrillRecord:读回自己写的;拒绝错型、缺字段和更新的版本", () => {
   const ok = JSON.stringify(buildDrillRecord(PASSED_REPORT, FINISHED));
-  assert.equal(parseDrillRecord(ok, "last-drill.json").restoreSeconds, 41);
+  assert.equal(parseDrillRecord(ok, "f").restoreSeconds, 41);
 
   const bad = (over) => JSON.stringify({ ...JSON.parse(ok), ...over });
   assert.throws(() => parseDrillRecord("[]", "f"), /root is not an object/);
@@ -250,11 +222,12 @@ test("CLI:drill --record 在桶里没快照时记一次没通过;不加 --record
 
     const recorded = await runCli(["drill", "--record"], env);
     assert.equal(recorded.code, 1);
-    assert.match(recorded.stderr, /Drill result recorded/);
-    const record = JSON.parse(fake.objects.get("backupdrill/my-app/last-drill.json"));
+    assert.match(recorded.stderr, /Drill result recorded → s3:\/\/backups\/backupdrill\/my-app\.drills\/.*-failed\.json/);
+    const [key] = [...fake.objects.keys()];
+    assert.match(key, /^backupdrill\/my-app\.drills\/\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-\d{3}Z-failed\.json$/);
+    const record = JSON.parse(fake.objects.get(key));
     assert.equal(record.pass, false);
     assert.equal(record.snapshot, undefined);
-    assert.ok(!fake.objects.has("backupdrill/my-app/last-passed-drill.json"));
   } finally {
     await fake.close();
   }

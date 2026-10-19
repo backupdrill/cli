@@ -25,8 +25,8 @@ export function targetClient(config: BackupConfig): S3Client {
 }
 
 /**
- * 列出 root(带尾斜杠)下的全部快照目录,返回带尾斜杠的前缀,未排序。只看 CommonPrefixes:
- * root 下直接放的对象(如 drill --record 写的 last-drill.json)不会被当成快照。
+ * 列出 root(带尾斜杠)下的全部快照目录,返回带尾斜杠的前缀,未排序。只看 CommonPrefixes,
+ * root 下直接放的对象不算快照。
  */
 export async function listSnapshotPrefixes(
   s3: S3Client,

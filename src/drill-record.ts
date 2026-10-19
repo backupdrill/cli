@@ -1,5 +1,6 @@
-import { GetObjectCommand, PutObjectCommand, type S3Client } from "@aws-sdk/client-s3";
+import { PutObjectCommand, type S3Client } from "@aws-sdk/client-s3";
 import { requireBucket, type BackupConfig } from "./config.js";
+import { isTimeout, withDeadline } from "./deadline.js";
 import type { DrillReport } from "./drill.js";
 import { log } from "./log.js";
 import { targetClient } from "./snapshots.js";
@@ -8,23 +9,20 @@ import { TOOL_VERSION } from "./version.js";
 /**
  * `drill --record` 写进桶里的演练结论。`exporter` 只读桶,演练结果不落桶它就无从得知。
  *
- * 放在 <prefix>/<project>/ 下的两个对象(不是目录):resolveSnapshot 只看 CommonPrefixes,
- * 这一层的对象不会被当成快照。
- *  - last-drill.json:最近一次演练,不论成败
- *  - last-passed-drill.json:最近一次通过的演练。分开存,最近一次失败时上一次通过的时间还在,
- *    而且两份都是整份覆盖,不用先读后改
+ * 每次演练写一个新对象,从不覆盖:
+ *   <prefix>/<project>.drills/<结束时间>-<passed|failed>.json
+ * 为什么不是一份可覆盖的"最近一次":两次演练重叠时,先结束的那次可能后写进桶,把更新的
+ * "没通过"盖成更早的"通过",失败告警就没了;先读后写也挡不住(不是原子的),而各家
+ * S3 兼容存储对条件写入的支持参差不齐。每次一个对象,"哪次最新"留给读的一方按名字判断,
+ * 写入顺序就无所谓了。
  *
- * 只记结论,不记检查明细:失败明细里可能有 pg_restore 回显的表数据,而桶的读权限可能比
- * 演练日志给得更宽(exporter 只要只读 key)。
+ * 为什么放在 <project>.drills/,和快照目录并排而不是在它里面:resolveSnapshot(包括已经发出去的
+ * 旧版本)按字典序取 <project>/ 下最大的目录当最新快照,里面多一个 drills/ 会被当成快照。
+ *
+ * 文件名本身带着结束时间和结论,exporter 列一下目录就知道最近一次和最近一次通过是哪个;
+ * 只为了恢复用时才读一次通过的那份。只记结论,不记检查明细:失败明细里可能有 pg_restore
+ * 回显的表数据,而桶的读权限可能比演练日志给得更宽(exporter 只要只读 key)。
  */
-export const LAST_DRILL_FILE = "last-drill.json";
-export const LAST_PASSED_DRILL_FILE = "last-passed-drill.json";
-
-/**
- * 记录里的时间最多可以比读它的这台机器的时钟快多少。备份、演练、exporter 可能在不同机器上跑,
- * 几分钟的时钟差是正常的;再多就当这份记录不可信(见 newerExisting 和 exporter 的 summarize)。
- */
-export const CLOCK_SKEW_TOLERANCE_MS = 10 * 60_000;
 
 /** 版本规则同 manifest:缺省不接受,更高的版本明确报错让用户升级,不按旧结构硬读。 */
 export const DRILL_RECORD_SCHEMA_VERSION = 1;
@@ -33,7 +31,7 @@ export interface DrillRecord {
   schemaVersion: number;
   tool: "backupdrill-cli";
   toolVersion: string;
-  /** 演练结束的时间(ISO8601) */
+  /** 演练结束的时间(ISO8601),与文件名里的时间相同 */
   finishedAt: string;
   pass: boolean;
   /** 演练的快照名;演练在选定快照之前就失败了(没装 Docker、桶里没有快照)时没有 */
@@ -42,9 +40,25 @@ export interface DrillRecord {
   restoreSeconds?: number;
 }
 
-export function drillRecordKey(config: BackupConfig, file: string): string {
+/** 演练记录所在的"目录",带尾斜杠 */
+export function drillRecordsPrefix(config: BackupConfig): string {
   const storage = requireBucket(config);
-  return `${storage.prefix}/${config.projectName}/${file}`;
+  return `${storage.prefix}/${config.projectName}.drills/`;
+}
+
+/** 时间戳写法同快照目录名(把 ISO 里的 : 和 . 换成 -),定长,按名字排序就是按时间排序 */
+const RECORD_NAME = /^(\d{4}-\d{2}-\d{2})T(\d{2})-(\d{2})-(\d{2})-(\d{3})Z-(passed|failed)\.json$/;
+
+export function drillRecordName(record: Pick<DrillRecord, "finishedAt" | "pass">): string {
+  return `${record.finishedAt.replace(/[:.]/g, "-")}-${record.pass ? "passed" : "failed"}.json`;
+}
+
+/** 从文件名读出结束时间(毫秒)和结论;不是记录文件的名字返回 null */
+export function parseDrillRecordName(name: string): { finishedAt: number; pass: boolean } | null {
+  const m = RECORD_NAME.exec(name);
+  if (!m) return null;
+  const finishedAt = Date.parse(`${m[1]}T${m[2]}:${m[3]}:${m[4]}.${m[5]}Z`);
+  return Number.isFinite(finishedAt) ? { finishedAt, pass: m[6] === "passed" } : null;
 }
 
 /** report 为 null = 演练中途抛错、没有报告;这也算一次没通过的演练。 */
@@ -60,73 +74,24 @@ export function buildDrillRecord(report: DrillReport | null, finishedAt: Date): 
   };
 }
 
-/** 桶里已有的那份比 record 新时返回它的 finishedAt;没有、读不懂或更旧时返回 null。 */
-async function newerExisting(
-  s3: S3Client,
-  bucket: string,
-  key: string,
-  record: DrillRecord,
-  abortSignal?: AbortSignal
-): Promise<string | null> {
-  let text: string;
-  try {
-    const res = await s3.send(new GetObjectCommand({ Bucket: bucket, Key: key }), { abortSignal });
-    text = await res.Body!.transformToString();
-  } catch (error) {
-    const status = (error as { $metadata?: { httpStatusCode?: number } }).$metadata?.httpStatusCode;
-    if (status === 404 || (error as Error).name === "NoSuchKey") return null;
-    throw error;
-  }
-  let existing: DrillRecord;
-  try {
-    existing = parseDrillRecord(text, key);
-  } catch (error) {
-    // 更新的 CLI 写的:不覆盖,报出去(recordDrillOutcome 打警告,提示升级)
-    if (error instanceof UnsupportedDrillRecordVersion) throw error;
-    return null; // 坏掉的旧记录直接覆盖
-  }
-  const existingAt = Date.parse(existing.finishedAt);
-  // 时间在将来的记录(被改过,或写它的机器时钟快了)要是被当成"更新的",以后每次演练都会被
-  // 它挡住、指标永远停在那里。当坏记录覆盖,并说出来
-  // 和"现在"比,不和本次记录的时间比:本次记录本来就可能是延迟写进来的那份
-  if (existingAt > Date.now() + CLOCK_SKEW_TOLERANCE_MS) {
-    log.warn(`${key} says it finished at ${existing.finishedAt}, which is in the future; overwriting it.`);
-    return null;
-  }
-  return existingAt > Date.parse(record.finishedAt) ? existing.finishedAt : null;
-}
-
-/**
- * 两次演练同时跑(cron 重叠)时,先结束的那次可能后写到桶里,把更新的结论盖掉:
- * 一次更早的"通过"盖住更新的"没通过",失败告警就没了。所以写之前先读一下,桶里那份更新就不写。
- * 读和写之间还有一个很短的窗口,不是原子的;各家 S3 兼容存储对条件写入(If-Match)的支持
- * 参差不齐,为这个罕见情形不值得引入。
- */
+/** 写一个新对象,返回它的 key。不读桶:只需要写权限 */
 export async function writeDrillRecord(
   s3: S3Client,
   config: BackupConfig,
   record: DrillRecord,
   abortSignal?: AbortSignal
-): Promise<void> {
-  const bucket = requireBucket(config).bucket;
-  const files = record.pass ? [LAST_DRILL_FILE, LAST_PASSED_DRILL_FILE] : [LAST_DRILL_FILE];
-  for (const file of files) {
-    const key = drillRecordKey(config, file);
-    const newer = await newerExisting(s3, bucket, key, record, abortSignal);
-    if (newer) {
-      log.warn(`${file} already holds a newer drill (finished ${newer}); left it as it is.`);
-      continue;
-    }
-    await s3.send(
-      new PutObjectCommand({
-        Bucket: bucket,
-        Key: key,
-        Body: JSON.stringify(record, null, 2),
-        ContentType: "application/json",
-      }),
-      { abortSignal }
-    );
-  }
+): Promise<string> {
+  const key = drillRecordsPrefix(config) + drillRecordName(record);
+  await s3.send(
+    new PutObjectCommand({
+      Bucket: requireBucket(config).bucket,
+      Key: key,
+      Body: JSON.stringify(record, null, 2),
+      ContentType: "application/json",
+    }),
+    { abortSignal }
+  );
+  return key;
 }
 
 /** 记一笔最多等这么久:桶接了请求却不回应时,演练不能卡在这里,后面还要退出、发监控 ping */
@@ -144,23 +109,18 @@ export async function recordDrillOutcome(
 ): Promise<void> {
   const record = buildDrillRecord(report, new Date());
   try {
-    await writeDrillRecord(s3, config, record, AbortSignal.timeout(timeoutMs));
-    log.ok(`Drill result recorded → s3://${requireBucket(config).bucket}/${drillRecordKey(config, LAST_DRILL_FILE)}`);
+    const key = await withDeadline((signal) => writeDrillRecord(s3, config, record, signal), timeoutMs);
+    log.ok(`Drill result recorded → s3://${requireBucket(config).bucket}/${key}`);
   } catch (error) {
-    const e = error as Error;
-    const reason =
-      e.name === "TimeoutError" || e.name === "AbortError"
-        ? `no answer from the bucket within ${timeoutMs / 1000}s`
-        : e.message;
+    const reason = isTimeout(error)
+      ? `no answer from the bucket within ${timeoutMs / 1000}s`
+      : (error as Error).message;
     log.warn(
       `Could not record the drill result (${reason}). ` +
         `--record needs write access to the bucket. The drill's own result is unchanged.`
     );
   }
 }
-
-/** 更新的 CLI 写的记录:读不懂,但也不能当坏记录覆盖掉(那等于用旧格式把新信息抹了) */
-export class UnsupportedDrillRecordVersion extends Error {}
 
 function malformed(file: string, what: string): never {
   throw new Error(`${file} is malformed: ${what}`);
@@ -182,7 +142,7 @@ export function parseDrillRecord(json: string, file: string): DrillRecord {
     malformed(file, `schemaVersion ${JSON.stringify(r.schemaVersion)}`);
   }
   if (r.schemaVersion > DRILL_RECORD_SCHEMA_VERSION) {
-    throw new UnsupportedDrillRecordVersion(
+    throw new Error(
       `${file} uses schema version ${r.schemaVersion}, but this BackupDrill understands up to ` +
         `${DRILL_RECORD_SCHEMA_VERSION}. Upgrade the CLI (npm i -g backupdrill@latest) to read it.`
     );

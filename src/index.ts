@@ -140,8 +140,8 @@ program
   .option(PING_FLAG, PING_HELP)
   .option(
     "--record",
-    "write the outcome to last-drill.json (and last-passed-drill.json when it passes) in " +
-      "<prefix>/<project>/, where `backupdrill exporter` reads it. Needs write access to the bucket"
+    "write the outcome as a small JSON file in <prefix>/<project>.drills/, where " +
+      "`backupdrill exporter` reads it. Needs write access to the bucket"
   )
   .action(async (opts) => {
     const ping = createPinger(await resolvePingUrl({ flag: opts.pingUrl, configPath: opts.config }));
