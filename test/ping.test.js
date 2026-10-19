@@ -88,12 +88,20 @@ test("fail 打到 /fail,请求体是抹过连接信息的原因", async () => {
   }
 });
 
-test("slug 网址上的 ?create=1 留着,后缀落在问号前面", async () => {
+test("slug 网址上的 ?create=1 留着,后缀落在问号前面;结尾斜杠三种 ping 都去掉", async () => {
   const ping = createPinger(`${base}/ping/my-key/nightly-backup/?create=1`, FAST);
   await ping.start();
-  assert.equal(requests[0].path, "/ping/my-key/nightly-backup/start");
-  assert.equal(requests[0].query.get("create"), "1");
-  assert.ok(requests[0].query.get("rid"));
+  await ping.success("ok");
+  await ping.fail("boom");
+  assert.deepEqual(requests.map((r) => r.path), [
+    "/ping/my-key/nightly-backup/start",
+    "/ping/my-key/nightly-backup",
+    "/ping/my-key/nightly-backup/fail",
+  ]);
+  for (const r of requests) {
+    assert.equal(r.query.get("create"), "1");
+    assert.ok(r.query.get("rid"));
+  }
 });
 
 test("5xx 重试,4xx 不重试,都只打警告不抛错", async () => {
@@ -206,13 +214,16 @@ test("scrubForPing:Postgres 的 DETAIL / CONTEXT / 回显 SQL 里的值不外发
     'pg_restore: error: could not execute query: ERROR: duplicate key value violates unique constraint "orders_pkey"\n' +
     "DETAIL: Key (id)=(42) already exists.\nCommand was: INSERT INTO public.orders VALUES (42, 'card-4242');\n" +
     "pg_restore: warning: errors ignored on restore: 1";
-  const out = scrubForPing([postData, preData, multiLine].join("\n"), []);
-  for (const leak of ["demo-live-token-123456", "s3cr3t-note", "hunter2-value", "card-4242", "(42)"]) {
+  // 值里带着拼接符 " | " 也不能截在半路(第三轮审查复现过)
+  const pipeInValue = 'pg_restore failed: ERROR: could not create unique index "t_note_key" DETAIL: Key (note)=(a | card-9999) is duplicated.';
+  const out = scrubForPing([postData, preData, multiLine, pipeInValue].join("\n"), []);
+  for (const leak of ["demo-live-token-123456", "s3cr3t-note", "hunter2-value", "card-4242", "(42)", "card-9999"]) {
     assert.ok(!out.includes(leak), `still contains ${leak}:\n${out}`);
   }
   // 主报错留着,读告警的人还知道是哪类错
   assert.match(out, /could not create unique index/);
   assert.match(out, /violates not-null constraint/);
+  assert.match(out, /could not create unique index "t_note_key"/);
   assert.match(out, /errors ignored on restore/);
 });
 

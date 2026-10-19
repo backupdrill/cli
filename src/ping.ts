@@ -58,8 +58,9 @@ export function createPinger(
 
   const endpoint = (suffix: "" | "/start" | "/fail"): string => {
     const url = new URL(base.href);
-    // 改 pathname 而不是拼字符串:slug 网址可能带 ?create=1,后缀要落在问号前面
-    if (suffix) url.pathname = url.pathname.replace(/\/+$/, "") + suffix;
+    // 改 pathname 而不是拼字符串:slug 网址可能带 ?create=1,后缀要落在问号前面。
+    // 结尾的斜杠三种 ping 都去掉:Healthchecks 的 ping 路由不认带斜杠的网址
+    url.pathname = url.pathname.replace(/\/+$/, "") + suffix;
     url.searchParams.set("rid", rid);
     return url.href;
   };
@@ -174,9 +175,9 @@ export function scrubForPing(text: string, sensitive: string[]): string {
   }
   return out
     // Postgres 把具体的值放在 DETAIL / CONTEXT 这类附加字段里(唯一键冲突的键值、COPY 出错的整行),
-    // pg_restore 还会回显出错的 SQL。这些整段去掉,只留主报错;到换行或 " | "(多条报错的拼接符)为止。
-    // 引擎上报的恢复错误块已经压成一行,所以按行截就够;custom 格式的数据走 COPY,回显的 SQL 是 DDL
-    .replace(/\b(DETAIL|CONTEXT|HINT|QUERY|STATEMENT|LINE \d+|Command was):[^\n]*?(?=\s\|\s|\n|$)/g, "$1: [removed]")
+    // pg_restore 还会回显出错的 SQL。从第一个这类字段起把这一行剩下的全部去掉:值里什么字符都可能有,
+    // 包括多条报错之间的拼接符 " | ",所以不能指望找到字段的结尾。引擎上报的恢复错误块已经压成一行
+    .replace(/\b(DETAIL|CONTEXT|HINT|QUERY|STATEMENT|LINE \d+|Command was):[^\n]*/g, "$1: [removed]")
     // 主报错里偶尔也带值:键值对 (col)=(value),以及 invalid input syntax for type x: "value"
     .replace(/\(([^()]*)\)=\((?:[^()]|\([^()]*\))*\)/g, "($1)=([removed])")
     .replace(/(invalid input (?:syntax|value) for [^:"\n]*: )"[^"\n]*"/gi, '$1"[removed]"')
