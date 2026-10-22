@@ -19,6 +19,7 @@ import {
   parseCopyHeader,
   parseForeignKeys,
   parsePartitionAttachments,
+  parseTableColumns,
   type ForeignKeyDef,
   type QualifiedName,
 } from "./dump-sql.js";
@@ -74,12 +75,14 @@ export async function checkExternalReferences(opts: {
   const fkEntries = entries.filter((line) => /^\d+; \d+ \d+ FK CONSTRAINT /.test(line));
   if (!fkEntries.length) return result;
   const attachEntries = entries.filter((line) => /^\d+; \d+ \d+ TABLE ATTACH /.test(line));
+  // 建表语句:比较时要用引用方列的类型
+  const tableEntries = entries.filter((line) => /^\d+; \d+ \d+ TABLE (?!DATA |ATTACH )/.test(line));
 
   const listDir = await mkdtemp(join(tmpdir(), "backupdrill-refs-"));
   let definitions: string;
   try {
     const listFile = join(listDir, "fk.list");
-    await writeFile(listFile, [...fkEntries, ...attachEntries].join("\n") + "\n");
+    await writeFile(listFile, [...tableEntries, ...fkEntries, ...attachEntries].join("\n") + "\n");
     const ddl = await pgRestoreOutput(bin, ["-f", "-", `--use-list=${listFile}`, opts.dumpPath]);
     if (ddl.code !== 0) throw new Error(`pg_restore exited with code ${ddl.code}: ${oneLine(ddl.stderr)}`);
     definitions = ddl.stdout;
@@ -107,16 +110,21 @@ export async function checkExternalReferences(opts: {
     return below.length ? below.flatMap(leavesOf) : [table];
   };
   const pending = new Set(opts.pendingExtensionSchemas ?? []);
+  const tableColumns = parseTableColumns(definitions);
 
   const client = await connectPg(opts.targetUrl);
   try {
     const scans: Scan[] = [];
     for (const fk of external) {
-      let lookup: Awaited<ReturnType<typeof referencedColumnTypes>>;
+      let lookup: Awaited<ReturnType<typeof comparisonTypes>>;
       try {
-        lookup = await referencedColumnTypes(client, fk);
+        lookup = await comparisonTypes(client, fk, tableColumns.get(keyOf(fk.table)));
       } catch (error) {
         result.unchecked.push(`${describe(fk)}: could not look up ${formatQualified(fk.references)} on the target (${(error as Error).message})`);
+        continue;
+      }
+      if ("unchecked" in lookup) {
+        result.unchecked.push(`${describe(fk)}: ${lookup.unchecked}`);
         continue;
       }
       if ("problem" in lookup) {
@@ -177,7 +185,8 @@ export function describe(fk: ForeignKeyDef): string {
 
 interface Scan {
   checked: CheckedForeignKey;
-  types: Array<{ name: string; type: string }>;
+  /** 各外键列在比较时转成的类型(引用方列的类型,见 comparisonTypes) */
+  types: string[];
   /** 这条外键的数据所在的表(普通表就是它自己;分区表是各级叶子分区) */
   leaves: Set<string>;
   /** 读到过 COPY 块的表 */
@@ -189,31 +198,60 @@ interface Scan {
 }
 
 /**
- * 目标库上被引用列的类型,用来把 dump 里的文本值转回去比较。类型取**不带修饰符**的
- * (format_type(oid, NULL)):numeric(2,0) 这类修饰符在转换时会改值(1.1 变 1),外键比较却不会。
- * 表或列不在时返回给人看的原因(恢复必然失败)。
+ * 目标端的查询一律放进只读事务,查完回滚:dry-run 承诺零写入,而类型转换、域约束、自定义相等
+ * 运算符都能调用户函数(交叉审查第二轮复现过域 CHECK 写审计表)。每条语句各开一个事务,
+ * 一条出错不会让后面的查询跟着报 "current transaction is aborted"。
  */
-async function referencedColumnTypes(
+async function readOnly<T extends pg.QueryResultRow>(client: pg.Client, sql: string, params: unknown[]): Promise<pg.QueryResult<T>> {
+  await client.query("begin transaction read only");
+  try {
+    return await client.query<T>(sql, params);
+  } finally {
+    await client.query("rollback").catch(() => {});
+  }
+}
+
+/**
+ * 比较用的类型 = **引用方**列的类型(从 dump 的建表语句读)。外键校验做的就是"引用方的值 =
+ * 被引用列",按 Postgres 自己的运算符解析,跨类型(int4 → int8、float8 → float4)也是同一个比较;
+ * 把值转成被引用列的类型则会改值(交叉审查:float8 1.23456789 转 float4 就和舍入后的行对上了)。
+ * 引用方的类型要在目标上已经存在才转得了:建在备份 schema 里的域、枚举这时还没恢复,只能报没查成。
+ * 被引用的表或列不在时返回 problem(恢复必然失败)。
+ */
+async function comparisonTypes(
   client: pg.Client,
-  fk: ForeignKeyDef
-): Promise<{ types: Array<{ name: string; type: string }> } | { problem: string; tableMissing: boolean }> {
+  fk: ForeignKeyDef,
+  columnsInDump: Map<string, string> | undefined
+): Promise<{ types: string[] } | { problem: string; tableMissing: boolean } | { unchecked: string }> {
   const relation = `${quoteIdent(fk.references.schema)}.${quoteIdent(fk.references.name)}`;
-  const exists = await client.query<{ oid: string | null }>("select to_regclass($1)::oid as oid", [relation]);
+  const exists = await readOnly<{ oid: string | null }>(client, "select to_regclass($1)::oid as oid", [relation]);
   if (!exists.rows[0].oid) {
     return { problem: `${formatQualified(fk.references)} does not exist on the target`, tableMissing: true };
   }
-  const columns = await client.query<{ name: string; type: string }>(
-    `select a.attname as name, format_type(a.atttypid, null) as type
-       from pg_attribute a
+  const present = await readOnly<{ name: string }>(
+    client,
+    `select a.attname as name from pg_attribute a
       where a.attrelid = $1::oid and a.attnum > 0 and not a.attisdropped and a.attname = any($2::text[])`,
     [exists.rows[0].oid, fk.referencedColumns]
   );
-  const byName = new Map(columns.rows.map((row) => [row.name, row.type]));
-  const absent = fk.referencedColumns.filter((name) => !byName.has(name));
+  const names = new Set(present.rows.map((row) => row.name));
+  const absent = fk.referencedColumns.filter((name) => !names.has(name));
   if (absent.length) {
     return { problem: `${formatQualified(fk.references)} on the target has no column(s) ${absent.join(", ")}`, tableMissing: false };
   }
-  return { types: fk.referencedColumns.map((name) => ({ name, type: byName.get(name)! })) };
+  const types: string[] = [];
+  for (const column of fk.columns) {
+    const declared = columnsInDump?.get(column);
+    if (!declared) return { unchecked: `could not read the type of column ${column} from the dump` };
+    // format_type 给出规范写法(不带修饰符:值本来就出自这一列,修饰符不会再改它);
+    // 拼进 SQL 的只有它,dump 里的原文只当 to_regtype 的参数
+    const resolved = await readOnly<{ name: string | null }>(client, "select format_type(to_regtype($1), null) as name", [declared]);
+    if (!resolved.rows[0].name) {
+      return { unchecked: `column ${column} is of type ${declared}, which the target doesn't have until the restore creates it` };
+    }
+    types.push(resolved.rows[0].name);
+  }
+  return { types };
 }
 
 /**
@@ -254,7 +292,7 @@ async function scanDumpData(bin: string, dumpPath: string, scans: Scan[], client
     const entries = [...scan.batch.values()];
     scan.batch.clear();
     try {
-      const missing = await missingKeyIndexes(client, scan.checked.fk.references, scan.types, entries.map((e) => e.key));
+      const missing = await missingKeyIndexes(client, scan.checked.fk, scan.types, entries.map((e) => e.key));
       for (const index of missing) scan.checked.missingRows += entries[index - 1].rows;
     } catch (error) {
       // 只停这一条外键:比如值转不成被引用列的类型
@@ -336,23 +374,24 @@ async function scanDumpData(bin: string, dumpPath: string, scans: Scan[], client
   if (code !== 0) throw new Error(`pg_restore exited with code ${code}: ${oneLine(stderr)}`);
 }
 
-/** 一批键里哪些在被引用表里找不到;返回 1 起的下标。值按目标列的类型(不带修饰符)转换后比较。 */
+/** 一批键里哪些在被引用表里找不到;返回 1 起的下标。值按引用方列的类型转换,和外键校验同一个比较。 */
 async function missingKeyIndexes(
   client: pg.Client,
-  table: QualifiedName,
-  columns: Array<{ name: string; type: string }>,
+  fk: ForeignKeyDef,
+  types: string[],
   keys: string[][]
 ): Promise<number[]> {
-  const aliases = columns.map((_, i) => `c${i}`);
+  const aliases = types.map((_, i) => `c${i}`);
   const sql =
-    `select k.i::int as i from unnest(${columns.map((_, i) => `$${i + 1}::text[]`).join(", ")}) ` +
+    `select k.i::int as i from unnest(${types.map((_, i) => `$${i + 1}::text[]`).join(", ")}) ` +
     `with ordinality as k(${aliases.join(", ")}, i) ` +
-    `where not exists (select 1 from ${quoteIdent(table.schema)}.${quoteIdent(table.name)} r where ` +
-    columns.map((column, i) => `r.${quoteIdent(column.name)} = k.${aliases[i]}::${column.type}`).join(" and ") +
+    `where not exists (select 1 from ${quoteIdent(fk.references.schema)}.${quoteIdent(fk.references.name)} r where ` +
+    fk.referencedColumns.map((column, i) => `r.${quoteIdent(column)} = k.${aliases[i]}::${types[i]}`).join(" and ") +
     `)`;
-  const res = await client.query<{ i: number }>(
+  const res = await readOnly<{ i: number }>(
+    client,
     sql,
-    columns.map((_, i) => keys.map((key) => key[i]))
+    types.map((_, i) => keys.map((key) => key[i]))
   );
   return res.rows.map((row) => row.i);
 }

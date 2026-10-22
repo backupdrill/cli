@@ -82,6 +82,35 @@ export function parsePartitionAttachments(sql: string): Array<{ parent: Qualifie
 }
 
 /**
+ * pg_dump 的建表语句(dumpTableSchema)里每列的类型,按表(schema\0name)→ 列 → 类型。
+ *   CREATE [UNLOGGED ]TABLE <表> (\n    <列> <类型>[ COLLATE …][ DEFAULT …][ NOT NULL],\n    CONSTRAINT …\n)…;
+ * 类型是 format_type 的输出,本身不含 COLLATE/DEFAULT/NOT NULL/GENERATED 这些词,读到它们为止。
+ * 带引号的列名可以跨行,所以按位置往下读,不按行切。
+ */
+export function parseTableColumns(sql: string): Map<string, Map<string, string>> {
+  const tables = new Map<string, Map<string, string>>();
+  const header = new RegExp(String.raw`^CREATE (?:UNLOGGED )?TABLE ${QUALIFIED} \(\n`, "gm");
+  for (const match of sql.matchAll(header)) {
+    const columns = new Map<string, string>();
+    tables.set(`${unquoteIdent(match[1])}\u0000${unquoteIdent(match[2])}`, columns);
+    let at = match.index! + match[0].length;
+    const column = new RegExp(String.raw` {4}(${IDENT}) (.+?)(?= COLLATE | DEFAULT | NOT NULL| GENERATED |,?\n)`, "y");
+    while (at < sql.length && !sql.startsWith(")", at)) {
+      if (sql.startsWith("    CONSTRAINT ", at)) {
+        at = sql.indexOf("\n", at) + 1 || sql.length;
+        continue;
+      }
+      column.lastIndex = at;
+      const found = column.exec(sql);
+      if (!found) break;
+      columns.set(unquoteIdent(found[1]), found[2]);
+      at = sql.indexOf("\n", column.lastIndex) + 1 || sql.length;
+    }
+  }
+  return tables;
+}
+
+/**
  * 数据段的 COPY 头(dumpTableData_copy):"COPY <表> <列清单> FROM stdin;"。没有列的表列清单是空串,
  * 所以那一行中间是两个空格,返回空列表。
  */

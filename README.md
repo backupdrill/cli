@@ -202,7 +202,7 @@ backupdrill restore --database --target-supabase-url https://<ref>.supabase.co -
 
 Prefer files on disk instead? Skip the Storage target and pass `--storage-dir ./recovered`.
 
-`--dry-run` writes nothing to the target. Besides checking the target (not the source project, schemas empty, Postgres and `pg_restore` versions, extensions available), it downloads the dump to a temporary directory, checks its sha256 and looks for foreign keys that point outside the backup (see [Tables that reference auth.users](#tables-that-reference-authusers)). The real run repeats those checks before its first write. The database restore then runs in a single transaction: if any statement fails, nothing from the snapshot stays on the target, and you can run it again on the same project once you've fixed the cause. Extensions the run installed stay installed, since the next run needs them too, and the empty-target check doesn't count them. One transaction holds a lock on every table, index and sequence until it commits, so a very large schema can run out of lock slots: on Supabase's smallest compute size, about a thousand tables (partitions count as tables). The restore then stops with nothing written and tells you how to raise `max_locks_per_transaction`.
+`--dry-run` writes nothing to the target. Besides checking the target (not the source project, schemas empty, Postgres and `pg_restore` versions, extensions available), it downloads the dump to a temporary directory, checks its sha256 and looks for foreign keys that point outside the backup (see [Tables that reference auth.users](#tables-that-reference-authusers)). The real run repeats those checks before it writes any snapshot data; it installs the recorded extensions first, because a referenced table can come from one, and they stay installed if a check fails. The database restore then runs in a single transaction: if any statement fails, nothing from the snapshot stays on the target, and you can run it again on the same project once you've fixed the cause. Extensions the run installed stay installed, since the next run needs them too, and the empty-target check doesn't count them. One transaction holds a lock on every table, index and sequence until it commits, so a very large schema can run out of lock slots: on Supabase's smallest compute size, about a thousand tables (partitions count as tables). The restore then stops with nothing written and tells you how to raise `max_locks_per_transaction`.
 
 Or restore the dump by hand — into an **empty** database, without `--clean`:
 
@@ -228,7 +228,7 @@ A drill can't catch this. Its sandbox has no `auth.users` at all, so the drill r
 ✗ references outside the backup: public.profiles → auth.users (profiles_id_fkey): 200 of 200 row(s) point at auth.users rows the target doesn't have
 ```
 
-Nothing is written while that check fails. Copy the users into the new project first, then run the restore. While the old project is still reachable, the Postgres tools can do it. Use the Session pooler string of each project, and type the passwords at hidden prompts so they stay out of your shell history:
+While that check fails, no snapshot data is written. Copy the users into the new project first, then run the restore. While the old project is still reachable, the Postgres tools can do it. Use the Session pooler string of each project, and type the passwords at hidden prompts so they stay out of your shell history:
 
 ```bash
 read -rs OLD_PW; read -rs NEW_PW

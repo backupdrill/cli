@@ -1,6 +1,8 @@
 // checkExternalReferences 在真实 Postgres 上的边角(交叉审查 2026-10-23 第一轮逐条复现的形态):
 //  - 被引用的表由扩展创建:dry-run 时扩展还没装,不能当成 blocker;装上之后要真查;
 //  - 一条外键在目标端查询出错,不能把另一条外键已经确认的缺行吞掉;
+//  - 比较按引用方列的类型(外键自己的比较),不按被引用列的类型(第二轮:float8 → float4);
+//  - 目标端的查询都在只读事务里,域 CHECK 调的函数想写也写不进去(第二轮);
 //  - 带引号的名字里有换行,COPY 头跨行,不能静默跳过整块数据报"全找到了";
 //  - 目标列带类型修饰符(numeric(2,0)),比较时不能把 1.1 转成 1。
 import { test } from "node:test";
@@ -81,7 +83,7 @@ test(
          create extension bdtest_lookup schema ext_lookup;
          create table public.uses_lookup (lookup_id int references ext_lookup.lookup(id));
          insert into public.uses_lookup values (1), (2);
-         -- 目标端这张表的列是 int4,30000000000 转不过去 → 这条外键查询报错
+         -- 目标端这张表的列是 int4:按引用方的 bigint 比较(int8 = int4),找不到这一行,外键会失败
          create table auth.big (id bigint primary key);
          insert into auth.big values (30000000000);
          create table public.uses_big (big_id bigint references auth.big(id));
@@ -96,7 +98,25 @@ line" values ('00000000-0000-0000-0000-000000000001');
          create table auth.codes (code numeric(3,1) primary key);
          insert into auth.codes values (1.1);
          create table public.uses_code (code numeric(3,1) references auth.codes(code));
-         insert into public.uses_code values (1.1);`
+         insert into public.uses_code values (1.1);
+         -- 跨类型:引用方 float8;目标端被引用列是 float4,按引用方类型比较才是外键的比较
+         create table auth.f (id double precision primary key);
+         insert into auth.f values (1.23456789);
+         create table public.uses_f (v double precision references auth.f(id));
+         insert into public.uses_f values (1.23456789);
+         -- 引用方列的类型是另一个 schema 里的域,域 CHECK 会调一个写审计表的函数(目标端也有):只读事务必须挡住写
+         create schema types;
+         create table types.audit (v text);
+         create function types.log(v text) returns boolean language plpgsql as $f$ begin insert into types.audit values (v); return true; end $f$;
+         create domain types.code as text check (types.log(value));
+         create table auth.codes2 (code text primary key);
+         insert into auth.codes2 values ('a');
+         create table public.uses_dom (c types.code references auth.codes2(code));
+         insert into public.uses_dom values ('a');
+         -- 引用方列的类型建在备份的 schema 里:恢复之前目标上没有,只能报没查成
+         create domain public.uid as uuid;
+         create table public.uses_uid (u public.uid references auth.users(id));
+         insert into public.uses_uid values ('00000000-0000-0000-0000-000000000001');`
       );
       const dumpPath = join(work, "edge.pgcustom");
       await x(pgDump, ["--format=custom", "--no-owner", "--no-privileges", "--schema=public", "--dbname", source.url, "-f", dumpPath]);
@@ -109,7 +129,15 @@ line" values ('00000000-0000-0000-0000-000000000001');
          create table auth.users (id uuid primary key);
          create table auth.big (id int primary key);
          create table auth.codes (code numeric(2,0) primary key);
-         insert into auth.codes values (1);`
+         insert into auth.codes values (1);
+         create table auth.f (id real primary key);
+         insert into auth.f values (1.23456789);
+         create schema types;
+         create table types.audit (v text);
+         create function types.log(v text) returns boolean language plpgsql as $f$ begin insert into types.audit values (v); return true; end $f$;
+         create domain types.code as text check (types.log(value));
+         create table auth.codes2 (code text primary key);
+         insert into auth.codes2 values ('a');`
       );
       const check = (extra = {}) =>
         checkExternalReferences({ dumpPath, dumpedSchemas: ["public"], targetUrl: target.url, ...extra });
@@ -119,14 +147,22 @@ line" values ('00000000-0000-0000-0000-000000000001');
       // 扩展建的表:dry-run 时只报"装完扩展才能查",不拦
       assert.match(text(dry.unchecked), /public\.uses_lookup → ext_lookup\.lookup .*isn't on the target yet/);
       assert.doesNotMatch(text(dry.problems), /uses_lookup/);
-      // uses_big 在目标端比较时出错:只有它进 unchecked
-      assert.match(text(dry.unchecked), /public\.uses_big → auth\.big .*could not compare its rows on the target/);
-      // ……而 profiles 已经确认的缺行照样是 blocker
+      // bigint 引用 int4:跨类型照外键的比较来,30000000000 在目标上没有
+      assert.match(text(dry.problems), /public\.uses_big → auth\.big .*: 1 of 1 row\(s\)/);
+      // 一条外键在目标端比较出错(下面 uses_dom 的只读报错),别的外键已经确认的缺行照样是 blocker
       assert.match(text(dry.problems), /public\.profiles → auth\.users \(profiles_id_fkey\): 1 of 1 row\(s\)/);
       // 跨行的 COPY 头读出来了,缺行照报
       assert.match(text(dry.problems), /public\."multi\nline" → auth\.users [\s\S]*?: 1 of 1 row\(s\)/);
       // numeric(2,0) 不会把 1.1 变成 1
       assert.match(text(dry.problems), /public\.uses_code → auth\.codes .*: 1 of 1 row\(s\)/);
+      // float8 的 1.23456789 不等于 float4 存下来的 1.2345679:外键会失败,检查也要报缺
+      assert.match(text(dry.problems), /public\.uses_f → auth\.f .*: 1 of 1 row\(s\)/);
+      // 域 CHECK 想写审计表:只读事务挡住,这条外键报没查成,目标上什么都没写
+      assert.match(text(dry.unchecked), /public\.uses_dom → auth\.codes2 .*could not compare its rows on the target \(.*read-only transaction/);
+      const audit = await sql(target.url, "select count(*)::int as n from types.audit");
+      assert.equal(audit.rows[0].n, 0, "the check must not write to the target");
+      // 引用方类型在恢复之前不存在
+      assert.match(text(dry.unchecked), /public\.uses_uid → auth\.users .*type public\.uid, which the target doesn't have until the restore creates it/);
 
       // 不告诉它扩展待装时,表不在就是 blocker
       const strict = await check();

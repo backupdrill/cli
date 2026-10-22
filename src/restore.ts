@@ -255,6 +255,14 @@ async function assertEmptyTarget(
   schemas: string[],
   alsoRestoringStorage: boolean
 ): Promise<void> {
+  const objectCount = await userObjectCount(targetUrl, schemas);
+  if (objectCount > 0) {
+    throw new Error(nonEmptyTargetMessage(schemas, objectCount, alsoRestoringStorage));
+  }
+}
+
+/** 空目标门数的那些对象(见 assertEmptyTarget)有多少个。 */
+async function userObjectCount(targetUrl: string, schemas: string[]): Promise<number> {
   const client = await connectPg(targetUrl);
   try {
     const res = await client.query<{ n: string }>(
@@ -274,13 +282,38 @@ async function assertEmptyTarget(
          as n`,
       [schemas]
     );
-    const objectCount = Number(res.rows[0].n);
-    if (objectCount > 0) {
-      throw new Error(nonEmptyTargetMessage(schemas, objectCount, alsoRestoringStorage));
-    }
+    return Number(res.rows[0].n);
   } finally {
     await client.end();
   }
+}
+
+/**
+ * 恢复失败之后目标是什么状态,给报错接的那句话。单事务失败通常就是回滚了,但"通常"不够:
+ * COMMIT 发出去、回复在路上丢了,服务端已经提交,pg_restore 照样报错(交叉审查第二轮复现)。
+ * 所以不凭推断说"已回滚",而是回头数一遍目标:空的才这么说。
+ */
+async function targetStateAfterFailure(targetUrl: string, schemas: string[]): Promise<string> {
+  let objectCount: number;
+  try {
+    objectCount = await userObjectCount(targetUrl, schemas);
+  } catch (error) {
+    return (
+      ` The restore runs in one transaction, so a failed run normally leaves nothing behind, but checking ` +
+      `the target afterwards failed (${(error as Error).message}). Check it before running restore again.`
+    );
+  }
+  if (objectCount === 0) {
+    return (
+      " It ran in one transaction and was rolled back, so nothing from the snapshot is on the target and " +
+      "you can run restore again on the same project once the cause is fixed."
+    );
+  }
+  return (
+    ` The restore runs in one transaction, yet schema(s) ${schemas.join(", ")} now hold ${objectCount} ` +
+    `object(s), so it may have committed before pg_restore lost its connection. Check the target before ` +
+    `doing anything else; restore won't write into it again while those objects are there.`
+  );
 }
 
 /** README 里讲怎么先把 Auth 用户搬过去的那一节;报错和 dry-run 都指向它。 */
@@ -780,9 +813,8 @@ export async function runRestore(
       if (!engine.ok) {
         const failures = [...engine.preData.failures, ...engine.postData.failures];
         throw new Error(
-          `database restore failed: ${failures.join(" | ")}. It ran in one transaction and was rolled back, ` +
-            `so nothing from the snapshot is on the target and you can run restore again on the same project ` +
-            `once the cause is fixed.` +
+          `database restore failed: ${failures.join(" | ")}.` +
+            (await targetStateAfterFailure(targetUrl, manifest.database.schemas)) +
             restoreFailureAdvice(failures.join(" "))
         );
       }

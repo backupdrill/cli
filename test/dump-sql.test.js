@@ -7,6 +7,7 @@ import {
   parseCreateSchemas,
   parseForeignKeys,
   parsePartitionAttachments,
+  parseTableColumns,
 } from "../dist/dump-sql.js";
 import { firstRestoreError } from "../dist/restore-engine.js";
 import { restoreFailureAdvice } from "../dist/restore.js";
@@ -131,4 +132,38 @@ test("restoreFailureAdvice:锁槽用完时告诉用户怎么调 max_locks_per_tr
   assert.match(lockFailure, /out of shared memory HINT: You might need to increase "max_locks_per_transaction"\./);
   assert.match(restoreFailureAdvice(lockFailure), /supabase postgres-config update --config max_locks_per_transaction=256/);
   assert.equal(restoreFailureAdvice('schema "private" does not exist'), "");
+});
+
+test("parseTableColumns:pg_dump 建表语句里的列类型(修饰符、COLLATE、DEFAULT、生成列、CHECK 行、跨行的名字)", () => {
+  const sql = [
+    "CREATE TABLE public.orders (",
+    "    id bigint NOT NULL,",
+    "    status text DEFAULT 'paid'::text NOT NULL,",
+    "    created_at timestamp with time zone DEFAULT now() NOT NULL,",
+    "    amount numeric(10,2),",
+    '    name character varying(40) COLLATE pg_catalog."C",',
+    "    g integer GENERATED ALWAYS AS ((id + 1)) STORED,",
+    "    CONSTRAINT orders_amount_check CHECK ((amount > (0)::numeric))",
+    ");",
+    "CREATE TABLE public.parted (",
+    "    owner public.uid",
+    ")",
+    "PARTITION BY RANGE (owner);",
+    'CREATE TABLE public."multi',
+    'line" (',
+    '    "user',
+    'id" uuid',
+    ");",
+  ].join("\n");
+  const tables = parseTableColumns(sql);
+  assert.deepEqual([...tables.get("public\u0000orders")], [
+    ["id", "bigint"],
+    ["status", "text"],
+    ["created_at", "timestamp with time zone"],
+    ["amount", "numeric(10,2)"],
+    ["name", "character varying(40)"],
+    ["g", "integer"],
+  ]);
+  assert.deepEqual([...tables.get("public\u0000parted")], [["owner", "public.uid"]]);
+  assert.deepEqual([...tables.get("public\u0000multi\nline")], [["user\nid", "uuid"]]);
 });

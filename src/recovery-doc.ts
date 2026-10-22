@@ -109,7 +109,8 @@ ${
 If a table in this snapshot has a foreign key into \`auth.users\` (a \`profiles.id\`
 that references it, for example), copy the Auth users into the new project
 **before** restoring, or that foreign key can't be created and the restore fails.
-\`backupdrill restore --dry-run\` lists each such key and how many rows have no user.
+\`backupdrill restore --dry-run\` checks those keys against the new project and reports
+the rows that have no user, plus any key it couldn't check.
 Triggers on \`auth.users\` aren't in this snapshot either; recreate them afterwards.
 `
 }
@@ -162,9 +163,9 @@ Add \`--dry-run\` first to preview every check without writing anything. (Skip t
 \`read\` lines to have the CLI prompt you itself; \`unset\` both variables afterwards.)
 The CLI verifies the archive checksum, refuses non-empty targets, checks that rows
 referenced outside the snapshot (such as \`auth.users\`) are on the target, installs
-the extensions, restores in a single transaction through the same engine the weekly
-drills use (a failed restore leaves nothing behind), verifies table counts and row
-presence afterwards, then rebuilds buckets, uploads the
+the extensions, restores the database in a single transaction through the same
+engine the weekly drills use (if pg_restore fails, its changes are rolled back; the
+extensions stay installed), verifies table counts and row presence afterwards, then rebuilds buckets, uploads the
 Storage files back and reconciles every one against the target.
 
 More: https://backupdrill.com/docs/restore

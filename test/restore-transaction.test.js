@@ -8,7 +8,7 @@ import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { createHash } from "node:crypto";
-import { copyFileSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { chmodSync, copyFileSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import pg from "pg";
@@ -298,6 +298,69 @@ test(
       );
       assert.equal(await publicObjects(targetUrl), 0, "nothing may be left behind");
     } finally {
+      for (const id of ids) await x("docker", ["rm", "-fv", id]).catch(() => {});
+      rmSync(work, { recursive: true, force: true });
+    }
+  }
+);
+
+test(
+  "restore: when pg_restore reports a failure after the transaction committed, the error doesn't claim a rollback",
+  { skip: canRun ? false : "requires Docker + pg_dump", timeout: 180_000 },
+  async () => {
+    const ids = [];
+    const work = mkdtempSync(join(tmpdir(), "bd-commit-test-"));
+    const previous = process.env.BACKUPDRILL_PG_RESTORE;
+    try {
+      const [sourcePort, targetPort] = await Promise.all([startPostgres(ids), startPostgres(ids)]);
+      const sourceUrl = `postgresql://postgres:pw@127.0.0.1:${sourcePort}/postgres`;
+      const targetUrl = `postgresql://postgres:pw@localhost:${targetPort}/postgres`;
+      await sql(sourceUrl, "create table public.t (id int primary key); insert into public.t values (1);");
+      const dumpPath = join(work, "t.pgcustom");
+      await x(pgDump, ["--format=custom", "--no-owner", "--no-privileges", "--schema=public", "--dbname", sourceUrl, "-f", dumpPath]);
+      const buf = readFileSync(dumpPath);
+      // 模拟 COMMIT 的回复丢了:真 pg_restore 跑完(已提交),包装脚本再报一个连接断开的错
+      const realPgRestore = (await x("sh", ["-c", "command -v pg_restore"])).stdout.trim();
+      const wrapper = join(work, "pg_restore");
+      writeFileSync(
+        wrapper,
+        `#!/bin/sh\ncase " $* " in *" --single-transaction "*)\n  "${realPgRestore}" "$@" || exit $?\n` +
+          `  echo "pg_restore: error: could not execute query: server closed the connection unexpectedly" >&2\n  exit 1;;\n` +
+          `*) exec "${realPgRestore}" "$@";;\nesac\n`
+      );
+      chmodSync(wrapper, 0o755);
+      process.env.BACKUPDRILL_PG_RESTORE = wrapper;
+      const manifest = {
+        schemaVersion: 2,
+        tool: "backupdrill-cli",
+        toolVersion: "test",
+        createdAt: "2026-10-23T00:00:00.000Z",
+        projectName: "t",
+        database: {
+          serverVersion: "17.6",
+          pgDumpVersion: (await x(pgDump, ["--version"])).stdout.trim(),
+          schemas: ["public"],
+          tableCount: 1,
+          estimatedRowTotal: 1,
+          tables: [{ schema: "public", name: "t", estimatedRows: 1 }],
+        },
+        dump: { key: "backupdrill/t/snap/dump.pgcustom", format: "custom", bytes: buf.length, sha256: createHash("sha256").update(buf).digest("hex") },
+        storage: null,
+      };
+      const config = { databaseUrl: sourceUrl, projectName: "t", schemas: ["public"], storage: { bucket: "unused" } };
+      await assert.rejects(
+        runRestore(config, { store: localStore(manifest, dumpPath, buf), targetDatabaseUrl: targetUrl, confirmTarget: "localhost" }),
+        (error) => {
+          assert.match(error.message, /server closed the connection unexpectedly/);
+          assert.match(error.message, /may have committed/);
+          assert.doesNotMatch(error.message, /was rolled back/);
+          return true;
+        }
+      );
+      assert.ok((await publicUserObjects(targetUrl)) > 0, "the wrapper let the restore commit");
+    } finally {
+      if (previous === undefined) delete process.env.BACKUPDRILL_PG_RESTORE;
+      else process.env.BACKUPDRILL_PG_RESTORE = previous;
       for (const id of ids) await x("docker", ["rm", "-fv", id]).catch(() => {});
       rmSync(work, { recursive: true, force: true });
     }
