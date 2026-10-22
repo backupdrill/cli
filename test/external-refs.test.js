@@ -296,3 +296,62 @@ test(
     }
   }
 );
+
+test(
+  "checkExternalReferences inside the caller's transaction: nothing it calls can write, not even a sequence",
+  { skip: canRun ? false : "requires Docker + pg_dump", timeout: 120_000 },
+  async () => {
+    const ids = [];
+    const work = mkdtempSync(join(tmpdir(), "bd-refs-tx-"));
+    try {
+      const [source, target] = await Promise.all([startPostgres(ids), startPostgres(ids)]);
+      await sql(
+        source.url,
+        `create schema auth;
+         create table auth.codes (code text primary key);
+         insert into auth.codes values ('a');
+         create table public.uses (code text references auth.codes(code));
+         insert into public.uses values ('a');`
+      );
+      const dumpPath = join(work, "tx.pgcustom");
+      await x(pgDump, ["--format=custom", "--no-owner", "--no-privileges", "--schema=public", "--dbname", source.url, "-f", dumpPath]);
+      // 目标端被引用列的唯一索引用的运算符类,比较一次就推一下序列(回滚到保存点也撤不掉)
+      await sql(
+        target.url,
+        `create schema auth;
+         create schema types;
+         create sequence types.calls;
+         create function types.eq_counting(a text, b text) returns boolean language plpgsql
+           as $f$ begin perform nextval('types.calls'); return a = b; end $f$;
+         create operator types.= (leftarg = text, rightarg = text, function = types.eq_counting);
+         create function types.cmp_counting(a text, b text) returns int language plpgsql
+           as $f$ begin perform nextval('types.calls'); return bttextcmp(a, b); end $f$;
+         create operator class types.counting_ops for type text using btree as
+           operator 1 pg_catalog.<, operator 2 pg_catalog.<=, operator 3 types.=,
+           operator 4 pg_catalog.>=, operator 5 pg_catalog.>, function 1 types.cmp_counting(text, text);
+         create table auth.codes (code text);
+         create unique index on auth.codes (code types.counting_ops);
+         insert into auth.codes values ('a');
+         select setval('types.calls', 1, false);`
+      );
+      const client = new pg.Client({ connectionString: target.url });
+      await client.connect();
+      let result;
+      try {
+        await client.query("begin");
+        result = await checkExternalReferences({ dumpPath, dumpedSchemas: ["public"], targetUrl: target.url, inTransaction: client });
+        // 调用方的事务在检查之后还能用
+        await client.query("select 1");
+        await client.query("rollback");
+      } finally {
+        await client.end();
+      }
+      assert.match(result.unchecked.join("\n"), /uses_code_fkey.*read-only transaction/);
+      const seq = await sql(target.url, "select is_called from types.calls");
+      assert.equal(seq.rows[0].is_called, false, "the sequence was never advanced");
+    } finally {
+      for (const id of ids) await x("docker", ["rm", "-fv", id]).catch(() => {});
+      rmSync(work, { recursive: true, force: true });
+    }
+  }
+);
