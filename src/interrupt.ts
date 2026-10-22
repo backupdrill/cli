@@ -45,9 +45,12 @@ export function onInterrupt(cleanup: Cleanup): () => void {
  */
 export function stopOnInterrupt(child: ChildProcess, opts: { group?: boolean } = {}): () => void {
   const pid = child.pid;
+  // Windows 没有负 pid 的进程组信号,process.kill(-pid) 直接报错:那里退回到只看、只停子进程本身
+  // (和 --check-cmd 超时那条路一样),孙进程可能留下。没在 Windows 上测过
+  const byGroup = opts.group && process.platform !== "win32";
   const alive = (): boolean => {
     if (!pid) return false;
-    if (!opts.group) return child.exitCode === null && child.signalCode === null;
+    if (!byGroup) return child.exitCode === null && child.signalCode === null;
     try {
       process.kill(-pid, 0);
       return true;
@@ -57,7 +60,7 @@ export function stopOnInterrupt(child: ChildProcess, opts: { group?: boolean } =
   };
   const signal = (sig: NodeJS.Signals) => {
     try {
-      if (opts.group && pid) process.kill(-pid, sig);
+      if (byGroup && pid) process.kill(-pid, sig);
       else child.kill(sig);
     } catch {
       // 已经退出
