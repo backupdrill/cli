@@ -205,7 +205,8 @@ export function spawnPgRestore(
     // `kill <pid>` 只发给 node 时 pg_restore 收不到;中断时由我们停掉它
     stopOnInterrupt(proc);
     let stderr = "";
-    proc.stderr.on("data", (d: Buffer) => (stderr += d.toString()));
+    proc.stderr.setEncoding("utf8");
+    proc.stderr.on("data", (d: string) => (stderr += d));
     // 不透传原始 spawn Error:node 会把 spawnargs(含 --dbname 连接串=凭据)挂在
     // 异常对象上,顺着 reject 流进日志/Sentry。只保留启动失败的事实与 bin 名。
     proc.on("error", (error) =>
@@ -671,8 +672,11 @@ export function pgRestoreOutput(bin: string, args: string[]): Promise<{ code: nu
     stopOnInterrupt(proc);
     let stdout = "";
     let stderr = "";
-    proc.stdout.on("data", (d: Buffer) => (stdout += d.toString()));
-    proc.stderr.on("data", (d: Buffer) => (stderr += d.toString()));
+    // 按流解码:一个多字节字符可能被拆在两块里,逐块 toString 会把它解坏(schema 名里的中文就会对不上)
+    proc.stdout.setEncoding("utf8");
+    proc.stderr.setEncoding("utf8");
+    proc.stdout.on("data", (d: string) => (stdout += d));
+    proc.stderr.on("data", (d: string) => (stderr += d));
     proc.on("error", (error) =>
       reject(new Error(`${bin} failed to start: ${(error as NodeJS.ErrnoException).code ?? error.message}`))
     );

@@ -9,7 +9,10 @@ import {
   parsePartitionAttachments,
   parseTableColumns,
 } from "../dist/dump-sql.js";
-import { firstRestoreError } from "../dist/restore-engine.js";
+import { firstRestoreError, pgRestoreOutput } from "../dist/restore-engine.js";
+import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { restoreFailureAdvice } from "../dist/restore.js";
 
 // 夹具:pg_restore 17.11 对 supabase/postgres:17.6.1.084 源库转储(--schema=public)的原样输出
@@ -166,4 +169,29 @@ test("parseTableColumns:pg_dump 建表语句里的列类型(修饰符、COLLATE�
   ]);
   assert.deepEqual([...tables.get("public\u0000parted")], [["owner", "public.uid"]]);
   assert.deepEqual([...tables.get("public\u0000multi\nline")], [["user\nid", "uuid"]]);
+});
+
+test("pgRestoreOutput:多字节字符被拆在两块输出里也能解对", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "bd-utf8-"));
+  try {
+    // 假的 pg_restore:把 CREATE SCHEMA "数据";(pg_dump 给非 ASCII 名字加引号)拆在 "数" 的字节中间
+    // 分两次写,中间停一下,保证是两块
+    const bin = join(dir, "pg_restore");
+    writeFileSync(
+      bin,
+      `#!${process.execPath}
+const out = Buffer.from('CREATE SCHEMA "数据";\\n');
+const cut = out.indexOf(Buffer.from("数")) + 1;
+process.stdout.write(out.subarray(0, cut));
+setTimeout(() => process.stdout.write(out.subarray(cut)), 100);
+`
+    );
+    chmodSync(bin, 0o755);
+    const result = await pgRestoreOutput(bin, []);
+    assert.equal(result.code, 0);
+    assert.equal(result.stdout, 'CREATE SCHEMA "数据";\n');
+    assert.deepEqual(parseCreateSchemas(result.stdout), ["数据"]);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
