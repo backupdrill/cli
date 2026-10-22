@@ -15,6 +15,7 @@ import { join } from "node:path";
 import type { ExtensionInfo } from "./manifest.js";
 import { resolvePgRestoreBin } from "./pgbin.js";
 import { dumpUrlFor, connectPg, isSupabaseHost } from "./supabase-ca.js";
+import { onInterrupt, stopOnInterrupt } from "./interrupt.js";
 
 export type RestoreTargetKind = "sandbox" | "supabase";
 
@@ -194,6 +195,8 @@ export function spawnPgRestore(
       stdio: ["ignore", "ignore", "pipe"],
       env: libpqChildEnv(extraEnv, process.env, opts),
     });
+    // `kill <pid>` 只发给 node 时 pg_restore 收不到;中断时由我们停掉它
+    stopOnInterrupt(proc);
     let stderr = "";
     proc.stderr.on("data", (d: Buffer) => (stderr += d.toString()));
     // 不透传原始 spawn Error:node 会把 spawnargs(含 --dbname 连接串=凭据)挂在
@@ -748,6 +751,7 @@ export async function restoreDatabaseArtifact(opts: {
   }
   const { indexBuilds, rest } = splitPostDataList(listing.stdout);
   const listDir = await mkdtemp(join(tmpdir(), "backupdrill-restore-"));
+  const forgetListDir = onInterrupt(() => rm(listDir, { recursive: true, force: true }).catch(() => {}));
   try {
     const passes: ClassifiedPass[] = [];
     if (indexBuilds.length) {
@@ -800,5 +804,6 @@ export async function restoreDatabaseArtifact(opts: {
     return { preData, postData, ok: postData.failures.length === 0 };
   } finally {
     await rm(listDir, { recursive: true, force: true });
+    forgetListDir();
   }
 }
