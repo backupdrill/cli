@@ -44,6 +44,8 @@ export interface ExternalReferenceCheck {
   problems: string[];
   /** 没能检查的,一条一句。恢复在一个事务里跑,这些真出问题也会整体回滚,所以只提示不拦 */
   unchecked: string[];
+  /** 有外键要等扩展装上之后才查得了(见 pendingExtensions) */
+  waitingForExtensions: boolean;
 }
 
 const keyOf = (name: QualifiedName) => `${name.schema}\u0000${name.name}`;
@@ -61,13 +63,19 @@ export async function checkExternalReferences(opts: {
   dumpedSchemas: string[];
   targetUrl: string;
   /**
-   * 还没装到目标上的扩展会装进的 schema(dry-run 时才有;正式恢复先装扩展再查)。被引用的表在这些
-   * schema 里又暂时不存在时,可能是扩展装上之后才有的,这时报"装完扩展才查得了",不当成 blocker。
+   * manifest 里记着、目标上还没装的扩展。有它们在,被引用的表不在、引用方列的类型不在,都可能是
+   * 扩展装上之后才有的(扩展可以往别的 schema 里建表,只看它登记的 schema 不够,交叉审查复现),
+   * 这时报"装完扩展再查",不当成 blocker;正式恢复装完扩展会再查一遍。
    */
-  pendingExtensionSchemas?: string[];
+  pendingExtensions?: string[];
+  /**
+   * 调用方开着的事务(正式恢复里"先装扩展再复查"的那个):在它里面查,看得到还没提交的扩展。
+   * 每条查询包在一个保存点里、查完就回滚到保存点,检查本身留不下任何东西。
+   */
+  inTransaction?: pg.Client;
 }): Promise<ExternalReferenceCheck> {
   const bin = resolvePgRestoreBin();
-  const result: ExternalReferenceCheck = { checked: [], problems: [], unchecked: [] };
+  const result: ExternalReferenceCheck = { checked: [], problems: [], unchecked: [], waitingForExtensions: false };
 
   const listing = await pgRestoreOutput(bin, ["--list", opts.dumpPath]);
   if (listing.code !== 0) throw new Error(`pg_restore --list exited with code ${listing.code}: ${oneLine(listing.stderr)}`);
@@ -109,10 +117,18 @@ export async function checkExternalReferences(opts: {
     const below = children.get(keyOf(table)) ?? [];
     return below.length ? below.flatMap(leavesOf) : [table];
   };
-  const pending = new Set(opts.pendingExtensionSchemas ?? []);
+  const pending = opts.pendingExtensions ?? [];
+  const waitForExtensions = (fk: ForeignKeyDef, what: string) => {
+    result.waitingForExtensions = true;
+    result.unchecked.push(
+      `${describe(fk)}: ${what}; extension(s) ${pending.join(", ")} that the restore installs first may provide it, ` +
+        `so it is checked after they are installed`
+    );
+  };
   const tableColumns = parseTableColumns(definitions);
 
-  const client = await connectPg(opts.targetUrl);
+  const client = opts.inTransaction ?? (await connectPg(opts.targetUrl));
+  if (opts.inTransaction) insideCallerTransaction.add(client);
   try {
     const scans: Scan[] = [];
     for (const fk of external) {
@@ -124,15 +140,13 @@ export async function checkExternalReferences(opts: {
         continue;
       }
       if ("unchecked" in lookup) {
-        result.unchecked.push(`${describe(fk)}: ${lookup.unchecked}`);
+        if (lookup.typeMissing && pending.length) waitForExtensions(fk, lookup.unchecked);
+        else result.unchecked.push(`${describe(fk)}: ${lookup.unchecked}`);
         continue;
       }
       if ("problem" in lookup) {
-        if (lookup.tableMissing && pending.has(fk.references.schema)) {
-          result.unchecked.push(
-            `${describe(fk)}: ${formatQualified(fk.references)} isn't on the target yet, and an extension the restore ` +
-              `installs into schema ${fk.references.schema} may create it; the restore checks it after installing extensions`
-          );
+        if (lookup.tableMissing && pending.length) {
+          waitForExtensions(fk, `${formatQualified(fk.references)} isn't on the target yet`);
         } else {
           result.problems.push(`${describe(fk)}: ${lookup.problem}`);
         }
@@ -174,7 +188,8 @@ export async function checkExternalReferences(opts: {
       }
     }
   } finally {
-    await client.end();
+    if (opts.inTransaction) insideCallerTransaction.delete(client);
+    else await client.end();
   }
   return result;
 }
@@ -204,7 +219,19 @@ interface Scan {
  * 运算符都能调用户函数(交叉审查第二轮复现过域 CHECK 写审计表)。每条语句各开一个事务,
  * 一条出错不会让后面的查询跟着报 "current transaction is aborted"。
  */
+/** 用的是调用方事务的连接:不能另开事务,改用保存点,查完回滚到保存点(写了什么都撤掉)。 */
+const insideCallerTransaction = new WeakSet<pg.Client>();
+
 async function readOnly<T extends pg.QueryResultRow>(client: pg.Client, sql: string, params: unknown[]): Promise<pg.QueryResult<T>> {
+  if (insideCallerTransaction.has(client)) {
+    await client.query("savepoint backupdrill_check");
+    try {
+      await client.query("set local row_security = off");
+      return await client.query<T>(sql, params);
+    } finally {
+      await client.query("rollback to savepoint backupdrill_check").catch(() => {});
+    }
+  }
   await client.query("begin transaction read only");
   try {
     // 外键校验看得到被 RLS 藏起来的行,我们的查询看不到:关掉行级安全,真被它影响时 Postgres 直接报错
@@ -248,7 +275,9 @@ async function comparisonPlan(
   fk: ForeignKeyDef,
   columnsInDump: Map<string, string> | undefined
 ): Promise<
-  { comparisons: ColumnComparison[]; only: boolean } | { problem: string; tableMissing: boolean } | { unchecked: string }
+  | { comparisons: ColumnComparison[]; only: boolean }
+  | { problem: string; tableMissing: boolean }
+  | { unchecked: string; typeMissing?: boolean }
 > {
   const relation = `${quoteIdent(fk.references.schema)}.${quoteIdent(fk.references.name)}`;
   const exists = await readOnly<{ oid: string | null; kind: string | null }>(
@@ -307,7 +336,7 @@ async function comparisonPlan(
     );
     const fkBase = fkType.rows[0]?.base;
     if (!fkType.rows[0]?.oid || !fkBase) {
-      return { unchecked: `column ${column} uses type ${declared}, which is missing on the target` };
+      return { unchecked: `column ${column} uses type ${declared}, which is missing on the target`, typeMissing: true };
     }
     const opclass = index.classes[index.keys.indexOf(attnum.get(fk.referencedColumns[i])!)];
     // 先找 (输入类型, 引用方类型);没有就看能不能隐式转成输入类型,用 (输入类型, 输入类型)

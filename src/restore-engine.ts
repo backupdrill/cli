@@ -16,6 +16,7 @@ import { spawn } from "node:child_process";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import type { Client } from "pg";
 import type { ExtensionInfo } from "./manifest.js";
 import { parseCreateSchemas } from "./dump-sql.js";
 import { resolvePgRestoreBin } from "./pgbin.js";
@@ -379,27 +380,32 @@ export function quoteIdent(name: string): string {
  */
 export async function installExtensions(
   connString: string,
-  extensions: ExtensionInfo[]
+  extensions: ExtensionInfo[],
+  /** 调用方开着的事务:装在它里面(每个扩展一个保存点,装不上的不连累别的),提交与否由调用方定 */
+  inTransaction?: Client
 ): Promise<string[]> {
   if (!extensions.length) return [];
   // pgConnectOptions:Supabase 主机自动带打包根 CA(node-pg 把 require 按 verify-full
   // 处理,裸 Client 对 pooler 必报 self-signed chain);沙箱等非 Supabase 目标原样透传
-  const client = await connectPg(connString);
+  const client = inTransaction ?? (await connectPg(connString));
   const unavailable: string[] = [];
   try {
     for (const ext of extensions) {
+      if (inTransaction) await client.query("savepoint backupdrill_extension");
       try {
         await client.query(`create schema if not exists ${quoteIdent(ext.schema)}`);
         // CASCADE 自动带上依赖扩展,免受 manifest 里的安装顺序摆布
         await client.query(
           `create extension if not exists ${quoteIdent(ext.name)} schema ${quoteIdent(ext.schema)} cascade`
         );
+        if (inTransaction) await client.query("release savepoint backupdrill_extension");
       } catch {
+        if (inTransaction) await client.query("rollback to savepoint backupdrill_extension");
         unavailable.push(ext.name);
       }
     }
   } finally {
-    await client.end();
+    if (!inTransaction) await client.end();
   }
   return unavailable;
 }

@@ -203,10 +203,10 @@ line" values ('00000000-0000-0000-0000-000000000001');
       const check = (extra = {}) =>
         checkExternalReferences({ dumpPath, dumpedSchemas: ["public"], targetUrl: target.url, ...extra });
 
-      const dry = await check({ pendingExtensionSchemas: ["ext_lookup"] });
+      const dry = await check({ pendingExtensions: ["bdtest_lookup"] });
       const text = (list) => list.join("\n");
       // 扩展建的表:dry-run 时只报"装完扩展才能查",不拦
-      assert.match(text(dry.unchecked), /public\.uses_lookup → ext_lookup\.lookup .*isn't on the target yet/);
+      assert.match(text(dry.unchecked), /public\.uses_lookup → ext_lookup\.lookup .*isn't on the target yet; extension\(s\) bdtest_lookup that the restore installs first/);
       assert.doesNotMatch(text(dry.problems), /uses_lookup/);
       // bigint 引用 int4:跨类型照外键的比较来,30000000000 在目标上没有
       assert.match(text(dry.problems), /public\.uses_big → auth\.big .*: 1 of 1 row\(s\)/);
