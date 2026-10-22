@@ -785,17 +785,21 @@ export async function runRestore(
       // (先装扩展再查的话,查不过时扩展已经留在目标上,带配置表的扩展会让修好之后的重跑被空目标门拦下)
       const extensions = manifest.database.extensions ?? [];
       const installed = extensions.length ? await installedExtensions(targetUrl) : new Set<string>();
-      const checkReferences = async (pendingExtensions: string[], inTransaction?: Awaited<ReturnType<typeof connectPg>>) => {
+      const pendingExtensions = extensions.filter((ext) => !installed.has(ext.name)).map((ext) => ext.name);
+      const checkReferences = async (
+        pending: string[],
+        opts: { inTransaction?: Awaited<ReturnType<typeof connectPg>>; final: boolean }
+      ) => {
         log.step("Checking foreign keys that point outside the backup…");
         const references = await checkExternalReferences({
           dumpPath,
           dumpedSchemas: manifest.database.schemas,
           targetUrl,
-          pendingExtensions,
-          inTransaction,
+          pendingExtensions: pending,
+          inTransaction: opts.inTransaction,
         });
         const referenceProblems = logExternalReferences(references, manifest.database.schemas, false);
-        if (referenceProblems.length) {
+        if (referenceProblems.length && opts.final) {
           throw new Error(
             `the restore would fail on foreign keys, so nothing from the snapshot was written:\n  - ` +
               `${referenceProblems.join("\n  - ")}\n${referencesHint(manifest.database.schemas)}`
@@ -803,9 +807,9 @@ export async function runRestore(
         }
         return references;
       };
-      const firstCheck = await checkReferences(
-        extensions.filter((ext) => !installed.has(ext.name)).map((ext) => ext.name)
-      );
+      // 还有扩展没装时,第一遍查出的缺行也先不下结论:扩展装上可能把行补上(交叉审查复现过一个
+      // 往已有表里写种子数据的扩展)。这种情况交给下面"装扩展 + 复查"的事务去定,复查不过照样拦、照样回滚
+      const firstCheck = await checkReferences(pendingExtensions, { final: pendingExtensions.length === 0 });
 
       // 扩展预装:沙箱装不上只能记录(环境局限),真实目标装不上必须阻断——
       // 用户在 dashboard 一键可开,恢复残缺副本则要人工收拾(引擎头注的裁决分工)。
@@ -818,13 +822,13 @@ export async function runRestore(
         const unavailableMessage = (unavailable: string[]) =>
           `target cannot install extension(s): ${unavailable.join(", ")} — enable them in ` +
           `the Supabase dashboard (Database → Extensions) and retry.`;
-        if (firstCheck.waitingForExtensions) {
+        if (firstCheck.waitingForExtensions || firstCheck.problems.length) {
           const client = await connectPg(targetUrl);
           try {
             await client.query("begin");
             const unavailable = await installExtensions(targetUrl, extensions, client);
             if (unavailable.length) throw new Error(unavailableMessage(unavailable));
-            await checkReferences([], client);
+            await checkReferences([], { inTransaction: client, final: true });
             await client.query("commit");
           } catch (error) {
             await client.query("rollback").catch(() => {});

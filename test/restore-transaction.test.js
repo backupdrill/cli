@@ -607,3 +607,63 @@ test(
     }
   }
 );
+
+test(
+  "restore: rows an extension adds when it's installed count, so they don't block the restore",
+  { skip: canRun ? false : "requires Docker + pg_dump", timeout: 180_000 },
+  async () => {
+    const ids = [];
+    const work = mkdtempSync(join(tmpdir(), "bd-seed-"));
+    try {
+      const [sourcePort, targetPort] = await Promise.all([startPostgres(ids), startPostgres(ids)]);
+      const sourceUrl = `postgresql://postgres:pw@127.0.0.1:${sourcePort}/postgres`;
+      const targetUrl = `postgresql://postgres:pw@localhost:${targetPort}/postgres`;
+      // 目标上的扩展装的时候会往已有的 auth.codes 里写一行
+      const targetId = (await x("docker", ["ps", "-q", "--filter", `publish=${targetPort}`])).stdout.trim();
+      await x("docker", ["exec", "-u", "root", targetId, "sh", "-c",
+        "d=$(pg_config --sharedir)/extension; " +
+        "printf \"default_version = '1.0'\\nrelocatable = false\\n\" > $d/bdtest_seed.control; " +
+        "printf \"insert into auth.codes values ('a');\\n\" > $d/bdtest_seed--1.0.sql"]);
+      await sql(
+        sourceUrl,
+        `create schema auth;
+         create table auth.codes (code text primary key);
+         insert into auth.codes values ('a');
+         create table public.uses (code text references auth.codes(code));
+         insert into public.uses values ('a');`
+      );
+      const dumpPath = join(work, "seed.pgcustom");
+      await x(pgDump, ["--format=custom", "--no-owner", "--no-privileges", "--schema=public", "--dbname", sourceUrl, "-f", dumpPath]);
+      const buf = readFileSync(dumpPath);
+      const manifest = {
+        schemaVersion: 2,
+        tool: "backupdrill-cli",
+        toolVersion: "test",
+        createdAt: "2026-10-23T00:00:00.000Z",
+        projectName: "seed",
+        database: {
+          serverVersion: "17.6",
+          pgDumpVersion: (await x(pgDump, ["--version"])).stdout.trim(),
+          schemas: ["public"],
+          tableCount: 1,
+          estimatedRowTotal: 1,
+          tables: [{ schema: "public", name: "uses", estimatedRows: 1 }],
+          extensions: [{ name: "bdtest_seed", version: "1.0", schema: "ext_seed" }],
+        },
+        dump: { key: "backupdrill/seed/snap/dump.pgcustom", format: "custom", bytes: buf.length, sha256: createHash("sha256").update(buf).digest("hex") },
+        storage: null,
+      };
+      const config = { databaseUrl: sourceUrl, projectName: "seed", schemas: ["public"], storage: { bucket: "unused" } };
+      await sql(targetUrl, "create schema auth; create table auth.codes (code text primary key);");
+      const done = await runRestore(config, {
+        store: localStore(manifest, dumpPath, buf),
+        targetDatabaseUrl: targetUrl,
+        confirmTarget: "localhost",
+      });
+      assert.equal(done.databaseVerified, true, "the row the extension adds satisfies the foreign key");
+    } finally {
+      for (const id of ids) await x("docker", ["rm", "-fv", id]).catch(() => {});
+      rmSync(work, { recursive: true, force: true });
+    }
+  }
+);
