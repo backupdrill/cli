@@ -785,13 +785,14 @@ export async function runRestore(
       // (先装扩展再查的话,查不过时扩展已经留在目标上,带配置表的扩展会让修好之后的重跑被空目标门拦下)
       const extensions = manifest.database.extensions ?? [];
       const installed = extensions.length ? await installedExtensions(targetUrl) : new Set<string>();
-      const checkReferences = async (pendingExtensions: string[]) => {
+      const checkReferences = async (pendingExtensions: string[], inTransaction?: Awaited<ReturnType<typeof connectPg>>) => {
         log.step("Checking foreign keys that point outside the backup…");
         const references = await checkExternalReferences({
           dumpPath,
           dumpedSchemas: manifest.database.schemas,
           targetUrl,
           pendingExtensions,
+          inTransaction,
         });
         const referenceProblems = logExternalReferences(references, manifest.database.schemas, false);
         if (referenceProblems.length) {
@@ -808,19 +809,34 @@ export async function runRestore(
 
       // 扩展预装:沙箱装不上只能记录(环境局限),真实目标装不上必须阻断——
       // 用户在 dashboard 一键可开,恢复残缺副本则要人工收拾(引擎头注的裁决分工)。
-      // 装上的扩展在恢复失败时留着:下一次运行照样要它们,空目标门也不数扩展自带的对象(配置表除外)。
-      // (曾经在失败后删掉"本次新装的"扩展,交叉审查复现了它会误删别的连接同时装上的扩展。)
+      // 有外键要等扩展装上才查得了时,装扩展和复查放在同一个事务里,复查过了才提交:复查不过就连扩展
+      // 一起回滚,目标原样不动(否则带配置表的扩展留下来,修好之后的重跑会被空目标门拦下,交叉审查复现)。
+      // 正式恢复(pg_restore)失败时装上的扩展留着:下一次运行照样要它们,空目标门也不数扩展自带的对象
+      // (配置表除外)。曾经在失败后删掉"本次新装的"扩展,交叉审查复现了它会误删别的连接同时装上的扩展。
       if (extensions.length) {
         log.step(`Installing ${extensions.length} extension(s) on target…`);
-        const unavailable = await installExtensions(targetUrl, extensions);
-        if (unavailable.length) {
-          throw new Error(
-            `target cannot install extension(s): ${unavailable.join(", ")} — enable them in ` +
-              `the Supabase dashboard (Database → Extensions) and retry.`
-          );
+        const unavailableMessage = (unavailable: string[]) =>
+          `target cannot install extension(s): ${unavailable.join(", ")} — enable them in ` +
+          `the Supabase dashboard (Database → Extensions) and retry.`;
+        if (firstCheck.waitingForExtensions) {
+          const client = await connectPg(targetUrl);
+          try {
+            await client.query("begin");
+            const unavailable = await installExtensions(targetUrl, extensions, client);
+            if (unavailable.length) throw new Error(unavailableMessage(unavailable));
+            await checkReferences([], client);
+            await client.query("commit");
+          } catch (error) {
+            await client.query("rollback").catch(() => {});
+            throw error;
+          } finally {
+            await client.end();
+          }
+        } else {
+          const unavailable = await installExtensions(targetUrl, extensions);
+          if (unavailable.length) throw new Error(unavailableMessage(unavailable));
         }
       }
-      if (firstCheck.waitingForExtensions) await checkReferences([]);
 
       log.step("Restoring database into target…");
       const engine = await restoreDatabaseArtifact({ dumpPath, connString: targetUrl, target: "supabase" });

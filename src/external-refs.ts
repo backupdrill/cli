@@ -68,6 +68,11 @@ export async function checkExternalReferences(opts: {
    * 这时报"装完扩展再查",不当成 blocker;正式恢复装完扩展会再查一遍。
    */
   pendingExtensions?: string[];
+  /**
+   * 调用方开着的事务(正式恢复里"先装扩展再复查"的那个):在它里面查,看得到还没提交的扩展。
+   * 每条查询包在一个保存点里、查完就回滚到保存点,检查本身留不下任何东西。
+   */
+  inTransaction?: pg.Client;
 }): Promise<ExternalReferenceCheck> {
   const bin = resolvePgRestoreBin();
   const result: ExternalReferenceCheck = { checked: [], problems: [], unchecked: [], waitingForExtensions: false };
@@ -122,7 +127,8 @@ export async function checkExternalReferences(opts: {
   };
   const tableColumns = parseTableColumns(definitions);
 
-  const client = await connectPg(opts.targetUrl);
+  const client = opts.inTransaction ?? (await connectPg(opts.targetUrl));
+  if (opts.inTransaction) insideCallerTransaction.add(client);
   try {
     const scans: Scan[] = [];
     for (const fk of external) {
@@ -182,7 +188,8 @@ export async function checkExternalReferences(opts: {
       }
     }
   } finally {
-    await client.end();
+    if (opts.inTransaction) insideCallerTransaction.delete(client);
+    else await client.end();
   }
   return result;
 }
@@ -212,7 +219,19 @@ interface Scan {
  * 运算符都能调用户函数(交叉审查第二轮复现过域 CHECK 写审计表)。每条语句各开一个事务,
  * 一条出错不会让后面的查询跟着报 "current transaction is aborted"。
  */
+/** 用的是调用方事务的连接:不能另开事务,改用保存点,查完回滚到保存点(写了什么都撤掉)。 */
+const insideCallerTransaction = new WeakSet<pg.Client>();
+
 async function readOnly<T extends pg.QueryResultRow>(client: pg.Client, sql: string, params: unknown[]): Promise<pg.QueryResult<T>> {
+  if (insideCallerTransaction.has(client)) {
+    await client.query("savepoint backupdrill_check");
+    try {
+      await client.query("set local row_security = off");
+      return await client.query<T>(sql, params);
+    } finally {
+      await client.query("rollback to savepoint backupdrill_check").catch(() => {});
+    }
+  }
   await client.query("begin transaction read only");
   try {
     // 外键校验看得到被 RLS 藏起来的行,我们的查询看不到:关掉行级安全,真被它影响时 Postgres 直接报错

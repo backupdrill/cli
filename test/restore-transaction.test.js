@@ -163,7 +163,11 @@ test(
       const restore = (extra) =>
         runRestore(config, { store, targetDatabaseUrl: targetUrl, confirmTarget: "localhost", ...extra });
 
-      // 目标 1:没有 auth schema 的裸 Postgres —— 被引用的表根本不在
+      // 目标 1:没有 auth schema 的裸 Postgres —— 被引用的表根本不在。
+      // manifest 里的 pg_trgm 还没装时,dry-run 不能断定(扩展能往任何 schema 里建表),只报"装完再查";
+      // 装上之后就是确定的 blocker
+      await restore({ dryRun: true });
+      await sql(targetUrl, "create extension pg_trgm schema public");
       await assert.rejects(restore({ dryRun: true }), (error) => {
         assert.match(error.message, /auth\.users does not exist on the target/);
         return true;
@@ -438,10 +442,15 @@ test(
       const restore = () =>
         runRestore(config, { store: localStore(manifest, dumpPath, buf), targetDatabaseUrl: targetUrl, confirmTarget: "localhost" });
 
+      const cfgInstalled = async () =>
+        (await sql(targetUrl, "select count(*)::int as n from pg_extension where extname = 'bdtest_cfg'")).rows[0].n;
+      // auth.users 根本不在:有扩展待装,第一遍只能先记下;装扩展和复查在一个事务里,复查不过连扩展一起回滚
+      await assert.rejects(restore(), /auth\.users does not exist on the target/);
+      assert.equal(await cfgInstalled(), 0, "the extension is rolled back with the failed re-check");
+      // auth.users 在、但没有人:第一遍就拦下,什么都没装
       await sql(targetUrl, "create schema auth; create table auth.users (id uuid primary key);");
       await assert.rejects(restore(), /nothing from the snapshot was written/);
-      const installed = await sql(targetUrl, "select count(*)::int as n from pg_extension where extname = 'bdtest_cfg'");
-      assert.equal(installed.rows[0].n, 0, "the foreign-key check runs before any extension is installed");
+      assert.equal(await cfgInstalled(), 0, "the foreign-key check runs before any extension is installed");
 
       await sql(targetUrl, "insert into auth.users values ('00000000-0000-0000-0000-000000000001')");
       const done = await restore();
@@ -531,6 +540,67 @@ test(
       await sql(targetUrl, "insert into auth.users values ('a@example.com')");
       const done = await restore();
       assert.equal(done.databaseVerified, true);
+    } finally {
+      for (const id of ids) await x("docker", ["rm", "-fv", id]).catch(() => {});
+      rmSync(work, { recursive: true, force: true });
+    }
+  }
+);
+
+test(
+  "restore: a key whose type comes from an extension not yet installed is checked once the extension is in",
+  { skip: canRun ? false : "requires Docker + pg_dump", timeout: 180_000 },
+  async () => {
+    const ids = [];
+    const work = mkdtempSync(join(tmpdir(), "bd-citext-"));
+    try {
+      const [sourcePort, targetPort] = await Promise.all([startPostgres(ids), startPostgres(ids)]);
+      const sourceUrl = `postgresql://postgres:pw@127.0.0.1:${sourcePort}/postgres`;
+      const targetUrl = `postgresql://postgres:pw@localhost:${targetPort}/postgres`;
+      await sql(
+        sourceUrl,
+        `create schema auth;
+         create table auth.users (email text primary key);
+         insert into auth.users values ('a@example.com');
+         create schema extensions;
+         create extension citext schema extensions;
+         create table public.contacts (email extensions.citext references auth.users(email));
+         insert into public.contacts values ('a@example.com');`
+      );
+      const dumpPath = join(work, "citext.pgcustom");
+      await x(pgDump, ["--format=custom", "--no-owner", "--no-privileges", "--schema=public", "--dbname", sourceUrl, "-f", dumpPath]);
+      const buf = readFileSync(dumpPath);
+      const manifest = {
+        schemaVersion: 2,
+        tool: "backupdrill-cli",
+        toolVersion: "test",
+        createdAt: "2026-10-23T00:00:00.000Z",
+        projectName: "citext",
+        database: {
+          serverVersion: "17.6",
+          pgDumpVersion: (await x(pgDump, ["--version"])).stdout.trim(),
+          schemas: ["public"],
+          tableCount: 1,
+          estimatedRowTotal: 1,
+          tables: [{ schema: "public", name: "contacts", estimatedRows: 1 }],
+          extensions: [{ name: "citext", version: "1.6", schema: "extensions" }],
+        },
+        dump: { key: "backupdrill/citext/snap/dump.pgcustom", format: "custom", bytes: buf.length, sha256: createHash("sha256").update(buf).digest("hex") },
+        storage: null,
+      };
+      const config = { databaseUrl: sourceUrl, projectName: "citext", schemas: ["public"], storage: { bucket: "unused" } };
+      // 被引用的表在、但是空的;citext 还没装,所以第一遍认不出引用方的类型,只有装完再查才看得出缺人
+      await sql(targetUrl, "create schema auth; create table auth.users (email text primary key);");
+      await assert.rejects(
+        runRestore(config, { store: localStore(manifest, dumpPath, buf), targetDatabaseUrl: targetUrl, confirmTarget: "localhost" }),
+        (error) => {
+          assert.match(error.message, /restore would fail on foreign keys/);
+          assert.match(error.message, /public\.contacts → auth\.users \(contacts_email_fkey\): 1 of 1 row\(s\)/);
+          return true;
+        }
+      );
+      const citext = await sql(targetUrl, "select count(*)::int as n from pg_extension where extname = 'citext'");
+      assert.equal(citext.rows[0].n, 0, "citext was installed only inside the re-check's transaction and rolled back");
     } finally {
       for (const id of ids) await x("docker", ["rm", "-fv", id]).catch(() => {});
       rmSync(work, { recursive: true, force: true });
