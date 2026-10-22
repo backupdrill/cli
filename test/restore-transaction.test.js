@@ -447,10 +447,10 @@ test(
       // auth.users 根本不在:有扩展待装,第一遍只能先记下;装扩展和复查在一个事务里,复查不过连扩展一起回滚
       await assert.rejects(restore(), /auth\.users does not exist on the target/);
       assert.equal(await cfgInstalled(), 0, "the extension is rolled back with the failed re-check");
-      // auth.users 在、但没有人:第一遍就拦下,什么都没装
+      // auth.users 在、但没有人:扩展还没装,同样交给"装扩展 + 复查"的事务,复查不过一起回滚
       await sql(targetUrl, "create schema auth; create table auth.users (id uuid primary key);");
       await assert.rejects(restore(), /nothing from the snapshot was written/);
-      assert.equal(await cfgInstalled(), 0, "the foreign-key check runs before any extension is installed");
+      assert.equal(await cfgInstalled(), 0, "nothing stays installed after a failed check");
 
       await sql(targetUrl, "insert into auth.users values ('00000000-0000-0000-0000-000000000001')");
       const done = await restore();
@@ -655,6 +655,8 @@ test(
       };
       const config = { databaseUrl: sourceUrl, projectName: "seed", schemas: ["public"], storage: { bucket: "unused" } };
       await sql(targetUrl, "create schema auth; create table auth.codes (code text primary key);");
+      // dry-run 装不了扩展,同样不能把缺的行当成定论
+      await runRestore(config, { store: localStore(manifest, dumpPath, buf), targetDatabaseUrl: targetUrl, dryRun: true });
       const done = await runRestore(config, {
         store: localStore(manifest, dumpPath, buf),
         targetDatabaseUrl: targetUrl,
