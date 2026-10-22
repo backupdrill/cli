@@ -203,15 +203,11 @@ line" values ('00000000-0000-0000-0000-000000000001');
       const check = (extra = {}) =>
         checkExternalReferences({ dumpPath, dumpedSchemas: ["public"], targetUrl: target.url, ...extra });
 
+      const dry = await check({ pendingExtensions: ["bdtest_lookup"] });
       const text = (list) => list.join("\n");
-      // 有扩展待装(dry-run 时、正式恢复的第一遍):扩展建的表、扩展可能补上的行,都只报"装完扩展再查",不拦
-      const pending = await check({ pendingExtensions: ["bdtest_lookup"] });
-      assert.match(text(pending.unchecked), /public\.uses_lookup → ext_lookup\.lookup .*isn't on the target yet; extension\(s\) bdtest_lookup that the restore installs first/);
-      assert.match(text(pending.unchecked), /public\.profiles → auth\.users \(profiles_id_fkey\): 1 of 1 row\(s\) .* yet; extension\(s\) bdtest_lookup/);
-      assert.doesNotMatch(text(pending.problems), /profiles_id_fkey/, "missing rows wait for the extensions");
-      assert.equal(pending.waitingForExtensions, true);
-      // 下面的断言都在没有扩展待装时(装完扩展后的复查同样如此)
-      const dry = await check();
+      // 扩展建的表:dry-run 时只报"装完扩展才能查",不拦
+      assert.match(text(dry.unchecked), /public\.uses_lookup → ext_lookup\.lookup .*isn't on the target yet; extension\(s\) bdtest_lookup that the restore installs first/);
+      assert.doesNotMatch(text(dry.problems), /uses_lookup/);
       // bigint 引用 int4:跨类型照外键的比较来,30000000000 在目标上没有
       assert.match(text(dry.problems), /public\.uses_big → auth\.big .*: 1 of 1 row\(s\)/);
       // 一条外键在目标端比较出错(下面 uses_dom 的只读报错),别的外键已经确认的缺行照样是 blocker
@@ -243,8 +239,9 @@ line" values ('00000000-0000-0000-0000-000000000001');
       // 引用方类型在恢复之前不存在
       assert.match(text(dry.unchecked), /public\.uses_uid → auth\.users .*uses type public\.uid, which is missing on the target/);
 
-      // 没有扩展待装时,表不在就是 blocker
-      assert.match(text(dry.problems), /ext_lookup\.lookup does not exist on the target/);
+      // 不告诉它扩展待装时,表不在就是 blocker
+      const strict = await check();
+      assert.match(text(strict.problems), /ext_lookup\.lookup does not exist on the target/);
 
       // 扩展装上之后(正式恢复的顺序),这条外键能查,两行都找得到
       await sql(target.url, "create schema ext_lookup; create extension bdtest_lookup schema ext_lookup;");

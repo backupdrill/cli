@@ -174,19 +174,13 @@ export async function checkExternalReferences(opts: {
         const { fk, rows, missingRows } = scan.checked;
         if (missingRows > 0) {
           // 已经确认缺的行是事实,后面查不下去也不能把它吞掉
-          const finding = scan.failed
-            ? `at least ${missingRows.toLocaleString("en-US")} row(s) point at ${formatQualified(fk.references)} ` +
-              `rows the target doesn't have (the check stopped early: ${scan.failed})`
-            : `${missingRows.toLocaleString("en-US")} of ${rows.toLocaleString("en-US")} row(s) point at ` +
-              `${formatQualified(fk.references)} rows the target doesn't have`;
-          // 还有扩展没装时不下结论:装扩展可能把行补上(交叉审查复现过往已有表里写种子数据的扩展)。
-          // dry-run 和正式恢复的第一遍同样对待;正式恢复装完扩展的复查里 pending 为空,照常拦
-          if (pending.length) {
-            waitForExtensions(fk, `${finding} yet`);
-            result.checked = result.checked.filter((c) => c !== scan.checked);
-          } else {
-            result.problems.push(`${describe(fk)}: ${finding}`);
-          }
+          result.problems.push(
+            scan.failed
+              ? `${describe(fk)}: at least ${missingRows.toLocaleString("en-US")} row(s) point at ` +
+                  `${formatQualified(fk.references)} rows the target doesn't have (the check stopped early: ${scan.failed})`
+              : `${describe(fk)}: ${missingRows.toLocaleString("en-US")} of ${rows.toLocaleString("en-US")} row(s) ` +
+                  `point at ${formatQualified(fk.references)} rows the target doesn't have`
+          );
         } else if (scan.failed) {
           result.unchecked.push(`${describe(fk)}: ${scan.failed}`);
           result.checked = result.checked.filter((c) => c !== scan.checked);
