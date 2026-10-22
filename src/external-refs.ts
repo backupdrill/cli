@@ -226,10 +226,15 @@ async function readOnly<T extends pg.QueryResultRow>(client: pg.Client, sql: str
   if (insideCallerTransaction.has(client)) {
     await client.query("savepoint backupdrill_check");
     try {
+      // 保存点里也设成只读:回滚到保存点撤不掉序列的 nextval/setval(交叉审查复现),只读才拦得住;
+      // 这个设置随保存点一起撤销,外层事务照样能提交扩展
+      await client.query("set local transaction_read_only = on");
       await client.query("set local row_security = off");
       return await client.query<T>(sql, params);
     } finally {
+      // 回滚之后保存点还在,不 release 的话每条查询都往里套一层
       await client.query("rollback to savepoint backupdrill_check").catch(() => {});
+      await client.query("release savepoint backupdrill_check").catch(() => {});
     }
   }
   await client.query("begin transaction read only");
