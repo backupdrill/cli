@@ -734,7 +734,11 @@ export async function drillDump(
         postData.failures.length > 0
           ? `${postData.failures.length} failed: ${postData.failures[0]}`
           : postData.supabaseSkipped > 0
-            ? `user objects restored; ${postData.supabaseSkipped} Supabase-managed object(s) skipped (Supabase-managed tables such as auth.users do not exist in the drill sandbox)`
+            ? // 说清跳过的是什么,以及它对真实恢复意味着什么:2026-10-22 实验里演练 PASS,
+              // 恢复却死在被跳过的那条 FK → auth.users 上,因为新项目的 auth.users 是空的
+              `user objects restored; ${postData.supabaseSkipped} Supabase-managed object(s) skipped ` +
+              `(they reference tables such as auth.users, which the drill sandbox doesn't have; ` +
+              `restoring into a new project needs the rows they point at to be there first)`
             : "all post-data objects restored",
     });
 

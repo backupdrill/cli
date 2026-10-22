@@ -100,3 +100,15 @@ test("手动 pg_restore 命令经 PGPASSWORD:URL 无密码、密码不进 argv",
   assert.ok(doc.includes("read -rs PGPASSWORD && export PGPASSWORD"), "隐藏式输入,不进历史");
   assert.ok(doc.includes('postgresql://postgres.<target-ref>@<target-pooler-host>:5432/postgres'));
 });
+
+test("手册:只备 public 时写明先搬 auth.users;转储自带 auth 时不写", () => {
+  const doc = renderRecoveryDoc(manifest, ctx);
+  assert.match(doc, /foreign key into `auth\.users`/);
+  assert.match(doc, /\*\*before\*\* restoring/);
+  assert.match(doc, /backupdrill restore --dry-run/);
+  const withAuth = renderRecoveryDoc(
+    { ...manifest, database: { ...manifest.database, schemas: ["public", "auth"] } },
+    ctx
+  );
+  assert.doesNotMatch(withAuth, /\*\*before\*\* restoring/);
+});

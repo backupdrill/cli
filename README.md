@@ -59,7 +59,7 @@ Configure via **env vars**, a **config file**, or **flags** (precedence: flags >
 ### Env vars
 
 ```bash
-export BACKUPDRILL_DATABASE_URL="postgresql://postgres.<ref>:<pw>@aws-0-<region>.pooler.supabase.com:5432/postgres"
+export BACKUPDRILL_DATABASE_URL="postgresql://postgres.<ref>:<pw>@<pooler-host>:5432/postgres"
 export BACKUPDRILL_PROJECT_NAME="my-app"
 export BACKUPDRILL_S3_ENDPOINT="https://<account>.r2.cloudflarestorage.com"  # omit for AWS S3
 export BACKUPDRILL_S3_REGION="auto"
@@ -98,7 +98,7 @@ backupdrill backup --config backupdrill.config.json
 
 ## Get the connection string
 
-Use the **Session Pooler** string from your Supabase dashboard (Project Settings → Database → Connection string → Session pooler). The default `postgres` user works as-is — it owns your tables, so `pg_dump` passes row-level security.
+Use the **Session pooler** string: in the Supabase dashboard, open your project, click **Connect** at the top of the page and pick **Session pooler**. Copy the whole string rather than typing the host yourself, because the pooler host can't be worked out from the region. Replace `[YOUR-PASSWORD]` with the database password (percent-encode characters like `@` or `#`). The default `postgres` user works as-is — it owns your tables, so `pg_dump` passes row-level security.
 
 **Least-privilege role (advanced, usually not viable on Supabase):** `pg_dump` needs `select` on *sequences* too, and it **errors on any RLS-enabled table the role can't bypass** — and most Supabase tables have RLS on, while `bypassrls` can't be granted without superuser. Only use a dedicated role if your schema has no RLS tables:
 
@@ -188,7 +188,7 @@ backupdrill drill --check-cmd "npm run smoke"   # BACKUPDRILL_SANDBOX_URL points
 
 Your command runs after all structural checks pass, with `BACKUPDRILL_SANDBOX_URL` set to the sandbox's connection string. Exit 0 means pass; the result shows up in the report as an `app checks` line, and a non-zero exit fails the drill (the report keeps structural and app-level failures clearly separate). Entirely optional — without the flag, nothing changes and the report has no `app checks` line. There's a 10-minute timeout (the whole process tree is killed), and `--keep` leaves the sandbox container running when a drill fails so you can inspect it — the report JSON then includes a `keptSandbox` object with the container id and connection string (`docker rm -f <id>` when done).
 
-**What this can and cannot verify, honestly:** `BACKUPDRILL_SANDBOX_URL` connects as the sandbox **superuser**, and superusers bypass row-level security. The sandbox does carry a stub of the Supabase runtime — an `auth` schema whose `uid()`/`jwt()`/`role()`/`email()` return null, and the `anon`/`authenticated`/`service_role` roles — so functions, column defaults and policies that reference them restore instead of being skipped. The sandbox deliberately does not create Supabase-managed *tables* such as `auth.users`: an index, constraint or policy that points at one is reported as a skipped managed object (these are restored in a second, post-data pass where that exemption applies), while a *view* over one is created in the strict first pass and fails the drill — a real gap in what a public-only backup can rebuild, shown rather than hidden. A function *body* that selects from `auth.users` is different: PostgreSQL does not validate string-literal bodies (`AS $$ … $$`) during a restore (`check_function_bodies` is off in every dump), so such a function is recreated and the drill passes — it would only fail when called. The exception is an SQL-standard `BEGIN ATOMIC … END` body, which is parsed and dependency-checked at creation regardless of that setting, so one of those referencing a managed table fails the drill like a view does. That is exactly what `--check-cmd` is for: if your application depends on such a function, call it there. So use `--check-cmd` for data and business invariants ("orders reference existing users", "the row count I care about is sane"). It is **not** an RLS behavior test — `auth.uid()` is a stub and you are a superuser; verifying RLS takes an authenticated client stack with real JWTs, which no restore sandbox can fake generically.
+**What this can and cannot verify, honestly:** `BACKUPDRILL_SANDBOX_URL` connects as the sandbox **superuser**, and superusers bypass row-level security. The sandbox does carry a stub of the Supabase runtime — an `auth` schema whose `uid()`/`jwt()`/`role()`/`email()` return null, and the `anon`/`authenticated`/`service_role` roles — so functions, column defaults and policies that reference them restore instead of being skipped. The sandbox deliberately does not create Supabase-managed *tables* such as `auth.users`: an index, constraint or policy that points at one is reported as a skipped managed object (these are restored in a second, post-data pass where that exemption applies). A skipped foreign key into `auth.users` still matters for a real restore, see [Tables that reference auth.users](#tables-that-reference-authusers). A *view* over one is created in the strict first pass instead, and fails the drill — a real gap in what a public-only backup can rebuild, shown rather than hidden. A function *body* that selects from `auth.users` is different: PostgreSQL does not validate string-literal bodies (`AS $$ … $$`) during a restore (`check_function_bodies` is off in every dump), so such a function is recreated and the drill passes — it would only fail when called. The exception is an SQL-standard `BEGIN ATOMIC … END` body, which is parsed and dependency-checked at creation regardless of that setting, so one of those referencing a managed table fails the drill like a view does. That is exactly what `--check-cmd` is for: if your application depends on such a function, call it there. So use `--check-cmd` for data and business invariants ("orders reference existing users", "the row count I care about is sane"). It is **not** an RLS behavior test — `auth.uid()` is a stub and you are a superuser; verifying RLS takes an authenticated client stack with real JWTs, which no restore sandbox can fake generically.
 
 When you actually need to recover, `restore` puts the database back into a fresh
 target project (through the same engine the drills use, with verification) and
@@ -204,6 +204,8 @@ backupdrill restore --database --target-supabase-url https://<ref>.supabase.co -
 
 Prefer files on disk instead? Skip the Storage target and pass `--storage-dir ./recovered`.
 
+`--dry-run` writes nothing to the target. Besides checking the target (not the source project, schemas empty, Postgres and `pg_restore` versions, extensions available), it downloads the dump to a temporary directory, checks its sha256 and looks for foreign keys that point outside the backup (see [Tables that reference auth.users](#tables-that-reference-authusers)). The real run repeats those checks before it writes any snapshot data; it installs the recorded extensions first, because a referenced table can come from one, and they stay installed if a check fails. The database restore then runs in a single transaction: if any statement fails, nothing from the snapshot stays on the target, and you can run it again on the same project once you've fixed the cause. (If the connection drops while it commits, the error says so and asks you to check the target first.) Extensions the run installed stay installed, since the next run needs them too, and the empty-target check doesn't count them. One transaction holds a lock on every table, index and sequence until it commits, so a very large schema can run out of lock slots: on Supabase's smallest compute size, about a thousand tables (partitions count as tables). The restore then stops with nothing written and tells you how to raise `max_locks_per_transaction`.
+
 Or restore the dump by hand — into an **empty** database, without `--clean`:
 
 ```bash
@@ -213,8 +215,35 @@ pg_restore --no-owner --no-privileges --dbname "<target-connection-string>" dump
 Don't use `--clean` against a Supabase project: dropping and recreating the `public`
 schema silently wipes Supabase's default grants for `anon`/`authenticated` (the dump
 carries no ACLs), leaving the restored API returning 401s. One error is expected and
-harmless: `schema "public" already exists` — the target always has it. The
-`backupdrill restore` command above handles all of this (plus verification) for you.
+harmless: `schema "public" already exists` — the target always has it. An error
+on a foreign key into `auth.users` means the users have to be copied in first (see
+the next section). The `backupdrill restore` command above handles all of this (plus
+verification) for you.
+
+### Tables that reference auth.users
+
+By default a backup covers the `public` schema only, so your Auth users are not in it. Plenty of Supabase apps have a table like `profiles` whose `id` is a foreign key to `auth.users(id)`. When the restore recreates that key in a new project, Postgres checks every `profiles` row against `auth.users`, and in a new project that table is empty, so the restore fails.
+
+A drill can't catch this. Its sandbox has no `auth.users` at all, so the drill reports that foreign key as a skipped Supabase-managed object and passes. `restore --dry-run` checks it against the real target and tells you how many rows have nothing to point at:
+
+```
+✗ references outside the backup: public.profiles → auth.users (profiles_id_fkey): 200 of 200 row(s) point at auth.users rows the target doesn't have
+```
+
+While that check fails, no snapshot data is written. Copy the users into the new project first, then run the restore. While the old project is still reachable, the Postgres tools can do it. Use the Session pooler string of each project, and type the passwords at hidden prompts so they stay out of your shell history:
+
+```bash
+read -rs OLD_PW; read -rs NEW_PW
+PGPASSWORD="$OLD_PW" pg_dump --data-only --table=auth.users --table=auth.identities \
+  "postgresql://postgres.<old-ref>@<old-pooler-host>:5432/postgres" |
+  PGPASSWORD="$NEW_PW" psql -v ON_ERROR_STOP=1 \
+  "postgresql://postgres.<new-ref>@<new-pooler-host>:5432/postgres"
+unset OLD_PW NEW_PW
+```
+
+`auth.identities` holds each user's sign-in methods; users copied with it can sign in to the new project with their old password. If the old project is gone, the users can only come from a backup that includes the `auth` schema, such as Supabase's own daily backups on a paid plan. A backupdrill snapshot of `public` doesn't have them.
+
+Triggers you created on `auth.users`, such as the common one that inserts a `profiles` row on sign-up, belong to that table, so they aren't in the backup either. Create them again after the restore.
 
 ## 2.0 migration — `restore` flags changed
 

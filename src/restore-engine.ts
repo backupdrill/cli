@@ -8,11 +8,16 @@
 //     不会带回来),恢复出的 API 直接 401;
 //  3. dump 自带 CREATE SCHEMA,而目标(新容器或 Supabase)恒有同名 schema →
 //     pre-data 阶段的 schema "already exists" 是两类目标共同的预期冲突。
+//
+// 真实目标(2.7.0 起)整份恢复放在一个事务里:失败就整体回滚,目标还是空的,修好原因可以在同一个
+// 项目上直接重跑。此前两遍恢复各自自动提交,post-data 里一条外键失败,表和数据已经落库,重跑被
+// 空目标门挡住(2026-10-22 实验:profiles → auth.users)。沙箱用完即毁,不需要事务,保留两遍 + 并行。
 import { spawn } from "node:child_process";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ExtensionInfo } from "./manifest.js";
+import { parseCreateSchemas } from "./dump-sql.js";
 import { resolvePgRestoreBin } from "./pgbin.js";
 import { dumpUrlFor, connectPg, isSupabaseHost } from "./supabase-ca.js";
 import { interrupted, onInterrupt, stopOnInterrupt } from "./interrupt.js";
@@ -457,10 +462,9 @@ export async function installSandboxShim(
 }
 
 /**
- * 两遍恢复(真实首演炸出的设计,现为 drill 与真实恢复共用):
+ * 两遍恢复(真实首演炸出的设计;2.7.0 起只用于演练沙箱,真实目标见 restoreInOneTransaction):
  * 1. pre-data+data —— 表结构 + 数据。除 schema 冲突(预期)外任何错误都是硬失败。
- * 2. post-data —— 用户自己的索引/约束/触发器必须恢复成功;allowlist 按目标类型:
- *    沙箱豁免 Supabase 托管对象引用,真实 Supabase 目标零豁免。
+ * 2. post-data —— 用户自己的索引/约束/触发器必须恢复成功;沙箱豁免 Supabase 托管对象引用。
  */
 /**
  * 凭据不进 argv(D6 同源要求):连接串里的密码对 `ps` 全程可见——拆出来经
@@ -654,10 +658,11 @@ export function splitPostDataList(listing: string): { indexBuilds: string[]; res
   return { indexBuilds, rest };
 }
 
-function listPostData(bin: string, dumpPath: string): Promise<{ code: number | null; stdout: string; stderr: string }> {
+/** 不连库的 pg_restore(--list、-f - 出 SQL),整段收集 stdout。只用于目录和 DDL 这类小输出。 */
+export function pgRestoreOutput(bin: string, args: string[]): Promise<{ code: number | null; stdout: string; stderr: string }> {
   return new Promise((resolve, reject) => {
     // 只读归档、不连库,但同样钉 C locale,和恢复子进程一致
-    const proc = spawn(bin, ["--list", "--section=post-data", dumpPath], {
+    const proc = spawn(bin, args, {
       stdio: ["ignore", "pipe", "pipe"],
       env: libpqChildEnv(),
     });
@@ -690,6 +695,95 @@ function mergePasses(passes: ClassifiedPass[]): ClassifiedPass {
 }
 
 /**
+ * 真实目标:整份归档一次 `pg_restore --single-transaction`(隐含 --exit-on-error),任何一条语句失败,
+ * 连接断开,服务端回滚,目标上不留任何东西。Supabase 官方的整库恢复指引(psql --single-transaction
+ * + ON_ERROR_STOP)也是这个做法。
+ *
+ * 唯一的障碍是文件头注 3 的预期冲突:dump 自带 CREATE SCHEMA public,一报错整个事务就没了。所以先用
+ * 目录(-L)把**目标上已经存在**的 schema 条目拿掉,其余照原顺序原样恢复;目标上没有的 schema
+ * (比如 BACKUPDRILL_SCHEMAS 里的自定义 schema)照常 CREATE。拿掉之后就没有任何可以容忍的错误了,
+ * 和两遍恢复时真实目标"除 schema 冲突外零豁免"的口径一致。
+ * 代价是锁:每张表连同索引、序列、TOAST 各占一个锁槽,直到提交。max_connections 60 的目标上实测
+ * 900 张表能过、1200 张表报 out of shared memory(restore.ts restoreFailureAdvice 给出调参办法);
+ * 撞上了也是整体回滚,不会留半截。
+ */
+async function restoreInOneTransaction(
+  bin: string,
+  dumpPath: string,
+  connString: string,
+  common: string[],
+  env: NodeJS.ProcessEnv,
+  childOpts: { supabaseHost: boolean; urlSslMode?: string | null }
+): Promise<ClassifiedPass> {
+  const fail = (failure: string): ClassifiedPass => ({ expectedSkips: 0, failures: [failure] });
+  const listing = await pgRestoreOutput(bin, ["--list", dumpPath]);
+  if (listing.code !== 0) {
+    return fail(`pg_restore --list exited with code ${listing.code}: ${listing.stderr.trim().replace(/\s+/g, " ").slice(0, 200)}`);
+  }
+  const entries = listing.stdout.split("\n").filter((line) => /^\d+;/.test(line));
+  const listDir = await mkdtemp(join(tmpdir(), "backupdrill-restore-"));
+  try {
+    // 目录行里的名字和属主之间只隔一个空格,名字本身又可以带空格,拆不准。让 pg_restore 把这几条
+    // 写成 SQL,按顺序读 CREATE SCHEMA 后面的标识符,第 i 条语句就是第 i 行
+    const schemaEntries = entries.filter((line) => /^\d+; \d+ \d+ SCHEMA - /.test(line));
+    const skip = new Set<string>();
+    if (schemaEntries.length) {
+      const schemaList = join(listDir, "schemas.list");
+      await writeFile(schemaList, schemaEntries.join("\n") + "\n");
+      const ddl = await pgRestoreOutput(bin, ["-f", "-", `--use-list=${schemaList}`, dumpPath]);
+      const names = parseCreateSchemas(ddl.stdout);
+      if (ddl.code !== 0 || names.length !== schemaEntries.length) {
+        return fail(`could not read the schema entries in the archive (pg_restore exited with code ${ddl.code})`);
+      }
+      const client = await connectPg(connString);
+      try {
+        const existing = await client.query<{ nspname: string }>(
+          "select nspname from pg_namespace where nspname = any($1::text[])",
+          [names]
+        );
+        const present = new Set(existing.rows.map((row) => row.nspname));
+        schemaEntries.forEach((line, i) => {
+          if (present.has(names[i])) skip.add(line);
+        });
+      } finally {
+        await client.end();
+      }
+    }
+    const listFile = join(listDir, "restore.list");
+    await writeFile(listFile, entries.filter((line) => !skip.has(line)).join("\n") + "\n");
+    const run = await spawnPgRestore(bin, ["--single-transaction", `--use-list=${listFile}`, ...common], env, childOpts);
+    if (run.code === 0) return { expectedSkips: 0, failures: [] };
+    if (run.code === null) return fail(`pg_restore was killed by a signal: ${firstRestoreError(run.stderr)}`);
+    return fail(firstRestoreError(run.stderr));
+  } finally {
+    await rm(listDir, { recursive: true, force: true });
+  }
+}
+
+/**
+ * 单事务恢复只会有一条错误(--exit-on-error)。给人看的形态:主消息 + DETAIL/HINT 全文,再带上出错
+ * 语句的开头,方便认出是哪个对象。不再截成 200 字符——那样会把 "is not present in table" 这半句
+ * 切掉,用户看不出缺的是什么(2026-10-22 实验原样截在 "is no")。
+ */
+export function firstRestoreError(stderr: string): string {
+  const block = stderr.split(/(?=pg_restore: error:)/).find((b) => b.startsWith("pg_restore: error:"));
+  if (!block) return stderr.trim().replace(/\s+/g, " ").slice(0, 300) || "(no stderr)";
+  const lines = block.split("\n");
+  const message = lines[0]
+    .replace(/^pg_restore: error: (?:could not execute query: )?/, "")
+    .replace(/^ERROR:\s+/, "")
+    .trim();
+  const details = lines.filter((line) => /^(?:DETAIL|HINT):/.test(line)).map((line) => line.replace(/\s+/g, " ").trim());
+  const commandAt = lines.findIndex((line) => line.startsWith("Command was:"));
+  const command =
+    commandAt < 0
+      ? ""
+      : lines.slice(commandAt).join(" ").replace(/^Command was:\s*/, "").replace(/\s+/g, " ").trim();
+  const statement = command ? ` (statement: ${command.length > 160 ? `${command.slice(0, 160)}…` : command})` : "";
+  return [message, ...details].join(" ") + statement;
+}
+
+/**
  * 两遍恢复(形状见 credentialSafeDbArgs 上方那段"两遍恢复"注释),`jobs` > 1 时按下面的方式并行(2026-10-17 实测:2 核机器上同一份
  * dump,原生 -j2 比 -j1 在 5 GB 快 14%、10 GB 快 12%):
  * 1. pre-data+data 一遍加 --jobs。pg_restore 并行时先在主进程里单独跑完 pre-data,fork 之后
@@ -699,8 +793,8 @@ function mergePasses(passes: ClassifiedPass[]): ClassifiedPass {
  * 2. post-data 拆成两份清单(splitPostDataList):建索引那份并行,退出码 0 即通过,报过错
  *    的条目单连接重跑定结论;其余单连接、照旧按目标类型分类。
  *    两遍下来,同一份备份不管几路并行,结论都和 jobs=1 一样。
- * 真实 Supabase 目标(restore.ts)不传 jobs:每一路都是一条 pooler 连接,小规格项目的连接数
- * 和算力都紧,并行没测过,保持原来的单连接两遍。
+ * 真实 Supabase 目标(restore.ts)不走这里:单事务恢复(restoreInOneTransaction)不能并行,
+ * 而且每一路都是一条 pooler 连接,小规格项目的连接数和算力都紧。
  */
 export async function restoreDatabaseArtifact(opts: {
   dumpPath: string;
@@ -718,6 +812,10 @@ export async function restoreDatabaseArtifact(opts: {
   const { url, env } = credentialSafeDbArgs(dumpUrlFor(opts.connString));
   const common = ["--no-owner", "--no-privileges", "--dbname", url, opts.dumpPath];
   const childOpts = { supabaseHost: isSupabaseHost(opts.connString), urlSslMode: urlSslModeOf(url) };
+  if (opts.target === "supabase") {
+    const pass = await restoreInOneTransaction(bin, opts.dumpPath, opts.connString, common, env, childOpts);
+    return { preData: pass, postData: { expectedSkips: 0, failures: [] }, ok: pass.failures.length === 0 };
+  }
   const jobs = Math.max(1, Math.floor(opts.jobs ?? 1));
   const parallel = jobs > 1;
   const jobsArg = parallel ? [`--jobs=${jobs}`] : [];
@@ -745,7 +843,7 @@ export async function restoreDatabaseArtifact(opts: {
     return { preData, postData, ok: postData.failures.length === 0 };
   }
 
-  const listing = await listPostData(bin, opts.dumpPath);
+  const listing = await pgRestoreOutput(bin, ["--list", "--section=post-data", opts.dumpPath]);
   if (listing.code !== 0) {
     const detail = listing.stderr.trim().replace(/\s+/g, " ").slice(0, 200) || "(no stderr)";
     const postData = { expectedSkips: 0, failures: [`pg_restore --list exited with code ${listing.code}: ${detail}`] };
