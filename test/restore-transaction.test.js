@@ -452,3 +452,88 @@ test(
     }
   }
 );
+
+test(
+  "restore: keys that depend on extensions not yet on the target are checked again after installing them",
+  { skip: canRun ? false : "requires Docker + pg_dump", timeout: 180_000 },
+  async () => {
+    const ids = [];
+    const work = mkdtempSync(join(tmpdir(), "bd-ext-recheck-"));
+    try {
+      const [sourcePort, targetPort] = await Promise.all([startPostgres(ids), startPostgres(ids)]);
+      const sourceUrl = `postgresql://postgres:pw@127.0.0.1:${sourcePort}/postgres`;
+      const targetUrl = `postgresql://postgres:pw@localhost:${targetPort}/postgres`;
+      // 一个登记在 ext_a、表却建在 ext_b 的扩展
+      for (const port of [sourcePort, targetPort]) {
+        const id = (await x("docker", ["ps", "-q", "--filter", `publish=${port}`])).stdout.trim();
+        await x("docker", ["exec", "-u", "root", id, "sh", "-c",
+          "d=$(pg_config --sharedir)/extension; " +
+          "printf \"default_version = '1.0'\\nrelocatable = false\\n\" > $d/bdtest_xs.control; " +
+          "printf \"create schema if not exists ext_b;\\ncreate table ext_b.lookup (id int primary key);\\ninsert into ext_b.lookup values (1);\\n\" > $d/bdtest_xs--1.0.sql"]);
+      }
+      await sql(
+        sourceUrl,
+        `create schema auth;
+         create table auth.users (email text primary key);
+         insert into auth.users values ('a@example.com');
+         create schema extensions;
+         create extension citext schema extensions;
+         create schema ext_a;
+         create extension bdtest_xs schema ext_a;
+         -- 引用方列是 citext:目标上还没装 citext,这个类型得等装完才认得
+         create table public.contacts (email extensions.citext references auth.users(email));
+         insert into public.contacts values ('a@example.com');
+         create table public.uses_xs (id int references ext_b.lookup(id));
+         insert into public.uses_xs values (1);`
+      );
+      const dumpPath = join(work, "ext.pgcustom");
+      await x(pgDump, ["--format=custom", "--no-owner", "--no-privileges", "--schema=public", "--dbname", sourceUrl, "-f", dumpPath]);
+      const buf = readFileSync(dumpPath);
+      const manifest = {
+        schemaVersion: 2,
+        tool: "backupdrill-cli",
+        toolVersion: "test",
+        createdAt: "2026-10-23T00:00:00.000Z",
+        projectName: "ext",
+        database: {
+          serverVersion: "17.6",
+          pgDumpVersion: (await x(pgDump, ["--version"])).stdout.trim(),
+          schemas: ["public"],
+          tableCount: 2,
+          estimatedRowTotal: 2,
+          tables: [
+            { schema: "public", name: "contacts", estimatedRows: 1 },
+            { schema: "public", name: "uses_xs", estimatedRows: 1 },
+          ],
+          extensions: [
+            { name: "citext", version: "1.6", schema: "extensions" },
+            { name: "bdtest_xs", version: "1.0", schema: "ext_a" },
+          ],
+        },
+        dump: { key: "backupdrill/ext/snap/dump.pgcustom", format: "custom", bytes: buf.length, sha256: createHash("sha256").update(buf).digest("hex") },
+        storage: null,
+      };
+      const config = { databaseUrl: sourceUrl, projectName: "ext", schemas: ["public"], storage: { bucket: "unused" } };
+      const restore = (extra = {}) =>
+        runRestore(config, { store: localStore(manifest, dumpPath, buf), targetDatabaseUrl: targetUrl, confirmTarget: "localhost", ...extra });
+
+      // 目标:auth.users 是空的;两个扩展都还没装
+      await sql(targetUrl, "create schema auth; create table auth.users (email text primary key);");
+      // dry-run 装不了扩展:这两条外键都只能报"装完再查",不拦
+      await restore({ dryRun: true });
+      // 正式恢复:先查(两条都等扩展),装扩展,再查 —— contacts 缺人,在写快照之前拦下;ext_b.lookup 装完就有了
+      await assert.rejects(restore(), (error) => {
+        assert.match(error.message, /restore would fail on foreign keys/);
+        assert.match(error.message, /public\.contacts → auth\.users \(contacts_email_fkey\): 1 of 1 row\(s\)/);
+        assert.doesNotMatch(error.message, /ext_b\.lookup/);
+        return true;
+      });
+      await sql(targetUrl, "insert into auth.users values ('a@example.com')");
+      const done = await restore();
+      assert.equal(done.databaseVerified, true);
+    } finally {
+      for (const id of ids) await x("docker", ["rm", "-fv", id]).catch(() => {});
+      rmSync(work, { recursive: true, force: true });
+    }
+  }
+);

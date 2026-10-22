@@ -526,9 +526,9 @@ export function restoreFailureAdvice(failure: string): string {
 async function inspectDumpForTarget(manifest: Manifest, targetUrl: string, reader: SnapshotReader): Promise<string[]> {
   // 正式恢复先装扩展再查外键;dry-run 不装,被引用的表可能要等扩展装上才有
   const installed = await installedExtensions(targetUrl);
-  const pendingExtensionSchemas = (manifest.database.extensions ?? [])
+  const pendingExtensions = (manifest.database.extensions ?? [])
     .filter((ext) => !installed.has(ext.name))
-    .map((ext) => ext.schema);
+    .map((ext) => ext.name);
   const workdir = await mkdtemp(join(tmpdir(), "backupdrill-dryrun-"));
   try {
     log.step("Downloading dump to inspect it (read-only)…");
@@ -550,7 +550,7 @@ async function inspectDumpForTarget(manifest: Manifest, targetUrl: string, reade
         dumpPath,
         dumpedSchemas: manifest.database.schemas,
         targetUrl,
-        pendingExtensionSchemas,
+        pendingExtensions,
       });
       return logExternalReferences(check, manifest.database.schemas, true);
     } catch (error) {
@@ -785,13 +785,13 @@ export async function runRestore(
       // (先装扩展再查的话,查不过时扩展已经留在目标上,带配置表的扩展会让修好之后的重跑被空目标门拦下)
       const extensions = manifest.database.extensions ?? [];
       const installed = extensions.length ? await installedExtensions(targetUrl) : new Set<string>();
-      const checkReferences = async (pendingExtensionSchemas: string[]) => {
+      const checkReferences = async (pendingExtensions: string[]) => {
         log.step("Checking foreign keys that point outside the backup…");
         const references = await checkExternalReferences({
           dumpPath,
           dumpedSchemas: manifest.database.schemas,
           targetUrl,
-          pendingExtensionSchemas,
+          pendingExtensions,
         });
         const referenceProblems = logExternalReferences(references, manifest.database.schemas, false);
         if (referenceProblems.length) {
@@ -803,7 +803,7 @@ export async function runRestore(
         return references;
       };
       const firstCheck = await checkReferences(
-        extensions.filter((ext) => !installed.has(ext.name)).map((ext) => ext.schema)
+        extensions.filter((ext) => !installed.has(ext.name)).map((ext) => ext.name)
       );
 
       // 扩展预装:沙箱装不上只能记录(环境局限),真实目标装不上必须阻断——

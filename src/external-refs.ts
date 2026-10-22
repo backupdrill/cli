@@ -44,7 +44,7 @@ export interface ExternalReferenceCheck {
   problems: string[];
   /** 没能检查的,一条一句。恢复在一个事务里跑,这些真出问题也会整体回滚,所以只提示不拦 */
   unchecked: string[];
-  /** 有外键要等扩展装上之后才查得了(见 pendingExtensionSchemas) */
+  /** 有外键要等扩展装上之后才查得了(见 pendingExtensions) */
   waitingForExtensions: boolean;
 }
 
@@ -63,10 +63,11 @@ export async function checkExternalReferences(opts: {
   dumpedSchemas: string[];
   targetUrl: string;
   /**
-   * 还没装到目标上的扩展会装进的 schema(dry-run 时才有;正式恢复先装扩展再查)。被引用的表在这些
-   * schema 里又暂时不存在时,可能是扩展装上之后才有的,这时报"装完扩展才查得了",不当成 blocker。
+   * manifest 里记着、目标上还没装的扩展。有它们在,被引用的表不在、引用方列的类型不在,都可能是
+   * 扩展装上之后才有的(扩展可以往别的 schema 里建表,只看它登记的 schema 不够,交叉审查复现),
+   * 这时报"装完扩展再查",不当成 blocker;正式恢复装完扩展会再查一遍。
    */
-  pendingExtensionSchemas?: string[];
+  pendingExtensions?: string[];
 }): Promise<ExternalReferenceCheck> {
   const bin = resolvePgRestoreBin();
   const result: ExternalReferenceCheck = { checked: [], problems: [], unchecked: [], waitingForExtensions: false };
@@ -111,7 +112,14 @@ export async function checkExternalReferences(opts: {
     const below = children.get(keyOf(table)) ?? [];
     return below.length ? below.flatMap(leavesOf) : [table];
   };
-  const pending = new Set(opts.pendingExtensionSchemas ?? []);
+  const pending = opts.pendingExtensions ?? [];
+  const waitForExtensions = (fk: ForeignKeyDef, what: string) => {
+    result.waitingForExtensions = true;
+    result.unchecked.push(
+      `${describe(fk)}: ${what}; extension(s) ${pending.join(", ")} that the restore installs first may provide it, ` +
+        `so it is checked after they are installed`
+    );
+  };
   const tableColumns = parseTableColumns(definitions);
 
   const client = await connectPg(opts.targetUrl);
@@ -126,16 +134,13 @@ export async function checkExternalReferences(opts: {
         continue;
       }
       if ("unchecked" in lookup) {
-        result.unchecked.push(`${describe(fk)}: ${lookup.unchecked}`);
+        if (lookup.typeMissing && pending.length) waitForExtensions(fk, lookup.unchecked);
+        else result.unchecked.push(`${describe(fk)}: ${lookup.unchecked}`);
         continue;
       }
       if ("problem" in lookup) {
-        if (lookup.tableMissing && pending.has(fk.references.schema)) {
-          result.waitingForExtensions = true;
-          result.unchecked.push(
-            `${describe(fk)}: ${formatQualified(fk.references)} isn't on the target yet, and an extension the restore ` +
-              `installs into schema ${fk.references.schema} may create it; the restore checks it after installing extensions`
-          );
+        if (lookup.tableMissing && pending.length) {
+          waitForExtensions(fk, `${formatQualified(fk.references)} isn't on the target yet`);
         } else {
           result.problems.push(`${describe(fk)}: ${lookup.problem}`);
         }
@@ -251,7 +256,9 @@ async function comparisonPlan(
   fk: ForeignKeyDef,
   columnsInDump: Map<string, string> | undefined
 ): Promise<
-  { comparisons: ColumnComparison[]; only: boolean } | { problem: string; tableMissing: boolean } | { unchecked: string }
+  | { comparisons: ColumnComparison[]; only: boolean }
+  | { problem: string; tableMissing: boolean }
+  | { unchecked: string; typeMissing?: boolean }
 > {
   const relation = `${quoteIdent(fk.references.schema)}.${quoteIdent(fk.references.name)}`;
   const exists = await readOnly<{ oid: string | null; kind: string | null }>(
@@ -310,7 +317,7 @@ async function comparisonPlan(
     );
     const fkBase = fkType.rows[0]?.base;
     if (!fkType.rows[0]?.oid || !fkBase) {
-      return { unchecked: `column ${column} uses type ${declared}, which is missing on the target` };
+      return { unchecked: `column ${column} uses type ${declared}, which is missing on the target`, typeMissing: true };
     }
     const opclass = index.classes[index.keys.indexOf(attnum.get(fk.referencedColumns[i])!)];
     // 先找 (输入类型, 引用方类型);没有就看能不能隐式转成输入类型,用 (输入类型, 输入类型)
