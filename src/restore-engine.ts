@@ -660,12 +660,15 @@ export function splitPostDataList(listing: string): { indexBuilds: string[]; res
 
 /** 不连库的 pg_restore(--list、-f - 出 SQL),整段收集 stdout。只用于目录和 DDL 这类小输出。 */
 export function pgRestoreOutput(bin: string, args: string[]): Promise<{ code: number | null; stdout: string; stderr: string }> {
+  // 和 spawnPgRestore 一样:收到信号之后不再起,起了的中断时停掉(并行演练里读目录的那一步也是它)
+  if (interrupted()) return Promise.reject(new Error("interrupted; not starting pg_restore"));
   return new Promise((resolve, reject) => {
     // 只读归档、不连库,但同样钉 C locale,和恢复子进程一致
     const proc = spawn(bin, args, {
       stdio: ["ignore", "pipe", "pipe"],
       env: libpqChildEnv(),
     });
+    stopOnInterrupt(proc);
     let stdout = "";
     let stderr = "";
     proc.stdout.on("data", (d: Buffer) => (stdout += d.toString()));

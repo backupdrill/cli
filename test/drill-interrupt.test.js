@@ -343,6 +343,54 @@ test(
   }
 );
 
+test(
+  "drill: SIGTERM while pg_restore lists the archive (parallel restore) stops it too",
+  { skip: canRun ? false : "requires Docker + pg_dump", timeout: 180_000 },
+  async () => {
+    const tmp = mkdtempSync(join(tmpdir(), "bd-sig-test-"));
+    const s3 = await startFakeS3({ bucket: "backups" });
+    let listPid = null;
+    try {
+      await seedBucket(s3, await makeDump(tmp));
+      // pg_restore 包装:--list 那一步挂住(读目录本来很快),其余照转真的 pg_restore
+      const realPgRestore = process.env.BACKUPDRILL_PG_RESTORE || (await x("sh", ["-c", "command -v pg_restore"])).stdout.trim();
+      const mark = join(tmp, "list-started");
+      const wrapper = join(tmp, "pg_restore");
+      writeFileSync(
+        wrapper,
+        `#!${process.execPath}
+const args = process.argv.slice(2);
+if (args.includes("--list")) {
+  require("fs").writeFileSync(${JSON.stringify(mark)}, String(process.pid));
+  setTimeout(() => {}, 600000);
+} else process.exit(require("child_process").spawnSync(${JSON.stringify(realPgRestore)}, args, { stdio: "inherit" }).status ?? 1);
+`
+      );
+      chmodSync(wrapper, 0o755);
+      const run = startDrill(s3, tmp, [], { env: { BACKUPDRILL_PG_RESTORE: wrapper } });
+      const listed = await Promise.race([
+        waitFor("pg_restore --list", () => existsSync(mark), 120_000).then(() => true),
+        run.exited.then(() => false),
+      ]);
+      if (!listed) {
+        // 只有并行恢复才单独列目录;Docker 只给 1 核或很少内存时演练走单连接,这一步不存在
+        assert.match(run.stderr(), /Drill PASSED/, run.stderr());
+        return;
+      }
+      listPid = Number(readFileSync(mark, "utf8"));
+      run.child.kill("SIGTERM");
+      const { code } = await run.exited;
+      assert.equal(code, 143, `exit code; stderr:\n${run.stderr()}`);
+      await waitFor("pg_restore --list to stop", () => !alive(listPid), 5_000);
+      assert.deepEqual(leftovers(tmp), [], "temporary files removed");
+    } finally {
+      if (listPid && alive(listPid)) process.kill(listPid, "SIGKILL");
+      await s3.close();
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  }
+);
+
 test("interrupt: cleanups registered while the cleanup is running still run before exit", async () => {
   const tmp = mkdtempSync(join(tmpdir(), "bd-sig-test-"));
   try {
