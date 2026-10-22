@@ -387,7 +387,7 @@ test(
 );
 
 test(
-  "restore: a foreign-key failure installs nothing, so the retry after copying users isn't blocked by an extension's config table",
+  "restore: a foreign-key failure leaves no extension behind, so the retry after copying users isn't blocked by an extension's config table",
   { skip: canRun ? false : "requires Docker + pg_dump", timeout: 180_000 },
   async () => {
     const ids = [];
@@ -447,10 +447,10 @@ test(
       // auth.users 根本不在:有扩展待装,第一遍只能先记下;装扩展和复查在一个事务里,复查不过连扩展一起回滚
       await assert.rejects(restore(), /auth\.users does not exist on the target/);
       assert.equal(await cfgInstalled(), 0, "the extension is rolled back with the failed re-check");
-      // auth.users 在、但没有人:第一遍就拦下,什么都没装
+      // auth.users 在、但没有人:扩展还没装,第一遍不下结论;装扩展和复查在一个事务里,复查不过一起回滚
       await sql(targetUrl, "create schema auth; create table auth.users (id uuid primary key);");
       await assert.rejects(restore(), /nothing from the snapshot was written/);
-      assert.equal(await cfgInstalled(), 0, "the foreign-key check runs before any extension is installed");
+      assert.equal(await cfgInstalled(), 0, "the extension is rolled back with the failed re-check");
 
       await sql(targetUrl, "insert into auth.users values ('00000000-0000-0000-0000-000000000001')");
       const done = await restore();
