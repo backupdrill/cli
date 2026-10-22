@@ -47,14 +47,23 @@ export interface ExternalReferenceCheck {
 
 const keyOf = (name: QualifiedName) => `${name.schema}\u0000${name.name}`;
 
+/** 一个 COPY 头最长读这么多字符;超过就当作读不了,免得坏归档把内存吃满。 */
+const MAX_COPY_HEADER = 100_000;
+
 /**
  * 读 dump,找出指向 dumpedSchemas 之外的外键,逐条拿目标库对行。只读:目标库上只跑 select。
- * pg_restore 起不来、归档读不了时抛错,由调用方当成 blocker。
+ * pg_restore 起不来、归档读不了时抛错,由调用方当成 blocker。单条外键查不成(目标端报错、
+ * 数据块读不了)只影响它自己,记进 unchecked,不拖累别的外键的结论。
  */
 export async function checkExternalReferences(opts: {
   dumpPath: string;
   dumpedSchemas: string[];
   targetUrl: string;
+  /**
+   * 还没装到目标上的扩展会装进的 schema(dry-run 时才有;正式恢复先装扩展再查)。被引用的表在这些
+   * schema 里又暂时不存在时,可能是扩展装上之后才有的,这时报"装完扩展才查得了",不当成 blocker。
+   */
+  pendingExtensionSchemas?: string[];
 }): Promise<ExternalReferenceCheck> {
   const bin = resolvePgRestoreBin();
   const result: ExternalReferenceCheck = { checked: [], problems: [], unchecked: [] };
@@ -88,52 +97,71 @@ export async function checkExternalReferences(opts: {
   const external = foreignKeys.filter((fk) => !dumped.has(fk.references.schema) && fk.validatesRows);
   if (!external.length) return result;
 
-  // 分区父表上的外键,数据在各个分区里(dump 按叶子分区写 COPY)
+  // 分区父表上的外键,数据在各级叶子分区里(dump 只给叶子写 COPY)
   const children = new Map<string, QualifiedName[]>();
   for (const { parent, child } of parsePartitionAttachments(definitions)) {
     children.set(keyOf(parent), [...(children.get(keyOf(parent)) ?? []), child]);
   }
-  const dataTablesOf = (table: QualifiedName): QualifiedName[] => {
+  const leavesOf = (table: QualifiedName): QualifiedName[] => {
     const below = children.get(keyOf(table)) ?? [];
-    return [table, ...below.flatMap(dataTablesOf)];
+    return below.length ? below.flatMap(leavesOf) : [table];
   };
+  const pending = new Set(opts.pendingExtensionSchemas ?? []);
 
   const client = await connectPg(opts.targetUrl);
   try {
     const scans: Scan[] = [];
     for (const fk of external) {
-      const types = await referencedColumnTypes(client, fk);
-      if (typeof types === "string") {
-        result.problems.push(`${describe(fk)}: ${types}`);
+      let lookup: Awaited<ReturnType<typeof referencedColumnTypes>>;
+      try {
+        lookup = await referencedColumnTypes(client, fk);
+      } catch (error) {
+        result.unchecked.push(`${describe(fk)}: could not look up ${formatQualified(fk.references)} on the target (${(error as Error).message})`);
+        continue;
+      }
+      if ("problem" in lookup) {
+        if (lookup.tableMissing && pending.has(fk.references.schema)) {
+          result.unchecked.push(
+            `${describe(fk)}: ${formatQualified(fk.references)} isn't on the target yet, and an extension the restore ` +
+              `installs into schema ${fk.references.schema} may create it; the restore checks it after installing extensions`
+          );
+        } else {
+          result.problems.push(`${describe(fk)}: ${lookup.problem}`);
+        }
         continue;
       }
       const checked: CheckedForeignKey = { fk, rows: 0, missingRows: 0 };
       result.checked.push(checked);
-      scans.push({ checked, types, tables: new Set(dataTablesOf(fk.table).map(keyOf)), batch: new Map() });
+      scans.push({ checked, types: lookup.types, leaves: new Set(leavesOf(fk.table).map(keyOf)), seen: new Set(), batch: new Map() });
     }
     if (scans.length) {
       try {
         await scanDumpData(bin, opts.dumpPath, scans, client);
       } catch (error) {
-        // 目标端查询出错(权限、类型转换)不等于恢复一定失败:如实报没查成
-        for (const scan of scans) {
-          result.unchecked.push(`${describe(scan.checked.fk)}: could not check (${(error as Error).message})`);
-        }
-        result.checked = result.checked.filter((c) => !scans.some((s) => s.checked === c));
-        return result;
+        for (const scan of scans) scan.failed ??= `could not read the dump's data (${(error as Error).message})`;
       }
       for (const scan of scans) {
-        if (scan.missingColumn) {
-          result.unchecked.push(`${describe(scan.checked.fk)}: ${scan.missingColumn}`);
-          result.checked = result.checked.filter((c) => c !== scan.checked);
-          continue;
+        const unseen = [...scan.leaves].filter((table) => !scan.seen.has(table));
+        if (!scan.failed && unseen.length) {
+          const names = unseen.map((key) => {
+            const [schema, name] = key.split("\u0000");
+            return formatQualified({ schema, name });
+          });
+          scan.failed = `could not read the dumped data of ${names.join(", ")}`;
         }
-        if (scan.checked.missingRows > 0) {
-          const { fk, rows, missingRows } = scan.checked;
+        const { fk, rows, missingRows } = scan.checked;
+        if (missingRows > 0) {
+          // 已经确认缺的行是事实,后面查不下去也不能把它吞掉
           result.problems.push(
-            `${describe(fk)}: ${missingRows.toLocaleString("en-US")} of ${rows.toLocaleString("en-US")} row(s) ` +
-              `point at ${formatQualified(fk.references)} rows the target doesn't have`
+            scan.failed
+              ? `${describe(fk)}: at least ${missingRows.toLocaleString("en-US")} row(s) point at ` +
+                  `${formatQualified(fk.references)} rows the target doesn't have (the check stopped early: ${scan.failed})`
+              : `${describe(fk)}: ${missingRows.toLocaleString("en-US")} of ${rows.toLocaleString("en-US")} row(s) ` +
+                  `point at ${formatQualified(fk.references)} rows the target doesn't have`
           );
+        } else if (scan.failed) {
+          result.unchecked.push(`${describe(fk)}: ${scan.failed}`);
+          result.checked = result.checked.filter((c) => c !== scan.checked);
         }
       }
     }
@@ -150,24 +178,32 @@ export function describe(fk: ForeignKeyDef): string {
 interface Scan {
   checked: CheckedForeignKey;
   types: Array<{ name: string; type: string }>;
-  /** 这条外键的数据所在的表(本表 + 各级分区) */
-  tables: Set<string>;
+  /** 这条外键的数据所在的表(普通表就是它自己;分区表是各级叶子分区) */
+  leaves: Set<string>;
+  /** 读到过 COPY 块的表 */
+  seen: Set<string>;
   /** 本批待查的不同键 → 出现的行数 */
   batch: Map<string, { key: string[]; rows: number }>;
-  /** 某个数据块里缺了外键列(生成列不进 COPY):这条外键没法从 dump 里取值 */
-  missingColumn?: string;
+  /** 查不下去的原因(数据里没有外键列、目标端查询报错…);有了就不再收键 */
+  failed?: string;
 }
 
-/** 目标库上被引用表的列类型;表或列不在时返回给人看的原因(恢复必然失败)。 */
+/**
+ * 目标库上被引用列的类型,用来把 dump 里的文本值转回去比较。类型取**不带修饰符**的
+ * (format_type(oid, NULL)):numeric(2,0) 这类修饰符在转换时会改值(1.1 变 1),外键比较却不会。
+ * 表或列不在时返回给人看的原因(恢复必然失败)。
+ */
 async function referencedColumnTypes(
   client: pg.Client,
   fk: ForeignKeyDef
-): Promise<Array<{ name: string; type: string }> | string> {
+): Promise<{ types: Array<{ name: string; type: string }> } | { problem: string; tableMissing: boolean }> {
   const relation = `${quoteIdent(fk.references.schema)}.${quoteIdent(fk.references.name)}`;
   const exists = await client.query<{ oid: string | null }>("select to_regclass($1)::oid as oid", [relation]);
-  if (!exists.rows[0].oid) return `${formatQualified(fk.references)} does not exist on the target`;
+  if (!exists.rows[0].oid) {
+    return { problem: `${formatQualified(fk.references)} does not exist on the target`, tableMissing: true };
+  }
   const columns = await client.query<{ name: string; type: string }>(
-    `select a.attname as name, format_type(a.atttypid, a.atttypmod) as type
+    `select a.attname as name, format_type(a.atttypid, null) as type
        from pg_attribute a
       where a.attrelid = $1::oid and a.attnum > 0 and not a.attisdropped and a.attname = any($2::text[])`,
     [exists.rows[0].oid, fk.referencedColumns]
@@ -175,9 +211,9 @@ async function referencedColumnTypes(
   const byName = new Map(columns.rows.map((row) => [row.name, row.type]));
   const absent = fk.referencedColumns.filter((name) => !byName.has(name));
   if (absent.length) {
-    return `${formatQualified(fk.references)} on the target has no column(s) ${absent.join(", ")}`;
+    return { problem: `${formatQualified(fk.references)} on the target has no column(s) ${absent.join(", ")}`, tableMissing: false };
   }
-  return fk.referencedColumns.map((name) => ({ name, type: byName.get(name)! }));
+  return { types: fk.referencedColumns.map((name) => ({ name, type: byName.get(name)! })) };
 }
 
 /**
@@ -190,7 +226,7 @@ async function scanDumpData(bin: string, dumpPath: string, scans: Scan[], client
   const schemas = new Set<string>();
   const names = new Set<string>();
   for (const scan of scans) {
-    for (const table of scan.tables) {
+    for (const table of scan.leaves) {
       wanted.set(table, [...(wanted.get(table) ?? []), scan]);
       const [schema, name] = table.split("\u0000");
       schemas.add(schema);
@@ -213,28 +249,47 @@ async function scanDumpData(bin: string, dumpPath: string, scans: Scan[], client
   });
   exited.catch(() => {});
 
-  // 当前 COPY 块里每条外键要取的列下标;null = 不在 COPY 块里
-  let current: Array<{ scan: Scan; indexes: number[] }> | null = null;
   const flush = async (scan: Scan) => {
-    if (!scan.batch.size) return;
+    if (!scan.batch.size || scan.failed) return;
     const entries = [...scan.batch.values()];
     scan.batch.clear();
-    const missing = await missingKeyIndexes(client, scan.checked.fk.references, scan.types, entries.map((e) => e.key));
-    for (const index of missing) scan.checked.missingRows += entries[index - 1].rows;
+    try {
+      const missing = await missingKeyIndexes(client, scan.checked.fk.references, scan.types, entries.map((e) => e.key));
+      for (const index of missing) scan.checked.missingRows += entries[index - 1].rows;
+    } catch (error) {
+      // 只停这一条外键:比如值转不成被引用列的类型
+      scan.failed = `could not compare its rows on the target (${(error as Error).message})`;
+    }
+  };
+
+  // 当前 COPY 块里每条外键要取的列下标;null = 不在 COPY 块里,[] = 在一个不需要的块里
+  let current: Array<{ scan: Scan; indexes: number[] }> | null = null;
+  // 带引号的名字里可以有换行,COPY 头就会跨行:攒到引号配平、以 FROM stdin; 结尾为止
+  let header: string | null = null;
+  const openHeader = (text: string) => {
+    const parsed = parseCopyHeader(text);
+    current = [];
+    if (!parsed) return; // 读不了的块整块跳过;它的表没记成 seen,最后会报没查成
+    const consumers = wanted.get(keyOf(parsed.table)) ?? [];
+    for (const scan of consumers) {
+      scan.seen.add(keyOf(parsed.table));
+      const indexes = scan.checked.fk.columns.map((column) => parsed.columns.indexOf(column));
+      if (indexes.some((i) => i < 0)) {
+        // 生成列不进 COPY
+        scan.failed ??= `column(s) ${scan.checked.fk.columns.join(", ")} are not in the dumped data of ${formatQualified(parsed.table)}`;
+        continue;
+      }
+      current.push({ scan, indexes });
+    }
   };
   const onLine = (line: string): Promise<void> | void => {
     if (current === null) {
-      const header = parseCopyHeader(line);
-      if (!header) return;
-      const consumers = wanted.get(keyOf(header.table)) ?? [];
-      current = [];
-      for (const scan of consumers) {
-        const indexes = scan.checked.fk.columns.map((column) => header.columns.indexOf(column));
-        if (indexes.some((i) => i < 0)) {
-          scan.missingColumn = `column(s) ${scan.checked.fk.columns.join(", ")} are not in the dumped data of ${formatQualified(header.table)}`;
-          continue;
-        }
-        current.push({ scan, indexes });
+      if (header === null && !line.startsWith("COPY ")) return;
+      header = header === null ? line : `${header}\n${line}`;
+      const quotes = header.split('"').length - 1;
+      if ((quotes % 2 === 0 && header.endsWith(" FROM stdin;")) || header.length > MAX_COPY_HEADER) {
+        openHeader(header);
+        header = null;
       }
       return;
     }
@@ -242,9 +297,11 @@ async function scanDumpData(bin: string, dumpPath: string, scans: Scan[], client
       current = null;
       return;
     }
+    if (!current.length) return;
     const fields = line.split("\t");
     let pending: Promise<void>[] | null = null;
     for (const { scan, indexes } of current) {
+      if (scan.failed) continue;
       const key = indexes.map((i) => (i < fields.length ? decodeCopyField(fields[i]) : null));
       if (key.some((value) => value === null)) continue;
       scan.checked.rows += 1;
@@ -279,7 +336,7 @@ async function scanDumpData(bin: string, dumpPath: string, scans: Scan[], client
   if (code !== 0) throw new Error(`pg_restore exited with code ${code}: ${oneLine(stderr)}`);
 }
 
-/** 一批键里哪些在被引用表里找不到;返回 1 起的下标。按目标列类型转换后比较,和外键校验同一口径。 */
+/** 一批键里哪些在被引用表里找不到;返回 1 起的下标。值按目标列的类型(不带修饰符)转换后比较。 */
 async function missingKeyIndexes(
   client: pg.Client,
   table: QualifiedName,

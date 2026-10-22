@@ -16,7 +16,6 @@ import {
   refFromStorageEndpoint,
   assertNoHostOverride,
   normalizeHost,
-  quoteIdent,
 } from "./restore-engine.js";
 import { checkExternalReferences, describe, type ExternalReferenceCheck } from "./external-refs.js";
 import type { SnapshotReader } from "./snapshot-store.js";
@@ -247,6 +246,9 @@ export function nonEmptyTargetMessage(
  * schema 内零用户对象——关系、函数/过程、独立类型(enum/domain/range/composite)
  * 全部计入:只查关系时,"目标里只有函数"会放行,然后在 pre-data 中途撞冲突,
  * 留下半截目标(评审第 7 轮)。
+ * 扩展自带的对象不算(pg_depend deptype 'e'):转储里从来没有扩展成员,和恢复内容撞不上;
+ * 算进去的话,用户照我们的提示在控制台把扩展开进 public,或者上一次失败的恢复已经装好了扩展,
+ * 都会被这道门挡住(2.7.0)。
  */
 async function assertEmptyTarget(
   targetUrl: string,
@@ -258,11 +260,17 @@ async function assertEmptyTarget(
     const res = await client.query<{ n: string }>(
       `select
          (select count(*) from pg_class c join pg_namespace n on n.oid = c.relnamespace
-           where n.nspname = any($1::text[]) and c.relkind in ('r','p','m','v','S','f','c'))
+           where n.nspname = any($1::text[]) and c.relkind in ('r','p','m','v','S','f','c')
+             and not exists (select 1 from pg_depend d where d.classid = 'pg_class'::regclass
+                               and d.objid = c.oid and d.deptype = 'e'))
        + (select count(*) from pg_proc p join pg_namespace n on n.oid = p.pronamespace
-           where n.nspname = any($1::text[]))
+           where n.nspname = any($1::text[])
+             and not exists (select 1 from pg_depend d where d.classid = 'pg_proc'::regclass
+                               and d.objid = p.oid and d.deptype = 'e'))
        + (select count(*) from pg_type t join pg_namespace n on n.oid = t.typnamespace
-           where n.nspname = any($1::text[]) and t.typtype in ('e','d','r'))
+           where n.nspname = any($1::text[]) and t.typtype in ('e','d','r')
+             and not exists (select 1 from pg_depend d where d.classid = 'pg_type'::regclass
+                               and d.objid = t.oid and d.deptype = 'e'))
          as n`,
       [schemas]
     );
@@ -479,6 +487,11 @@ export function restoreFailureAdvice(failure: string): string {
 
 /** dry-run 的读 dump 部分:下载到临时目录,对校验和,查指向备份之外的外键。返回 blocker。 */
 async function inspectDumpForTarget(manifest: Manifest, targetUrl: string, reader: SnapshotReader): Promise<string[]> {
+  // 正式恢复先装扩展再查外键;dry-run 不装,被引用的表可能要等扩展装上才有
+  const installed = await installedExtensions(targetUrl);
+  const pendingExtensionSchemas = (manifest.database.extensions ?? [])
+    .filter((ext) => !installed.has(ext.name))
+    .map((ext) => ext.schema);
   const workdir = await mkdtemp(join(tmpdir(), "backupdrill-dryrun-"));
   try {
     log.step("Downloading dump to inspect it (read-only)…");
@@ -496,7 +509,12 @@ async function inspectDumpForTarget(manifest: Manifest, targetUrl: string, reade
     }
     log.ok(`archive integrity: sha256 matches (${sha256.slice(0, 12)}…)`);
     try {
-      const check = await checkExternalReferences({ dumpPath, dumpedSchemas: manifest.database.schemas, targetUrl });
+      const check = await checkExternalReferences({
+        dumpPath,
+        dumpedSchemas: manifest.database.schemas,
+        targetUrl,
+        pendingExtensionSchemas,
+      });
       return logExternalReferences(check, manifest.database.schemas, true);
     } catch (error) {
       log.error(`references outside the backup: could not read the dump — ${(error as Error).message}`);
@@ -507,6 +525,7 @@ async function inspectDumpForTarget(manifest: Manifest, targetUrl: string, reade
   }
 }
 
+/** 目标上已经装了哪些扩展。 */
 async function installedExtensions(targetUrl: string): Promise<Set<string>> {
   const client = await connectPg(targetUrl);
   try {
@@ -514,32 +533,6 @@ async function installedExtensions(targetUrl: string): Promise<Set<string>> {
     return new Set(res.rows.map((row) => row.extname));
   } finally {
     await client.end();
-  }
-}
-
-/**
- * 恢复失败后把**这次运行**装上的扩展再删掉,返回接在报错后面的一句话。只删运行前没有的:用户自己
- * 在控制台开过的扩展不动。不删的话,装进 public 的扩展(函数、类型)会让下一次运行被空目标门拦下。
- * 数据库恢复本身在一个事务里已经回滚,这里没有别的对象依赖它们,用默认的 RESTRICT 就够。
- */
-async function removeExtensionsAddedSince(targetUrl: string, before: Set<string>): Promise<string> {
-  let added: string[] = [];
-  try {
-    added = [...(await installedExtensions(targetUrl))].filter((name) => !before.has(name));
-    if (!added.length) return "";
-    const client = await connectPg(targetUrl);
-    try {
-      await client.query(`drop extension if exists ${added.map(quoteIdent).join(", ")}`);
-    } finally {
-      await client.end();
-    }
-    return ` The extension(s) this run installed (${added.join(", ")}) were removed again.`;
-  } catch (error) {
-    const which = added.length ? added.join(", ") : "it installed";
-    return (
-      ` Could not remove the extension(s) ${which} this run installed (${(error as Error).message}); ` +
-      `drop them before retrying, or the empty-target check may refuse the next run.`
-    );
   }
 }
 
@@ -749,8 +742,25 @@ export async function runRestore(
         );
       }
 
+      // 扩展预装:沙箱装不上只能记录(环境局限),真实目标装不上必须阻断——
+      // 用户在 dashboard 一键可开,恢复残缺副本则要人工收拾(引擎头注的裁决分工)。
+      // 装上的扩展在恢复失败时留着:下一次运行照样要它们,空目标门也不数扩展自带的对象。
+      // (曾经在失败后删掉"本次新装的"扩展,交叉审查复现了它会误删别的连接同时装上的扩展。)
+      const extensions = manifest.database.extensions ?? [];
+      if (extensions.length) {
+        log.step(`Installing ${extensions.length} extension(s) on target…`);
+        const unavailable = await installExtensions(targetUrl, extensions);
+        if (unavailable.length) {
+          throw new Error(
+            `target cannot install extension(s): ${unavailable.join(", ")} — enable them in ` +
+              `the Supabase dashboard (Database → Extensions) and retry.`
+          );
+        }
+      }
+
       // 指向备份之外的外键(典型:profiles.id → auth.users),目标上缺被引用的行,恢复必然失败。
-      // 和 dry-run 同一份检查,在第一次写入之前拦下,报错直接说缺什么、去哪补。
+      // 和 dry-run 同一份检查,在写任何快照内容之前拦下,报错直接说缺什么、去哪补。放在装扩展之后:
+      // 被引用的表也可能是扩展建的
       log.step("Checking foreign keys that point outside the backup…");
       const references = await checkExternalReferences({
         dumpPath,
@@ -760,41 +770,21 @@ export async function runRestore(
       const referenceProblems = logExternalReferences(references, manifest.database.schemas, false);
       if (referenceProblems.length) {
         throw new Error(
-          `the restore would fail on foreign keys, so nothing was written:\n  - ${referenceProblems.join("\n  - ")}\n` +
-            referencesHint(manifest.database.schemas)
+          `the restore would fail on foreign keys, so nothing from the snapshot was written:\n  - ` +
+            `${referenceProblems.join("\n  - ")}\n${referencesHint(manifest.database.schemas)}`
         );
       }
 
-      // 扩展预装:沙箱装不上只能记录(环境局限),真实目标装不上必须阻断——
-      // 用户在 dashboard 一键可开,恢复残缺副本则要人工收拾(引擎头注的裁决分工)
-      const extensions = manifest.database.extensions ?? [];
-      const extensionsBefore = extensions.length ? await installedExtensions(targetUrl) : null;
-      try {
-        if (extensions.length) {
-          log.step(`Installing ${extensions.length} extension(s) on target…`);
-          const unavailable = await installExtensions(targetUrl, extensions);
-          if (unavailable.length) {
-            throw new Error(
-              `target cannot install extension(s): ${unavailable.join(", ")} — enable them in ` +
-                `the Supabase dashboard (Database → Extensions) and retry.`
-            );
-          }
-        }
-
-        log.step("Restoring database into target…");
-        const engine = await restoreDatabaseArtifact({ dumpPath, connString: targetUrl, target: "supabase" });
-        if (!engine.ok) {
-          const failures = [...engine.preData.failures, ...engine.postData.failures];
-          throw new Error(
-            `database restore failed: ${failures.join(" | ")}. It ran in one transaction and was rolled back, ` +
-              `so nothing from the snapshot is on the target and you can run restore again on the same project ` +
-              `once the cause is fixed.` +
-              restoreFailureAdvice(failures.join(" "))
-          );
-        }
-      } catch (error) {
-        if (extensionsBefore) (error as Error).message += await removeExtensionsAddedSince(targetUrl, extensionsBefore);
-        throw error;
+      log.step("Restoring database into target…");
+      const engine = await restoreDatabaseArtifact({ dumpPath, connString: targetUrl, target: "supabase" });
+      if (!engine.ok) {
+        const failures = [...engine.preData.failures, ...engine.postData.failures];
+        throw new Error(
+          `database restore failed: ${failures.join(" | ")}. It ran in one transaction and was rolled back, ` +
+            `so nothing from the snapshot is on the target and you can run restore again on the same project ` +
+            `once the cause is fixed.` +
+            restoreFailureAdvice(failures.join(" "))
+        );
       }
       result.restoredToDatabase = true;
 

@@ -59,7 +59,21 @@ async function sql(url, text) {
   }
 }
 
-/** public 里的关系、函数、类型总数 = 空目标门数的那些对象。 */
+/** public 里不属于任何扩展的关系、函数、类型 = 空目标门数的那些对象。 */
+async function publicUserObjects(url) {
+  const res = await sql(
+    url,
+    `select count(*)::int as n from (
+       select c.oid, 'pg_class'::regclass as cls from pg_class c where c.relnamespace = 'public'::regnamespace
+       union all select p.oid, 'pg_proc'::regclass from pg_proc p where p.pronamespace = 'public'::regnamespace
+       union all select t.oid, 'pg_type'::regclass from pg_type t
+         where t.typnamespace = 'public'::regnamespace and t.typtype in ('e','d','r','c') and t.typrelid = 0
+     ) o where not exists (select 1 from pg_depend d where d.classid = o.cls and d.objid = o.oid and d.deptype = 'e')`
+  );
+  return res.rows[0].n;
+}
+
+/** public 里的关系、函数、类型总数(含扩展自带的)。 */
 async function publicObjects(url) {
   const res = await sql(
     url,
@@ -161,8 +175,8 @@ test(
         assert.doesNotMatch(error.message, /legacy_owner_fkey/, "NOT VALID foreign keys are not validated on restore");
         return true;
       });
-      await assert.rejects(restore({}), /nothing was written/);
-      assert.equal(await publicObjects(targetUrl), 0, "refused restore must not write anything");
+      await assert.rejects(restore({}), /nothing from the snapshot was written/);
+      assert.equal(await publicUserObjects(targetUrl), 0, "refused restore must not write anything from the snapshot");
 
       // 只补上两个用户:还差一个,dry-run 必须报 1 of 3
       await sql(
@@ -174,17 +188,21 @@ test(
       const dry = await restore({ dryRun: true });
       assert.equal(dry.dryRun, true);
 
-      // 外键都对上了,但 private.touch() 不在目标上:恢复在 post-data 失败,必须整体回滚,
-      // 本次装进 public 的 pg_trgm 也要删掉,否则下一次会被空目标门拦下
+      // 外键都对上了,但 private.touch() 不在目标上:恢复在 post-data 失败,必须整体回滚。
+      // 本次装进 public 的 pg_trgm 留着(下次还要用),空目标门不数扩展自带的函数,下一次照样能跑
       await assert.rejects(restore({}), (error) => {
         assert.match(error.message, /schema "private" does not exist/);
         assert.match(error.message, /rolled back/);
-        assert.match(error.message, /\(pg_trgm\) were removed again/);
         return true;
       });
-      assert.equal(await publicObjects(targetUrl), 0, "failed restore must leave nothing in public");
       const trgm = await sql(targetUrl, "select count(*)::int as n from pg_extension where extname = 'pg_trgm'");
-      assert.equal(trgm.rows[0].n, 0, "extension installed by the failed run is removed");
+      assert.equal(trgm.rows[0].n, 1, "the extension stays installed");
+      assert.ok((await publicObjects(targetUrl)) > 0, "pg_trgm's own functions live in public");
+      assert.equal(await publicUserObjects(targetUrl), 0, "nothing from the snapshot is left in public");
+      // 和扩展同时存在、又不属于扩展的对象照样挡门
+      await sql(targetUrl, "create table public.stray (id int)");
+      await assert.rejects(restore({ dryRun: true }), /contain 1 existing object/);
+      await sql(targetUrl, "drop table public.stray");
 
       // 修好原因,同一个目标直接重跑
       await sql(
