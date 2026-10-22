@@ -247,7 +247,7 @@ async function comparisonTypes(
     // 拼进 SQL 的只有它,dump 里的原文只当 to_regtype 的参数
     const resolved = await readOnly<{ name: string | null }>(client, "select format_type(to_regtype($1), null) as name", [declared]);
     if (!resolved.rows[0].name) {
-      return { unchecked: `column ${column} is of type ${declared}, which the target doesn't have until the restore creates it` };
+      return { unchecked: `column ${column} uses type ${declared}, which is missing on the target` };
     }
     types.push(resolved.rows[0].name);
   }

@@ -164,8 +164,9 @@ Add \`--dry-run\` first to preview every check without writing anything. (Skip t
 The CLI verifies the archive checksum, refuses non-empty targets, checks that rows
 referenced outside the snapshot (such as \`auth.users\`) are on the target, installs
 the extensions, restores the database in a single transaction through the same
-engine the weekly drills use (if pg_restore fails, its changes are rolled back; the
-extensions stay installed), verifies table counts and row presence afterwards, then rebuilds buckets, uploads the
+engine the weekly drills use (an SQL error rolls it back and the extensions stay
+installed; if the connection drops while it commits, check the target before
+retrying), verifies table counts and row presence afterwards, then rebuilds buckets, uploads the
 Storage files back and reconciles every one against the target.
 
 More: https://backupdrill.com/docs/restore

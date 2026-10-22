@@ -162,7 +162,7 @@ line" values ('00000000-0000-0000-0000-000000000001');
       const audit = await sql(target.url, "select count(*)::int as n from types.audit");
       assert.equal(audit.rows[0].n, 0, "the check must not write to the target");
       // 引用方类型在恢复之前不存在
-      assert.match(text(dry.unchecked), /public\.uses_uid → auth\.users .*type public\.uid, which the target doesn't have until the restore creates it/);
+      assert.match(text(dry.unchecked), /public\.uses_uid → auth\.users .*uses type public\.uid, which is missing on the target/);
 
       // 不告诉它扩展待装时,表不在就是 blocker
       const strict = await check();
