@@ -387,7 +387,7 @@ test(
 );
 
 test(
-  "restore: a foreign-key failure installs nothing, so the retry after copying users isn't blocked by an extension's config table",
+  "restore: a foreign-key failure leaves no extension behind, so the retry after copying users isn't blocked by an extension's config table",
   { skip: canRun ? false : "requires Docker + pg_dump", timeout: 180_000 },
   async () => {
     const ids = [];
@@ -447,10 +447,10 @@ test(
       // auth.users 根本不在:有扩展待装,第一遍只能先记下;装扩展和复查在一个事务里,复查不过连扩展一起回滚
       await assert.rejects(restore(), /auth\.users does not exist on the target/);
       assert.equal(await cfgInstalled(), 0, "the extension is rolled back with the failed re-check");
-      // auth.users 在、但没有人:第一遍就拦下,什么都没装
+      // auth.users 在、但没有人:扩展还没装,第一遍不下结论;装扩展和复查在一个事务里,复查不过一起回滚
       await sql(targetUrl, "create schema auth; create table auth.users (id uuid primary key);");
       await assert.rejects(restore(), /nothing from the snapshot was written/);
-      assert.equal(await cfgInstalled(), 0, "the foreign-key check runs before any extension is installed");
+      assert.equal(await cfgInstalled(), 0, "the extension is rolled back with the failed re-check");
 
       await sql(targetUrl, "insert into auth.users values ('00000000-0000-0000-0000-000000000001')");
       const done = await restore();
@@ -609,7 +609,7 @@ test(
 );
 
 test(
-  "restore: rows an extension adds when it's installed count, so they don't block the restore",
+  "restore: rows or a unique index that an extension adds when it's installed count, so they don't block the restore",
   { skip: canRun ? false : "requires Docker + pg_dump", timeout: 180_000 },
   async () => {
     const ids = [];
@@ -623,14 +623,21 @@ test(
       await x("docker", ["exec", "-u", "root", targetId, "sh", "-c",
         "d=$(pg_config --sharedir)/extension; " +
         "printf \"default_version = '1.0'\\nrelocatable = false\\n\" > $d/bdtest_seed.control; " +
-        "printf \"insert into auth.codes values ('a');\\n\" > $d/bdtest_seed--1.0.sql"]);
+        "printf \"insert into auth.codes values ('a');\\n\" > $d/bdtest_seed--1.0.sql; " +
+        // 另一个扩展给已有的表补上外键要的唯一索引
+        "printf \"default_version = '1.0'\\nrelocatable = false\\n\" > $d/bdtest_index.control; " +
+        "printf \"create unique index codes2_code_key on auth.codes2 (code);\\n\" > $d/bdtest_index--1.0.sql"]);
       await sql(
         sourceUrl,
         `create schema auth;
          create table auth.codes (code text primary key);
          insert into auth.codes values ('a');
          create table public.uses (code text references auth.codes(code));
-         insert into public.uses values ('a');`
+         insert into public.uses values ('a');
+         create table auth.codes2 (code text primary key);
+         insert into auth.codes2 values ('b');
+         create table public.uses2 (code text references auth.codes2(code));
+         insert into public.uses2 values ('b');`
       );
       const dumpPath = join(work, "seed.pgcustom");
       await x(pgDump, ["--format=custom", "--no-owner", "--no-privileges", "--schema=public", "--dbname", sourceUrl, "-f", dumpPath]);
@@ -645,22 +652,38 @@ test(
           serverVersion: "17.6",
           pgDumpVersion: (await x(pgDump, ["--version"])).stdout.trim(),
           schemas: ["public"],
-          tableCount: 1,
-          estimatedRowTotal: 1,
-          tables: [{ schema: "public", name: "uses", estimatedRows: 1 }],
-          extensions: [{ name: "bdtest_seed", version: "1.0", schema: "ext_seed" }],
+          tableCount: 2,
+          estimatedRowTotal: 2,
+          tables: [
+            { schema: "public", name: "uses", estimatedRows: 1 },
+            { schema: "public", name: "uses2", estimatedRows: 1 },
+          ],
+          extensions: [
+            { name: "bdtest_seed", version: "1.0", schema: "ext_seed" },
+            { name: "bdtest_index", version: "1.0", schema: "ext_index" },
+          ],
         },
         dump: { key: "backupdrill/seed/snap/dump.pgcustom", format: "custom", bytes: buf.length, sha256: createHash("sha256").update(buf).digest("hex") },
         storage: null,
       };
       const config = { databaseUrl: sourceUrl, projectName: "seed", schemas: ["public"], storage: { bucket: "unused" } };
-      await sql(targetUrl, "create schema auth; create table auth.codes (code text primary key);");
+      // auth.codes2 有那一行,但还没有唯一索引:外键建不出来,直到 bdtest_index 装上
+      await sql(
+        targetUrl,
+        "create schema auth; create table auth.codes (code text primary key); " +
+          "create table auth.codes2 (code text); insert into auth.codes2 values ('b');"
+      );
+      // dry-run 装不了扩展,按现在的行算:缺的这一行照旧是 blocker(有意的取舍,见 restore.ts)
+      await assert.rejects(
+        runRestore(config, { store: localStore(manifest, dumpPath, buf), targetDatabaseUrl: targetUrl, dryRun: true }),
+        /uses_code_fkey\): 1 of 1 row\(s\)/
+      );
       const done = await runRestore(config, {
         store: localStore(manifest, dumpPath, buf),
         targetDatabaseUrl: targetUrl,
         confirmTarget: "localhost",
       });
-      assert.equal(done.databaseVerified, true, "the row the extension adds satisfies the foreign key");
+      assert.equal(done.databaseVerified, true, "the row and the index the extensions add satisfy the foreign keys");
     } finally {
       for (const id of ids) await x("docker", ["rm", "-fv", id]).catch(() => {});
       rmSync(work, { recursive: true, force: true });

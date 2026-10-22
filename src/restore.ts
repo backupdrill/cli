@@ -807,8 +807,12 @@ export async function runRestore(
         }
         return references;
       };
-      // 还有扩展没装时,第一遍查出的缺行也先不下结论:扩展装上可能把行补上(交叉审查复现过一个
-      // 往已有表里写种子数据的扩展)。这种情况交给下面"装扩展 + 复查"的事务去定,复查不过照样拦、照样回滚
+      // 还有扩展没装时,第一遍查出的问题(缺行、缺列、缺唯一索引)先不下结论:扩展装上可能补上它们
+      // (交叉审查复现过往已有表里写种子数据、建唯一索引的扩展)。交给下面"装扩展 + 复查"的事务去定,
+      // 复查不过照样拦、连扩展一起回滚。
+      // dry-run 装不了扩展,这些照旧报成 blocker:新建的 Supabase 项目通常还没装源库用过的扩展,
+      // 要是 dry-run 也先不下结论,最常见的"auth.users 是空的"就只剩一条警告了。代价是那种往别人的表里
+      // 补数据的扩展,dry-run 会比正式恢复更严
       const firstCheck = await checkReferences(pendingExtensions, { final: pendingExtensions.length === 0 });
 
       // 扩展预装:沙箱装不上只能记录(环境局限),真实目标装不上必须阻断——
