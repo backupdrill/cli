@@ -5,6 +5,7 @@
 //  - 目标端的查询都在只读事务里,比较时调到的函数想写也写不进去(第二轮);
 //  - 用外键自己的相等运算符(唯一索引的运算符族里找,带 schema):citext 不在 search_path 上也按 citext 比(推送前审查);
 //  - 同一张表上两条外键同一批次攒满时一个接一个查,一条报错不连累另一条(推送前审查);
+//  - char(n) / bit(n) 的值不能被转换截短;可延迟的唯一约束不算(推送前审查第 2 次);
 //  - 带引号的名字里有换行,COPY 头跨行,不能静默跳过整块数据报"全找到了";
 //  - 目标列带类型修饰符(numeric(2,0)),比较时不能把 1.1 转成 1。
 import { test } from "node:test";
@@ -129,6 +130,20 @@ line" values ('00000000-0000-0000-0000-000000000001');
          insert into public.pairs
            select u.id, 'k' || u.n from (select id, row_number() over () as n from auth.users
                                           where id <> '00000000-0000-0000-0000-000000000001') u;
+         -- char(4) / bit(4):转换不能把值截成一位(ABCD 和 AXYZ 不是同一个键)
+         create table auth.chars (code char(4) primary key);
+         insert into auth.chars values ('ABCD');
+         create table public.uses_char (code char(4) references auth.chars(code));
+         insert into public.uses_char values ('ABCD');
+         create table auth.bits (b bit(4) primary key);
+         insert into auth.bits values (B'1010');
+         create table public.uses_bit (b bit(4) references auth.bits(b));
+         insert into public.uses_bit values (B'1010');
+         -- 目标上被引用列只有可延迟的唯一约束:外键建不出来
+         create table auth.deferred (id int primary key);
+         insert into auth.deferred values (1);
+         create table public.uses_deferred (id int references auth.deferred(id));
+         insert into public.uses_deferred values (1);
          -- 引用方列的类型建在备份的 schema 里:恢复之前目标上没有,只能报没查成
          create domain public.uid as uuid;
          create table public.uses_uid (u public.uid references auth.users(id));
@@ -169,7 +184,13 @@ line" values ('00000000-0000-0000-0000-000000000001');
          create schema extensions;
          create extension citext schema extensions;
          create table auth.emails (email extensions.citext primary key);
-         insert into auth.emails values ('alice');`
+         insert into auth.emails values ('alice');
+         create table auth.chars (code char(4) primary key);
+         insert into auth.chars values ('AXYZ');
+         create table auth.bits (b bit(4) primary key);
+         insert into auth.bits values (B'1001');
+         create table auth.deferred (id int, constraint deferred_id_key unique (id) deferrable);
+         insert into auth.deferred values (1);`
       );
       const check = (extra = {}) =>
         checkExternalReferences({ dumpPath, dumpedSchemas: ["public"], targetUrl: target.url, ...extra });
@@ -200,6 +221,11 @@ line" values ('00000000-0000-0000-0000-000000000001');
       // pairs 上两条外键同一批次攒满:c 那条报错只影响它自己,u 那条 6000 行缺 6000 行照报
       assert.match(text(dry.problems), /public\.pairs → auth\.users \(pairs_u_fkey\): 6,000 of 6,000 row\(s\)/);
       assert.match(text(dry.unchecked), /public\.pairs → auth\.codes2 \(pairs_c_fkey\): could not compare its rows on the target/);
+      // 只比第一位的话 ABCD = AXYZ、1010 = 1001,这里必须报缺
+      assert.match(text(dry.problems), /public\.uses_char → auth\.chars .*: 1 of 1 row\(s\)/);
+      assert.match(text(dry.problems), /public\.uses_bit → auth\.bits .*: 1 of 1 row\(s\)/);
+      // 可延迟的唯一约束撑不起外键
+      assert.match(text(dry.problems), /public\.uses_deferred → auth\.deferred .*no unique index on \(id\)/);
       // 引用方类型在恢复之前不存在
       assert.match(text(dry.unchecked), /public\.uses_uid → auth\.users .*uses type public\.uid, which is missing on the target/);
 

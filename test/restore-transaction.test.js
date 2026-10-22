@@ -193,6 +193,16 @@ test(
       const dry = await restore({ dryRun: true });
       assert.equal(dry.dryRun, true);
 
+      // 扩展的配置表(pg_extension_config_dump)照样算已有对象:转储会带它的数据,恢复会插重复行
+      const targetId = (await x("docker", ["ps", "-q", "--filter", `publish=${targetPort}`])).stdout.trim();
+      await x("docker", ["exec", "-u", "root", targetId, "sh", "-c",
+        "d=$(pg_config --sharedir)/extension; " +
+        "printf \"default_version = '1.0'\\nrelocatable = false\\n\" > $d/bdtest_cfg.control; " +
+        "printf \"create table cfg (k text);\\nselect pg_catalog.pg_extension_config_dump('cfg', '');\\n\" > $d/bdtest_cfg--1.0.sql"]);
+      await sql(targetUrl, "create extension bdtest_cfg schema public");
+      await assert.rejects(restore({ dryRun: true }), /contain 1 existing object/);
+      await sql(targetUrl, "drop extension bdtest_cfg");
+
       // 外键都对上了,但 private.touch() 不在目标上:恢复在 post-data 失败,必须整体回滚。
       // 本次装进 public 的 pg_trgm 留着(下次还要用),空目标门不数扩展自带的函数,下一次照样能跑
       await assert.rejects(restore({}), (error) => {

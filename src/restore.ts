@@ -246,9 +246,10 @@ export function nonEmptyTargetMessage(
  * schema 内零用户对象——关系、函数/过程、独立类型(enum/domain/range/composite)
  * 全部计入:只查关系时,"目标里只有函数"会放行,然后在 pre-data 中途撞冲突,
  * 留下半截目标(评审第 7 轮)。
- * 扩展自带的对象不算(pg_depend deptype 'e'):转储里从来没有扩展成员,和恢复内容撞不上;
+ * 扩展自带的对象不算(pg_depend deptype 'e'):转储不带扩展成员的定义,和恢复内容撞不上;
  * 算进去的话,用户照我们的提示在控制台把扩展开进 public,或者上一次失败的恢复已经装好了扩展,
- * 都会被这道门挡住(2.7.0)。
+ * 都会被这道门挡住(2.7.0)。扩展的**配置表和配置序列**(pg_extension.extconfig)除外:pg_dump 会把
+ * 它们的数据带上,恢复会往里插重复行,序列的 setval 还不随事务回滚(交叉审查复现),照旧算已有对象。
  */
 async function assertEmptyTarget(
   targetUrl: string,
@@ -269,10 +270,11 @@ async function userObjectCount(targetUrl: string, schemas: string[]): Promise<nu
       `select
          (select count(*) from pg_class c join pg_namespace n on n.oid = c.relnamespace
            where n.nspname = any($1::text[]) and c.relkind in ('r','p','m','v','S','f','c')
-             and not exists (select 1 from pg_depend d where d.deptype = 'e'
-                               and ((d.classid = 'pg_class'::regclass and d.objid = c.oid)
-                                 -- 扩展建的复合类型(dblink 的 dblink_pkey_results)登记在类型上,不在关系上
-                                 or (d.classid = 'pg_type'::regclass and d.objid = c.reltype))))
+             and not (exists (select 1 from pg_depend d where d.deptype = 'e'
+                                and ((d.classid = 'pg_class'::regclass and d.objid = c.oid)
+                                  -- 扩展建的复合类型(dblink 的 dblink_pkey_results)登记在类型上,不在关系上
+                                  or (d.classid = 'pg_type'::regclass and d.objid = c.reltype)))
+                      and not exists (select 1 from pg_extension e where c.oid = any(e.extconfig))))
        + (select count(*) from pg_proc p join pg_namespace n on n.oid = p.pronamespace
            where n.nspname = any($1::text[])
              and not exists (select 1 from pg_depend d where d.classid = 'pg_proc'::regclass

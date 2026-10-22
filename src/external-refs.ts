@@ -211,10 +211,20 @@ async function readOnly<T extends pg.QueryResultRow>(client: pg.Client, sql: str
   }
 }
 
-/** 一列怎么比:`r.<被引用列>::<左类型> OPERATOR(<schema>.<op>) k.<值>::<右类型>`,每一段都取自目标的系统表。 */
+/**
+ * 拿来写 `::类型` 的名字。format_type 给 bpchar 和 bit 的是 character / bit,写进转换里就成了
+ * char(1) / bit(1),值被截成一位(交叉审查复现:ABCD 和 AXYZ 被当成同一个键)。这两个换成不带长度的写法。
+ */
+const CAST_NAME = (oid: string) => `case ${oid}
+    when 'pg_catalog.bpchar'::regtype then 'pg_catalog.bpchar'
+    when 'pg_catalog._bpchar'::regtype then 'pg_catalog.bpchar[]'
+    when 'pg_catalog.bit'::regtype then 'pg_catalog.varbit'
+    when 'pg_catalog._bit'::regtype then 'pg_catalog.varbit[]'
+    else format_type(${oid}, null) end`;
+
+/** 一列怎么比:`r.<被引用列> OPERATOR(<schema>.<op>) k.<值>::<右类型>`,每一段都取自目标的系统表。 */
 interface ColumnComparison {
   referencedColumn: string;
-  leftType: string;
   operator: string;
   /** 引用方的值先转成它自己的类型(去掉域),再按需转成运算符右侧的类型 */
   rightCast: string;
@@ -250,11 +260,12 @@ async function comparisonPlan(
   if (absent.length) {
     return { problem: `${formatQualified(fk.references)} on the target has no column(s) ${absent.join(", ")}`, tableMissing: false };
   }
-  // 外键要求被引用列上有一个恰好覆盖这几列的唯一索引(顺序不限)
+  // 外键要求被引用列上有一个恰好覆盖这几列的唯一索引(顺序不限),而且不能是可延迟的(indimmediate)
   const indexes = await readOnly<{ keys: string; classes: string; nkeys: number }>(
     client,
     `select i.indkey::text as keys, i.indclass::text as classes, i.indnkeyatts::int as nkeys from pg_index i
-      where i.indrelid = $1::oid and i.indisunique and i.indisvalid and i.indpred is null and i.indexprs is null`,
+      where i.indrelid = $1::oid and i.indisunique and i.indimmediate and i.indisvalid
+        and i.indpred is null and i.indexprs is null`,
     [relid]
   );
   const wanted = fk.referencedColumns.map((name) => attnum.get(name)!).sort((a, b) => a - b).join(" ");
@@ -280,7 +291,7 @@ async function comparisonPlan(
          union all
          select t.oid, ty.typbasetype, t.depth + 1 from t join pg_type ty on ty.oid = t.base
           where ty.typtype = 'd' and t.depth < 20)
-       select oid::text as oid, base::text as base, format_type(base, null) as name from t order by depth desc limit 1`,
+       select oid::text as oid, base::text as base, ${CAST_NAME("base")} as name from t order by depth desc limit 1`,
       [declared]
     );
     const fkBase = fkType.rows[0]?.base;
@@ -289,10 +300,10 @@ async function comparisonPlan(
     }
     const opclass = index.classes[index.keys.indexOf(attnum.get(fk.referencedColumns[i])!)];
     // 先找 (输入类型, 引用方类型);没有就看能不能隐式转成输入类型,用 (输入类型, 输入类型)
-    const operator = await readOnly<{ schema: string; name: string; left: string; right: string; coerced: boolean }>(
+    const operator = await readOnly<{ schema: string; name: string; right: string; coerced: boolean }>(
       client,
-      `select n.nspname as schema, o.oprname as name, format_type(o.oprleft, null) as left,
-              format_type(o.oprright, null) as right, o.oprright <> $2::oid as coerced
+      `select n.nspname as schema, o.oprname as name,
+              ${CAST_NAME("o.oprright")} as right, o.oprright <> $2::oid as coerced
          from pg_opclass oc
          join pg_amop am on am.amopfamily = oc.opcfamily and am.amoplefttype = oc.opcintype and am.amopstrategy = 3
          join pg_operator o on o.oid = am.amopopr
@@ -314,7 +325,6 @@ async function comparisonPlan(
     // 运算符名只由符号组成(系统表保证),schema 照常加引号
     comparisons.push({
       referencedColumn: fk.referencedColumns[i],
-      leftType: op.left,
       operator: `OPERATOR(${quoteIdent(op.schema)}.${op.name})`,
       rightCast: op.coerced ? `${fkType.rows[0].name}::${op.right}` : op.right,
     });
@@ -459,7 +469,8 @@ async function missingKeyIndexes(
     `with ordinality as k(${aliases.join(", ")}, i) ` +
     `where not exists (select 1 from ${quoteIdent(fk.references.schema)}.${quoteIdent(fk.references.name)} r where ` +
     comparisons
-      .map((c, i) => `r.${quoteIdent(c.referencedColumn)}::${c.leftType} ${c.operator} k.${aliases[i]}::${c.rightCast}`)
+      // 被引用列不做转换(转成 character / bit 这类名字会截断它);运算符写死了 schema,右边的类型也定了
+      .map((c, i) => `r.${quoteIdent(c.referencedColumn)} ${c.operator} k.${aliases[i]}::${c.rightCast}`)
       .join(" and ") +
     `)`;
   const res = await readOnly<{ i: number }>(
