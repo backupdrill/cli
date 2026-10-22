@@ -68,7 +68,10 @@ async function publicUserObjects(url) {
        union all select p.oid, 'pg_proc'::regclass from pg_proc p where p.pronamespace = 'public'::regnamespace
        union all select t.oid, 'pg_type'::regclass from pg_type t
          where t.typnamespace = 'public'::regnamespace and t.typtype in ('e','d','r','c') and t.typrelid = 0
-     ) o where not exists (select 1 from pg_depend d where d.classid = o.cls and d.objid = o.oid and d.deptype = 'e')`
+     ) o where not exists (select 1 from pg_depend d where d.deptype = 'e'
+                             and ((d.classid = o.cls and d.objid = o.oid)
+                               or (o.cls = 'pg_class'::regclass and d.classid = 'pg_type'::regclass
+                                   and d.objid = (select reltype from pg_class where oid = o.oid))))`
   );
   return res.rows[0].n;
 }
@@ -166,9 +169,11 @@ test(
         return true;
       });
 
-      // 目标 2:新项目的样子 —— auth.users 在,但一行都没有
-      await sql(targetUrl, "create schema auth; create table auth.users (id uuid primary key);");
+      // 目标 2:新项目的样子 —— auth.users 在,但一行都没有。再在 public 里开一个 dblink(像在控制台里开的):
+      // 它带着扩展自己的复合类型,空目标门不能把它当成已有对象
+      await sql(targetUrl, "create schema auth; create table auth.users (id uuid primary key); create extension dblink schema public;");
       await assert.rejects(restore({ dryRun: true }), (error) => {
+        assert.doesNotMatch(error.message, /existing object/, "extension objects don't make the target non-empty");
         assert.match(error.message, /public\.profiles → auth\.users \(profiles_id_fkey\): 3 of 3 row\(s\)/);
         // 分区父表的外键按分区里的数据算
         assert.match(error.message, /public\.events → auth\.users \(events_Actor Id_fkey\): 20 of 20 row\(s\)/);

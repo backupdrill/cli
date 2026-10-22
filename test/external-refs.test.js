@@ -2,7 +2,9 @@
 //  - 被引用的表由扩展创建:dry-run 时扩展还没装,不能当成 blocker;装上之后要真查;
 //  - 一条外键在目标端查询出错,不能把另一条外键已经确认的缺行吞掉;
 //  - 比较按引用方列的类型(外键自己的比较),不按被引用列的类型(第二轮:float8 → float4);
-//  - 目标端的查询都在只读事务里,域 CHECK 调的函数想写也写不进去(第二轮);
+//  - 目标端的查询都在只读事务里,比较时调到的函数想写也写不进去(第二轮);
+//  - 用外键自己的相等运算符(唯一索引的运算符族里找,带 schema):citext 不在 search_path 上也按 citext 比(推送前审查);
+//  - 同一张表上两条外键同一批次攒满时一个接一个查,一条报错不连累另一条(推送前审查);
 //  - 带引号的名字里有换行,COPY 头跨行,不能静默跳过整块数据报"全找到了";
 //  - 目标列带类型修饰符(numeric(2,0)),比较时不能把 1.1 转成 1。
 import { test } from "node:test";
@@ -113,6 +115,20 @@ line" values ('00000000-0000-0000-0000-000000000001');
          insert into auth.codes2 values ('a');
          create table public.uses_dom (c types.code references auth.codes2(code));
          insert into public.uses_dom values ('a');
+         -- citext 装在 extensions(不在 search_path 上):得用 citext 自己的相等,ALICE 和 alice 是同一个键
+         create schema extensions;
+         create extension citext schema extensions;
+         create table auth.emails (email extensions.citext primary key);
+         insert into auth.emails values ('alice');
+         create table public.uses_ci (email extensions.citext references auth.emails(email));
+         insert into public.uses_ci values ('ALICE');
+         -- 同一张表上两条外键,同一批次一起攒满(> 5000 个键);其中一条在目标上比较会报错
+         insert into auth.users select gen_random_uuid() from generate_series(1, 6000);
+         insert into auth.codes2 select 'k' || g from generate_series(1, 6000) g;
+         create table public.pairs (u uuid references auth.users(id), c types.code references auth.codes2(code));
+         insert into public.pairs
+           select u.id, 'k' || u.n from (select id, row_number() over () as n from auth.users
+                                          where id <> '00000000-0000-0000-0000-000000000001') u;
          -- 引用方列的类型建在备份的 schema 里:恢复之前目标上没有,只能报没查成
          create domain public.uid as uuid;
          create table public.uses_uid (u public.uid references auth.users(id));
@@ -136,8 +152,24 @@ line" values ('00000000-0000-0000-0000-000000000001');
          create table types.audit (v text);
          create function types.log(v text) returns boolean language plpgsql as $f$ begin insert into types.audit values (v); return true; end $f$;
          create domain types.code as text check (types.log(value));
-         create table auth.codes2 (code text primary key);
-         insert into auth.codes2 values ('a');`
+         -- 被引用列上唯一索引的运算符类:它的 = 和比较函数每调用一次都想往审计表里写一行
+         -- (顺序扫描调 =,索引扫描调比较函数,哪种计划都躲不开)。比较必须在只读事务里
+         create function types.eq_logged(a text, b text) returns boolean language plpgsql
+           as $f$ begin insert into types.audit values (a); return a = b; end $f$;
+         create operator types.= (leftarg = text, rightarg = text, function = types.eq_logged);
+         create function types.cmp_logged(a text, b text) returns int language plpgsql
+           as $f$ begin insert into types.audit values (a); return bttextcmp(a, b); end $f$;
+         create operator class types.logged_ops for type text using btree as
+           operator 1 pg_catalog.<, operator 2 pg_catalog.<=, operator 3 types.=,
+           operator 4 pg_catalog.>=, operator 5 pg_catalog.>, function 1 types.cmp_logged(text, text);
+         create table auth.codes2 (code text);
+         create unique index on auth.codes2 (code types.logged_ops);
+         insert into auth.codes2 values ('a');
+         truncate types.audit;
+         create schema extensions;
+         create extension citext schema extensions;
+         create table auth.emails (email extensions.citext primary key);
+         insert into auth.emails values ('alice');`
       );
       const check = (extra = {}) =>
         checkExternalReferences({ dumpPath, dumpedSchemas: ["public"], targetUrl: target.url, ...extra });
@@ -157,10 +189,17 @@ line" values ('00000000-0000-0000-0000-000000000001');
       assert.match(text(dry.problems), /public\.uses_code → auth\.codes .*: 1 of 1 row\(s\)/);
       // float8 的 1.23456789 不等于 float4 存下来的 1.2345679:外键会失败,检查也要报缺
       assert.match(text(dry.problems), /public\.uses_f → auth\.f .*: 1 of 1 row\(s\)/);
-      // 域 CHECK 想写审计表:只读事务挡住,这条外键报没查成,目标上什么都没写
+      // 索引运算符的 = 想写审计表:只读事务挡住,这条外键报没查成,目标上什么都没写
       assert.match(text(dry.unchecked), /public\.uses_dom → auth\.codes2 .*could not compare its rows on the target \(.*read-only transaction/);
       const audit = await sql(target.url, "select count(*)::int as n from types.audit");
       assert.equal(audit.rows[0].n, 0, "the check must not write to the target");
+      // citext:按外键的运算符(extensions.=)比,大小写不同也找得到
+      const ci = dry.checked.find((c) => c.fk.constraint === "uses_ci_email_fkey");
+      assert.ok(ci, `uses_ci should be checked; unchecked: ${text(dry.unchecked)}; problems: ${text(dry.problems)}`);
+      assert.equal(ci.missingRows, 0);
+      // pairs 上两条外键同一批次攒满:c 那条报错只影响它自己,u 那条 6000 行缺 6000 行照报
+      assert.match(text(dry.problems), /public\.pairs → auth\.users \(pairs_u_fkey\): 6,000 of 6,000 row\(s\)/);
+      assert.match(text(dry.unchecked), /public\.pairs → auth\.codes2 \(pairs_c_fkey\): could not compare its rows on the target/);
       // 引用方类型在恢复之前不存在
       assert.match(text(dry.unchecked), /public\.uses_uid → auth\.users .*uses type public\.uid, which is missing on the target/);
 

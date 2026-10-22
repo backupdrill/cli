@@ -269,8 +269,10 @@ async function userObjectCount(targetUrl: string, schemas: string[]): Promise<nu
       `select
          (select count(*) from pg_class c join pg_namespace n on n.oid = c.relnamespace
            where n.nspname = any($1::text[]) and c.relkind in ('r','p','m','v','S','f','c')
-             and not exists (select 1 from pg_depend d where d.classid = 'pg_class'::regclass
-                               and d.objid = c.oid and d.deptype = 'e'))
+             and not exists (select 1 from pg_depend d where d.deptype = 'e'
+                               and ((d.classid = 'pg_class'::regclass and d.objid = c.oid)
+                                 -- 扩展建的复合类型(dblink 的 dblink_pkey_results)登记在类型上,不在关系上
+                                 or (d.classid = 'pg_type'::regclass and d.objid = c.reltype))))
        + (select count(*) from pg_proc p join pg_namespace n on n.oid = p.pronamespace
            where n.nspname = any($1::text[])
              and not exists (select 1 from pg_depend d where d.classid = 'pg_proc'::regclass

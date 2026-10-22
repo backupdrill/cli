@@ -116,9 +116,9 @@ export async function checkExternalReferences(opts: {
   try {
     const scans: Scan[] = [];
     for (const fk of external) {
-      let lookup: Awaited<ReturnType<typeof comparisonTypes>>;
+      let lookup: Awaited<ReturnType<typeof comparisonPlan>>;
       try {
-        lookup = await comparisonTypes(client, fk, tableColumns.get(keyOf(fk.table)));
+        lookup = await comparisonPlan(client, fk, tableColumns.get(keyOf(fk.table)));
       } catch (error) {
         result.unchecked.push(`${describe(fk)}: could not look up ${formatQualified(fk.references)} on the target (${(error as Error).message})`);
         continue;
@@ -140,7 +140,7 @@ export async function checkExternalReferences(opts: {
       }
       const checked: CheckedForeignKey = { fk, rows: 0, missingRows: 0 };
       result.checked.push(checked);
-      scans.push({ checked, types: lookup.types, leaves: new Set(leavesOf(fk.table).map(keyOf)), seen: new Set(), batch: new Map() });
+      scans.push({ checked, comparisons: lookup.comparisons, leaves: new Set(leavesOf(fk.table).map(keyOf)), seen: new Set(), batch: new Map() });
     }
     if (scans.length) {
       try {
@@ -185,8 +185,8 @@ export function describe(fk: ForeignKeyDef): string {
 
 interface Scan {
   checked: CheckedForeignKey;
-  /** 各外键列在比较时转成的类型(引用方列的类型,见 comparisonTypes) */
-  types: string[];
+  /** 各外键列怎么和被引用列比较(见 comparisonPlan) */
+  comparisons: ColumnComparison[];
   /** 这条外键的数据所在的表(普通表就是它自己;分区表是各级叶子分区) */
   leaves: Set<string>;
   /** 读到过 COPY 块的表 */
@@ -211,47 +211,115 @@ async function readOnly<T extends pg.QueryResultRow>(client: pg.Client, sql: str
   }
 }
 
+/** 一列怎么比:`r.<被引用列>::<左类型> OPERATOR(<schema>.<op>) k.<值>::<右类型>`,每一段都取自目标的系统表。 */
+interface ColumnComparison {
+  referencedColumn: string;
+  leftType: string;
+  operator: string;
+  /** 引用方的值先转成它自己的类型(去掉域),再按需转成运算符右侧的类型 */
+  rightCast: string;
+}
+
 /**
- * 比较用的类型 = **引用方**列的类型(从 dump 的建表语句读)。外键校验做的就是"引用方的值 =
- * 被引用列",按 Postgres 自己的运算符解析,跨类型(int4 → int8、float8 → float4)也是同一个比较;
- * 把值转成被引用列的类型则会改值(交叉审查:float8 1.23456789 转 float4 就和舍入后的行对上了)。
- * 引用方的类型要在目标上已经存在才转得了:建在备份 schema 里的域、枚举这时还没恢复,只能报没查成。
- * 被引用的表或列不在时返回 problem(恢复必然失败)。
+ * 照外键自己的做法定比较方式(ATAddForeignKeyConstraint):找被引用列上那个唯一索引,取它每列的
+ * 运算符族,在族里找 (索引输入类型, 引用方类型) 的相等运算符;找不到而引用方类型能隐式转成索引输入
+ * 类型时,用 (输入类型, 输入类型) 那个。运算符带 schema 写死:裸 `=` 在 search_path 里看不到
+ * extensions 时会把 citext 解析成 text 的相等,大小写不同的值就被误报成缺(交叉审查复现)。
+ * 引用方列的类型从 dump 的建表语句读,值本来就出自这一列。
+ * 被引用的表、列、唯一索引不在时返回 problem(建外键必然失败);其余没法照做的报 unchecked。
  */
-async function comparisonTypes(
+async function comparisonPlan(
   client: pg.Client,
   fk: ForeignKeyDef,
   columnsInDump: Map<string, string> | undefined
-): Promise<{ types: string[] } | { problem: string; tableMissing: boolean } | { unchecked: string }> {
+): Promise<{ comparisons: ColumnComparison[] } | { problem: string; tableMissing: boolean } | { unchecked: string }> {
   const relation = `${quoteIdent(fk.references.schema)}.${quoteIdent(fk.references.name)}`;
   const exists = await readOnly<{ oid: string | null }>(client, "select to_regclass($1)::oid as oid", [relation]);
-  if (!exists.rows[0].oid) {
+  const relid = exists.rows[0].oid;
+  if (!relid) {
     return { problem: `${formatQualified(fk.references)} does not exist on the target`, tableMissing: true };
   }
-  const present = await readOnly<{ name: string }>(
+  const attributes = await readOnly<{ name: string; num: number }>(
     client,
-    `select a.attname as name from pg_attribute a
+    `select a.attname as name, a.attnum::int as num from pg_attribute a
       where a.attrelid = $1::oid and a.attnum > 0 and not a.attisdropped and a.attname = any($2::text[])`,
-    [exists.rows[0].oid, fk.referencedColumns]
+    [relid, fk.referencedColumns]
   );
-  const names = new Set(present.rows.map((row) => row.name));
-  const absent = fk.referencedColumns.filter((name) => !names.has(name));
+  const attnum = new Map(attributes.rows.map((row) => [row.name, row.num]));
+  const absent = fk.referencedColumns.filter((name) => !attnum.has(name));
   if (absent.length) {
     return { problem: `${formatQualified(fk.references)} on the target has no column(s) ${absent.join(", ")}`, tableMissing: false };
   }
-  const types: string[] = [];
-  for (const column of fk.columns) {
+  // 外键要求被引用列上有一个恰好覆盖这几列的唯一索引(顺序不限)
+  const indexes = await readOnly<{ keys: string; classes: string; nkeys: number }>(
+    client,
+    `select i.indkey::text as keys, i.indclass::text as classes, i.indnkeyatts::int as nkeys from pg_index i
+      where i.indrelid = $1::oid and i.indisunique and i.indisvalid and i.indpred is null and i.indexprs is null`,
+    [relid]
+  );
+  const wanted = fk.referencedColumns.map((name) => attnum.get(name)!).sort((a, b) => a - b).join(" ");
+  const index = indexes.rows
+    .map((row) => ({ keys: row.keys.split(" ").slice(0, row.nkeys).map(Number), classes: row.classes.split(" ") }))
+    .find((row) => [...row.keys].sort((a, b) => a - b).join(" ") === wanted);
+  if (!index) {
+    return {
+      problem: `${formatQualified(fk.references)} on the target has no unique index on (${fk.referencedColumns.join(", ")}), so the foreign key can't be created`,
+      tableMissing: false,
+    };
+  }
+  const comparisons: ColumnComparison[] = [];
+  for (let i = 0; i < fk.columns.length; i++) {
+    const column = fk.columns[i];
     const declared = columnsInDump?.get(column);
     if (!declared) return { unchecked: `could not read the type of column ${column} from the dump` };
-    // format_type 给出规范写法(不带修饰符:值本来就出自这一列,修饰符不会再改它);
-    // 拼进 SQL 的只有它,dump 里的原文只当 to_regtype 的参数
-    const resolved = await readOnly<{ name: string | null }>(client, "select format_type(to_regtype($1), null) as name", [declared]);
-    if (!resolved.rows[0].name) {
+    const fkType = await readOnly<{ oid: string | null; base: string | null; name: string | null }>(
+      client,
+      // 域按外键的做法换成底层类型(可以多层嵌套)
+      `with recursive t(oid, base, depth) as (
+         select to_regtype($1)::oid, to_regtype($1)::oid, 0
+         union all
+         select t.oid, ty.typbasetype, t.depth + 1 from t join pg_type ty on ty.oid = t.base
+          where ty.typtype = 'd' and t.depth < 20)
+       select oid::text as oid, base::text as base, format_type(base, null) as name from t order by depth desc limit 1`,
+      [declared]
+    );
+    const fkBase = fkType.rows[0]?.base;
+    if (!fkType.rows[0]?.oid || !fkBase) {
       return { unchecked: `column ${column} uses type ${declared}, which is missing on the target` };
     }
-    types.push(resolved.rows[0].name);
+    const opclass = index.classes[index.keys.indexOf(attnum.get(fk.referencedColumns[i])!)];
+    // 先找 (输入类型, 引用方类型);没有就看能不能隐式转成输入类型,用 (输入类型, 输入类型)
+    const operator = await readOnly<{ schema: string; name: string; left: string; right: string; coerced: boolean }>(
+      client,
+      `select n.nspname as schema, o.oprname as name, format_type(o.oprleft, null) as left,
+              format_type(o.oprright, null) as right, o.oprright <> $2::oid as coerced
+         from pg_opclass oc
+         join pg_amop am on am.amopfamily = oc.opcfamily and am.amoplefttype = oc.opcintype and am.amopstrategy = 3
+         join pg_operator o on o.oid = am.amopopr
+         join pg_namespace n on n.oid = o.oprnamespace
+        where oc.oid = $1::oid
+          and (am.amoprighttype = $2::oid
+               or (am.amoprighttype = oc.opcintype
+                   and not exists (select 1 from pg_amop x where x.amopfamily = oc.opcfamily and x.amoplefttype = oc.opcintype
+                                     and x.amoprighttype = $2::oid and x.amopstrategy = 3)
+                   and exists (select 1 from pg_cast c where c.castsource = $2::oid and c.casttarget = oc.opcintype
+                                 and c.castcontext = 'i')))
+        order by (am.amoprighttype = $2::oid) desc limit 1`,
+      [opclass, fkBase]
+    );
+    const op = operator.rows[0];
+    if (!op) {
+      return { unchecked: `can't tell how the foreign key would compare ${declared} with ${formatQualified(fk.references)}.${fk.referencedColumns[i]}` };
+    }
+    // 运算符名只由符号组成(系统表保证),schema 照常加引号
+    comparisons.push({
+      referencedColumn: fk.referencedColumns[i],
+      leftType: op.left,
+      operator: `OPERATOR(${quoteIdent(op.schema)}.${op.name})`,
+      rightCast: op.coerced ? `${fkType.rows[0].name}::${op.right}` : op.right,
+    });
   }
-  return { types };
+  return { comparisons };
 }
 
 /**
@@ -292,7 +360,7 @@ async function scanDumpData(bin: string, dumpPath: string, scans: Scan[], client
     const entries = [...scan.batch.values()];
     scan.batch.clear();
     try {
-      const missing = await missingKeyIndexes(client, scan.checked.fk, scan.types, entries.map((e) => e.key));
+      const missing = await missingKeyIndexes(client, scan.checked.fk, scan.comparisons, entries.map((e) => e.key));
       for (const index of missing) scan.checked.missingRows += entries[index - 1].rows;
     } catch (error) {
       // 只停这一条外键:比如值转不成被引用列的类型
@@ -337,7 +405,7 @@ async function scanDumpData(bin: string, dumpPath: string, scans: Scan[], client
     }
     if (!current.length) return;
     const fields = line.split("\t");
-    let pending: Promise<void>[] | null = null;
+    let full: Scan[] | null = null;
     for (const { scan, indexes } of current) {
       if (scan.failed) continue;
       const key = indexes.map((i) => (i < fields.length ? decodeCopyField(fields[i]) : null));
@@ -347,9 +415,13 @@ async function scanDumpData(bin: string, dumpPath: string, scans: Scan[], client
       const seen = scan.batch.get(id);
       if (seen) seen.rows += 1;
       else scan.batch.set(id, { key: key as string[], rows: 1 });
-      if (scan.batch.size >= KEY_BATCH) (pending ??= []).push(flush(scan));
+      if (scan.batch.size >= KEY_BATCH) (full ??= []).push(scan);
     }
-    if (pending) return Promise.all(pending).then(() => {});
+    // 一个接一个查:几条外键共用一条连接,同时开事务会互相串(一条报错把另一条的查询也拖成 aborted)
+    if (full) {
+      const ready = full;
+      return ready.reduce((chain, scan) => chain.then(() => flush(scan)), Promise.resolve());
+    }
   };
 
   try {
@@ -374,24 +446,26 @@ async function scanDumpData(bin: string, dumpPath: string, scans: Scan[], client
   if (code !== 0) throw new Error(`pg_restore exited with code ${code}: ${oneLine(stderr)}`);
 }
 
-/** 一批键里哪些在被引用表里找不到;返回 1 起的下标。值按引用方列的类型转换,和外键校验同一个比较。 */
+/** 一批键里哪些在被引用表里找不到;返回 1 起的下标。比较方式见 comparisonPlan。 */
 async function missingKeyIndexes(
   client: pg.Client,
   fk: ForeignKeyDef,
-  types: string[],
+  comparisons: ColumnComparison[],
   keys: string[][]
 ): Promise<number[]> {
-  const aliases = types.map((_, i) => `c${i}`);
+  const aliases = comparisons.map((_, i) => `c${i}`);
   const sql =
-    `select k.i::int as i from unnest(${types.map((_, i) => `$${i + 1}::text[]`).join(", ")}) ` +
+    `select k.i::int as i from unnest(${comparisons.map((_, i) => `$${i + 1}::text[]`).join(", ")}) ` +
     `with ordinality as k(${aliases.join(", ")}, i) ` +
     `where not exists (select 1 from ${quoteIdent(fk.references.schema)}.${quoteIdent(fk.references.name)} r where ` +
-    fk.referencedColumns.map((column, i) => `r.${quoteIdent(column)} = k.${aliases[i]}::${types[i]}`).join(" and ") +
+    comparisons
+      .map((c, i) => `r.${quoteIdent(c.referencedColumn)}::${c.leftType} ${c.operator} k.${aliases[i]}::${c.rightCast}`)
+      .join(" and ") +
     `)`;
   const res = await readOnly<{ i: number }>(
     client,
     sql,
-    types.map((_, i) => keys.map((key) => key[i]))
+    comparisons.map((_, i) => keys.map((key) => key[i]))
   );
   return res.rows.map((row) => row.i);
 }
