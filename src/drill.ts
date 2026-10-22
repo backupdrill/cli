@@ -200,6 +200,28 @@ export function sandboxDataVolumeTarget(major: number): string {
   return major >= 18 ? "/var/lib/postgresql" : "/var/lib/postgresql/data";
 }
 
+/**
+ * 沙箱镜像先单独拉好。让 docker run 自己拉的话,拉取和建容器在同一个命令里:中断落在拉取中途,
+ * 停掉命令也说不准守护进程之后还会不会把容器建出来(交叉审查)。拆开之后,慢的那一步(第一次拉镜像
+ * 可能好几分钟)什么都不建,中断时直接停掉;docker run 只剩建容器和启动。
+ */
+async function ensureImage(image: string): Promise<void> {
+  const present = await execFileAsync("docker", ["image", "inspect", "--format", "{{.Id}}", image]).then(
+    () => true,
+    () => false
+  );
+  if (present) return;
+  throwIfInterrupted();
+  log.step(`Pulling ${image}…`);
+  const pull = execFileAsync("docker", ["pull", "--quiet", image]);
+  const forget = pull.child ? stopOnInterrupt(pull.child) : () => {};
+  try {
+    await pull;
+  } finally {
+    forget();
+  }
+}
+
 async function startEphemeralPostgres(image: string, major: number, resourceName?: string): Promise<Ephemeral> {
   const dataVolumeTarget = sandboxDataVolumeTarget(major);
   if (resourceName) {
@@ -211,6 +233,7 @@ async function startEphemeralPostgres(image: string, major: number, resourceName
   log.step(`Starting ephemeral ${image}…`);
   const resources = await dockerResources();
   const tuning = sandboxTuning(resources.memoryBytes, resources.cpus);
+  await ensureImage(image);
   // 名字先定好:Ctrl+C 可能落在 docker run 还没返回 ID 的时候,按名字才删得掉
   const name = resourceName ?? `backupdrill-drill-${randomBytes(6).toString("hex")}`;
   throwIfInterrupted();
@@ -255,19 +278,22 @@ async function startEphemeralPostgres(image: string, major: number, resourceName
   const teardown = () =>
     (teardownRun ??= (async () => {
       if (!runSettled) {
-        // 中断落在 docker run 还没返回的时候(第一次跑要拉镜像,可能好几分钟):不干等它,
-        // 停掉 docker 命令本身,它退出之后按名字删。守护进程收到的创建请求可能比命令退出晚一点落地,
-        // 所以隔一秒再删一次;否则 CLI 退出之后才冒出来的容器就没人管了(交叉审查复现)
-        started.child?.kill("SIGTERM");
+        // 中断落在 docker run 还没返回的时候。镜像已经在本地(ensureImage),它只剩建容器和启动,
+        // 等它落定再按名字删:中途停掉命令说不准守护进程会不会稍后把容器建出来(交叉审查复现)。
+        // Docker 迟迟不回话就不等了,把容器名告诉用户
         let timer: NodeJS.Timeout | undefined;
-        const exited = await Promise.race([
+        const settled = await Promise.race([
           started.then(() => true, () => true),
-          new Promise<boolean>((resolve) => (timer = setTimeout(() => resolve(false), 5_000))),
+          new Promise<boolean>((resolve) => (timer = setTimeout(() => resolve(false), 20_000))),
         ]);
         clearTimeout(timer);
-        if (!exited) started.child?.kill("SIGKILL");
-        await removeByName();
-        await new Promise((resolve) => setTimeout(resolve, 1_000));
+        if (!settled) {
+          started.child?.kill("SIGKILL");
+          log.warn(
+            `docker run did not finish within 20s; if a container named ${name} shows up later, ` +
+              `remove it with: docker rm -fv ${name}`
+          );
+        }
       }
       await removeByName();
       // 显式删卷(--rm 不可靠,见下);幂等,已经没了也不报错

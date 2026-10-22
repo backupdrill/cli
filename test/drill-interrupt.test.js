@@ -249,49 +249,94 @@ test(
   }
 );
 
+/**
+ * 假的 docker:放在 PATH 最前面,别的子命令照转真 docker。
+ * mode "slow-pull":image inspect 说镜像不在,pull 挂 10 分钟(模拟第一次拉镜像);
+ * mode "late-create":run 先等 4 秒再真的去建容器(模拟守护进程晚一点才把容器建出来)。
+ * 每次 pull / run 把自己的 pid 和容器名写进 mark 文件。
+ */
+async function fakeDocker(tmp, mode) {
+  const realDocker = (await x("sh", ["-c", "command -v docker"])).stdout.trim();
+  const bin = join(tmp, "bin");
+  const marks = { pull: join(tmp, "pull-started"), run: join(tmp, "run-started") };
+  await x("mkdir", ["-p", bin]);
+  writeFileSync(
+    join(bin, "docker"),
+    `#!${process.execPath}
+const { spawnSync } = require("child_process");
+const fs = require("fs");
+const args = process.argv.slice(2);
+const real = () => process.exit(spawnSync(${JSON.stringify(realDocker)}, args, { stdio: "inherit" }).status ?? 1);
+const mode = ${JSON.stringify(mode)};
+if (mode === "slow-pull" && args[0] === "image" && args[1] === "inspect") process.exit(1);
+if (mode === "slow-pull" && args[0] === "pull") {
+  fs.writeFileSync(${JSON.stringify(marks.pull)}, String(process.pid));
+  setTimeout(() => process.exit(0), 600000);
+} else if (args[0] === "run") {
+  fs.writeFileSync(${JSON.stringify(marks.run)}, process.pid + " " + args[args.indexOf("--name") + 1]);
+  if (mode === "late-create") setTimeout(real, 4000); else real();
+} else real();
+`
+  );
+  chmodSync(join(bin, "docker"), 0o755);
+  return { realDocker, marks, PATH: `${bin}:${process.env.PATH}` };
+}
+
 test(
-  "drill: SIGINT while docker run is still starting (image pull) stops it, so no sandbox appears after exit",
+  "drill: SIGINT while the sandbox image is still being pulled stops the pull and never starts a sandbox",
   { skip: canRun ? false : "requires Docker + pg_dump", timeout: 120_000 },
   async () => {
     const tmp = mkdtempSync(join(tmpdir(), "bd-sig-test-"));
     const s3 = await startFakeS3({ bucket: "backups" });
-    let wrapperPid = null;
-    let name = null;
+    let pullPid = null;
     try {
       await seedBucket(s3, await makeDump(tmp));
-      // 假的 docker:别的子命令照转真 docker,run 先挂 10 分钟再真的去起容器,模拟第一次拉镜像
-      const realDocker = (await x("sh", ["-c", "command -v docker"])).stdout.trim();
-      const bin = join(tmp, "bin");
-      const mark = join(tmp, "run-started");
-      await x("mkdir", ["-p", bin]);
-      writeFileSync(
-        join(bin, "docker"),
-        `#!${process.execPath}
-const { spawnSync } = require("child_process");
-const args = process.argv.slice(2);
-const real = () => process.exit(spawnSync(${JSON.stringify(realDocker)}, args, { stdio: "inherit" }).status ?? 1);
-if (args[0] === "run") {
-  require("fs").writeFileSync(${JSON.stringify(mark)}, process.pid + " " + args[args.indexOf("--name") + 1]);
-  setTimeout(real, 600000);
-} else real();
-`
-      );
-      chmodSync(join(bin, "docker"), 0o755);
-      const run = startDrill(s3, tmp, [], { env: { PATH: `${bin}:${process.env.PATH}` } });
-      await waitFor("docker run to start", () => existsSync(mark), 120_000);
-      [wrapperPid, name] = readFileSync(mark, "utf8").split(" ");
-      wrapperPid = Number(wrapperPid);
+      const docker = await fakeDocker(tmp, "slow-pull");
+      const run = startDrill(s3, tmp, [], { env: { PATH: docker.PATH } });
+      await waitFor("docker pull to start", () => existsSync(docker.marks.pull), 120_000);
+      pullPid = Number(readFileSync(docker.marks.pull, "utf8"));
       const sentAt = Date.now();
       run.child.kill("SIGINT");
       const { code } = await run.exited;
       assert.equal(code, 130, `exit code; stderr:\n${run.stderr()}`);
-      assert.ok(Date.now() - sentAt < 20_000, "does not wait for the slow docker run");
-      assert.equal(alive(wrapperPid), false, "the pending docker run was stopped, so it can't create the sandbox later");
-      assert.equal((await x(realDocker, ["ps", "-aq", "--filter", `name=^${name}$`])).stdout.trim(), "", "no sandbox container");
+      assert.ok(Date.now() - sentAt < 15_000, "does not wait for the pull");
+      assert.equal(alive(pullPid), false, "the pull was stopped");
+      assert.equal(existsSync(docker.marks.run), false, "docker run was never started");
       assert.deepEqual(leftovers(tmp), [], "temporary files removed");
     } finally {
-      if (wrapperPid && alive(wrapperPid)) process.kill(wrapperPid, "SIGKILL");
-      if (name) await x("docker", ["rm", "-fv", name]).catch(() => {});
+      if (pullPid && alive(pullPid)) process.kill(pullPid, "SIGKILL");
+      await s3.close();
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  }
+);
+
+test(
+  "drill: SIGINT while docker run is still creating the sandbox waits for it, then removes it",
+  { skip: canRun ? false : "requires Docker + pg_dump", timeout: 120_000 },
+  async () => {
+    const tmp = mkdtempSync(join(tmpdir(), "bd-sig-test-"));
+    const s3 = await startFakeS3({ bucket: "backups" });
+    let name = null;
+    let realDocker = "docker";
+    try {
+      await seedBucket(s3, await makeDump(tmp));
+      const docker = await fakeDocker(tmp, "late-create");
+      realDocker = docker.realDocker;
+      const run = startDrill(s3, tmp, [], { env: { PATH: docker.PATH } });
+      await waitFor("docker run to start", () => existsSync(docker.marks.run), 120_000);
+      name = readFileSync(docker.marks.run, "utf8").split(" ")[1];
+      run.child.kill("SIGINT");
+      const { code } = await run.exited;
+      assert.equal(code, 130, `exit code; stderr:\n${run.stderr()}`);
+      // 容器是在信号之后约 4 秒才建出来的;CLI 等它落定再删,退出时和之后都不该有它
+      const containers = async () => (await x(realDocker, ["ps", "-aq", "--filter", `name=^${name}$`])).stdout.trim();
+      assert.equal(await containers(), "", "no sandbox container at exit");
+      await new Promise((r) => setTimeout(r, 2_000));
+      assert.equal(await containers(), "", "and none shows up later");
+      assert.deepEqual(leftovers(tmp), [], "temporary files removed");
+    } finally {
+      if (name) await x(realDocker, ["rm", "-fv", name]).catch(() => {});
       await s3.close();
       rmSync(tmp, { recursive: true, force: true });
     }

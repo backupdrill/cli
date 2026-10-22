@@ -77,8 +77,11 @@ export function stopOnInterrupt(child: ChildProcess, opts: { group?: boolean } =
   return forget;
 }
 
-/** 每个清理最多等这么久:docker 守护进程卡住时也要能退出。 */
-const CLEANUP_TIMEOUT_MS = 30_000;
+/**
+ * 每个清理最多等这么久:docker 守护进程卡住时也要能退出。要比沙箱的收尾(等 docker run 落定 20 秒、
+ * docker rm 最多 60 秒)长,不然收尾还没做完就退出了。
+ */
+const CLEANUP_TIMEOUT_MS = 90_000;
 
 async function runCleanups(): Promise<void> {
   // 一直跑到没有登记为止:清理途中主流程可能还登记了新东西(比如收到信号时正在返回的 docker run)
@@ -93,10 +96,13 @@ async function runTasks(tasks: Cleanup[]): Promise<void> {
   for (const task of tasks) {
     let timer: NodeJS.Timeout | undefined;
     try {
-      await Promise.race([
-        Promise.resolve().then(task),
-        new Promise<void>((resolve) => (timer = setTimeout(resolve, CLEANUP_TIMEOUT_MS))),
+      const finished = await Promise.race([
+        Promise.resolve()
+          .then(task)
+          .then(() => true),
+        new Promise<boolean>((resolve) => (timer = setTimeout(() => resolve(false), CLEANUP_TIMEOUT_MS))),
       ]);
+      if (!finished) log.warn(`a cleanup step did not finish within ${CLEANUP_TIMEOUT_MS / 1000}s; check \`docker ps -a\``);
     } catch {
       // 清理函数自己报告失败;一个失败不挡后面的
     } finally {
