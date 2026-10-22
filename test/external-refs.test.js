@@ -144,6 +144,11 @@ line" values ('00000000-0000-0000-0000-000000000001');
          insert into auth.deferred values (1);
          create table public.uses_deferred (id int references auth.deferred(id));
          insert into public.uses_deferred values (1);
+         -- 被引用表在目标上有继承子表:外键只认父表自己的行
+         create table auth.parent (id int primary key);
+         insert into auth.parent values (5);
+         create table public.uses_parent (id int references auth.parent(id));
+         insert into public.uses_parent values (5);
          -- 引用方列的类型建在备份的 schema 里:恢复之前目标上没有,只能报没查成
          create domain public.uid as uuid;
          create table public.uses_uid (u public.uid references auth.users(id));
@@ -190,7 +195,10 @@ line" values ('00000000-0000-0000-0000-000000000001');
          create table auth.bits (b bit(4) primary key);
          insert into auth.bits values (B'1001');
          create table auth.deferred (id int, constraint deferred_id_key unique (id) deferrable);
-         insert into auth.deferred values (1);`
+         insert into auth.deferred values (1);
+         create table auth.parent (id int primary key);
+         create table auth.child () inherits (auth.parent);
+         insert into auth.child values (5);`
       );
       const check = (extra = {}) =>
         checkExternalReferences({ dumpPath, dumpedSchemas: ["public"], targetUrl: target.url, ...extra });
@@ -224,6 +232,8 @@ line" values ('00000000-0000-0000-0000-000000000001');
       // 只比第一位的话 ABCD = AXYZ、1010 = 1001,这里必须报缺
       assert.match(text(dry.problems), /public\.uses_char → auth\.chars .*: 1 of 1 row\(s\)/);
       assert.match(text(dry.problems), /public\.uses_bit → auth\.bits .*: 1 of 1 row\(s\)/);
+      // 5 只在继承子表里:外键看不到它,必须报缺
+      assert.match(text(dry.problems), /public\.uses_parent → auth\.parent .*: 1 of 1 row\(s\)/);
       // 可延迟的唯一约束撑不起外键
       assert.match(text(dry.problems), /public\.uses_deferred → auth\.deferred .*no unique index on \(id\)/);
       // 引用方类型在恢复之前不存在
@@ -240,6 +250,46 @@ line" values ('00000000-0000-0000-0000-000000000001');
       assert.ok(lookup, `checked: ${afterInstall.checked.map((c) => c.fk.constraint)}`);
       assert.equal(lookup.rows, 2);
       assert.equal(lookup.missingRows, 0);
+    } finally {
+      for (const id of ids) await x("docker", ["rm", "-fv", id]).catch(() => {});
+      rmSync(work, { recursive: true, force: true });
+    }
+  }
+);
+
+test(
+  "checkExternalReferences: rows hidden by RLS are reported as not checked, not as missing",
+  { skip: canRun ? false : "requires Docker + pg_dump", timeout: 120_000 },
+  async () => {
+    const ids = [];
+    const work = mkdtempSync(join(tmpdir(), "bd-refs-rls-"));
+    try {
+      const [source, target] = await Promise.all([startPostgres(ids), startPostgres(ids)]);
+      await sql(
+        source.url,
+        `create schema auth;
+         create table auth.users (id uuid primary key);
+         insert into auth.users values ('00000000-0000-0000-0000-000000000001');
+         create table public.profiles (id uuid primary key references auth.users(id));
+         insert into public.profiles values ('00000000-0000-0000-0000-000000000001');`
+      );
+      const dumpPath = join(work, "rls.pgcustom");
+      await x(pgDump, ["--format=custom", "--no-owner", "--no-privileges", "--schema=public", "--dbname", source.url, "-f", dumpPath]);
+      // 目标:行在,但开了 RLS、没有策略;检查用一个不是表主人、也没有 BYPASSRLS 的角色连
+      await sql(
+        target.url,
+        `create schema auth;
+         create table auth.users (id uuid primary key);
+         insert into auth.users values ('00000000-0000-0000-0000-000000000001');
+         alter table auth.users enable row level security;
+         create role checker login password 'pw';
+         grant usage on schema auth to checker;
+         grant select on auth.users to checker;`
+      );
+      const checkerUrl = target.url.replace("postgres:pw@", "checker:pw@");
+      const result = await checkExternalReferences({ dumpPath, dumpedSchemas: ["public"], targetUrl: checkerUrl });
+      assert.deepEqual(result.problems, [], "a row RLS hides from us is not a missing row");
+      assert.match(result.unchecked.join("\n"), /profiles_id_fkey.*row-level security/);
     } finally {
       for (const id of ids) await x("docker", ["rm", "-fv", id]).catch(() => {});
       rmSync(work, { recursive: true, force: true });

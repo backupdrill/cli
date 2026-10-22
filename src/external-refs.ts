@@ -140,7 +140,7 @@ export async function checkExternalReferences(opts: {
       }
       const checked: CheckedForeignKey = { fk, rows: 0, missingRows: 0 };
       result.checked.push(checked);
-      scans.push({ checked, comparisons: lookup.comparisons, leaves: new Set(leavesOf(fk.table).map(keyOf)), seen: new Set(), batch: new Map() });
+      scans.push({ checked, comparisons: lookup.comparisons, only: lookup.only, leaves: new Set(leavesOf(fk.table).map(keyOf)), seen: new Set(), batch: new Map() });
     }
     if (scans.length) {
       try {
@@ -187,6 +187,8 @@ interface Scan {
   checked: CheckedForeignKey;
   /** 各外键列怎么和被引用列比较(见 comparisonPlan) */
   comparisons: ColumnComparison[];
+  /** 被引用表是普通表:只查它自己的行(FROM ONLY) */
+  only: boolean;
   /** 这条外键的数据所在的表(普通表就是它自己;分区表是各级叶子分区) */
   leaves: Set<string>;
   /** 读到过 COPY 块的表 */
@@ -205,6 +207,9 @@ interface Scan {
 async function readOnly<T extends pg.QueryResultRow>(client: pg.Client, sql: string, params: unknown[]): Promise<pg.QueryResult<T>> {
   await client.query("begin transaction read only");
   try {
+    // 外键校验看得到被 RLS 藏起来的行,我们的查询看不到:关掉行级安全,真被它影响时 Postgres 直接报错
+    // (算"没查成"),而不是悄悄少返回几行、把存在的行报成缺(推送前审查)
+    await client.query("set local row_security = off");
     return await client.query<T>(sql, params);
   } finally {
     await client.query("rollback").catch(() => {});
@@ -242,9 +247,15 @@ async function comparisonPlan(
   client: pg.Client,
   fk: ForeignKeyDef,
   columnsInDump: Map<string, string> | undefined
-): Promise<{ comparisons: ColumnComparison[] } | { problem: string; tableMissing: boolean } | { unchecked: string }> {
+): Promise<
+  { comparisons: ColumnComparison[]; only: boolean } | { problem: string; tableMissing: boolean } | { unchecked: string }
+> {
   const relation = `${quoteIdent(fk.references.schema)}.${quoteIdent(fk.references.name)}`;
-  const exists = await readOnly<{ oid: string | null }>(client, "select to_regclass($1)::oid as oid", [relation]);
+  const exists = await readOnly<{ oid: string | null; kind: string | null }>(
+    client,
+    "select to_regclass($1)::oid as oid, (select relkind from pg_class where oid = to_regclass($1)) as kind",
+    [relation]
+  );
   const relid = exists.rows[0].oid;
   if (!relid) {
     return { problem: `${formatQualified(fk.references)} does not exist on the target`, tableMissing: true };
@@ -329,7 +340,8 @@ async function comparisonPlan(
       rightCast: op.coerced ? `${fkType.rows[0].name}::${op.right}` : op.right,
     });
   }
-  return { comparisons };
+  // 普通表的外键只认它自己的行,继承出来的子表里的行不算(查 ONLY);分区表的行都在分区里,不能加 ONLY
+  return { comparisons, only: exists.rows[0].kind !== "p" };
 }
 
 /**
@@ -370,7 +382,7 @@ async function scanDumpData(bin: string, dumpPath: string, scans: Scan[], client
     const entries = [...scan.batch.values()];
     scan.batch.clear();
     try {
-      const missing = await missingKeyIndexes(client, scan.checked.fk, scan.comparisons, entries.map((e) => e.key));
+      const missing = await missingKeyIndexes(client, scan.checked.fk, scan.comparisons, scan.only, entries.map((e) => e.key));
       for (const index of missing) scan.checked.missingRows += entries[index - 1].rows;
     } catch (error) {
       // 只停这一条外键:比如值转不成被引用列的类型
@@ -461,13 +473,14 @@ async function missingKeyIndexes(
   client: pg.Client,
   fk: ForeignKeyDef,
   comparisons: ColumnComparison[],
+  only: boolean,
   keys: string[][]
 ): Promise<number[]> {
   const aliases = comparisons.map((_, i) => `c${i}`);
   const sql =
     `select k.i::int as i from unnest(${comparisons.map((_, i) => `$${i + 1}::text[]`).join(", ")}) ` +
     `with ordinality as k(${aliases.join(", ")}, i) ` +
-    `where not exists (select 1 from ${quoteIdent(fk.references.schema)}.${quoteIdent(fk.references.name)} r where ` +
+    `where not exists (select 1 from ${only ? "only " : ""}${quoteIdent(fk.references.schema)}.${quoteIdent(fk.references.name)} r where ` +
     comparisons
       // 被引用列不做转换(转成 character / bit 这类名字会截断它);运算符写死了 schema,右边的类型也定了
       .map((c, i) => `r.${quoteIdent(c.referencedColumn)} ${c.operator} k.${aliases[i]}::${c.rightCast}`)
