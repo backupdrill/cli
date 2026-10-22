@@ -779,11 +779,37 @@ export async function runRestore(
         );
       }
 
+      // 指向备份之外的外键(典型:profiles.id → auth.users),目标上缺被引用的行,恢复必然失败。
+      // 和 dry-run 同一份检查,在往目标写任何东西(连扩展都还没装)之前拦下,报错直接说缺什么、去哪补。
+      // 被引用的表也可能是待装的扩展建的:这种先记下,装完扩展再查一遍。
+      // (先装扩展再查的话,查不过时扩展已经留在目标上,带配置表的扩展会让修好之后的重跑被空目标门拦下)
+      const extensions = manifest.database.extensions ?? [];
+      const installed = extensions.length ? await installedExtensions(targetUrl) : new Set<string>();
+      const checkReferences = async (pendingExtensionSchemas: string[]) => {
+        log.step("Checking foreign keys that point outside the backup…");
+        const references = await checkExternalReferences({
+          dumpPath,
+          dumpedSchemas: manifest.database.schemas,
+          targetUrl,
+          pendingExtensionSchemas,
+        });
+        const referenceProblems = logExternalReferences(references, manifest.database.schemas, false);
+        if (referenceProblems.length) {
+          throw new Error(
+            `the restore would fail on foreign keys, so nothing from the snapshot was written:\n  - ` +
+              `${referenceProblems.join("\n  - ")}\n${referencesHint(manifest.database.schemas)}`
+          );
+        }
+        return references;
+      };
+      const firstCheck = await checkReferences(
+        extensions.filter((ext) => !installed.has(ext.name)).map((ext) => ext.schema)
+      );
+
       // 扩展预装:沙箱装不上只能记录(环境局限),真实目标装不上必须阻断——
       // 用户在 dashboard 一键可开,恢复残缺副本则要人工收拾(引擎头注的裁决分工)。
-      // 装上的扩展在恢复失败时留着:下一次运行照样要它们,空目标门也不数扩展自带的对象。
+      // 装上的扩展在恢复失败时留着:下一次运行照样要它们,空目标门也不数扩展自带的对象(配置表除外)。
       // (曾经在失败后删掉"本次新装的"扩展,交叉审查复现了它会误删别的连接同时装上的扩展。)
-      const extensions = manifest.database.extensions ?? [];
       if (extensions.length) {
         log.step(`Installing ${extensions.length} extension(s) on target…`);
         const unavailable = await installExtensions(targetUrl, extensions);
@@ -794,23 +820,7 @@ export async function runRestore(
           );
         }
       }
-
-      // 指向备份之外的外键(典型:profiles.id → auth.users),目标上缺被引用的行,恢复必然失败。
-      // 和 dry-run 同一份检查,在写任何快照内容之前拦下,报错直接说缺什么、去哪补。放在装扩展之后:
-      // 被引用的表也可能是扩展建的
-      log.step("Checking foreign keys that point outside the backup…");
-      const references = await checkExternalReferences({
-        dumpPath,
-        dumpedSchemas: manifest.database.schemas,
-        targetUrl,
-      });
-      const referenceProblems = logExternalReferences(references, manifest.database.schemas, false);
-      if (referenceProblems.length) {
-        throw new Error(
-          `the restore would fail on foreign keys, so nothing from the snapshot was written:\n  - ` +
-            `${referenceProblems.join("\n  - ")}\n${referencesHint(manifest.database.schemas)}`
-        );
-      }
+      if (firstCheck.waitingForExtensions) await checkReferences([]);
 
       log.step("Restoring database into target…");
       const engine = await restoreDatabaseArtifact({ dumpPath, connString: targetUrl, target: "supabase" });

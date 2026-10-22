@@ -381,3 +381,74 @@ test(
     }
   }
 );
+
+test(
+  "restore: a foreign-key failure installs nothing, so the retry after copying users isn't blocked by an extension's config table",
+  { skip: canRun ? false : "requires Docker + pg_dump", timeout: 180_000 },
+  async () => {
+    const ids = [];
+    const work = mkdtempSync(join(tmpdir(), "bd-cfg-test-"));
+    try {
+      const [sourcePort, targetPort] = await Promise.all([startPostgres(ids), startPostgres(ids)]);
+      const sourceUrl = `postgresql://postgres:pw@127.0.0.1:${sourcePort}/postgres`;
+      const targetUrl = `postgresql://postgres:pw@localhost:${targetPort}/postgres`;
+      // 带配置表的扩展,两边都放好文件
+      for (const port of [sourcePort, targetPort]) {
+        const id = (await x("docker", ["ps", "-q", "--filter", `publish=${port}`])).stdout.trim();
+        await x("docker", ["exec", "-u", "root", id, "sh", "-c",
+          "d=$(pg_config --sharedir)/extension; " +
+          "printf \"default_version = '1.0'\\nrelocatable = false\\n\" > $d/bdtest_cfg.control; " +
+          "printf \"create table cfg (k text);\\nselect pg_catalog.pg_extension_config_dump('cfg', '');\\n\" > $d/bdtest_cfg--1.0.sql"]);
+      }
+      await sql(
+        sourceUrl,
+        `create schema auth;
+         create table auth.users (id uuid primary key);
+         insert into auth.users values ('00000000-0000-0000-0000-000000000001');
+         create table public.profiles (id uuid primary key references auth.users(id));
+         insert into public.profiles values ('00000000-0000-0000-0000-000000000001');
+         create extension bdtest_cfg schema public;`
+      );
+      const dumpPath = join(work, "cfg.pgcustom");
+      await x(pgDump, ["--format=custom", "--no-owner", "--no-privileges", "--schema=public", "--dbname", sourceUrl, "-f", dumpPath]);
+      const buf = readFileSync(dumpPath);
+      const manifest = {
+        schemaVersion: 2,
+        tool: "backupdrill-cli",
+        toolVersion: "test",
+        createdAt: "2026-10-23T00:00:00.000Z",
+        projectName: "cfg",
+        database: {
+          serverVersion: "17.6",
+          pgDumpVersion: (await x(pgDump, ["--version"])).stdout.trim(),
+          schemas: ["public"],
+          // 备份端按 public 里的表数,扩展的配置表也在其中
+          tableCount: 2,
+          estimatedRowTotal: 1,
+          tables: [
+            { schema: "public", name: "cfg", estimatedRows: 0 },
+            { schema: "public", name: "profiles", estimatedRows: 1 },
+          ],
+          extensions: [{ name: "bdtest_cfg", version: "1.0", schema: "public" }],
+        },
+        dump: { key: "backupdrill/cfg/snap/dump.pgcustom", format: "custom", bytes: buf.length, sha256: createHash("sha256").update(buf).digest("hex") },
+        storage: null,
+      };
+      const config = { databaseUrl: sourceUrl, projectName: "cfg", schemas: ["public"], storage: { bucket: "unused" } };
+      const restore = () =>
+        runRestore(config, { store: localStore(manifest, dumpPath, buf), targetDatabaseUrl: targetUrl, confirmTarget: "localhost" });
+
+      await sql(targetUrl, "create schema auth; create table auth.users (id uuid primary key);");
+      await assert.rejects(restore(), /nothing from the snapshot was written/);
+      const installed = await sql(targetUrl, "select count(*)::int as n from pg_extension where extname = 'bdtest_cfg'");
+      assert.equal(installed.rows[0].n, 0, "the foreign-key check runs before any extension is installed");
+
+      await sql(targetUrl, "insert into auth.users values ('00000000-0000-0000-0000-000000000001')");
+      const done = await restore();
+      assert.equal(done.databaseVerified, true, "the retry on the same target goes through");
+    } finally {
+      for (const id of ids) await x("docker", ["rm", "-fv", id]).catch(() => {});
+      rmSync(work, { recursive: true, force: true });
+    }
+  }
+);

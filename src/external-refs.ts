@@ -44,6 +44,8 @@ export interface ExternalReferenceCheck {
   problems: string[];
   /** 没能检查的,一条一句。恢复在一个事务里跑,这些真出问题也会整体回滚,所以只提示不拦 */
   unchecked: string[];
+  /** 有外键要等扩展装上之后才查得了(见 pendingExtensionSchemas) */
+  waitingForExtensions: boolean;
 }
 
 const keyOf = (name: QualifiedName) => `${name.schema}\u0000${name.name}`;
@@ -67,7 +69,7 @@ export async function checkExternalReferences(opts: {
   pendingExtensionSchemas?: string[];
 }): Promise<ExternalReferenceCheck> {
   const bin = resolvePgRestoreBin();
-  const result: ExternalReferenceCheck = { checked: [], problems: [], unchecked: [] };
+  const result: ExternalReferenceCheck = { checked: [], problems: [], unchecked: [], waitingForExtensions: false };
 
   const listing = await pgRestoreOutput(bin, ["--list", opts.dumpPath]);
   if (listing.code !== 0) throw new Error(`pg_restore --list exited with code ${listing.code}: ${oneLine(listing.stderr)}`);
@@ -129,6 +131,7 @@ export async function checkExternalReferences(opts: {
       }
       if ("problem" in lookup) {
         if (lookup.tableMissing && pending.has(fk.references.schema)) {
+          result.waitingForExtensions = true;
           result.unchecked.push(
             `${describe(fk)}: ${formatQualified(fk.references)} isn't on the target yet, and an extension the restore ` +
               `installs into schema ${fk.references.schema} may create it; the restore checks it after installing extensions`
