@@ -21,7 +21,7 @@ import {
 import { connectPg } from "./supabase-ca.js";
 import { localPgRestoreMajor, restoreToolBreaksOnTarget, sandboxMajorFor } from "./pgbin.js";
 import { log } from "./log.js";
-import { onInterrupt, stopOnInterrupt } from "./interrupt.js";
+import { onInterrupt, stopOnInterrupt, throwIfInterrupted } from "./interrupt.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -213,6 +213,7 @@ async function startEphemeralPostgres(image: string, major: number, resourceName
   const tuning = sandboxTuning(resources.memoryBytes, resources.cpus);
   // 名字先定好:Ctrl+C 可能落在 docker run 还没返回 ID 的时候,按名字才删得掉
   const name = resourceName ?? `backupdrill-drill-${randomBytes(6).toString("hex")}`;
+  throwIfInterrupted();
   const started = execFileAsync("docker", [
     "run",
     "-d",
@@ -235,20 +236,40 @@ async function startEphemeralPostgres(image: string, major: number, resourceName
   // 两边各发一次 docker rm 会撞上 "removal already in progress",后到的那个报删除失败,
   // 进程又在真正删完之前就退出了(信号测试抓到的竞争)。
   let volumeName: string | null = resourceName ?? null;
+  let runSettled = false;
+  started.then(
+    () => (runSettled = true),
+    () => (runSettled = true)
+  );
+  const removeByName = async () => {
+    try {
+      // -v 连匿名卷一起删:中断可能落在下面查卷名之前
+      await execFileAsync("docker", ["rm", "-fv", name], { timeout: 60_000 });
+    } catch (error) {
+      if (!/No such container/i.test(String((error as { stderr?: string }).stderr ?? error))) {
+        log.warn(`could not remove the drill sandbox; remove it with: docker rm -fv ${name}`);
+      }
+    }
+  };
   let teardownRun: Promise<void> | null = null;
   const teardown = () =>
     (teardownRun ??= (async () => {
-      // 先等 docker run 自己结束(成功或失败):中断可能落在它还没返回的时候,
-      // 这时就删,守护进程可能在我们删完之后才把容器建出来。按名字删,拿没拿到 ID 都删得到
-      await started.catch(() => {});
-      try {
-        // -v 连匿名卷一起删:中断可能落在下面查卷名之前
-        await execFileAsync("docker", ["rm", "-fv", name], { timeout: 60_000 });
-      } catch (error) {
-        if (!/No such container/i.test(String((error as { stderr?: string }).stderr ?? error))) {
-          log.warn(`could not remove the drill sandbox; remove it with: docker rm -fv ${name}`);
-        }
+      if (!runSettled) {
+        // 中断落在 docker run 还没返回的时候(第一次跑要拉镜像,可能好几分钟):不干等它,
+        // 停掉 docker 命令本身,它退出之后按名字删。守护进程收到的创建请求可能比命令退出晚一点落地,
+        // 所以隔一秒再删一次;否则 CLI 退出之后才冒出来的容器就没人管了(交叉审查复现)
+        started.child?.kill("SIGTERM");
+        let timer: NodeJS.Timeout | undefined;
+        const exited = await Promise.race([
+          started.then(() => true, () => true),
+          new Promise<boolean>((resolve) => (timer = setTimeout(() => resolve(false), 5_000))),
+        ]);
+        clearTimeout(timer);
+        if (!exited) started.child?.kill("SIGKILL");
+        await removeByName();
+        await new Promise((resolve) => setTimeout(resolve, 1_000));
       }
+      await removeByName();
       // 显式删卷(--rm 不可靠,见下);幂等,已经没了也不报错
       if (volumeName) await execFileAsync("docker", ["volume", "rm", "-f", volumeName]).catch(() => {});
     })());
@@ -654,6 +675,7 @@ export async function drillDump(
     }
 
     await opts.supervision?.observe({ phase: "restore" });
+    throwIfInterrupted();
     const started = Date.now();
     log.step("Restoring into ephemeral Postgres…");
     let postData: PostDataResult;
@@ -697,6 +719,7 @@ export async function drillDump(
     // 语义层钩子:只在结构层全绿时才跑——结构已失败时再跑应用检查,只会把
     // 一次失败报成两层失败,误导排查方向。没配置则不跑、报告里不出现该行。
     if (appCheckCommand && checks.every((c) => c.pass)) {
+      throwIfInterrupted();
       log.step("Running app checks…");
       checks.push(await runAppCheck(appCheckCommand, pg.connString));
     }

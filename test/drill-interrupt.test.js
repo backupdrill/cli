@@ -6,7 +6,7 @@ import assert from "node:assert/strict";
 import { execFile, spawn } from "node:child_process";
 import { promisify } from "node:util";
 import { createHash } from "node:crypto";
-import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -95,12 +95,13 @@ async function seedBucket(s3, dump) {
 }
 
 /** 起真 CLI。环境只给它需要的,临时目录指到测试自己的目录里,结束后能数有没有剩下东西。 */
-function startDrill(s3, tmp, args, { ownGroup = false } = {}) {
+function startDrill(s3, tmp, args, { ownGroup = false, env = {} } = {}) {
   const child = spawn(process.execPath, [CLI, "drill", "--config", join(tmp, "none.json"), ...args], {
     // ownGroup:CLI 自成一个进程组,测试可以像终端按 Ctrl+C 那样给整组发信号
     detached: ownGroup,
     env: {
-      PATH: process.env.PATH,
+      PATH: env.PATH ?? process.env.PATH,
+      ...env,
       HOME: process.env.HOME,
       ...(process.env.DOCKER_HOST ? { DOCKER_HOST: process.env.DOCKER_HOST } : {}),
       ...(process.env.BACKUPDRILL_PG_RESTORE ? { BACKUPDRILL_PG_RESTORE: process.env.BACKUPDRILL_PG_RESTORE } : {}),
@@ -207,3 +208,123 @@ test(
     }
   }
 );
+
+test(
+  "drill: SIGINT also kills --check-cmd descendants that ignore SIGTERM",
+  { skip: canRun ? false : "requires Docker + pg_dump", timeout: 180_000 },
+  async () => {
+    const tmp = mkdtempSync(join(tmpdir(), "bd-sig-test-"));
+    const s3 = await startFakeS3({ bucket: "backups" });
+    let containerId = null;
+    const pids = [];
+    try {
+      await seedBucket(s3, await makeDump(tmp));
+      const marker = join(tmp, "check-started");
+      // 检查命令再起一个忽略 SIGTERM 的孙进程(同一进程组):组长被 SIGTERM 停掉之后,孙进程得靠 SIGKILL
+      const script = join(tmp, "check.cjs");
+      writeFileSync(
+        script,
+        `const { spawn } = require("child_process");
+         const g = spawn(process.execPath, ["-e", "process.on('SIGTERM', () => {}); setInterval(() => {}, 1000)"], { stdio: "ignore" });
+         require("fs").writeFileSync(process.argv[2], [process.pid, g.pid, process.env.BACKUPDRILL_SANDBOX_URL].join(" "));
+         setInterval(() => {}, 1000);`
+      );
+      const run = startDrill(s3, tmp, ["--check-cmd", `node ${script} ${marker}`]);
+      await waitFor("--check-cmd to start", () => existsSync(marker), 120_000);
+      const [checkPid, grandchildPid, sandboxUrl] = readFileSync(marker, "utf8").split(" ");
+      pids.push(Number(checkPid), Number(grandchildPid));
+      containerId = (await x("docker", ["ps", "-q", "--filter", `publish=${new URL(sandboxUrl).port}`])).stdout.trim();
+      run.child.kill("SIGINT");
+      const { code } = await run.exited;
+      assert.equal(code, 130, `exit code; stderr:\n${run.stderr()}`);
+      assert.equal(alive(Number(checkPid)), false, "check command stopped");
+      assert.equal(alive(Number(grandchildPid)), false, "TERM-ignoring grandchild killed");
+      await assert.rejects(x("docker", ["inspect", containerId]), /no such/i, "sandbox container removed");
+    } finally {
+      for (const pid of pids) if (alive(pid)) process.kill(pid, "SIGKILL");
+      if (containerId) await x("docker", ["rm", "-fv", containerId]).catch(() => {});
+      await s3.close();
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  }
+);
+
+test(
+  "drill: SIGINT while docker run is still starting (image pull) stops it, so no sandbox appears after exit",
+  { skip: canRun ? false : "requires Docker + pg_dump", timeout: 120_000 },
+  async () => {
+    const tmp = mkdtempSync(join(tmpdir(), "bd-sig-test-"));
+    const s3 = await startFakeS3({ bucket: "backups" });
+    let wrapperPid = null;
+    let name = null;
+    try {
+      await seedBucket(s3, await makeDump(tmp));
+      // 假的 docker:别的子命令照转真 docker,run 先挂 10 分钟再真的去起容器,模拟第一次拉镜像
+      const realDocker = (await x("sh", ["-c", "command -v docker"])).stdout.trim();
+      const bin = join(tmp, "bin");
+      const mark = join(tmp, "run-started");
+      await x("mkdir", ["-p", bin]);
+      writeFileSync(
+        join(bin, "docker"),
+        `#!${process.execPath}
+const { spawnSync } = require("child_process");
+const args = process.argv.slice(2);
+const real = () => process.exit(spawnSync(${JSON.stringify(realDocker)}, args, { stdio: "inherit" }).status ?? 1);
+if (args[0] === "run") {
+  require("fs").writeFileSync(${JSON.stringify(mark)}, process.pid + " " + args[args.indexOf("--name") + 1]);
+  setTimeout(real, 600000);
+} else real();
+`
+      );
+      chmodSync(join(bin, "docker"), 0o755);
+      const run = startDrill(s3, tmp, [], { env: { PATH: `${bin}:${process.env.PATH}` } });
+      await waitFor("docker run to start", () => existsSync(mark), 120_000);
+      [wrapperPid, name] = readFileSync(mark, "utf8").split(" ");
+      wrapperPid = Number(wrapperPid);
+      const sentAt = Date.now();
+      run.child.kill("SIGINT");
+      const { code } = await run.exited;
+      assert.equal(code, 130, `exit code; stderr:\n${run.stderr()}`);
+      assert.ok(Date.now() - sentAt < 20_000, "does not wait for the slow docker run");
+      assert.equal(alive(wrapperPid), false, "the pending docker run was stopped, so it can't create the sandbox later");
+      assert.equal((await x(realDocker, ["ps", "-aq", "--filter", `name=^${name}$`])).stdout.trim(), "", "no sandbox container");
+      assert.deepEqual(leftovers(tmp), [], "temporary files removed");
+    } finally {
+      if (wrapperPid && alive(wrapperPid)) process.kill(wrapperPid, "SIGKILL");
+      if (name) await x("docker", ["rm", "-fv", name]).catch(() => {});
+      await s3.close();
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  }
+);
+
+test("interrupt: cleanups registered while the cleanup is running still run before exit", async () => {
+  const tmp = mkdtempSync(join(tmpdir(), "bd-sig-test-"));
+  try {
+    const marker = join(tmp, "late-cleanup-ran");
+    const ready = join(tmp, "ready");
+    const script = join(tmp, "late.mjs");
+    const interruptModule = new URL("../dist/interrupt.js", import.meta.url).href;
+    // 第一个清理跑的时候主流程又登记了一个(比如收到信号时刚返回的 docker run):它也得跑
+    writeFileSync(
+      script,
+      `import { exitCleanlyOnSignals, onInterrupt } from ${JSON.stringify(interruptModule)};
+       import { writeFileSync } from "node:fs";
+       exitCleanlyOnSignals("test");
+       onInterrupt(async () => {
+         onInterrupt(() => writeFileSync(${JSON.stringify(marker)}, "ran"));
+         await new Promise((r) => setTimeout(r, 100));
+       });
+       writeFileSync(${JSON.stringify(ready)}, "ready");
+       setInterval(() => {}, 1000);`
+    );
+    const child = spawn(process.execPath, [script], { stdio: "ignore" });
+    const exited = new Promise((resolve) => child.on("exit", (code) => resolve(code)));
+    await waitFor("script ready", () => existsSync(ready), 10_000);
+    child.kill("SIGINT");
+    assert.equal(await exited, 130);
+    assert.equal(existsSync(marker), true, "late registration ran");
+  } finally {
+    rmSync(tmp, { recursive: true, force: true });
+  }
+});

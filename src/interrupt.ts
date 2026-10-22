@@ -21,6 +21,14 @@ export function interrupted(): boolean {
   return interruptedBy !== null;
 }
 
+/**
+ * 收到信号之后不再开始新的一步(起容器、跑 pg_restore、跑检查命令)。清理在跑的时候主流程还活着,
+ * 一个刚返回的探测会接着往下走:不拦的话,清理快照之后才起的沙箱就没人删了(交叉审查)。
+ */
+export function throwIfInterrupted(): void {
+  if (interruptedBy) throw new Error(`${interruptedBy} received; stopping`);
+}
+
 /** 登记一个中断时要跑的清理;返回注销函数,正常走完后调用。 */
 export function onInterrupt(cleanup: Cleanup): () => void {
   pending.add(cleanup);
@@ -30,31 +38,42 @@ export function onInterrupt(cleanup: Cleanup): () => void {
 }
 
 /**
- * 中断时停掉一个子进程。detached 的子进程(自成进程组,如 --check-cmd)按组发信号,
- * 连它派生的孙进程一起停。先 SIGTERM 给它收尾的机会,2 秒后还在就 SIGKILL。
+ * 中断时停掉一个子进程。先 SIGTERM 给它收尾的机会,2 秒后还在就 SIGKILL。
+ * group:子进程自成进程组(detached,如 --check-cmd),按组发信号,连它派生的进程一起停。
+ * 看的是**整组**还在不在,不是组长:shell 收到 SIGTERM 先退了,忽略 SIGTERM 的孙进程还在,
+ * 只盯组长就会跳过 SIGKILL 把它留下(交叉审查复现)。
  */
 export function stopOnInterrupt(child: ChildProcess, opts: { group?: boolean } = {}): () => void {
+  const pid = child.pid;
+  const alive = (): boolean => {
+    if (!pid) return false;
+    if (!opts.group) return child.exitCode === null && child.signalCode === null;
+    try {
+      process.kill(-pid, 0);
+      return true;
+    } catch {
+      return false;
+    }
+  };
   const signal = (sig: NodeJS.Signals) => {
     try {
-      if (opts.group && child.pid) process.kill(-child.pid, sig);
+      if (opts.group && pid) process.kill(-pid, sig);
       else child.kill(sig);
     } catch {
       // 已经退出
     }
   };
   const forget = onInterrupt(async () => {
-    if (child.exitCode !== null || child.signalCode !== null) return;
-    const exited = new Promise<void>((resolve) => child.once("close", () => resolve()));
+    if (!alive()) return;
     signal("SIGTERM");
-    let timer: NodeJS.Timeout | undefined;
-    const timedOut = await Promise.race([
-      exited.then(() => false),
-      new Promise<boolean>((resolve) => (timer = setTimeout(() => resolve(true), 2_000))),
-    ]);
-    clearTimeout(timer);
-    if (timedOut) signal("SIGKILL");
+    const deadline = Date.now() + 2_000;
+    while (alive() && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 100));
+    if (alive()) signal("SIGKILL");
   });
-  child.once("close", forget);
+  // 组长退出时组里可能还有进程:那就继续登记着,中断时照样能按组停掉
+  child.once("close", () => {
+    if (!alive()) forget();
+  });
   return forget;
 }
 
@@ -62,8 +81,15 @@ export function stopOnInterrupt(child: ChildProcess, opts: { group?: boolean } =
 const CLEANUP_TIMEOUT_MS = 30_000;
 
 async function runCleanups(): Promise<void> {
-  const tasks = [...pending].reverse();
-  pending.clear();
+  // 一直跑到没有登记为止:清理途中主流程可能还登记了新东西(比如收到信号时正在返回的 docker run)
+  for (let round = 0; pending.size && round < 10; round++) {
+    const tasks = [...pending].reverse();
+    pending.clear();
+    await runTasks(tasks);
+  }
+}
+
+async function runTasks(tasks: Cleanup[]): Promise<void> {
   for (const task of tasks) {
     let timer: NodeJS.Timeout | undefined;
     try {

@@ -15,7 +15,7 @@ import { join } from "node:path";
 import type { ExtensionInfo } from "./manifest.js";
 import { resolvePgRestoreBin } from "./pgbin.js";
 import { dumpUrlFor, connectPg, isSupabaseHost } from "./supabase-ca.js";
-import { onInterrupt, stopOnInterrupt } from "./interrupt.js";
+import { interrupted, onInterrupt, stopOnInterrupt } from "./interrupt.js";
 
 export type RestoreTargetKind = "sandbox" | "supabase";
 
@@ -190,6 +190,8 @@ export function spawnPgRestore(
   extraEnv: NodeJS.ProcessEnv = {},
   opts: { supabaseHost: boolean; urlSslMode?: string | null } = { supabaseHost: false }
 ): Promise<{ code: number | null; stderr: string }> {
+  // 收到信号之后不再起新的一遍(两遍恢复、并行建索引后的重跑都是一个接一个起的)
+  if (interrupted()) return Promise.reject(new Error("interrupted; not starting pg_restore"));
   return new Promise((resolve, reject) => {
     const proc = spawn(bin, args, {
       stdio: ["ignore", "ignore", "pipe"],
