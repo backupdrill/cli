@@ -16,7 +16,10 @@ import {
   refFromStorageEndpoint,
   assertNoHostOverride,
   normalizeHost,
+  quoteIdent,
 } from "./restore-engine.js";
+import { checkExternalReferences, describe, type ExternalReferenceCheck } from "./external-refs.js";
+import type { SnapshotReader } from "./snapshot-store.js";
 import { verifyRestored, type DrillCheck } from "./drill.js";
 import {
   restoreStorage,
@@ -272,16 +275,57 @@ async function assertEmptyTarget(
   }
 }
 
+/** README 里讲怎么先把 Auth 用户搬过去的那一节;报错和 dry-run 都指向它。 */
+const AUTH_USERS_GUIDE = "https://github.com/backupdrill/cli#tables-that-reference-authusers";
+
+function referencesHint(schemas: string[]): string {
+  return (
+    `This backup only holds schema(s) ${schemas.join(", ")}, so those rows have to be on the target before ` +
+    `the restore. Copy them over first (Supabase Auth users: ${AUTH_USERS_GUIDE}), then run restore again.`
+  );
+}
+
+/**
+ * 外键检查结果打印成预检行;返回 blocker 句子(空 = 不拦)。dry-run 和正式执行共用同一份判定;
+ * 正式执行时问题不在这里打印,由调用方带着提示一起抛出,免得同一句话出现两遍。
+ */
+function logExternalReferences(check: ExternalReferenceCheck, schemas: string[], printProblems: boolean): string[] {
+  for (const note of check.unchecked) {
+    log.warn(`references outside the backup: ${note} — not checked; a failed restore is rolled back`);
+  }
+  if (check.problems.length) {
+    if (printProblems) {
+      for (const problem of check.problems) log.error(`references outside the backup: ${problem}`);
+      log.warn(referencesHint(schemas));
+    }
+    return check.problems;
+  }
+  if (check.checked.length) {
+    for (const { fk, rows } of check.checked) {
+      log.ok(
+        `references outside the backup: ${describe(fk)} — ${rows.toLocaleString("en-US")} row(s), ` +
+          `all found on the target`
+      );
+    }
+  } else if (!check.unchecked.length) {
+    log.ok(`references outside the backup: no foreign key points outside ${schemas.join(", ")}`);
+  }
+  return [];
+}
+
 /**
  * dry-run 只读预检(PRD §5.3.2):零写入,把正式执行会撞的墙全部提前撞一遍。
  * 逐项打印,任何 blocker 汇总后抛出(退出码非零 = "现在执行不会成功")。
+ * 有目标库时会把 dump 下载到本地临时目录读一遍(2.7.0 起):归档校验和、指向备份之外的外键,
+ * 这两类墙只有看了 dump 才撞得到。下载是读桶,目标库上仍然只有 select。
  */
 async function dryRunPreflight(
   config: BackupConfig,
   manifest: Manifest,
   targetUrl: string | undefined,
   storageTarget: StorageRestoreTarget | null,
-  alsoRestoringStorage: boolean
+  alsoRestoringStorage: boolean,
+  reader: SnapshotReader
 ): Promise<void> {
   const blockers: string[] = [];
   const db = manifest.database;
@@ -325,6 +369,7 @@ async function dryRunPreflight(
       blockers.push((error as Error).message);
       log.error(`empty-target check: ${(error as Error).message}`);
     }
+    let toolReadsArchive = false;
     const client = await connectPg(targetUrl);
     try {
       // SHOW 的结果列名是 server_version;用 current_setting 显式起别名,
@@ -352,6 +397,7 @@ async function dryRunPreflight(
         blockers.push(`local pg_restore v${toolMajor} < archive requirement v${requiredMajor}`);
         log.error(`pg_restore tool: local v${toolMajor} cannot read a v${requiredMajor} archive`);
       } else {
+        toolReadsArchive = true;
         log.ok(`pg_restore tool: local v${toolMajor} ≥ archive requirement v${requiredMajor}`);
       }
       const toolTargetBlocker =
@@ -379,6 +425,11 @@ async function dryRunPreflight(
       }
     } finally {
       await client.end();
+    }
+    if (toolReadsArchive) {
+      blockers.push(...(await inspectDumpForTarget(manifest, targetUrl, reader)));
+    } else {
+      log.warn("dump not inspected (archive checksum, references outside the backup) — needs a working pg_restore");
     }
   } else {
     log.warn("no target database URL — database restore would be skipped");
@@ -408,6 +459,88 @@ async function dryRunPreflight(
     );
   }
   log.ok("dry run passed — nothing was written; re-run with --confirm-target to execute");
+}
+
+/**
+ * 单事务恢复特有的失败:每张表连同它的索引、序列、TOAST 表在提交前都占着一个锁槽。槽数 =
+ * max_locks_per_transaction × (max_connections + …),Supabase 最小规格(max_connections 60)实测
+ * 900 张表能过、1200 张表报 out of shared memory(2026-10-23,PG 17)。分区多的库会撞上。
+ * Supabase 只能用 CLI 调这个参数(会重启数据库),照官方文档的命令给出来。
+ */
+export function restoreFailureAdvice(failure: string): string {
+  if (!/max_locks_per_transaction/.test(failure)) return "";
+  return (
+    " The target ran out of lock slots: a single-transaction restore holds a lock on every table, index " +
+    "and sequence until it commits. Raise max_locks_per_transaction on the target and retry. On Supabase " +
+    "that takes the Supabase CLI and restarts the database: supabase postgres-config update " +
+    "--config max_locks_per_transaction=256 --project-ref <target-ref> --experimental"
+  );
+}
+
+/** dry-run 的读 dump 部分:下载到临时目录,对校验和,查指向备份之外的外键。返回 blocker。 */
+async function inspectDumpForTarget(manifest: Manifest, targetUrl: string, reader: SnapshotReader): Promise<string[]> {
+  const workdir = await mkdtemp(join(tmpdir(), "backupdrill-dryrun-"));
+  try {
+    log.step("Downloading dump to inspect it (read-only)…");
+    const dumpPath = join(workdir, "dump.pgcustom");
+    let sha256: string;
+    try {
+      ({ sha256 } = await reader.downloadDump(manifest, dumpPath));
+    } catch (error) {
+      log.error(`dump download: ${(error as Error).message}`);
+      return [`dump download failed: ${(error as Error).message}`];
+    }
+    if (sha256 !== manifest.dump.sha256) {
+      log.error(`archive integrity: sha256 ${sha256.slice(0, 12)}… does not match manifest ${manifest.dump.sha256.slice(0, 12)}…`);
+      return ["archive checksum does not match the manifest"];
+    }
+    log.ok(`archive integrity: sha256 matches (${sha256.slice(0, 12)}…)`);
+    try {
+      const check = await checkExternalReferences({ dumpPath, dumpedSchemas: manifest.database.schemas, targetUrl });
+      return logExternalReferences(check, manifest.database.schemas, true);
+    } catch (error) {
+      log.error(`references outside the backup: could not read the dump — ${(error as Error).message}`);
+      return [`could not read the dump: ${(error as Error).message}`];
+    }
+  } finally {
+    await rm(workdir, { recursive: true, force: true }).catch(() => {});
+  }
+}
+
+async function installedExtensions(targetUrl: string): Promise<Set<string>> {
+  const client = await connectPg(targetUrl);
+  try {
+    const res = await client.query<{ extname: string }>("select extname from pg_extension");
+    return new Set(res.rows.map((row) => row.extname));
+  } finally {
+    await client.end();
+  }
+}
+
+/**
+ * 恢复失败后把**这次运行**装上的扩展再删掉,返回接在报错后面的一句话。只删运行前没有的:用户自己
+ * 在控制台开过的扩展不动。不删的话,装进 public 的扩展(函数、类型)会让下一次运行被空目标门拦下。
+ * 数据库恢复本身在一个事务里已经回滚,这里没有别的对象依赖它们,用默认的 RESTRICT 就够。
+ */
+async function removeExtensionsAddedSince(targetUrl: string, before: Set<string>): Promise<string> {
+  let added: string[] = [];
+  try {
+    added = [...(await installedExtensions(targetUrl))].filter((name) => !before.has(name));
+    if (!added.length) return "";
+    const client = await connectPg(targetUrl);
+    try {
+      await client.query(`drop extension if exists ${added.map(quoteIdent).join(", ")}`);
+    } finally {
+      await client.end();
+    }
+    return ` The extension(s) this run installed (${added.join(", ")}) were removed again.`;
+  } catch (error) {
+    const which = added.length ? added.join(", ") : "it installed";
+    return (
+      ` Could not remove the extension(s) ${which} this run installed (${(error as Error).message}); ` +
+      `drop them before retrying, or the empty-target check may refuse the next run.`
+    );
+  }
 }
 
 /**
@@ -520,7 +653,7 @@ export async function runRestore(
   // dry-run:只读预检后直接返回,零写入(PRD §5.3.2)
   if (opts.dryRun) {
     log.step(`Dry run for snapshot ${snapshot} — nothing will be written`);
-    await dryRunPreflight(config, manifest, opts.targetDatabaseUrl, storageTarget, alsoRestoringStorage);
+    await dryRunPreflight(config, manifest, opts.targetDatabaseUrl, storageTarget, alsoRestoringStorage, reader);
     result.dryRun = true;
     return result;
   }
@@ -616,25 +749,52 @@ export async function runRestore(
         );
       }
 
+      // 指向备份之外的外键(典型:profiles.id → auth.users),目标上缺被引用的行,恢复必然失败。
+      // 和 dry-run 同一份检查,在第一次写入之前拦下,报错直接说缺什么、去哪补。
+      log.step("Checking foreign keys that point outside the backup…");
+      const references = await checkExternalReferences({
+        dumpPath,
+        dumpedSchemas: manifest.database.schemas,
+        targetUrl,
+      });
+      const referenceProblems = logExternalReferences(references, manifest.database.schemas, false);
+      if (referenceProblems.length) {
+        throw new Error(
+          `the restore would fail on foreign keys, so nothing was written:\n  - ${referenceProblems.join("\n  - ")}\n` +
+            referencesHint(manifest.database.schemas)
+        );
+      }
+
       // 扩展预装:沙箱装不上只能记录(环境局限),真实目标装不上必须阻断——
       // 用户在 dashboard 一键可开,恢复残缺副本则要人工收拾(引擎头注的裁决分工)
       const extensions = manifest.database.extensions ?? [];
-      if (extensions.length) {
-        log.step(`Installing ${extensions.length} extension(s) on target…`);
-        const unavailable = await installExtensions(targetUrl, extensions);
-        if (unavailable.length) {
+      const extensionsBefore = extensions.length ? await installedExtensions(targetUrl) : null;
+      try {
+        if (extensions.length) {
+          log.step(`Installing ${extensions.length} extension(s) on target…`);
+          const unavailable = await installExtensions(targetUrl, extensions);
+          if (unavailable.length) {
+            throw new Error(
+              `target cannot install extension(s): ${unavailable.join(", ")} — enable them in ` +
+                `the Supabase dashboard (Database → Extensions) and retry.`
+            );
+          }
+        }
+
+        log.step("Restoring database into target…");
+        const engine = await restoreDatabaseArtifact({ dumpPath, connString: targetUrl, target: "supabase" });
+        if (!engine.ok) {
+          const failures = [...engine.preData.failures, ...engine.postData.failures];
           throw new Error(
-            `target cannot install extension(s): ${unavailable.join(", ")} — enable them in ` +
-              `the Supabase dashboard (Database → Extensions) and retry.`
+            `database restore failed: ${failures.join(" | ")}. It ran in one transaction and was rolled back, ` +
+              `so nothing from the snapshot is on the target and you can run restore again on the same project ` +
+              `once the cause is fixed.` +
+              restoreFailureAdvice(failures.join(" "))
           );
         }
-      }
-
-      log.step("Restoring database into target…");
-      const engine = await restoreDatabaseArtifact({ dumpPath, connString: targetUrl, target: "supabase" });
-      if (!engine.ok) {
-        const failures = [...engine.preData.failures, ...engine.postData.failures];
-        throw new Error(`database restore failed: ${failures.join(" | ")}`);
+      } catch (error) {
+        if (extensionsBefore) (error as Error).message += await removeExtensionsAddedSince(targetUrl, extensionsBefore);
+        throw error;
       }
       result.restoredToDatabase = true;
 

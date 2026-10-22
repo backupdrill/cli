@@ -102,7 +102,17 @@ ${
 Supabase **Auth users/sessions, secret values, Edge Function code and most
 platform settings are NOT in this snapshot**. After restoring, reconfigure them
 by hand. This is a database + Storage snapshot, not a full project image.
-
+${
+  db.schemas.includes("auth")
+    ? ""
+    : `
+If a table in this snapshot has a foreign key into \`auth.users\` (a \`profiles.id\`
+that references it, for example), copy the Auth users into the new project
+**before** restoring, or that foreign key can't be created and the restore fails.
+\`backupdrill restore --dry-run\` lists each such key and how many rows have no user.
+Triggers on \`auth.users\` aren't in this snapshot either; recreate them afterwards.
+`
+}
 ## Restore the database (into an EMPTY project)
 
 1. Create a **fresh** Supabase project (never restore onto the source project),
@@ -130,7 +140,8 @@ unset PGPASSWORD
 \`\`\`
 
 One error is expected and harmless: \`schema "public" already exists\` (the
-target always has it). Do **not** use \`--clean\` against a Supabase project —
+target always has it). A foreign key error mentioning \`auth.users\` means the
+Auth users were not copied in first (see "Not covered" above). Do **not** use \`--clean\` against a Supabase project —
 dropping and recreating \`public\` silently wipes Supabase's default grants for
 \`anon\`/\`authenticated\`, and the restored API answers 401.
 
@@ -149,9 +160,11 @@ ${cliRestoreCommand}
 
 Add \`--dry-run\` first to preview every check without writing anything. (Skip the
 \`read\` lines to have the CLI prompt you itself; \`unset\` both variables afterwards.)
-The CLI verifies the archive checksum, refuses non-empty targets, installs the
-extensions, restores through the same engine the weekly drills use, verifies
-table counts and row presence afterwards, then rebuilds buckets, uploads the
+The CLI verifies the archive checksum, refuses non-empty targets, checks that rows
+referenced outside the snapshot (such as \`auth.users\`) are on the target, installs
+the extensions, restores in a single transaction through the same engine the weekly
+drills use (a failed restore leaves nothing behind), verifies table counts and row
+presence afterwards, then rebuilds buckets, uploads the
 Storage files back and reconciles every one against the target.
 
 More: https://backupdrill.com/docs/restore

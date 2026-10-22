@@ -8,7 +8,7 @@
 #
 # REQUIRED SECRETS (database backup)
 #   BACKUPDRILL_DATABASE_URL          Supabase Session Pooler connection string
-#                                     (Project Settings → Database → Session pooler).
+#                                     (dashboard: Connect → Session pooler).
 #                                     The default postgres user works as-is; a
 #                                     read-only role usually fails under RLS —
 #                                     see the README's connection-string section.
