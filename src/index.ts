@@ -225,7 +225,11 @@ program
       "service-role key via env BACKUPDRILL_TARGET_SERVICE_ROLE_KEY or a hidden prompt"
   )
   .option("--confirm-target <ref>", "type the TARGET project ref to confirm writing to it")
-  .option("--dry-run", "run every read-only preflight check and write nothing")
+  .option(
+    "--dry-run",
+    "run every read-only preflight check and write nothing (downloads the dump to check it, " +
+      "including foreign keys that point outside the backup)"
+  )
   .option(
     "--acknowledge-unverified-source",
     "proceed although the source identity cannot be verified (legacy snapshot without config) — " +
