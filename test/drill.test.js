@@ -122,9 +122,10 @@ test(
     //    + owned 20 + profile 2。owned 的 20 行是 shim 的直接证据:没有 auth.uid() 桩,
     //    这张表在 pre-data 就建不出来,行数会少 20、表数会少 1。
     // 只看匿名卷(Docker 给镜像 VOLUME 自动建的卷带 com.docker.volume.anonymous 标签):
-    // 并发跑的其他容器若建命名卷,不该让本用例误红
+    // 并发跑的其他容器若建命名卷,不该让本用例误红。也只看没有容器挂着的(dangling):
+    // node --test 并行跑各文件,别的用例的沙箱此刻正挂着自己的卷,那不是泄漏
     const anonVolumes = async () =>
-      (await x("docker", ["volume", "ls", "-q", "-f", "label=com.docker.volume.anonymous"])).stdout.trim().split("\n").filter(Boolean);
+      (await x("docker", ["volume", "ls", "-q", "-f", "label=com.docker.volume.anonymous", "-f", "dangling=true"])).stdout.trim().split("\n").filter(Boolean);
     const volumesBefore = await anonVolumes();
     const good = await drillDump(dumpPath, manifest, "good");
     assert.equal(good.pass, true, "good backup should pass");

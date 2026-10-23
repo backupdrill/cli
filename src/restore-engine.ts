@@ -21,6 +21,7 @@ import type { ExtensionInfo } from "./manifest.js";
 import { parseCreateSchemas } from "./dump-sql.js";
 import { resolvePgRestoreBin } from "./pgbin.js";
 import { dumpUrlFor, connectPg, isSupabaseHost } from "./supabase-ca.js";
+import { interrupted, onInterrupt, stopOnInterrupt } from "./interrupt.js";
 
 export type RestoreTargetKind = "sandbox" | "supabase";
 
@@ -195,11 +196,15 @@ export function spawnPgRestore(
   extraEnv: NodeJS.ProcessEnv = {},
   opts: { supabaseHost: boolean; urlSslMode?: string | null } = { supabaseHost: false }
 ): Promise<{ code: number | null; stderr: string }> {
+  // 收到信号之后不再起新的一遍(两遍恢复、并行建索引后的重跑都是一个接一个起的)
+  if (interrupted()) return Promise.reject(new Error("interrupted; not starting pg_restore"));
   return new Promise((resolve, reject) => {
     const proc = spawn(bin, args, {
       stdio: ["ignore", "ignore", "pipe"],
       env: libpqChildEnv(extraEnv, process.env, opts),
     });
+    // `kill <pid>` 只发给 node 时 pg_restore 收不到;中断时由我们停掉它
+    stopOnInterrupt(proc);
     let stderr = "";
     proc.stderr.setEncoding("utf8");
     proc.stderr.on("data", (d: string) => (stderr += d));
@@ -662,12 +667,15 @@ export function splitPostDataList(listing: string): { indexBuilds: string[]; res
 
 /** 不连库的 pg_restore(--list、-f - 出 SQL),整段收集 stdout。只用于目录和 DDL 这类小输出。 */
 export function pgRestoreOutput(bin: string, args: string[]): Promise<{ code: number | null; stdout: string; stderr: string }> {
+  // 和 spawnPgRestore 一样:收到信号之后不再起,起了的中断时停掉(并行演练里读目录的那一步也是它)
+  if (interrupted()) return Promise.reject(new Error("interrupted; not starting pg_restore"));
   return new Promise((resolve, reject) => {
     // 只读归档、不连库,但同样钉 C locale,和恢复子进程一致
     const proc = spawn(bin, args, {
       stdio: ["ignore", "pipe", "pipe"],
       env: libpqChildEnv(),
     });
+    stopOnInterrupt(proc);
     let stdout = "";
     let stderr = "";
     // 按流解码:一个多字节字符可能被拆在两块里,逐块 toString 会把它解坏(schema 名里的中文就会对不上)
@@ -856,6 +864,7 @@ export async function restoreDatabaseArtifact(opts: {
   }
   const { indexBuilds, rest } = splitPostDataList(listing.stdout);
   const listDir = await mkdtemp(join(tmpdir(), "backupdrill-restore-"));
+  const forgetListDir = onInterrupt(() => rm(listDir, { recursive: true, force: true }).catch(() => {}));
   try {
     const passes: ClassifiedPass[] = [];
     if (indexBuilds.length) {
@@ -908,5 +917,6 @@ export async function restoreDatabaseArtifact(opts: {
     return { preData, postData, ok: postData.failures.length === 0 };
   } finally {
     await rm(listDir, { recursive: true, force: true });
+    forgetListDir();
   }
 }

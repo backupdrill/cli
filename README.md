@@ -176,6 +176,8 @@ Backups record your installed Postgres extensions in the manifest, and the drill
 
 The sandbox restore runs up to 4 parallel `pg_restore` jobs, sized from the CPUs and memory Docker reports, so a 2 vCPU / 8 GB machine gets 2. Table data and index builds run in parallel. Foreign keys, triggers and policies run on a single connection to keep their error messages separate, including errors about Supabase-managed objects such as `auth.users`. `backupdrill restore` into a real Supabase project stays on a single connection.
 
+Ctrl+C (or a SIGTERM from whatever runs the drill) stops it and cleans up: the CLI stops a running `--check-cmd` and `pg_restore`, removes the sandbox container and its volume, deletes the downloaded dump, and exits with 130 (143 for SIGTERM). `--keep` doesn't apply to an interrupted drill. Press Ctrl+C a second time to exit without waiting for the cleanup.
+
 ### Run your own checks against the restored copy
 
 The drill's structural checks (tables, rows, checksums) can't know what "working" means for *your* app — business invariants only have answers in your code. `--check-cmd` hands you the restored sandbox before it's destroyed:

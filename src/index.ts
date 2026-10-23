@@ -10,6 +10,7 @@ import { Writable } from "node:stream";
 import { runRestore, NO_SOURCE_DATABASE } from "./restore.js";
 import { recordDrillOutcome } from "./drill-record.js";
 import { DEFAULT_EXPORTER_PORT, startExporter } from "./exporter.js";
+import { exitCleanlyOnSignals, interrupted } from "./interrupt.js";
 
 /** 隐藏式秘密输入(PRD §5.3.1):终端不回显;无 TTY(CI/脚本)时明确要求走环境变量。 */
 async function promptSecret(label: string): Promise<string> {
@@ -144,6 +145,8 @@ program
       "`backupdrill exporter` reads it. Needs write access to the bucket"
   )
   .action(async (opts) => {
+    // Ctrl+C / SIGTERM:删掉沙箱容器、停掉 --check-cmd 和 pg_restore、删下载的 dump,再以 130/143 退出
+    const stopHandlingSignals = exitCleanlyOnSignals("drill");
     const ping = createPinger(await resolvePingUrl({ flag: opts.pingUrl, configPath: opts.config }));
     await ping.start();
     // config 放在 try 外面:出错时 /fail 要用它抹敏感值,--record 要用它记一笔"没通过"
@@ -175,6 +178,8 @@ program
         appCheckCommand: opts.checkCmd,
         keepSandboxOnFailure: opts.keep,
       });
+      // 被打断的演练不出报告、不 ping、不记录:信号处理在收尾,完了会以 130/143 退出
+      if (interrupted()) return;
       console.error("");
       for (const c of report.checks) {
         console.error(`  ${c.pass ? "✓" : "✗"} ${c.name} — ${c.detail}`);
@@ -195,6 +200,7 @@ program
         await ping.fail(outcome.text, sensitiveValuesOf(config));
       }
     } catch (error) {
+      if (interrupted()) return;
       const message = (error as Error).message;
       log.error(message);
       process.exitCode = 1;
@@ -204,6 +210,8 @@ program
         `backupdrill ${TOOL_VERSION}: drill failed. ${pingMessageOf(error)}`,
         sensitiveValuesOf(config)
       );
+    } finally {
+      stopHandlingSignals();
     }
   });
 

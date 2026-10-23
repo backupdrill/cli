@@ -1,4 +1,5 @@
 import { execFile, spawn } from "node:child_process";
+import { randomBytes } from "node:crypto";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -20,6 +21,7 @@ import {
 import { connectPg } from "./supabase-ca.js";
 import { localPgRestoreMajor, restoreToolBreaksOnTarget, sandboxMajorFor } from "./pgbin.js";
 import { log } from "./log.js";
+import { onInterrupt, stopOnInterrupt, throwIfInterrupted } from "./interrupt.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -78,10 +80,12 @@ interface Ephemeral {
   containerId: string;
   port: string;
   connString: string;
-  /** 数据目录的匿名卷名(postgres 镜像 VOLUME);销毁容器后显式删除 */
-  volumeName: string | null;
   /** pg_restore 并行路数,随调参一起按 Docker 的内存和 CPU 定(见 sandboxTuning) */
   restoreJobs: number;
+  /** 删容器和数据卷;幂等,正常收尾和中断收尾共用 */
+  teardown: () => Promise<void>;
+  /** 注销中断清理(见 interrupt.ts);沙箱销毁或按 --keep 保留之后调用 */
+  forgetInterruptCleanup: () => void;
 }
 
 /**
@@ -196,6 +200,28 @@ export function sandboxDataVolumeTarget(major: number): string {
   return major >= 18 ? "/var/lib/postgresql" : "/var/lib/postgresql/data";
 }
 
+/**
+ * 沙箱镜像先单独拉好。让 docker run 自己拉的话,拉取和建容器在同一个命令里:中断落在拉取中途,
+ * 停掉命令也说不准守护进程之后还会不会把容器建出来(交叉审查)。拆开之后,慢的那一步(第一次拉镜像
+ * 可能好几分钟)什么都不建,中断时直接停掉;docker run 只剩建容器和启动。
+ */
+async function ensureImage(image: string): Promise<void> {
+  const present = await execFileAsync("docker", ["image", "inspect", "--format", "{{.Id}}", image]).then(
+    () => true,
+    () => false
+  );
+  if (present) return;
+  throwIfInterrupted();
+  log.step(`Pulling ${image}…`);
+  const pull = execFileAsync("docker", ["pull", "--quiet", image]);
+  const forget = pull.child ? stopOnInterrupt(pull.child) : () => {};
+  try {
+    await pull;
+  } finally {
+    forget();
+  }
+}
+
 async function startEphemeralPostgres(image: string, major: number, resourceName?: string): Promise<Ephemeral> {
   const dataVolumeTarget = sandboxDataVolumeTarget(major);
   if (resourceName) {
@@ -207,12 +233,17 @@ async function startEphemeralPostgres(image: string, major: number, resourceName
   log.step(`Starting ephemeral ${image}…`);
   const resources = await dockerResources();
   const tuning = sandboxTuning(resources.memoryBytes, resources.cpus);
-  const { stdout } = await execFileAsync("docker", [
+  await ensureImage(image);
+  // 名字先定好:Ctrl+C 可能落在 docker run 还没返回 ID 的时候,按名字才删得掉
+  const name = resourceName ?? `backupdrill-drill-${randomBytes(6).toString("hex")}`;
+  throwIfInterrupted();
+  const started = execFileAsync("docker", [
     "run",
     "-d",
     "--rm",
-    ...(resourceName ? ["--name", resourceName, "--mount",
-      `type=volume,source=${resourceName},target=${dataVolumeTarget}`] : []),
+    "--name",
+    name,
+    ...(resourceName ? ["--mount", `type=volume,source=${resourceName},target=${dataVolumeTarget}`] : []),
     "-e",
     "POSTGRES_PASSWORD=drill",
     "-e",
@@ -224,10 +255,62 @@ async function startEphemeralPostgres(image: string, major: number, resourceName
     "postgres",
     ...tuning.settings.flatMap((kv) => ["-c", kv]),
   ]);
+  // 删容器只有一份:正常收尾(drillDump 的 finally)和中断收尾(interrupt.ts)等的是同一个 promise。
+  // 两边各发一次 docker rm 会撞上 "removal already in progress",后到的那个报删除失败,
+  // 进程又在真正删完之前就退出了(信号测试抓到的竞争)。
+  let volumeName: string | null = resourceName ?? null;
+  let runSettled = false;
+  started.then(
+    () => (runSettled = true),
+    () => (runSettled = true)
+  );
+  const removeByName = async () => {
+    try {
+      // -v 连匿名卷一起删:中断可能落在下面查卷名之前
+      await execFileAsync("docker", ["rm", "-fv", name], { timeout: 60_000 });
+    } catch (error) {
+      if (!/No such container/i.test(String((error as { stderr?: string }).stderr ?? error))) {
+        log.warn(`could not remove the drill sandbox; remove it with: docker rm -fv ${name}`);
+      }
+    }
+  };
+  let teardownRun: Promise<void> | null = null;
+  const teardown = () =>
+    (teardownRun ??= (async () => {
+      if (!runSettled) {
+        // 中断落在 docker run 还没返回的时候。镜像已经在本地(ensureImage),它只剩建容器和启动,
+        // 等它落定再按名字删:中途停掉命令说不准守护进程会不会稍后把容器建出来(交叉审查复现)。
+        // Docker 迟迟不回话就不等了,把容器名告诉用户
+        let timer: NodeJS.Timeout | undefined;
+        const settled = await Promise.race([
+          started.then(() => true, () => true),
+          new Promise<boolean>((resolve) => (timer = setTimeout(() => resolve(false), 20_000))),
+        ]);
+        clearTimeout(timer);
+        if (!settled) {
+          started.child?.kill("SIGKILL");
+          log.warn(
+            `docker run did not finish within 20s; if a container named ${name} shows up later, ` +
+              `remove it with: docker rm -fv ${name}`
+          );
+        }
+      }
+      await removeByName();
+      // 显式删卷(--rm 不可靠,见下);幂等,已经没了也不报错
+      if (volumeName) await execFileAsync("docker", ["volume", "rm", "-f", volumeName]).catch(() => {});
+    })());
+  const forgetInterruptCleanup = onInterrupt(teardown);
+  let stdout: string;
+  try {
+    ({ stdout } = await started);
+  } catch (error) {
+    forgetInterruptCleanup();
+    throw error;
+  }
   const containerId = stdout.trim();
   // postgres 镜像把数据目录声明成 VOLUME → 每次 run 都建一个匿名卷。生产实测 `--rm` **没有**把它
   // 带走(一次演练遗留 37.6 GB,三次失败把 59 GB 根盘灌满),所以记下卷名,销毁容器后显式删。
-  const volumeName = resourceName ?? await execFileAsync("docker", [
+  volumeName = resourceName ?? await execFileAsync("docker", [
     "inspect",
     "-f",
     '{{range .Mounts}}{{if eq .Type "volume"}}{{.Name}}{{end}}{{end}}',
@@ -263,15 +346,15 @@ async function startEphemeralPostgres(image: string, major: number, resourceName
           "postgres",
           "-q",
         ]);
-        return { containerId, port, connString, volumeName, restoreJobs: tuning.restoreJobs };
+        return { containerId, port, connString, restoreJobs: tuning.restoreJobs, teardown, forgetInterruptCleanup };
       } catch {
         await new Promise((r) => setTimeout(r, 500));
       }
     }
     throw new Error("ephemeral Postgres did not become ready within 30s");
   } catch (error) {
-    await execFileAsync("docker", ["rm", "-f", containerId]).catch(() => {});
-    if (volumeName) await execFileAsync("docker", ["volume", "rm", "-f", volumeName]).catch(() => {});
+    await teardown();
+    forgetInterruptCleanup();
     throw error;
   }
 }
@@ -500,6 +583,8 @@ export function runAppCheck(
       // 孙进程会在沙箱销毁后继续跑(xreview 抓出的资源泄漏)。
       detached: true,
     });
+    // 也因为自成一组,终端的 Ctrl+C 到不了它:中断时由我们按组停掉
+    stopOnInterrupt(proc, { group: true });
     let timedOut = false;
     const timer = setTimeout(() => {
       timedOut = true;
@@ -616,6 +701,7 @@ export async function drillDump(
     }
 
     await opts.supervision?.observe({ phase: "restore" });
+    throwIfInterrupted();
     const started = Date.now();
     log.step("Restoring into ephemeral Postgres…");
     let postData: PostDataResult;
@@ -663,6 +749,7 @@ export async function drillDump(
     // 语义层钩子:只在结构层全绿时才跑——结构已失败时再跑应用检查,只会把
     // 一次失败报成两层失败,误导排查方向。没配置则不跑、报告里不出现该行。
     if (appCheckCommand && checks.every((c) => c.pass)) {
+      throwIfInterrupted();
       log.step("Running app checks…");
       checks.push(await runAppCheck(appCheckCommand, pg.connString));
     }
@@ -699,10 +786,10 @@ export async function drillDump(
     } else {
       await observeCleanup(opts.supervision);
       log.step("Tearing down ephemeral Postgres…");
-      await execFileAsync("docker", ["rm", "-f", pg.containerId]).catch(() => {});
-      // 显式删匿名卷(--rm 不可靠,见 startEphemeralPostgres);幂等,已被 --rm 带走也不报错
-      if (pg.volumeName) await execFileAsync("docker", ["volume", "rm", "-f", pg.volumeName]).catch(() => {});
+      await pg.teardown();
     }
+    // 删完了,或者按 --keep 有意留着:之后再收到信号都不该再动它
+    pg.forgetInterruptCleanup();
   }
 }
 
@@ -730,6 +817,10 @@ export async function runDrill(
 
   const workdir = opts.supervision?.workdir ?? await mkdtemp(join(tmpdir(), "backupdrill-"));
   const dumpPath = join(workdir, "dump.pgcustom");
+  // 下载的 dump 在这里;托管模式的目录归 supervisor 管
+  const forgetWorkdir = opts.supervision
+    ? () => {}
+    : onInterrupt(() => rm(workdir, { recursive: true, force: true }).catch(() => {}));
   try {
     await opts.supervision?.observe({ phase: "download", dumpBytes: manifest.dump.bytes });
     log.step("Downloading dump…");
@@ -779,5 +870,6 @@ export async function runDrill(
     });
   } finally {
     if (!opts.supervision) await rm(workdir, { recursive: true, force: true }).catch(() => {});
+    forgetWorkdir();
   }
 }
