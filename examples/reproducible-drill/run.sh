@@ -38,7 +38,7 @@ done
 
 RUN_ID="$$"
 SOURCE_CONTAINER="bd-demo-source-$RUN_ID"
-S3_CONTAINER="bd-demo-minio-$RUN_ID"
+S3_CONTAINER="bd-demo-s3-$RUN_ID"
 PG_PORT="${PG_PORT:-15432}"
 S3_PORT="${S3_PORT:-19000}"
 
@@ -50,11 +50,12 @@ S3_SECRET_KEY="$(openssl rand -hex 24)"
 WORKDIR="$(mktemp -d)"
 CONFIG="$WORKDIR/backupdrill.config.json"
 
-# 只删本次 docker run 真正返回的 ID —— 按名字盲删会在 pid 复用时误伤别人的容器
+# 只删本次 docker run 真正返回的 ID —— 按名字盲删会在 pid 复用时误伤别人的容器。
+# -v:postgres 镜像的数据目录是匿名卷,不带 -v 每跑一次就留一个卷
 CREATED_IDS=()
 cleanup() {
   for id in "${CREATED_IDS[@]:-}"; do
-    [ -n "$id" ] && docker rm -f "$id" >/dev/null 2>&1 || true
+    [ -n "$id" ] && docker rm -fv "$id" >/dev/null 2>&1 || true
   done
   rm -rf "$WORKDIR"
 }
@@ -88,10 +89,18 @@ CREATED_IDS+=("$(docker run -d --name "$SOURCE_CONTAINER" -e POSTGRES_PASSWORD="
 wait_for "Postgres" 90 docker exec "$SOURCE_CONTAINER" pg_isready -U postgres
 
 echo "==> S3-compatible store (destination bucket + Storage source bucket)"
-CREATED_IDS+=("$(docker run -d --name "$S3_CONTAINER" -p 127.0.0.1:"$S3_PORT":9000 \
-  -e MINIO_ROOT_USER="$S3_ACCESS_KEY" -e MINIO_ROOT_PASSWORD="$S3_SECRET_KEY" \
-  minio/minio:RELEASE.2025-04-22T22-12-26Z server /data)")
-wait_for "MinIO" 90 curl -fsS "http://127.0.0.1:$S3_PORT/minio/health/live"
+# versitygw's POSIX backend: each top-level directory under /data is a bucket. The two
+# buckets are created up front; storage-setup.mjs then finds them already there.
+# --sidecar keeps object metadata (Content-Type, Cache-Control) in files instead of
+# extended attributes, which not every Docker storage driver supports.
+# (The MinIO image this used before can no longer be pulled: Docker Hub answers
+# "denied" and quay.io 401.)
+CREATED_IDS+=("$(docker run -d --name "$S3_CONTAINER" -p 127.0.0.1:"$S3_PORT":7070 \
+  -e ROOT_ACCESS_KEY="$S3_ACCESS_KEY" -e ROOT_SECRET_KEY="$S3_SECRET_KEY" \
+  --entrypoint sh versity/versitygw:v1.9.0 \
+  -c "mkdir -p /data/user-uploads /data/acme-backups /meta && exec versitygw posix --sidecar /meta /data")")
+# Any HTTP answer (an unsigned request gets 403) means the gateway is up.
+wait_for "S3 store" 90 curl -sS -o /dev/null "http://127.0.0.1:$S3_PORT/"
 
 sed -e "s|__PG_PASSWORD__|$PG_PASSWORD|" -e "s|__PG_PORT__|$PG_PORT|" \
     -e "s|__S3_PORT__|$S3_PORT|" -e "s|__S3_ACCESS_KEY__|$S3_ACCESS_KEY|" \
