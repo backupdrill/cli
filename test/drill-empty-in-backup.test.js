@@ -70,7 +70,7 @@ test(
       await psql(
         source.id,
         'create table tricky(id int, "x FROM stdin;\n\\.\ny" text); insert into tricky values (1, \'a\'); ' +
-          'create table "line\nbreak"(id int);'
+          'create table "line\nbreak"(id int); create table "cr\rname"(id int);'
       );
       await x(pgDump, [
         "--format=custom", "--no-owner", "--no-privileges", "--schema=public", "--dbname", source.conn, "-f", dumpPath,
@@ -84,6 +84,7 @@ test(
       assert.equal(await tableDataInDump(dumpPath, "public", "no_such_table"), "unknown");
       assert.equal(await tableDataInDump(dumpPath, "public", "tricky"), "rows");
       assert.equal(await tableDataInDump(dumpPath, "public", "line\nbreak"), "empty");
+      assert.equal(await tableDataInDump(dumpPath, "public", "cr\rname"), "empty");
       assert.equal(await tableDataInDump(join(tmp, "missing.pgcustom"), "public", "kept"), "unknown");
 
       const buf = readFileSync(dumpPath);
@@ -92,7 +93,7 @@ test(
         projectName: "test",
         database: {
           serverVersion: "17.4", pgDumpVersion: "test", schemas: ["public"],
-          tableCount: 6, estimatedRowTotal: 61,
+          tableCount: 7, estimatedRowTotal: 61,
           tables: [
             { schema: "public", name: "Odd Name", estimatedRows: 2 },
             // 统计说 drained 有 3 行,dump 里其实是空的 —— 生产上 recovery_job_secrets 的样子
@@ -100,6 +101,8 @@ test(
             { schema: "public", name: "kept", estimatedRows: 50 },
             { schema: "public", name: "kept_mv", estimatedRows: 5 },
             { schema: "public", name: "line\nbreak", estimatedRows: 0 },
+            // 统计说有行、dump 里是空的,名字里还带 \r:readline 会把它切断,回查就查不清
+            { schema: "public", name: "cr\rname", estimatedRows: 4 },
             { schema: "public", name: "tricky", estimatedRows: 1 },
           ],
         },
@@ -114,7 +117,10 @@ test(
       const report = await drillDump(dumpPath, manifest, "empty-in-backup");
       const populated = report.checks.find((c) => c.name === "populated tables came back");
       assert.equal(populated?.pass, true, JSON.stringify(report.checks));
-      assert.equal(populated.detail, "no populated table restored empty (already empty in the backup: public.drained)");
+      assert.equal(
+        populated.detail,
+        "no populated table restored empty (already empty in the backup: public.drained, public.cr\rname)"
+      );
       assert.equal(report.pass, true);
 
       // 3. 真故障照样抓:目标库只有表结构没有数据(kept 恢复空了,dump 里却有 50 行)
@@ -134,7 +140,7 @@ test(
       const withoutDump = await verifyRestored(target.conn, manifest);
       assert.equal(
         withoutDump.checks.find((c) => c.name === "populated tables came back").detail,
-        "restored empty despite manifest rows: public.drained, public.kept, public.kept_mv, public.tricky"
+        "restored empty despite manifest rows: public.drained, public.kept, public.kept_mv, public.cr\rname, public.tricky"
       );
     } finally {
       await x("docker", ["rm", "-f", source.id]).catch(() => {});
