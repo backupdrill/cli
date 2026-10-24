@@ -860,7 +860,7 @@ export async function runRestore(
 
       // 与演练同一套表级验证:两条路径对同一快照必须同一结论(PRD §5.2 验收)
       log.step("Verifying restored tables…");
-      const verified = await verifyRestored(targetUrl, manifest);
+      const verified = await verifyRestored(targetUrl, manifest, dumpPath);
       result.databaseChecks = verified.checks;
       result.databaseVerified = verified.checks.every((c) => c.pass);
       for (const check of verified.checks) {

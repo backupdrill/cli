@@ -17,6 +17,7 @@ import {
   quoteIdent,
   restoreDatabaseArtifact,
   installSandboxShim,
+  tableDataInDump,
 } from "./restore-engine.js";
 import { connectPg } from "./supabase-ca.js";
 import { localPgRestoreMajor, restoreToolBreaksOnTarget, sandboxMajorFor } from "./pgbin.js";
@@ -413,7 +414,9 @@ async function pgRestore(
 /** 导出:真实恢复(restore.ts)复用同一套表级验证——两条路径对同一快照必须同一结论。 */
 export async function verifyRestored(
   connString: string,
-  manifest: Manifest
+  manifest: Manifest,
+  /** 恢复用的那份 dump:恢复出空表时回查它,见第 3 项检查 */
+  dumpPath?: string
 ): Promise<{ checks: DrillCheck[]; tableCount: number; rowTotal: number }> {
   // pgConnectOptions:真实 Supabase 目标(restore 复用本函数)需要打包根 CA;
   // 沙箱的 docker 连接串非 Supabase 主机,原样透传,行为不变
@@ -494,21 +497,32 @@ export async function verifyRestored(
     // 未填充的 matview 豁免:REFRESH 失败已由 post-data 检查裁决(用户对象失败
     // = 演练失败,Supabase 托管依赖 = 预期跳过),这里再报一次会把环境预期
     // 误标成备份损坏。
-    const emptied = manifest.database.tables.filter(
+    const restoredEmpty = manifest.database.tables.filter(
       (t) =>
         t.estimatedRows > 0 &&
         !unpopulatedMatviews.has(`${t.schema}.${t.name}`) &&
         (counts.get(`${t.schema}.${t.name}`) ?? 0) === 0
     );
+    // manifest 的行数是 pg_dump 之前另开连接取的 n_live_tup(统计估算),和 dump 不是同一个快照。
+    // 队列、会话、一次性密钥这类表,取统计时有行、dump 时已经删光,恢复出 0 行是对的
+    // (2026-10-24 生产演练:recovery_job_secrets)。所以拿 dump 本身作证:dump 里也是 0 行才放过,
+    // dump 有行或查不清,照样判失败。
+    const emptyInBackup: typeof restoredEmpty = [];
+    const emptied: typeof restoredEmpty = [];
+    for (const t of restoredEmpty) {
+      const inDump = dumpPath ? await tableDataInDump(dumpPath, t.schema, t.name) : "unknown";
+      (inDump === "empty" ? emptyInBackup : emptied).push(t);
+    }
+    const names = (tables: typeof restoredEmpty) => tables.map((t) => `${t.schema}.${t.name}`).join(", ");
     checks.push({
       name: "populated tables came back",
       pass: emptied.length === 0,
       detail:
-        emptied.length === 0
-          ? "no populated table restored empty"
-          : `restored empty despite manifest rows: ${emptied
-              .map((t) => `${t.schema}.${t.name}`)
-              .join(", ")}`,
+        emptied.length > 0
+          ? `restored empty despite manifest rows: ${names(emptied)}`
+          : emptyInBackup.length > 0
+            ? `no populated table restored empty (already empty in the backup: ${names(emptyInBackup)})`
+            : "no populated table restored empty",
     });
 
     return { checks, tableCount: restoredTables.length, rowTotal };
@@ -743,7 +757,7 @@ export async function drillDump(
     });
 
     await opts.supervision?.observe({ phase: "verify" });
-    const verify = await verifyRestored(pg.connString, manifest);
+    const verify = await verifyRestored(pg.connString, manifest, dumpPath);
     checks.push(...verify.checks);
 
     // 语义层钩子:只在结构层全绿时才跑——结构已失败时再跑应用检查,只会把

@@ -13,6 +13,7 @@
 // 项目上直接重跑。此前两遍恢复各自自动提交,post-data 里一条外键失败,表和数据已经落库,重跑被
 // 空目标门挡住(2026-10-22 实验:profiles → auth.users)。沙箱用完即毁,不需要事务,保留两遍 + 并行。
 import { spawn } from "node:child_process";
+import { createInterface } from "node:readline";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -919,4 +920,48 @@ export async function restoreDatabaseArtifact(opts: {
     await rm(listDir, { recursive: true, force: true });
     forgetListDir();
   }
+}
+
+/**
+ * 这张表在 dump 里有没有数据行。只看 COPY 段:COPY 头的下一行是 `\.` 就是空表,否则有行;
+ * 拿到答案就停掉 pg_restore,不读完整份 dump。没有 COPY 段(matview 的数据是 REFRESH)、
+ * pg_restore 起不来或出错,都返回 "unknown",由调用方按"查不清"处理。
+ */
+export function tableDataInDump(
+  dumpPath: string,
+  schema: string,
+  table: string
+): Promise<"rows" | "empty" | "unknown"> {
+  if (interrupted()) return Promise.resolve("unknown");
+  return new Promise((resolve) => {
+    // -n/-t 在 pg_restore 里是精确名,不是 pg_dump 那种模式;不连库,只往 stdout 出 SQL
+    const proc = spawn(
+      resolvePgRestoreBin(),
+      ["--data-only", `--schema=${schema}`, `--table=${table}`, "--file=-", dumpPath],
+      { stdio: ["ignore", "pipe", "ignore"] }
+    );
+    const forget = stopOnInterrupt(proc);
+    let answer: "rows" | "empty" | "unknown" = "unknown";
+    let inCopy = false;
+    const lines = createInterface({ input: proc.stdout });
+    lines.on("line", (line) => {
+      if (answer !== "unknown") return;
+      if (!inCopy) {
+        inCopy = line.startsWith("COPY ") && line.endsWith(" FROM stdin;");
+        return;
+      }
+      answer = line === "\\." ? "empty" : "rows";
+      proc.kill("SIGTERM");
+    });
+    proc.on("error", () => {
+      forget();
+      resolve("unknown");
+    });
+    // 拿到答案后是我们自己停的,退出码不看;没拿到答案就退出(出错或没有 COPY 段)= 查不清
+    proc.on("close", () => {
+      forget();
+      lines.close();
+      resolve(answer);
+    });
+  });
 }
