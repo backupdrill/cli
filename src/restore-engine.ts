@@ -19,7 +19,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Client } from "pg";
 import type { ExtensionInfo } from "./manifest.js";
-import { parseCreateSchemas } from "./dump-sql.js";
+import { MAX_COPY_HEADER, parseCopyHeader, parseCreateSchemas } from "./dump-sql.js";
 import { resolvePgRestoreBin } from "./pgbin.js";
 import { dumpUrlFor, connectPg, isSupabaseHost } from "./supabase-ca.js";
 import { interrupted, onInterrupt, stopOnInterrupt } from "./interrupt.js";
@@ -923,9 +923,9 @@ export async function restoreDatabaseArtifact(opts: {
 }
 
 /**
- * 这张表在 dump 里有没有数据行。只看 COPY 段:COPY 头的下一行是 `\.` 就是空表,否则有行;
+ * 这张表在 dump 里有没有数据行。只看它自己的 COPY 段:COPY 头的下一行是 `\.` 就是空表,否则有行;
  * 拿到答案就停掉 pg_restore,不读完整份 dump。没有 COPY 段(matview 的数据是 REFRESH)、
- * pg_restore 起不来或出错,都返回 "unknown",由调用方按"查不清"处理。
+ * COPY 头读不懂或不是这张表、pg_restore 起不来或出错,都返回 "unknown",由调用方按"查不清"处理。
  */
 export function tableDataInDump(
   dumpPath: string,
@@ -943,15 +943,33 @@ export function tableDataInDump(
     const forget = stopOnInterrupt(proc);
     let answer: "rows" | "empty" | "unknown" = "unknown";
     let inCopy = false;
+    let done = false;
+    const stop = () => {
+      done = true;
+      proc.kill("SIGTERM");
+    };
+    // 带引号的名字里可以有换行(列名里甚至能写 FROM stdin; 和 \.),COPY 头就会跨行:
+    // 攒到引号配平、以 FROM stdin; 结尾为止,再按 COPY 头的语法解析、核对是不是这张表(同 scanDumpData)
+    let header: string | null = null;
     const lines = createInterface({ input: proc.stdout });
     lines.on("line", (line) => {
-      if (answer !== "unknown") return;
+      if (done) return;
       if (!inCopy) {
-        inCopy = line.startsWith("COPY ") && line.endsWith(" FROM stdin;");
+        if (header === null && !line.startsWith("COPY ")) return;
+        header = header === null ? line : `${header}\n${line}`;
+        const balanced = (header.split('"').length - 1) % 2 === 0;
+        if (!(balanced && header.endsWith(" FROM stdin;"))) {
+          if (header.length > MAX_COPY_HEADER) stop();
+          return;
+        }
+        const parsed = parseCopyHeader(header);
+        header = null;
+        if (!parsed || parsed.table.schema !== schema || parsed.table.name !== table) return stop();
+        inCopy = true;
         return;
       }
       answer = line === "\\." ? "empty" : "rows";
-      proc.kill("SIGTERM");
+      stop();
     });
     proc.on("error", () => {
       forget();

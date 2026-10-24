@@ -65,6 +65,13 @@ test(
           'create table "Odd Name"(id int primary key); insert into "Odd Name" values (1), (2); ' +
           "create materialized view kept_mv as select id from kept where id <= 5;"
       );
+      // 带引号的名字里能有换行:列名里写上 FROM stdin; 和 \.,只看单行的话 COPY 头会在第一行"结束"、
+      // 下一行 \. 被当成空表结束符(交叉审查复现过)。表名里带换行的空表同理要认得出来
+      await psql(
+        source.id,
+        'create table tricky(id int, "x FROM stdin;\n\\.\ny" text); insert into tricky values (1, \'a\'); ' +
+          'create table "line\nbreak"(id int);'
+      );
       await x(pgDump, [
         "--format=custom", "--no-owner", "--no-privileges", "--schema=public", "--dbname", source.conn, "-f", dumpPath,
       ]);
@@ -75,6 +82,8 @@ test(
       assert.equal(await tableDataInDump(dumpPath, "public", "Odd Name"), "rows");
       assert.equal(await tableDataInDump(dumpPath, "public", "kept_mv"), "unknown", "matview data is a REFRESH, not COPY");
       assert.equal(await tableDataInDump(dumpPath, "public", "no_such_table"), "unknown");
+      assert.equal(await tableDataInDump(dumpPath, "public", "tricky"), "rows");
+      assert.equal(await tableDataInDump(dumpPath, "public", "line\nbreak"), "empty");
       assert.equal(await tableDataInDump(join(tmp, "missing.pgcustom"), "public", "kept"), "unknown");
 
       const buf = readFileSync(dumpPath);
@@ -83,13 +92,15 @@ test(
         projectName: "test",
         database: {
           serverVersion: "17.4", pgDumpVersion: "test", schemas: ["public"],
-          tableCount: 4, estimatedRowTotal: 60,
+          tableCount: 6, estimatedRowTotal: 61,
           tables: [
             { schema: "public", name: "Odd Name", estimatedRows: 2 },
             // 统计说 drained 有 3 行,dump 里其实是空的 —— 生产上 recovery_job_secrets 的样子
             { schema: "public", name: "drained", estimatedRows: 3 },
             { schema: "public", name: "kept", estimatedRows: 50 },
             { schema: "public", name: "kept_mv", estimatedRows: 5 },
+            { schema: "public", name: "line\nbreak", estimatedRows: 0 },
+            { schema: "public", name: "tricky", estimatedRows: 1 },
           ],
         },
         dump: {
@@ -112,17 +123,18 @@ test(
       await psql(target.id, "drop schema public cascade;");
       await x(pgRestore, ["--schema-only", "--no-owner", "--no-privileges", "--dbname", target.conn, dumpPath]);
       await psql(target.id, "refresh materialized view kept_mv; insert into \"Odd Name\" values (1), (2);");
+      // tricky 也恢复空了(只恢复了结构),dump 里却有 1 行:多行 COPY 头要读对,不能误判成空表
       const verified = await verifyRestored(target.conn, manifest, dumpPath);
       const check = verified.checks.find((c) => c.name === "populated tables came back");
       assert.equal(check.pass, false);
       // kept_mv 刷新后跟着 kept 是 0 行;matview 回查不出(数据是 REFRESH 不是 COPY)= 查不清,照样判失败
-      assert.equal(check.detail, "restored empty despite manifest rows: public.kept, public.kept_mv");
+      assert.equal(check.detail, "restored empty despite manifest rows: public.kept, public.kept_mv, public.tricky");
 
       // 4. 不给 dump 路径(老调用方式)= 不回查,行为和以前一样
       const withoutDump = await verifyRestored(target.conn, manifest);
       assert.equal(
         withoutDump.checks.find((c) => c.name === "populated tables came back").detail,
-        "restored empty despite manifest rows: public.drained, public.kept, public.kept_mv"
+        "restored empty despite manifest rows: public.drained, public.kept, public.kept_mv, public.tricky"
       );
     } finally {
       await x("docker", ["rm", "-f", source.id]).catch(() => {});
