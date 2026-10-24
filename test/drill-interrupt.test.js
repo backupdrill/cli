@@ -460,25 +460,35 @@ function startInterruptScript(tmp, { cleanupMs, viaForwarder }) {
   return { child, exited, marker, ready, stderr: () => stderr };
 }
 
-test("interrupt: one Ctrl+C under npx, which delivers SIGINT twice, still runs the cleanup", async () => {
-  const tmp = mkdtempSync(join(tmpdir(), "bd-sig-test-"));
-  try {
+test(
+  "interrupt: one Ctrl+C under npx, which delivers SIGINT twice, still runs the cleanup",
+  { skip: process.platform === "win32" ? "process groups are POSIX-only" : false },
+  async () => {
+    const tmp = mkdtempSync(join(tmpdir(), "bd-sig-test-"));
     const run = startInterruptScript(tmp, { cleanupMs: 300, viaForwarder: true });
-    await waitFor("script ready", () => existsSync(run.ready), 10_000);
-    // 发给整个进程组,和终端里按 Ctrl+C 一样:脚本直接收到一次,转发层又转来一次
-    process.kill(-run.child.pid, "SIGINT");
-    assert.equal(await run.exited, 130);
-    assert.equal(existsSync(run.marker), true, `cleanup ran; stderr:\n${run.stderr()}`);
-    assert.doesNotMatch(run.stderr(), /SIGINT again/);
-  } finally {
-    rmSync(tmp, { recursive: true, force: true });
+    try {
+      await waitFor("script ready", () => existsSync(run.ready), 10_000);
+      // 发给整个进程组,和终端里按 Ctrl+C 一样:脚本直接收到一次,转发层又转来一次
+      process.kill(-run.child.pid, "SIGINT");
+      assert.equal(await run.exited, 130);
+      assert.equal(existsSync(run.marker), true, `cleanup ran; stderr:\n${run.stderr()}`);
+      assert.doesNotMatch(run.stderr(), /SIGINT again/);
+    } finally {
+      // 断言失败时转发层和脚本都还挂着(setInterval),不收掉 npm test 会一直等
+      try {
+        process.kill(-run.child.pid, "SIGKILL");
+      } catch {
+        // 已经退出了
+      }
+      rmSync(tmp, { recursive: true, force: true });
+    }
   }
-});
+);
 
 test("interrupt: a second Ctrl+C more than a second later skips the cleanup", async () => {
   const tmp = mkdtempSync(join(tmpdir(), "bd-sig-test-"));
+  const run = startInterruptScript(tmp, { cleanupMs: 10_000, viaForwarder: false });
   try {
-    const run = startInterruptScript(tmp, { cleanupMs: 10_000, viaForwarder: false });
     await waitFor("script ready", () => existsSync(run.ready), 10_000);
     run.child.kill("SIGINT");
     await new Promise((r) => setTimeout(r, 1_500));
@@ -487,6 +497,7 @@ test("interrupt: a second Ctrl+C more than a second later skips the cleanup", as
     assert.match(run.stderr(), /SIGINT again — exiting without finishing the cleanup/);
     assert.equal(existsSync(run.marker), false, "cleanup was skipped");
   } finally {
+    if (alive(run.child.pid)) run.child.kill("SIGKILL");
     rmSync(tmp, { recursive: true, force: true });
   }
 });
