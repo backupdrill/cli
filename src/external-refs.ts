@@ -14,6 +14,7 @@ import { join } from "node:path";
 import { StringDecoder } from "node:string_decoder";
 import type pg from "pg";
 import {
+  MAX_COPY_HEADER,
   decodeCopyField,
   formatQualified,
   parseCopyHeader,
@@ -49,9 +50,6 @@ export interface ExternalReferenceCheck {
 }
 
 const keyOf = (name: QualifiedName) => `${name.schema}\u0000${name.name}`;
-
-/** 一个 COPY 头最长读这么多字符;超过就当作读不了,免得坏归档把内存吃满。 */
-const MAX_COPY_HEADER = 100_000;
 
 /**
  * 读 dump,找出指向 dumpedSchemas 之外的外键,逐条拿目标库对行。只读:目标库上只跑 select。

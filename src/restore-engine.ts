@@ -18,7 +18,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Client } from "pg";
 import type { ExtensionInfo } from "./manifest.js";
-import { parseCreateSchemas } from "./dump-sql.js";
+import { MAX_COPY_HEADER, parseCopyHeader, parseCreateSchemas } from "./dump-sql.js";
 import { resolvePgRestoreBin } from "./pgbin.js";
 import { dumpUrlFor, connectPg, isSupabaseHost } from "./supabase-ca.js";
 import { interrupted, onInterrupt, stopOnInterrupt } from "./interrupt.js";
@@ -919,4 +919,90 @@ export async function restoreDatabaseArtifact(opts: {
     await rm(listDir, { recursive: true, force: true });
     forgetListDir();
   }
+}
+
+/**
+ * 逐块读 `pg_restore --data-only -f -` 的输出,判断某张表的 COPY 段有没有数据行。
+ * 返回一个喂数据的函数:能下结论时返回 "rows" / "empty",确定查不清返回 "unknown",
+ * 还要更多输出返回 null。纯函数,方便单测。
+ *
+ * 只按 \n 切行,不用 readline:readline 把 \r 也当换行(引号名里可以有 \r),还会把一整行数据
+ * 读进内存(大 bytea 行能有几百 MB)。COPY 头之后只看紧跟着的几个字符。
+ * 带引号的名字里还可以有换行(列名里甚至能写 FROM stdin; 和 \.),COPY 头就会跨行:攒到引号配平、
+ * 以 FROM stdin; 结尾为止,再按 COPY 头的语法解析、核对是不是这张表(同 scanDumpData)。
+ */
+export function copyDataProbe(
+  schema: string,
+  table: string
+): (chunk: string) => "rows" | "empty" | "unknown" | null {
+  let buffer = "";
+  let header: string | null = null;
+  let inData = false;
+  return (chunk) => {
+    buffer += chunk;
+    for (;;) {
+      if (inData) {
+        // 结束符一行只有 \.;数据里以 \. 开头的值会被转义成 \\.,不会混淆
+        if (buffer.startsWith("\\.\n")) return "empty";
+        if (!"\\.\n".startsWith(buffer)) return "rows";
+        return null; // 字符还不够判断
+      }
+      const newline = buffer.indexOf("\n");
+      if (newline < 0) return buffer.length + (header?.length ?? 0) > MAX_COPY_HEADER ? "unknown" : null;
+      const line = buffer.slice(0, newline);
+      buffer = buffer.slice(newline + 1);
+      if (header === null && !line.startsWith("COPY ")) continue;
+      header = header === null ? line : `${header}\n${line}`;
+      const balanced = (header.split('"').length - 1) % 2 === 0;
+      if (!(balanced && header.endsWith(" FROM stdin;"))) {
+        if (header.length > MAX_COPY_HEADER) return "unknown";
+        continue;
+      }
+      const parsed = parseCopyHeader(header);
+      header = null;
+      if (!parsed || parsed.table.schema !== schema || parsed.table.name !== table) return "unknown";
+      inData = true;
+    }
+  };
+}
+
+/**
+ * 这张表在 dump 里有没有数据行(判断见 copyDataProbe)。拿到答案就停掉 pg_restore,不读完整份 dump。
+ * 没有 COPY 段(matview 的数据是 REFRESH)、COPY 头读不懂或不是这张表、pg_restore 起不来或出错,
+ * 都返回 "unknown",由调用方按"查不清"处理。
+ */
+export function tableDataInDump(
+  dumpPath: string,
+  schema: string,
+  table: string
+): Promise<"rows" | "empty" | "unknown"> {
+  if (interrupted()) return Promise.resolve("unknown");
+  return new Promise((resolve) => {
+    // -n/-t 在 pg_restore 里是精确名,不是 pg_dump 那种模式;不连库,只往 stdout 出 SQL。
+    // 和 pgRestoreOutput 一样钉 C locale
+    const proc = spawn(
+      resolvePgRestoreBin(),
+      ["--data-only", `--schema=${schema}`, `--table=${table}`, "--file=-", dumpPath],
+      { stdio: ["ignore", "pipe", "ignore"], env: libpqChildEnv() }
+    );
+    const forget = stopOnInterrupt(proc);
+    const probe = copyDataProbe(schema, table);
+    let answer: "rows" | "empty" | "unknown" | null = null;
+    // 按流解码:多字节字符可能被拆在两块里
+    proc.stdout.setEncoding("utf8");
+    proc.stdout.on("data", (chunk: string) => {
+      if (answer !== null) return;
+      answer = probe(chunk);
+      if (answer !== null) proc.kill("SIGTERM");
+    });
+    proc.on("error", () => {
+      forget();
+      resolve("unknown");
+    });
+    // 拿到答案后是我们自己停的,退出码不看;没拿到答案就退出(出错或没有 COPY 段)= 查不清
+    proc.on("close", () => {
+      forget();
+      resolve(answer ?? "unknown");
+    });
+  });
 }
