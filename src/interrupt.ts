@@ -15,6 +15,12 @@ type Cleanup = () => Promise<void> | void;
 
 const pending = new Set<Cleanup>();
 let interruptedBy: NodeJS.Signals | null = null;
+let interruptedAt = 0;
+
+// npx / npm exec 会把自己收到的 SIGINT/SIGTERM 再转发给 CLI(@npmcli/run-script 的 signal-manager)。
+// 终端里的 Ctrl+C 发给整个前台进程组,所以按一次,CLI 几乎同时收到两次:不挡的话第二次会被当成
+// "再按一次跳过清理",沙箱照样留下。离第一次不到这么久的同一个信号算同一次。
+const REPEATED_SIGNAL_GRACE_MS = 1000;
 
 /** 收到过信号没有。主流程据此闭嘴:信号处理正在收尾并会自己退出,别再打印报告、发 ping、写记录。 */
 export function interrupted(): boolean {
@@ -116,17 +122,20 @@ async function runTasks(tasks: Cleanup[]): Promise<void> {
 
 /**
  * CLI 专用:在 what(比如 "drill")运行期间接管 SIGINT/SIGTERM。第一次收到信号时跑完登记的清理,
- * 以 130(SIGINT)/ 143(SIGTERM)退出;清理途中再按一次 Ctrl+C 就不等了,直接退出。
+ * 以 130(SIGINT)/ 143(SIGTERM)退出;清理途中再按一次 Ctrl+C 就不等了,直接退出
+ * (1 秒内重复到达的同一个信号不算,见 REPEATED_SIGNAL_GRACE_MS)。
  * 返回卸载函数。
  */
 export function exitCleanlyOnSignals(what: string): () => void {
   const handler = (signal: NodeJS.Signals) => {
     const code = signal === "SIGINT" ? 130 : 143;
     if (interruptedBy) {
+      if (signal === interruptedBy && performance.now() - interruptedAt < REPEATED_SIGNAL_GRACE_MS) return;
       log.error(`${signal} again — exiting without finishing the cleanup`);
       process.exit(code);
     }
     interruptedBy = signal;
+    interruptedAt = performance.now();
     log.warn(
       `${signal} received — stopping the ${what} and cleaning up` +
         (signal === "SIGINT" ? " (press Ctrl+C again to skip)…" : "…")

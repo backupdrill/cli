@@ -421,3 +421,72 @@ test("interrupt: cleanups registered while the cleanup is running still run befo
     rmSync(tmp, { recursive: true, force: true });
   }
 });
+
+// 起一个只装了 exitCleanlyOnSignals 的小脚本:收到信号后的清理要跑 cleanupMs 才写 marker。
+// viaForwarder 时像 npx 那样套一层:外层自成进程组,把收到的 SIGINT/SIGTERM 再转发给脚本
+// (@npmcli/run-script 的 signal-manager 就是这么做的),退出码照搬脚本的。
+function startInterruptScript(tmp, { cleanupMs, viaForwarder }) {
+  const marker = join(tmp, "cleanup-ran");
+  const ready = join(tmp, "ready");
+  const script = join(tmp, "slow-cleanup.mjs");
+  const interruptModule = new URL("../dist/interrupt.js", import.meta.url).href;
+  writeFileSync(
+    script,
+    `import { exitCleanlyOnSignals, onInterrupt } from ${JSON.stringify(interruptModule)};
+     import { writeFileSync } from "node:fs";
+     exitCleanlyOnSignals("test");
+     onInterrupt(async () => {
+       await new Promise((r) => setTimeout(r, ${cleanupMs}));
+       writeFileSync(${JSON.stringify(marker)}, "ran");
+     });
+     writeFileSync(${JSON.stringify(ready)}, "ready");
+     setInterval(() => {}, 1000);`
+  );
+  const forwarder = join(tmp, "forwarder.mjs");
+  writeFileSync(
+    forwarder,
+    `import { spawn } from "node:child_process";
+     const child = spawn(process.execPath, [${JSON.stringify(script)}], { stdio: "inherit" });
+     for (const signal of ["SIGINT", "SIGTERM"]) process.on(signal, () => child.kill(signal));
+     child.on("exit", (code) => process.exit(code ?? 1));`
+  );
+  const child = spawn(process.execPath, [viaForwarder ? forwarder : script], {
+    detached: viaForwarder,
+    stdio: ["ignore", "ignore", "pipe"],
+  });
+  let stderr = "";
+  child.stderr.on("data", (d) => (stderr += d.toString()));
+  const exited = new Promise((resolve) => child.on("exit", (code) => resolve(code)));
+  return { child, exited, marker, ready, stderr: () => stderr };
+}
+
+test("interrupt: one Ctrl+C under npx, which delivers SIGINT twice, still runs the cleanup", async () => {
+  const tmp = mkdtempSync(join(tmpdir(), "bd-sig-test-"));
+  try {
+    const run = startInterruptScript(tmp, { cleanupMs: 300, viaForwarder: true });
+    await waitFor("script ready", () => existsSync(run.ready), 10_000);
+    // 发给整个进程组,和终端里按 Ctrl+C 一样:脚本直接收到一次,转发层又转来一次
+    process.kill(-run.child.pid, "SIGINT");
+    assert.equal(await run.exited, 130);
+    assert.equal(existsSync(run.marker), true, `cleanup ran; stderr:\n${run.stderr()}`);
+    assert.doesNotMatch(run.stderr(), /SIGINT again/);
+  } finally {
+    rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test("interrupt: a second Ctrl+C more than a second later skips the cleanup", async () => {
+  const tmp = mkdtempSync(join(tmpdir(), "bd-sig-test-"));
+  try {
+    const run = startInterruptScript(tmp, { cleanupMs: 10_000, viaForwarder: false });
+    await waitFor("script ready", () => existsSync(run.ready), 10_000);
+    run.child.kill("SIGINT");
+    await new Promise((r) => setTimeout(r, 1_500));
+    run.child.kill("SIGINT");
+    assert.equal(await run.exited, 130);
+    assert.match(run.stderr(), /SIGINT again — exiting without finishing the cleanup/);
+    assert.equal(existsSync(run.marker), false, "cleanup was skipped");
+  } finally {
+    rmSync(tmp, { recursive: true, force: true });
+  }
+});
