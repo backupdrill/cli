@@ -202,30 +202,6 @@ export function sandboxDataVolumeTarget(major: number): string {
 }
 
 /**
- * 沙箱容器的 OCI 运行时,来自 BACKUPDRILL_DOCKER_RUNTIME(比如 runsc = gVisor)。不设或为空就不传
- * --runtime,用守护进程的默认运行时,docker run 的参数和以前一字不差。
- *
- * 为什么要能换:演练恢复的是别人的 dump,里面的函数、触发器、扩展会在沙箱 Postgres 里真的执行;
- * runc 下它们和宿主机共用一个内核,gVisor 在中间多隔一层系统调用。托管 worker 一台机器跑所有客户的
- * 演练,值得多这一层;用户自己电脑上跑 CLI 一般不用管。
- *
- * 只收运行时名字该有的字符(字母或数字开头,后面是字母、数字、. _ -):值来自环境、要拼进 docker run,
- * 这样它只能是一个运行时名,夹带不了别的 flag。不合格就报错而不是忽略:运营者以为开了 gVisor、
- * 实际悄悄跑在 runc 上,比演练直接失败更糟。
- */
-const SANDBOX_RUNTIME_NAME = /^[A-Za-z0-9][A-Za-z0-9_.-]*$/;
-export function sandboxRuntimeArgs(runtime = process.env.BACKUPDRILL_DOCKER_RUNTIME): string[] {
-  const name = runtime?.trim();
-  if (!name) return [];
-  if (!SANDBOX_RUNTIME_NAME.test(name)) {
-    throw new Error(
-      `BACKUPDRILL_DOCKER_RUNTIME must be a Docker runtime name such as runsc (letters, digits, ".", "_" or "-"), got ${JSON.stringify(runtime)}`
-    );
-  }
-  return [`--runtime=${name}`];
-}
-
-/**
  * 沙箱镜像先单独拉好。让 docker run 自己拉的话,拉取和建容器在同一个命令里:中断落在拉取中途,
  * 停掉命令也说不准守护进程之后还会不会把容器建出来(交叉审查)。拆开之后,慢的那一步(第一次拉镜像
  * 可能好几分钟)什么都不建,中断时直接停掉;docker run 只剩建容器和启动。
@@ -247,7 +223,7 @@ async function ensureImage(image: string): Promise<void> {
   }
 }
 
-async function startEphemeralPostgres(image: string, major: number, runtimeArgs: string[], resourceName?: string): Promise<Ephemeral> {
+async function startEphemeralPostgres(image: string, major: number, resourceName?: string): Promise<Ephemeral> {
   const dataVolumeTarget = sandboxDataVolumeTarget(major);
   if (resourceName) {
     const existing = await execFileAsync("docker", ["volume", "ls", "--format", "{{.Name}}", "--filter", `name=^${resourceName}$`], { timeout: 10_000 });
@@ -266,7 +242,6 @@ async function startEphemeralPostgres(image: string, major: number, runtimeArgs:
     "run",
     "-d",
     "--rm",
-    ...runtimeArgs,
     "--name",
     name,
     ...(resourceName ? ["--mount", `type=volume,source=${resourceName},target=${dataVolumeTarget}`] : []),
@@ -694,14 +669,13 @@ export async function drillDump(
       "--check-cmd is empty (did an env var fail to expand?) — refusing to report a check that would never run"
     );
   }
-  const runtimeArgs = sandboxRuntimeArgs(); // 同样在起沙箱之前拒绝写错的运行时名
 
   const checks: DrillCheck[] = [...preChecks];
   await opts.supervision?.observe({ phase: "sandbox" });
   const sourceMajor = parseInt(manifest.database.serverVersion, 10);
   const toolMajor = await localPgRestoreMajor();
   const sandboxMajor = sandboxMajorFor(sourceMajor, toolMajor);
-  const pg = await startEphemeralPostgres(sandboxImage(manifest, sandboxMajor), sandboxMajor, runtimeArgs, opts.supervision?.resourceName);
+  const pg = await startEphemeralPostgres(sandboxImage(manifest, sandboxMajor), sandboxMajor, opts.supervision?.resourceName);
   let pass = false; // 异常路径视为失败,供 finally 决定 --keep 是否保留沙箱
   try {
     if (sandboxMajor !== sourceMajor) {
@@ -848,8 +822,6 @@ export async function runDrill(
   } = {}
 ): Promise<DrillReport> {
   validateSupervision(opts.supervision, opts.appCheckCommand, opts.keepSandboxOnFailure);
-  // 运行时名字写错要在下载 dump 之前就报出来,不能等几 GB 下完、起沙箱时才失败
-  sandboxRuntimeArgs();
   const store = opts.store ?? s3SnapshotStore(config);
   const reader = await store.openSnapshot(opts.snapshot);
   const snapshot = reader.name;
