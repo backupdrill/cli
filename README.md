@@ -86,6 +86,7 @@ All recognized variables:
 | `BACKUPDRILL_SUPABASE_STORAGE_*` | Storage-file source (endpoint/region/keys/buckets) — see [Backing up Storage files](#backing-up-storage-files-too) | — |
 | `BACKUPDRILL_PG_DUMP` | Path to the `pg_dump` binary to use | `pg_dump` on `PATH` |
 | `BACKUPDRILL_PG_RESTORE` | Path to `pg_restore` (used by `drill` and `restore`) | next to `BACKUPDRILL_PG_DUMP`, else `pg_restore` on `PATH` |
+| `BACKUPDRILL_DOCKER_RUNTIME` | Docker runtime for the `drill` sandbox, e.g. `runsc` to run it under gVisor (the runtime must already be registered with Docker) | Docker's default runtime |
 | `BACKUPDRILL_PING_URL` | Healthchecks.io ping URL for `backup` and `drill` — see [Alerts with Healthchecks.io](#alerts-with-healthchecksio) | — |
 
 ### Config file
