@@ -136,7 +136,7 @@ A backup pulls data **out** of Supabase, which counts as **egress on your Supaba
 
 - Backup traffic (pg_dump + first-time file downloads) is **uncached egress: $0.09/GB** above your plan's included allowance.
 - Included uncached egress: **Free 5 GB · Pro 250 GB · Team 250 GB** per month.
-- **Spend Cap exists only on Pro, and it's ON by default.** With it on, going past the quota isn't billed. Supabase emails your billing address and starts a grace period, and if usage stays over it **restricts your organization's projects** (your app, not just the backup) until the next billing cycle or until you turn Spend Cap OFF. Turn it OFF up front to be billed the overage instead.
+- **Spend Cap exists only on Pro, and it's ON by default.** With it on, going past the quota isn't billed. Supabase emails your billing address and starts a grace period, and if usage stays over it **restricts your organization's projects** (your app, not just the backup) until the next billing cycle or until you turn Spend Cap OFF. The grace period isn't renewed every time: go over again before the dashboard's notice clears (that takes several billing cycles under the limits) and the restriction can start right away. Turn Spend Cap OFF up front to be billed the overage instead.
 - **Team has no Spend Cap**, so egress past the included 250 GB is always billed at $0.09/GB.
 - **Free never bills overage.** Exceeding the included 5 GB/month starts Supabase's Fair Use process: a notification to your billing email, then a grace period, then egress restrictions if usage stays over (the restriction clears at the next billing cycle or when you upgrade). Sustained large backups are not viable on Free.
 

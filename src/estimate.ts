@@ -101,12 +101,13 @@ export function overageNote(pricing: EgressPricing): string {
       `quota is billed at $${pricing.pricePerGb}/GB, so the numbers above are what you'd pay.`
     );
   }
-  // 开着 Spend Cap 超额不是立刻断:Supabase 先发邮件、给宽限期,持续超额才限制整个组织的项目
-  // (文档 Exceeding Quotas + Fair Use Policy,2026-10-29 核)
+  // 开着 Spend Cap 超额不是立刻断:Supabase 先发邮件、给宽限期,持续超额才限制整个组织的项目;
+  // 宽限期用过一次后,几个账期内再超就没有新的宽限期(文档 Exceeding Quotas + Fair Use Policy,2026-10-29 核)
   return (
     "Spend Cap is ON by default on Pro. Going past the " +
     `${pricing.includedGb} GB egress quota with it on isn't billed: Supabase emails ` +
-    "your billing address, starts a grace period, then restricts your organization's " +
+    "your billing address, starts a grace period (none if you went over recently), " +
+    "then restricts your organization's " +
     "projects if usage stays over (your app, not just the backup). Turn Spend Cap OFF " +
     "to be billed for the overage instead, and the numbers above are what you'd pay."
   );
