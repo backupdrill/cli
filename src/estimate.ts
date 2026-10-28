@@ -17,7 +17,7 @@ export interface EgressPricing {
   // Free = 永不计费:超额走 Fair Use 流程(通知 → 宽限期 → 限制),持续超额跑不通;
   // 付费计划看 spendCap。字段名沿用 hardCap,语义是"超额不可计费、只会被限"
   hardCap: boolean;
-  // Supabase 只有 Pro 有 Spend Cap(默认开,开着时超额会被限);Team 没有,超额直接计费
+  // Supabase 只有 Pro 有 Spend Cap(默认开,开着时超额不计费、持续超额会被限);Team 没有,超额直接计费
   // (2026-10-29 核 Supabase 文档 Control your costs)。不填按有 Spend Cap 处理,与 2.7.1 及以前一致
   spendCap?: boolean;
 }
@@ -93,7 +93,7 @@ export function project(
   return { dbBytes, storageBytes, perRunGb, rows };
 }
 
-/** 付费计划超出 egress 额度时会怎样:Pro 看 Spend Cap(默认开,会被限),Team 没有 Spend Cap、直接计费 */
+/** 付费计划超出 egress 额度时会怎样:Pro 看 Spend Cap(默认开,不计费但可能被限),Team 没有 Spend Cap、直接计费 */
 export function overageNote(pricing: EgressPricing): string {
   if (pricing.spendCap === false) {
     return (
@@ -101,12 +101,14 @@ export function overageNote(pricing: EgressPricing): string {
       `quota is billed at $${pricing.pricePerGb}/GB, so the numbers above are what you'd pay.`
     );
   }
+  // 开着 Spend Cap 超额不是立刻断:Supabase 先发邮件、给宽限期,持续超额才限制整个组织的项目
+  // (文档 Exceeding Quotas + Fair Use Policy,2026-10-29 核)
   return (
-    "Spend Cap is ON by default on Pro. If a backup pushes you past the " +
-    `${pricing.includedGb} GB egress quota, Supabase throttles your project's ` +
-    "egress for the rest of the month (your app's traffic too), and the backup " +
-    "fails. Turn Spend Cap OFF to allow billed overage instead — then the " +
-    "numbers above are what you'd pay."
+    "Spend Cap is ON by default on Pro. Going past the " +
+    `${pricing.includedGb} GB egress quota with it on isn't billed: Supabase emails ` +
+    "your billing address, starts a grace period, then restricts your organization's " +
+    "projects if usage stays over (your app, not just the backup). Turn Spend Cap OFF " +
+    "to be billed for the overage instead, and the numbers above are what you'd pay."
   );
 }
 

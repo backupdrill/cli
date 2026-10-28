@@ -5,9 +5,10 @@ import { overageNote } from "../dist/estimate.js";
 // Supabase 只有 Pro 有 Spend Cap(默认开);Team 没有,超额直接计费。
 // 2.7.1 及以前 estimate --plan team 也说 "Spend Cap is ON by default on Pro/Team"。
 
-test("Pro: warns that the default Spend Cap blocks egress past the quota", () => {
+test("Pro: says the default Spend Cap means no overage bill but restrictions if usage stays over", () => {
   const note = overageNote({ planLabel: "Pro", includedGb: 250, pricePerGb: 0.09, hardCap: false, spendCap: true });
   assert.match(note, /^Spend Cap is ON by default on Pro\./);
+  assert.match(note, /grace period/);
   assert.doesNotMatch(note, /Team/);
 });
 

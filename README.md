@@ -136,7 +136,7 @@ A backup pulls data **out** of Supabase, which counts as **egress on your Supaba
 
 - Backup traffic (pg_dump + first-time file downloads) is **uncached egress: $0.09/GB** above your plan's included allowance.
 - Included uncached egress: **Free 5 GB · Pro 250 GB · Team 250 GB** per month.
-- **Spend Cap exists only on Pro, and it's ON by default.** If a backup pushes you past the quota, Supabase **throttles your whole project's egress** for the rest of the month and the backup fails — turn Spend Cap OFF to be billed the overage instead.
+- **Spend Cap exists only on Pro, and it's ON by default.** With it on, going past the quota isn't billed. Supabase emails your billing address and starts a grace period, and if usage stays over it **restricts your organization's projects** (your app, not just the backup) until the next billing cycle or until you turn Spend Cap OFF. Turn it OFF up front to be billed the overage instead.
 - **Team has no Spend Cap**, so egress past the included 250 GB is always billed at $0.09/GB.
 - **Free never bills overage.** Exceeding the included 5 GB/month starts Supabase's Fair Use process: a notification to your billing email, then a grace period, then egress restrictions if usage stays over (the restriction clears at the next billing cycle or when you upgrade). Sustained large backups are not viable on Free.
 
@@ -164,7 +164,7 @@ backupdrill estimate --plan pro   # measures your DB + Storage, prints the proje
 <prefix>/<project>.drills/<finished-at>-<passed|failed>-<tag>.json  # only with drill --record: one file per drill
 ```
 
-Versions up to 2.7.1 took an empty `BACKUPDRILL_PROJECT_NAME` (what an unset GitHub Actions secret becomes) as the project name, so those backups sit under `<prefix>//<timestamp>/`. Later versions treat it as unset and use `supabase`. To drill or restore one of the older snapshots, pass `--project-name ''`, as its RECOVERY.md already does.
+Versions up to 2.7.1 took an empty `BACKUPDRILL_PROJECT_NAME` (what an unset GitHub Actions secret becomes) as the project name, so those backups sit under `<prefix>//<timestamp>/`. Later versions treat it as unset and take the name from your config file, or use `supabase` if the file doesn't set one. To drill or restore one of the older snapshots, pass `--project-name ''`, as its RECOVERY.md already does.
 
 ## Restoring & drilling
 
