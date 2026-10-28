@@ -58,6 +58,14 @@ interface RawConfig {
   pingUrl?: string;
 }
 
+/** "a, b" → ["a", "b"]。只有逗号和空白时算没设:空列表会盖掉配置文件里的值。 */
+function listFromEnv(value: string | undefined): string[] | undefined {
+  const items = value?.split(",").map((s) => s.trim()).filter(Boolean);
+  return items?.length ? items : undefined;
+}
+
+// 环境变量的空串一律算没设:GitHub Actions 里没配的 secret 展开就是空串,
+// examples/scheduled-backup.yml 把每个可选项都这样传进来。
 function fromEnv(): RawConfig {
   const env = process.env;
   const storage: Partial<StorageConfig> = {};
@@ -81,17 +89,13 @@ function fromEnv(): RawConfig {
   if (env.BACKUPDRILL_SUPABASE_STORAGE_SECRET_ACCESS_KEY)
     supabaseStorage.secretAccessKey =
       env.BACKUPDRILL_SUPABASE_STORAGE_SECRET_ACCESS_KEY;
-  if (env.BACKUPDRILL_SUPABASE_STORAGE_BUCKETS)
-    supabaseStorage.buckets = env.BACKUPDRILL_SUPABASE_STORAGE_BUCKETS.split(",")
-      .map((s) => s.trim())
-      .filter(Boolean);
+  const buckets = listFromEnv(env.BACKUPDRILL_SUPABASE_STORAGE_BUCKETS);
+  if (buckets) supabaseStorage.buckets = buckets;
 
   return {
-    databaseUrl: env.BACKUPDRILL_DATABASE_URL || env.DATABASE_URL,
-    projectName: env.BACKUPDRILL_PROJECT_NAME,
-    schemas: env.BACKUPDRILL_SCHEMAS
-      ? env.BACKUPDRILL_SCHEMAS.split(",").map((s) => s.trim()).filter(Boolean)
-      : undefined,
+    databaseUrl: env.BACKUPDRILL_DATABASE_URL || env.DATABASE_URL || undefined,
+    projectName: env.BACKUPDRILL_PROJECT_NAME || undefined,
+    schemas: listFromEnv(env.BACKUPDRILL_SCHEMAS),
     storage,
     supabaseStorage,
   };
@@ -152,6 +156,8 @@ export async function loadConfig(opts: {
   const o = opts.overrides;
 
   const databaseUrl = o.databaseUrl ?? env.databaseUrl ?? file.databaseUrl;
+  // 显式传 --project-name '' 仍按空名处理:2.7.1 及以前,环境变量的空串会让快照落在
+  // <prefix>//<时间戳>/,那些快照里的 RECOVERY.md 写的就是 --project-name '',得能找回来
   const projectName =
     o.projectName ?? env.projectName ?? file.projectName ?? "supabase";
   const schemas =

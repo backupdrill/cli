@@ -37,11 +37,11 @@ import { TOOL_VERSION } from "./version.js";
 // Supabase egress 定价表(2026-07-10 核实,来源见 README「Egress & cost」)。
 // 备份流量 100% 未缓存,故用 uncached 单价 $0.09/GB;included 用 uncached 额度。
 // Free 永不计费:超额走 Fair Use 流程(通知 → 宽限期 → 限制),持续大备份不可行;
-// Pro/Team 由 Spend Cap 决定超额限流还是计费。
+// 只有 Pro 有 Spend Cap(默认开,超额被限,关掉才计费);Team 没有 Spend Cap,超额直接计费。
 const EGRESS_PRICING: Record<"free" | "pro" | "team", EgressPricing> = {
   free: { planLabel: "Free", includedGb: 5, pricePerGb: 0.09, hardCap: true },
-  pro: { planLabel: "Pro", includedGb: 250, pricePerGb: 0.09, hardCap: false },
-  team: { planLabel: "Team", includedGb: 250, pricePerGb: 0.09, hardCap: false },
+  pro: { planLabel: "Pro", includedGb: 250, pricePerGb: 0.09, hardCap: false, spendCap: true },
+  team: { planLabel: "Team", includedGb: 250, pricePerGb: 0.09, hardCap: false, spendCap: false },
 };
 
 // backup 和 drill 共用:按 Healthchecks.io 的约定报告开始、成功、失败

@@ -15,8 +15,11 @@ export interface EgressPricing {
   includedGb: number; // 该计划每月包含的 uncached egress 额度 GB
   planLabel: string;
   // Free = 永不计费:超额走 Fair Use 流程(通知 → 宽限期 → 限制),持续超额跑不通;
-  // Pro/Team 视 Spend Cap 而定。字段名沿用 hardCap,语义是"超额不可计费、只会被限"
+  // 付费计划看 spendCap。字段名沿用 hardCap,语义是"超额不可计费、只会被限"
   hardCap: boolean;
+  // Supabase 只有 Pro 有 Spend Cap(默认开,开着时超额会被限);Team 没有,超额直接计费
+  // (2026-10-29 核 Supabase 文档 Control your costs)。不填按有 Spend Cap 处理,与 2.7.1 及以前一致
+  spendCap?: boolean;
 }
 
 // 超出这个月度成本就该提醒用户"备份的 egress 账单快赶上订阅费了"
@@ -90,6 +93,23 @@ export function project(
   return { dbBytes, storageBytes, perRunGb, rows };
 }
 
+/** 付费计划超出 egress 额度时会怎样:Pro 看 Spend Cap(默认开,会被限),Team 没有 Spend Cap、直接计费 */
+export function overageNote(pricing: EgressPricing): string {
+  if (pricing.spendCap === false) {
+    return (
+      `${pricing.planLabel} has no Spend Cap: egress past the ${pricing.includedGb} GB ` +
+      `quota is billed at $${pricing.pricePerGb}/GB, so the numbers above are what you'd pay.`
+    );
+  }
+  return (
+    "Spend Cap is ON by default on Pro. If a backup pushes you past the " +
+    `${pricing.includedGb} GB egress quota, Supabase throttles your project's ` +
+    "egress for the rest of the month (your app's traffic too), and the backup " +
+    "fails. Turn Spend Cap OFF to allow billed overage instead — then the " +
+    "numbers above are what you'd pay."
+  );
+}
+
 export async function runEstimate(
   config: BackupConfig,
   pricing: EgressPricing
@@ -152,14 +172,7 @@ export async function runEstimate(
       );
     }
   } else {
-    // Pro/Team:Spend Cap 决定是"限流"还是"账单"
-    log.warn(
-      "Spend Cap is ON by default on Pro/Team. If a backup pushes you past the " +
-        `${pricing.includedGb} GB egress quota, Supabase throttles your project's ` +
-        "egress for the rest of the month (your app's traffic too), and the backup " +
-        "fails. Turn Spend Cap OFF to allow billed overage instead — then the " +
-        "numbers above are what you'd pay."
-    );
+    log.warn(overageNote(pricing));
     const worst = daily?.monthlyCost ?? 0;
     if (worst >= SUBSCRIPTION_FLOOR_USD) {
       log.warn(

@@ -141,3 +141,124 @@ test("missing required config still errors with a helpful message", async () => 
     /Missing required config/
   );
 });
+
+// GitHub Actions 里没配的 secret 展开成空串。examples/scheduled-backup.yml 把
+// BACKUPDRILL_PROJECT_NAME 等可选项都这样传,2.7.1 及以前空串被当成真名,快照落进
+// backupdrill//<时间戳>/。这组测试锁死:环境变量的空串 = 没设。
+function requiredEnv() {
+  process.env.BACKUPDRILL_DATABASE_URL = "postgresql://env-db";
+  process.env.BACKUPDRILL_S3_BUCKET = "env-bucket";
+  process.env.BACKUPDRILL_S3_ACCESS_KEY_ID = "env-key";
+  process.env.BACKUPDRILL_S3_SECRET_ACCESS_KEY = "env-secret";
+}
+
+test("an empty BACKUPDRILL_PROJECT_NAME falls back to the default name, so keys never get an empty segment", async () => {
+  requiredEnv();
+  process.env.BACKUPDRILL_PROJECT_NAME = "";
+
+  const config = await loadConfig({ configPath: join(dir, "missing.json"), overrides: cliOverrides() });
+
+  assert.equal(config.projectName, "supabase");
+  const { s3SnapshotStore } = await import("../dist/snapshot-store.js");
+  const writer = await s3SnapshotStore(config).createSnapshot("2026-10-29T03-00-00Z");
+  assert.equal(writer.dumpKey, "backupdrill/supabase/2026-10-29T03-00-00Z/dump.pgcustom");
+});
+
+test("an empty BACKUPDRILL_PROJECT_NAME doesn't hide the config file's name", async () => {
+  requiredEnv();
+  process.env.BACKUPDRILL_PROJECT_NAME = "";
+  const path = join(dir, "backupdrill.config.json");
+  writeFileSync(path, JSON.stringify({ projectName: "from-file" }));
+
+  const config = await loadConfig({ configPath: path, overrides: cliOverrides() });
+
+  assert.equal(config.projectName, "from-file");
+});
+
+test("--project-name '' still reaches snapshots an older version wrote under <prefix>//", async () => {
+  // 那些快照的 RECOVERY.md 里写的恢复命令就是 --project-name '',显式的空名必须原样保留
+  requiredEnv();
+  const config = await loadConfig({
+    configPath: join(dir, "missing.json"),
+    overrides: cliOverrides({ projectName: "" }),
+  });
+
+  assert.equal(config.projectName, "");
+  const { renderRecoveryDoc } = await import("../dist/recovery-doc.js");
+  const doc = renderRecoveryDoc(
+    {
+      projectName: "",
+      database: { serverVersion: "17.6", pgDumpVersion: "pg_dump (PostgreSQL) 17.6", schemas: ["public"], tableCount: 1, estimatedRowTotal: 1, tables: [] },
+      dump: { key: "backupdrill//2026-10-01T03-00-00Z/dump.pgcustom", format: "custom", bytes: 1, sha256: "abc" },
+    },
+    { snapshot: "2026-10-01T03-00-00Z", bucket: "b", prefix: "backupdrill", projectName: "" }
+  );
+  assert.ok(doc.includes("--project-name '' \\"), "old runbooks carry --project-name ''");
+});
+
+test("empty DATABASE_URL variables don't hide the config file's databaseUrl", async () => {
+  process.env.BACKUPDRILL_DATABASE_URL = "";
+  process.env.DATABASE_URL = "";
+  process.env.BACKUPDRILL_S3_BUCKET = "env-bucket";
+  process.env.BACKUPDRILL_S3_ACCESS_KEY_ID = "env-key";
+  process.env.BACKUPDRILL_S3_SECRET_ACCESS_KEY = "env-secret";
+  const path = join(dir, "backupdrill.config.json");
+  writeFileSync(path, JSON.stringify({ databaseUrl: "postgresql://file-db" }));
+
+  const config = await loadConfig({ configPath: path, overrides: cliOverrides() });
+
+  assert.equal(config.databaseUrl, "postgresql://file-db");
+});
+
+test("list variables with only commas and spaces don't replace the config file's lists", async () => {
+  requiredEnv();
+  process.env.BACKUPDRILL_SCHEMAS = " , ";
+  process.env.BACKUPDRILL_SUPABASE_STORAGE_BUCKETS = ",";
+  const path = join(dir, "backupdrill.config.json");
+  writeFileSync(
+    path,
+    JSON.stringify({
+      schemas: ["public", "app"],
+      supabaseStorage: {
+        endpoint: "https://ref.storage.supabase.co/storage/v1/s3",
+        accessKeyId: "src-key",
+        secretAccessKey: "src-secret",
+        buckets: ["avatars"],
+      },
+    })
+  );
+
+  const config = await loadConfig({ configPath: path, overrides: cliOverrides() });
+
+  assert.deepEqual(config.schemas, ["public", "app"]);
+  assert.deepEqual(config.supabaseStorage.buckets, ["avatars"]);
+});
+
+test("empty optional variables from an unset secret leave every default in place", async () => {
+  requiredEnv();
+  for (const key of [
+    "BACKUPDRILL_PROJECT_NAME",
+    "BACKUPDRILL_SCHEMAS",
+    "BACKUPDRILL_S3_ENDPOINT",
+    "BACKUPDRILL_S3_REGION",
+    "BACKUPDRILL_S3_PREFIX",
+    "BACKUPDRILL_S3_FORCE_PATH_STYLE",
+    "BACKUPDRILL_SUPABASE_STORAGE_ENDPOINT",
+    "BACKUPDRILL_SUPABASE_STORAGE_REGION",
+    "BACKUPDRILL_SUPABASE_STORAGE_ACCESS_KEY_ID",
+    "BACKUPDRILL_SUPABASE_STORAGE_SECRET_ACCESS_KEY",
+    "BACKUPDRILL_SUPABASE_STORAGE_BUCKETS",
+  ]) {
+    process.env[key] = "";
+  }
+
+  const config = await loadConfig({ configPath: join(dir, "missing.json"), overrides: cliOverrides() });
+
+  assert.equal(config.projectName, "supabase");
+  assert.deepEqual(config.schemas, ["public"]);
+  assert.equal(config.storage.endpoint, undefined);
+  assert.equal(config.storage.region, "auto");
+  assert.equal(config.storage.prefix, "backupdrill");
+  assert.equal(config.storage.forcePathStyle, false);
+  assert.equal(config.supabaseStorage, undefined);
+});
