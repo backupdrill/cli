@@ -265,14 +265,45 @@ every process on the machine):
 
 ## GitHub Action / scheduled backups
 
-Want this running on a schedule without paying for a server? Run it in GitHub Actions.
+Want this running on a schedule without paying for a server? Use the [Supabase Backup with BackupDrill](https://github.com/backupdrill/supabase-backup-action) action. It installs `pg_dump` 17 from the PostgreSQL apt repo (PGDG), runs `backupdrill backup` with the newest 2.x release of this CLI, and with `drill: "true"` restores the new snapshot into a throwaway Postgres on the runner and checks it.
 
-1. Copy [`examples/scheduled-backup.yml`](examples/scheduled-backup.yml) into **your own** repo at `.github/workflows/scheduled-backup.yml`. (It lives under `examples/` here so GitHub doesn't try to run it in this repo — it's a template.) It runs daily and can also be triggered by hand from the Actions tab. The workflow installs `postgresql-client-17` from the PGDG apt repo (so `pg_dump`'s major version matches Supabase) and points the CLI at it via `BACKUPDRILL_PG_DUMP`.
-2. Add these repo secrets (Settings → Secrets and variables → Actions):
-   - **Required:** `BACKUPDRILL_DATABASE_URL`, `BACKUPDRILL_S3_BUCKET`, `BACKUPDRILL_S3_ACCESS_KEY_ID`, `BACKUPDRILL_S3_SECRET_ACCESS_KEY`
-   - **Optional (destination):** `BACKUPDRILL_S3_ENDPOINT` (for R2/B2), `BACKUPDRILL_S3_REGION`, `BACKUPDRILL_PROJECT_NAME`
-   - **Optional (alerts):** `BACKUPDRILL_PING_URL` — see [Alerts with Healthchecks.io](#alerts-with-healthchecksio)
-   - **Optional (Storage files):** set all four of `BACKUPDRILL_SUPABASE_STORAGE_ENDPOINT`, `BACKUPDRILL_SUPABASE_STORAGE_REGION`, `BACKUPDRILL_SUPABASE_STORAGE_ACCESS_KEY_ID`, `BACKUPDRILL_SUPABASE_STORAGE_SECRET_ACCESS_KEY` to also back up Storage files; leave them unset to back up the database only.
+```yaml
+# .github/workflows/supabase-backup.yml in your own (private) repo
+name: supabase-backup
+on:
+  schedule:
+    - cron: "0 3 * * 0" # weekly; read the egress section above before going daily
+  workflow_dispatch: {}
+permissions:
+  contents: read
+concurrency:
+  group: supabase-backup
+  cancel-in-progress: false
+jobs:
+  backup:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: backupdrill/supabase-backup-action@v1
+        with:
+          database-url: ${{ secrets.BACKUPDRILL_DATABASE_URL }}
+          s3-bucket: ${{ secrets.BACKUPDRILL_S3_BUCKET }}
+          s3-access-key-id: ${{ secrets.BACKUPDRILL_S3_ACCESS_KEY_ID }}
+          s3-secret-access-key: ${{ secrets.BACKUPDRILL_S3_SECRET_ACCESS_KEY }}
+          s3-endpoint: ${{ secrets.BACKUPDRILL_S3_ENDPOINT }}
+          s3-region: ${{ secrets.BACKUPDRILL_S3_REGION }}
+          drill: "true"
+```
+
+Add the secrets under Settings → Secrets and variables → Actions:
+
+- **Required:** `BACKUPDRILL_DATABASE_URL`, `BACKUPDRILL_S3_BUCKET`, `BACKUPDRILL_S3_ACCESS_KEY_ID`, `BACKUPDRILL_S3_SECRET_ACCESS_KEY`
+- **Optional (destination):** `BACKUPDRILL_S3_ENDPOINT` (for R2/B2) and `BACKUPDRILL_S3_REGION` (AWS S3 needs the bucket's region; R2 works with the default `auto`). A readable project name goes in the `project-name` input.
+- **Optional (alerts):** `BACKUPDRILL_PING_URL`, passed as `ping-url`. See [Alerts with Healthchecks.io](#alerts-with-healthchecksio).
+- **Optional (Storage files):** the four `BACKUPDRILL_SUPABASE_STORAGE_*` values, passed as the `supabase-storage-endpoint`, `-region`, `-access-key-id` and `-secret-access-key` inputs. Leave them out to back up the database only.
+
+The action's README lists every input and output.
+
+Prefer a plain workflow file? [`examples/scheduled-backup.yml`](examples/scheduled-backup.yml) runs the backup without the action and without a drill. Copy it into your own repo at `.github/workflows/scheduled-backup.yml` and add the same secrets. (It lives under `examples/` here so GitHub doesn't try to run it in this repo.) It runs daily and can also be started by hand from the Actions tab.
 
 Before switching to a **daily** schedule, read the egress-cost section above — every run is egress on your Supabase bill.
 
