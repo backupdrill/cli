@@ -101,7 +101,7 @@ export function refFromStorageEndpoint(endpoint: string): string | null {
 export interface ClassifiedPass {
   /** allowlist 命中数(环境预期/托管冲突)——如实入报告,不算失败 */
   expectedSkips: number;
-  /** 真失败(压缩到 200 字符的错误块) */
+  /** 真失败(压缩空白、按 FAILURE_DETAIL_MAX_CHARS 截断的错误块) */
   failures: string[];
 }
 
@@ -290,6 +290,13 @@ const NEVER_MATCH = /(?!)/;
  * 抽出 `ERROR:` 之后的那段作为主消息,allowlist 对它**整条**匹配(两端锚定,见上);
  * 没有 `ERROR:` 前缀的块(归档器致命错等)整行当主消息,锚定的 allowlist 不会认它 → 失败。
  */
+/**
+ * 单条失败写进报告时的长度上限。要装得下 ERROR 行 + DETAIL 行:外键校验失败时,被引用的父表名和
+ * 完整的键只在 DETAIL 里,原先 200 字符会把它们截掉(2026-10-30 一次外键失败的报告只剩半个 UUID)。
+ * 末尾的 "Command was:" 语句最先被截,无妨。
+ */
+const FAILURE_DETAIL_MAX_CHARS = 500;
+
 export function classifyBlocks(stderr: string, allow: RegExp): ClassifiedPass {
   const blocks = stderr
     .split(/(?=pg_restore: error:)/)
@@ -302,7 +309,7 @@ export function classifyBlocks(stderr: string, allow: RegExp): ClassifiedPass {
     if (allow.test(message)) {
       expectedSkips += 1;
     } else {
-      failures.push(block.replace(/\s+/g, " ").trim().slice(0, 200));
+      failures.push(block.replace(/\s+/g, " ").trim().slice(0, FAILURE_DETAIL_MAX_CHARS));
     }
   }
   return { expectedSkips, failures };
