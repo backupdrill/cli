@@ -114,6 +114,21 @@ test("classifyBlocks 只看 ERROR 行:DETAIL/CONTEXT/LINE 里的文字不参与�
   assert.equal(m.failures.length, 0);
 });
 
+// 外键校验失败的父表名和完整键只在 DETAIL 里,报告必须带上它们
+test("classifyBlocks 的失败文字保留完整的 DETAIL 行", () => {
+  const fkViolation =
+    'pg_restore: error: could not execute query: ERROR:  insert or update on table "order_items" violates foreign key constraint "order_items_order_id_fkey"\n' +
+    'DETAIL:  Key (order_id)=(0b9e3c1a-7f42-4d8e-a1c5-3e6f9d2b8a40) is not present in table "orders".\n' +
+    'Command was: ALTER TABLE ONLY public.order_items\n' +
+    '    ADD CONSTRAINT order_items_order_id_fkey FOREIGN KEY (order_id) REFERENCES public.orders(id) ON DELETE CASCADE;\n';
+  const r = classifyBlocks(fkViolation, SANDBOX_MANAGED_ERROR);
+  assert.equal(r.failures.length, 1);
+  assert.match(r.failures[0], /Key \(order_id\)=\(0b9e3c1a-7f42-4d8e-a1c5-3e6f9d2b8a40\) is not present in table "orders"\./);
+  // 上限仍在:超长语句不会把整段 stderr 塞进报告
+  const huge = classifyBlocks(fkViolation.replace("ON DELETE CASCADE", "x".repeat(5000)), SANDBOX_MANAGED_ERROR);
+  assert.ok(huge.failures[0].length <= 500);
+});
+
 // 第四轮(交叉审查,PG17 复现):主消息本身也能内嵌行值 —— 表达式索引 (col::uuid) 撞上
 // 内容恰好是一条诊断文字的行。allowlist 两端锚定后,子串永远匹配不上整条主消息。
 test("allowlist 两端锚定:主消息内嵌的行值不算缺对象诊断", () => {
