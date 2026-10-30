@@ -7,9 +7,10 @@
 // 与源库的实际状态一致,数据一行不丢。真实恢复因此成功并在报告里列出这些外键;演练仍判失败,
 // 因为这是用户该清理的数据问题(创始人决策 2026-10-31,起因是 2026-10-30 一个 Team 项目的演练)。
 //
-// 只处理两端都在本次备份里的外键:指向备份之外(如 auth.users)的外键另有预检
-// (external-refs.ts)和沙箱托管豁免,行为不变。分区父表上的外键也不处理,PostgreSQL 不允许
-// 给分区表加 NOT VALID 外键。
+// 只处理两端的数据都在本次快照里的外键(归档里有两张表的 TABLE DATA 条目):孤儿行这时只能来自源库。
+// 指向备份之外(如 auth.users)或扩展自带的表(数据不在 dump 里,恢复后是目标上扩展装出来的那份)的外键
+// 照旧严格校验,另有预检(external-refs.ts)和沙箱托管豁免。分区父表上的外键也不处理,PostgreSQL
+// 不允许给分区表加 NOT VALID 外键。
 import type { Client } from "pg";
 import { formatQualified, type ForeignKeyDef } from "./dump-sql.js";
 import { quoteIdent } from "./restore-engine.js";
@@ -23,13 +24,26 @@ export interface OrphanedForeignKey {
   orphanRows: number | null;
 }
 
-/** 能交给 addForeignKeys 处理的外键:两端都在备份里、会校验已有行、不在分区父表上。 */
-export function isDeferrableForeignKey(fk: ForeignKeyDef, dumpedSchemas: string[]): boolean {
+/**
+ * 归档目录里 TABLE DATA 条目对应的表:`<id>; 0 <oid> TABLE DATA <schema> <名> <属主>`。
+ * 名字可以带空格、不加引号,所以去掉末尾的属主后整串比对,不拆分。
+ */
+export function tablesWithData(listing: string): Set<string> {
+  const tables = new Set<string>();
+  for (const line of listing.split("\n")) {
+    const match = /^\d+; \d+ \d+ TABLE DATA (.*)$/.exec(line);
+    if (match) tables.add(match[1].slice(0, match[1].lastIndexOf(" ")));
+  }
+  return tables;
+}
+
+/** 能交给 addForeignKeys 处理的外键:两端的数据都在快照里、会校验已有行、不在分区父表上。 */
+export function isDeferrableForeignKey(fk: ForeignKeyDef, withData: Set<string>): boolean {
   return (
     fk.validatesRows &&
     !fk.onPartitionedTable &&
-    dumpedSchemas.includes(fk.table.schema) &&
-    dumpedSchemas.includes(fk.references.schema)
+    withData.has(`${fk.table.schema} ${fk.table.name}`) &&
+    withData.has(`${fk.references.schema} ${fk.references.name}`)
   );
 }
 

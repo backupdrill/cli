@@ -850,12 +850,7 @@ export async function runRestore(
       }
 
       log.step("Restoring database into target…");
-      const engine = await restoreDatabaseArtifact({
-        dumpPath,
-        connString: targetUrl,
-        target: "supabase",
-        dumpedSchemas: manifest.database.schemas,
-      });
+      const engine = await restoreDatabaseArtifact({ dumpPath, connString: targetUrl, target: "supabase" });
       if (!engine.ok) {
         const failures = [...engine.preData.failures, ...engine.postData.failures];
         throw new Error(

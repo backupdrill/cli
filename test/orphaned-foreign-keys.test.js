@@ -10,8 +10,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import pg from "pg";
 import { parseForeignKeys } from "../dist/dump-sql.js";
-import { isDeferrableForeignKey, notValidStatement, orphanCountSql } from "../dist/orphaned-foreign-keys.js";
+import { isDeferrableForeignKey, notValidStatement, orphanCountSql, tablesWithData } from "../dist/orphaned-foreign-keys.js";
 import { drillDump } from "../dist/drill.js";
+import { withoutRestrictWrapper } from "../dist/restore-engine.js";
 import { runRestore } from "../dist/restore.js";
 
 const x = promisify(execFile);
@@ -38,15 +39,60 @@ test("notValidStatement:NOT VALID 加在选项之后、分号之前", () => {
   );
 });
 
-test("isDeferrableForeignKey:只挪两端都在备份里、会校验已有行、不在分区父表上的外键", () => {
+test("tablesWithData:TABLE DATA 条目里的表名可以带空格,去掉末尾属主后整串比对", () => {
+  const listing = [
+    "; Archive created at 2026-10-31",
+    "3401; 0 16390 TABLE DATA public orders postgres",
+    "3402; 0 16400 TABLE DATA public Child Table postgres",
+    "3403; 1259 16410 TABLE public ext_items postgres",
+  ].join("\n");
+  assert.deepEqual([...tablesWithData(listing)], ["public orders", "public Child Table"]);
+});
+
+test("isDeferrableForeignKey:只挪两端数据都在快照里、会校验已有行、不在分区父表上的外键", () => {
+  const withData = new Set(["public a", "public b"]);
   const inside = fk("ALTER TABLE ONLY public.a\n    ADD CONSTRAINT a_fk FOREIGN KEY (x) REFERENCES public.b(id);");
-  assert.equal(isDeferrableForeignKey(inside, ["public"]), true);
+  assert.equal(isDeferrableForeignKey(inside, withData), true);
   const toAuth = fk("ALTER TABLE ONLY public.a\n    ADD CONSTRAINT a_fk FOREIGN KEY (x) REFERENCES auth.users(id);");
-  assert.equal(isDeferrableForeignKey(toAuth, ["public"]), false, "keys into auth.users keep the preflight path");
+  assert.equal(isDeferrableForeignKey(toAuth, withData), false, "keys into auth.users keep the preflight path");
+  // 扩展自带的表在 public 里,但数据不在 dump 里:恢复后是目标上的那份,缺行不能算源库的错
+  const toExtension = fk("ALTER TABLE ONLY public.a\n    ADD CONSTRAINT a_fk FOREIGN KEY (x) REFERENCES public.ext_items(id);");
+  assert.equal(isDeferrableForeignKey(toExtension, withData), false);
   const notValid = fk("ALTER TABLE ONLY public.a\n    ADD CONSTRAINT a_fk FOREIGN KEY (x) REFERENCES public.b(id) NOT VALID;");
-  assert.equal(isDeferrableForeignKey(notValid, ["public"]), false);
+  assert.equal(isDeferrableForeignKey(notValid, withData), false);
   const partitioned = fk("ALTER TABLE public.a\n    ADD CONSTRAINT a_fk FOREIGN KEY (x) REFERENCES public.b(id);");
-  assert.equal(isDeferrableForeignKey(partitioned, ["public"]), false, "PostgreSQL has no NOT VALID foreign key on a partitioned table");
+  assert.equal(isDeferrableForeignKey(partitioned, withData), false, "PostgreSQL has no NOT VALID foreign key on a partitioned table");
+});
+
+test("withoutRestrictWrapper:只去掉脚本首尾那一对元命令,字符串里同样字样的行保留", () => {
+  const script = [
+    "--",
+    "-- PostgreSQL database dump",
+    "--",
+    "\\restrict abc123",
+    "SET statement_timeout = 0;",
+    "COMMENT ON CONSTRAINT f ON public.t IS 'line one",
+    "\\restrict inside the comment",
+    "\\unrestrict inside too';",
+    "\\unrestrict abc123",
+    "",
+  ].join("\n");
+  assert.equal(
+    withoutRestrictWrapper(script),
+    [
+      "--",
+      "-- PostgreSQL database dump",
+      "--",
+      "SET statement_timeout = 0;",
+      "COMMENT ON CONSTRAINT f ON public.t IS 'line one",
+      "\\restrict inside the comment",
+      "\\unrestrict inside too';",
+      "",
+    ].join("\n")
+  );
+  // 旧版 pg_restore 没有包装行:一行都不动
+  const old = "SET x = 1;\nCOMMENT ON CONSTRAINT f ON public.t IS 'a\n\\restrict b';\n";
+  assert.equal(withoutRestrictWrapper(old), old);
 });
 
 const intEq = { schema: "pg_catalog", name: "=", left: "integer", right: "integer" };
@@ -149,7 +195,7 @@ test(
          create table public."Child Table" (id int primary key, order_id int,
            constraint "Child FK" foreign key (order_id) references public.orders(id));
          insert into public."Child Table" values (1, 1), (2, 2);
-         comment on constraint "Child FK" on public."Child Table" is 'quoted names';
+         comment on constraint "Child FK" on public."Child Table" is E'quoted names\\n\\\\restrict this line stays';
          set session_replication_role = replica;
          delete from public.orders where id in (2, 3);
          insert into public.swatches values (3, 'blue');
@@ -247,7 +293,7 @@ test(
           "where contype = 'f' and (conname like 'order_items_%' or conname = 'Child FK') order by 1"
       );
       assert.deepEqual(comments.rows, [
-        { conname: "Child FK", comment: "quoted names" },
+        { conname: "Child FK", comment: "quoted names\n\\restrict this line stays" },
         { conname: "order_items_order_id_fkey", comment: "every item belongs to an order" },
         { conname: "order_items_product_id_fkey", comment: "catalog link" },
       ]);
@@ -255,6 +301,86 @@ test(
       assert.equal(rows.rows[0].n, 20, "every row, orphans included, is back");
       // NOT VALID 照样拦新写入
       await assert.rejects(sql(targetUrl, "insert into public.order_items values (100, 99, 1)"), /violates foreign key constraint/);
+    } finally {
+      for (const id of ids) await x("docker", ["rm", "-fv", id]).catch(() => {});
+      rmSync(work, { recursive: true, force: true });
+    }
+  }
+);
+
+// 交叉审查复现:扩展自带的表在 public 里,数据却不在 dump 里(恢复后是目标上扩展装出来的那份)。
+// 缺行是目标的事,不能被放宽成 NOT VALID 再算到源库头上——这条外键必须照旧严格校验
+test(
+  "a foreign key into an extension's own table stays strict: missing rows on the target fail the restore",
+  { skip: canRun ? false : "requires Docker + pg_dump", timeout: 300_000 },
+  async () => {
+    const ids = [];
+    const work = mkdtempSync(join(tmpdir(), "bd-ext-fk-"));
+    try {
+      const [sourcePort, targetPort] = await Promise.all([startPostgres(ids), startPostgres(ids)]);
+      const sourceUrl = `postgresql://postgres:pw@127.0.0.1:${sourcePort}/postgres`;
+      const targetUrl = `postgresql://postgres:pw@localhost:${targetPort}/postgres`;
+      for (const port of [sourcePort, targetPort]) {
+        const id = (await x("docker", ["ps", "-q", "--filter", `publish=${port}`])).stdout.trim();
+        await x("docker", ["exec", "-u", "root", id, "sh", "-c",
+          "d=$(pg_config --sharedir)/extension; " +
+          "printf \"default_version = '1.0'\\nrelocatable = false\\n\" > $d/bdtest_items.control; " +
+          "printf \"create table ext_items (id int primary key);\\ninsert into ext_items values (1), (2);\\n\" > $d/bdtest_items--1.0.sql"]);
+      }
+      await sql(
+        sourceUrl,
+        `create extension bdtest_items schema public;
+         insert into public.ext_items values (3);
+         create table public.refs (id int primary key, item_id int references public.ext_items(id));
+         insert into public.refs values (1, 3);`
+      );
+      const dumpPath = join(work, "source.pgcustom");
+      await x(pgDump, ["--format=custom", "--no-owner", "--no-privileges", "--schema=public", "--dbname", sourceUrl, "-f", dumpPath]);
+      const buf = readFileSync(dumpPath);
+      const manifest = {
+        schemaVersion: 2,
+        tool: "backupdrill-cli",
+        toolVersion: "test",
+        createdAt: "2026-10-31T00:00:00.000Z",
+        projectName: "ext",
+        database: {
+          serverVersion: "17.6",
+          pgDumpVersion: (await x(pgDump, ["--version"])).stdout.trim(),
+          schemas: ["public"],
+          tableCount: 1,
+          estimatedRowTotal: 1,
+          tables: [{ schema: "public", name: "refs", estimatedRows: 1 }],
+          extensions: [{ name: "bdtest_items", version: "1.0", schema: "public" }],
+        },
+        dump: { key: "backupdrill/ext/snap/dump.pgcustom", format: "custom", bytes: buf.length, sha256: createHash("sha256").update(buf).digest("hex") },
+        storage: null,
+      };
+      const store = {
+        createSnapshot: async () => {
+          throw new Error("read-only test store");
+        },
+        openSnapshot: async () => ({
+          name: "snap",
+          readManifest: async () => JSON.stringify(manifest),
+          downloadDump: async (_m, dest) => {
+            copyFileSync(dumpPath, dest);
+            return { bytes: buf.length, sha256: manifest.dump.sha256 };
+          },
+          storageFiles: () => null,
+        }),
+      };
+      const config = { databaseUrl: sourceUrl, projectName: "ext", schemas: ["public"], storage: { bucket: "unused" } };
+      await assert.rejects(
+        runRestore(config, { store, targetDatabaseUrl: targetUrl, confirmTarget: "localhost" }),
+        (error) => {
+          assert.doesNotMatch(error.message, /NOT VALID/);
+          return true;
+        }
+      );
+      const leftover = await sql(targetUrl, "select count(*)::int as n from pg_constraint where conname = 'refs_item_id_fkey'");
+      assert.equal(leftover.rows[0].n, 0, "the key was not relaxed to NOT VALID");
+      const refs = await sql(targetUrl, "select to_regclass('public.refs') is null as gone");
+      assert.equal(refs.rows[0].gone, true, "nothing from the snapshot stays on the target");
     } finally {
       for (const id of ids) await x("docker", ["rm", "-fv", id]).catch(() => {});
       rmSync(work, { recursive: true, force: true });

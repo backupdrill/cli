@@ -25,6 +25,7 @@ import {
   addForeignKeys,
   describeOrphanedForeignKey,
   isDeferrableForeignKey,
+  tablesWithData,
   type OrphanedForeignKey,
 } from "./orphaned-foreign-keys.js";
 import { resolvePgRestoreBin } from "./pgbin.js";
@@ -144,12 +145,15 @@ async function deferredForeignKeys(
   bin: string,
   dumpPath: string,
   entries: string[],
-  dumpedSchemas: string[],
   listDir: string
 ): Promise<{ lines: Set<string>; fks: ForeignKeyDef[]; commentSql?: string }> {
   const none = { lines: new Set<string>(), fks: [] };
   const fkEntries = entries.filter((line) => /^\d+; \d+ \d+ FK CONSTRAINT /.test(line));
   if (!fkEntries.length) return none;
+  // 沙箱那边传进来的只有 post-data 条目,数据条目要看完整目录
+  const fullListing = await pgRestoreOutput(bin, ["--list", dumpPath]);
+  if (fullListing.code !== 0) return none;
+  const withData = tablesWithData(fullListing.stdout);
   const listFile = join(listDir, "foreign-keys.list");
   await writeFile(listFile, fkEntries.join("\n") + "\n");
   const ddl = await pgRestoreOutput(bin, ["-f", "-", `--use-list=${listFile}`, dumpPath]);
@@ -159,7 +163,7 @@ async function deferredForeignKeys(
   const lines = new Set<string>();
   const fks: ForeignKeyDef[] = [];
   parsed.forEach((fk, i) => {
-    if (!isDeferrableForeignKey(fk, dumpedSchemas)) return;
+    if (!isDeferrableForeignKey(fk, withData)) return;
     lines.add(fkEntries[i]);
     fks.push(fk);
   });
@@ -182,13 +186,23 @@ async function deferredForeignKeys(
   const comments = await pgRestoreOutput(bin, ["-f", "-", `--use-list=${commentList}`, dumpPath]);
   if (comments.code !== 0) return none;
   for (const line of commentLines) lines.add(line);
-  // 新版 pg_restore 的脚本带 psql 元命令(\restrict / \unrestrict),交给 node-pg 执行前去掉。
-  // 只认这两条:注释正文是字符串,里面换行后以反斜杠开头的行要原样保留
-  const commentSql = comments.stdout
-    .split("\n")
-    .filter((line) => !/^\\(?:un)?restrict\b/.test(line))
-    .join("\n");
-  return { lines, fks, commentSql };
+  return { lines, fks, commentSql: withoutRestrictWrapper(comments.stdout) };
+}
+
+/**
+ * 新版 pg_restore 的脚本首尾各有一条 psql 元命令(\restrict <key> / \unrestrict <key>),node-pg 执行不了。
+ * 只认位置:开头那条是第一行非空、非 -- 注释的行,结尾那条是最后一行非空行。注释正文是字符串,
+ * 里面换行后恰好以 \restrict 开头的行要原样保留(交叉审查)。
+ */
+export function withoutRestrictWrapper(script: string): string {
+  const lines = script.split("\n");
+  const opening = lines.findIndex((line) => line.trim() !== "" && !line.startsWith("--"));
+  let closing = lines.length - 1;
+  while (closing >= 0 && lines[closing].trim() === "") closing -= 1;
+  const drop = new Set<number>();
+  if (opening >= 0 && /^\\restrict \S+$/.test(lines[opening])) drop.add(opening);
+  if (closing > opening && /^\\unrestrict \S+$/.test(lines[closing])) drop.add(closing);
+  return lines.filter((_, i) => !drop.has(i)).join("\n");
 }
 
 /**
@@ -818,8 +832,7 @@ async function restoreInOneTransaction(
   connString: string,
   common: string[],
   env: NodeJS.ProcessEnv,
-  childOpts: { supabaseHost: boolean; urlSslMode?: string | null },
-  dumpedSchemas: string[]
+  childOpts: { supabaseHost: boolean; urlSslMode?: string | null }
 ): Promise<{ pass: ClassifiedPass; orphaned?: OrphanedForeignKey[]; committed?: boolean }> {
   const fail = (failure: string) => ({ pass: { expectedSkips: 0, failures: [failure] } });
   const listing = await pgRestoreOutput(bin, ["--list", dumpPath]);
@@ -855,7 +868,7 @@ async function restoreInOneTransaction(
         await client.end();
       }
     }
-    const deferred = await deferredForeignKeys(bin, dumpPath, entries, dumpedSchemas, listDir);
+    const deferred = await deferredForeignKeys(bin, dumpPath, entries, listDir);
     const listFile = join(listDir, "restore.list");
     await writeFile(
       listFile,
@@ -947,8 +960,7 @@ export async function restoreDatabaseArtifact(opts: {
       opts.connString,
       common,
       env,
-      childOpts,
-      opts.dumpedSchemas ?? []
+      childOpts
     );
     return {
       preData: pass,
@@ -991,7 +1003,7 @@ export async function restoreDatabaseArtifact(opts: {
   try {
     const postEntries = listing.stdout.split("\n").filter((line) => /^\d+;/.test(line));
     // 两端都在备份里的外键不交给 pg_restore,最后由 addForeignKeys 加:与真实恢复同一套判定
-    const deferred = await deferredForeignKeys(bin, opts.dumpPath, postEntries, opts.dumpedSchemas ?? [], listDir);
+    const deferred = await deferredForeignKeys(bin, opts.dumpPath, postEntries, listDir);
     const passes: ClassifiedPass[] = [];
     if (!parallel) {
       const args = ["--section=post-data", ...common];
