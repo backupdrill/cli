@@ -38,18 +38,48 @@ export function notValidStatement(statement: string): string {
   return statement.replace(/;\s*$/, " NOT VALID;");
 }
 
-/** 数违反外键的行。MATCH SIMPLE 只查引用列全非空的行;MATCH FULL 另算"部分为空"的行。 */
-export function orphanCountSql(fk: ForeignKeyDef): string {
+/**
+ * 外键自己比较时用的运算符(pg_constraint.conpfeqop,逐列 PK = FK)和被引用表是不是分区表。
+ * 从刚建好的约束上读:裸 = 的语义可能不同(citext 列上外键按不区分大小写比),继承子表也不该算进来。
+ */
+export interface ComparisonPlan {
+  operators: Array<{ schema: string; name: string; left: string; right: string }>;
+  referencedPartitioned: boolean;
+}
+
+export const COMPARISON_PLAN_SQL = `
+  select n.nspname as schema, o.oprname as name,
+         format_type(o.oprleft, null) as left, format_type(o.oprright, null) as right,
+         (select relkind = 'p' from pg_class where oid = c.confrelid) as referenced_partitioned
+    from pg_constraint c
+    cross join lateral unnest(c.conpfeqop) with ordinality as u(op, i)
+    join pg_operator o on o.oid = u.op
+    join pg_namespace n on n.oid = o.oprnamespace
+   where c.conname = $1 and c.conrelid = $2::regclass
+   order by u.i`;
+
+/**
+ * 数违反外键的行,与 PostgreSQL 校验外键(RI_Initial_Check)同一个口径:引用方 ONLY(外键不管继承子表),
+ * 被引用方普通表 ONLY、分区表带上分区;比较用约束记录的运算符和类型。
+ * MATCH SIMPLE 只查引用列全非空的行;MATCH FULL 另算"部分为空"的行。
+ */
+export function orphanCountSql(fk: ForeignKeyDef, plan: ComparisonPlan): string {
   const child = (column: string) => `c.${quoteIdent(column)}`;
   const allSet = fk.columns.map((column) => `${child(column)} is not null`).join(" and ");
   const anySet = fk.columns.map((column) => `${child(column)} is not null`).join(" or ");
   const matches = fk.columns
-    .map((column, i) => `p.${quoteIdent(fk.referencedColumns[i])} = ${child(column)}`)
+    .map((column, i) => {
+      const op = plan.operators[i];
+      return (
+        `p.${quoteIdent(fk.referencedColumns[i])}::${op.left} ` +
+        `OPERATOR(${quoteIdent(op.schema)}.${op.name}) ${child(column)}::${op.right}`
+      );
+    })
     .join(" and ");
-  const parent = `${quoteIdent(fk.references.schema)}.${quoteIdent(fk.references.name)}`;
+  const parent = `${plan.referencedPartitioned ? "" : "only "}${quoteIdent(fk.references.schema)}.${quoteIdent(fk.references.name)}`;
   const missing = `not exists (select 1 from ${parent} p where ${matches})`;
   const where = fk.matchFull ? `(${anySet}) and (not (${allSet}) or ${missing})` : `${allSet} and ${missing}`;
-  return `select count(*)::bigint as n from ${quoteIdent(fk.table.schema)}.${quoteIdent(fk.table.name)} c where ${where}`;
+  return `select count(*)::bigint as n from only ${quoteIdent(fk.table.schema)}.${quoteIdent(fk.table.name)} c where ${where}`;
 }
 
 /** 一条孤儿外键给人看的说法(演练报告的失败项、真实恢复报告的说明共用)。 */
@@ -74,9 +104,21 @@ export interface AddForeignKeysResult {
 export async function addForeignKeys(
   client: Client,
   fks: ForeignKeyDef[],
-  opts: { allow: RegExp; stopOnError: boolean }
+  opts: {
+    allow: RegExp;
+    stopOnError: boolean;
+    /** 这些外键上的 COMMENT(pg_restore 写出的 SQL):外键加完再执行,不然注释对象还不存在 */
+    commentSql?: string;
+  }
 ): Promise<AddForeignKeysResult> {
   const result: AddForeignKeysResult = { orphaned: [], expectedSkips: 0, failures: [] };
+  // 和 pg_restore 的脚本头一样关掉超时:角色上配的 statement_timeout 会让大表的外键校验中途被掐断。
+  // search_path 钉在 pg_catalog:pg_dump 的语句都是全限定名,计数用的类型名和运算符也就不会被用户
+  // schema 里的同名对象截走(沙箱里这条连接是超级用户)
+  await client.query(
+    "set statement_timeout = 0; set lock_timeout = 0; set idle_in_transaction_session_timeout = 0; " +
+      "set search_path = pg_catalog"
+  );
   await client.query("begin");
   try {
     for (const fk of fks) {
@@ -108,7 +150,20 @@ export async function addForeignKeys(
       await client.query("savepoint count_orphans");
       let orphanRows: number | null = null;
       try {
-        const counted = await client.query<{ n: string }>(orphanCountSql(fk));
+        const plan = await client.query<{
+          schema: string;
+          name: string;
+          left: string;
+          right: string;
+          referenced_partitioned: boolean;
+        }>(COMPARISON_PLAN_SQL, [fk.constraint, `${quoteIdent(fk.table.schema)}.${quoteIdent(fk.table.name)}`]);
+        if (plan.rows.length !== fk.columns.length) throw new Error("comparison operators not found");
+        const counted = await client.query<{ n: string }>(
+          orphanCountSql(fk, {
+            operators: plan.rows,
+            referencedPartitioned: plan.rows[0].referenced_partitioned,
+          })
+        );
         orphanRows = Number(counted.rows[0].n);
         await client.query("release savepoint count_orphans");
       } catch {
@@ -121,6 +176,19 @@ export async function addForeignKeys(
         referencedTable: formatQualified(fk.references),
         orphanRows,
       });
+    }
+    if (opts.commentSql) {
+      await client.query("savepoint add_comments");
+      try {
+        await client.query(opts.commentSql);
+        await client.query("release savepoint add_comments");
+      } catch (error) {
+        await client.query("rollback to savepoint add_comments");
+        if (opts.stopOnError) throw error;
+        const message = (error as Error).message;
+        if (opts.allow.test(message)) result.expectedSkips += 1;
+        else result.failures.push(`comments on foreign keys: ${message}`);
+      }
     }
     await client.query("commit");
   } catch (error) {

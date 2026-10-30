@@ -49,17 +49,30 @@ test("isDeferrableForeignKey:只挪两端都在备份里、会校验已有行、
   assert.equal(isDeferrableForeignKey(partitioned, ["public"]), false, "PostgreSQL has no NOT VALID foreign key on a partitioned table");
 });
 
-test("orphanCountSql:MATCH SIMPLE 跳过有空值的行;MATCH FULL 把部分为空的行算进去;名字一律加引号", () => {
+const intEq = { schema: "pg_catalog", name: "=", left: "integer", right: "integer" };
+
+test("orphanCountSql:约束自己的运算符和类型、两端 ONLY;MATCH SIMPLE 跳过有空值的行;名字一律加引号", () => {
   const simple = orphanCountSql(
-    fk('ALTER TABLE ONLY public."Order Items"\n    ADD CONSTRAINT f FOREIGN KEY (tenant, "Order Id") REFERENCES public.orders(tenant, id);')
+    fk('ALTER TABLE ONLY public."Order Items"\n    ADD CONSTRAINT f FOREIGN KEY (tenant, "Order Id") REFERENCES public.orders(tenant, id);'),
+    { operators: [intEq, { schema: "public", name: "=", left: "public.citext", right: "public.citext" }], referencedPartitioned: false }
   );
   assert.equal(
     simple,
-    'select count(*)::bigint as n from "public"."Order Items" c where c."tenant" is not null and c."Order Id" is not null and ' +
-      'not exists (select 1 from "public"."orders" p where p."tenant" = c."tenant" and p."id" = c."Order Id")'
+    'select count(*)::bigint as n from only "public"."Order Items" c where c."tenant" is not null and c."Order Id" is not null and ' +
+      'not exists (select 1 from only "public"."orders" p where p."tenant"::integer OPERATOR("pg_catalog".=) c."tenant"::integer ' +
+      'and p."id"::public.citext OPERATOR("public".=) c."Order Id"::public.citext)'
   );
+});
+
+test("orphanCountSql:被引用的是分区表时带上分区;MATCH FULL 把部分为空的行算进去", () => {
+  const parted = orphanCountSql(
+    fk("ALTER TABLE ONLY public.a\n    ADD CONSTRAINT f FOREIGN KEY (x) REFERENCES public.b(x);"),
+    { operators: [intEq], referencedPartitioned: true }
+  );
+  assert.match(parted, /not exists \(select 1 from "public"\."b" p where/);
   const full = orphanCountSql(
-    fk("ALTER TABLE ONLY public.a\n    ADD CONSTRAINT f FOREIGN KEY (x, y) REFERENCES public.b(x, y) MATCH FULL;")
+    fk("ALTER TABLE ONLY public.a\n    ADD CONSTRAINT f FOREIGN KEY (x, y) REFERENCES public.b(x, y) MATCH FULL;"),
+    { operators: [intEq, intEq], referencedPartitioned: false }
   );
   assert.match(full, /where \(c\."x" is not null or c\."y" is not null\) and \(not \(c\."x" is not null and c\."y" is not null\) or not exists/);
 });
@@ -117,8 +130,26 @@ test(
          insert into public.orders select generate_series(1, 5);
          insert into public.products values (1);
          insert into public.order_items select g, (g % 5) + 1, 1 from generate_series(1, 20) g;
+         -- 外键上的注释依赖外键本身,得跟着外键一起晚加
+         comment on constraint order_items_order_id_fkey on public.order_items is 'every item belongs to an order';
+         comment on constraint order_items_product_id_fkey on public.order_items is 'catalog link';
+         -- citext:外键按不区分大小写比,'red' 对得上 'Red',只有 'blue' 是孤儿
+         create extension citext schema public;
+         create table public.colors (name public.citext primary key);
+         create table public.swatches (id int primary key, color public.citext references public.colors(name));
+         insert into public.colors values ('Red');
+         insert into public.swatches values (1, 'red'), (2, 'RED');
+         -- 继承:普通表上的外键只看父表本身,只在子表里的 7 号不算数
+         create table public.regions (id int primary key);
+         create table public.regions_eu () inherits (public.regions);
+         create table public.stores (id int primary key, region_id int references public.regions(id));
+         insert into public.regions values (1);
+         insert into public.stores values (1, 1);
          set session_replication_role = replica;
          delete from public.orders where id in (2, 3);
+         insert into public.swatches values (3, 'blue');
+         insert into public.regions_eu values (7);
+         insert into public.stores values (2, 7);
          set session_replication_role = origin;`
       );
       const dumpPath = join(work, "source.pgcustom");
@@ -134,29 +165,38 @@ test(
           serverVersion: "17.6",
           pgDumpVersion: (await x(pgDump, ["--version"])).stdout.trim(),
           schemas: ["public"],
-          tableCount: 3,
-          estimatedRowTotal: 24,
+          tableCount: 8,
+          estimatedRowTotal: 33,
           tables: [
+            { schema: "public", name: "colors", estimatedRows: 1 },
             { schema: "public", name: "order_items", estimatedRows: 20 },
             { schema: "public", name: "orders", estimatedRows: 3 },
             { schema: "public", name: "products", estimatedRows: 1 },
+            { schema: "public", name: "regions", estimatedRows: 1 },
+            { schema: "public", name: "regions_eu", estimatedRows: 1 },
+            { schema: "public", name: "stores", estimatedRows: 2 },
+            { schema: "public", name: "swatches", estimatedRows: 3 },
           ],
+          extensions: [{ name: "citext", version: "1.6", schema: "public" }],
         },
         dump: { key: "backupdrill/orphans/snap/dump.pgcustom", format: "custom", bytes: buf.length, sha256: createHash("sha256").update(buf).digest("hex") },
         storage: null,
       };
       const expected = [
         { constraint: "order_items_order_id_fkey", table: "public.order_items", referencedTable: "public.orders", orphanRows: 8 },
+        { constraint: "stores_region_id_fkey", table: "public.stores", referencedTable: "public.regions", orphanRows: 1 },
+        { constraint: "swatches_color_fkey", table: "public.swatches", referencedTable: "public.colors", orphanRows: 1 },
       ];
+      const sorted = (list) => [...(list ?? [])].sort((a, b) => a.constraint.localeCompare(b.constraint));
 
       // 1. 演练:判失败,失败只因数据,报告说清真实恢复会怎样
       const report = await drillDump(dumpPath, manifest, "orphans");
       assert.equal(report.pass, false);
       assert.equal(report.failureCause, "source-data");
-      assert.deepEqual(report.orphanedForeignKeys, expected);
+      assert.deepEqual(sorted(report.orphanedForeignKeys), expected);
       const postData = report.checks.find((c) => c.name === "post-data objects");
       assert.equal(postData.pass, false);
-      assert.match(postData.detail, /^1 failed: 8 row\(s\) in public\.order_items point to rows missing from public\.orders/);
+      assert.match(postData.detail, /^3 failed: \d+ row\(s\) in public\.\w+ point to rows missing from public\.\w+/);
       assert.match(postData.detail, /adds this foreign key as NOT VALID/);
       assert.ok(report.checks.every((c) => c.pass || c.name === "post-data objects"), JSON.stringify(report.checks));
 
@@ -179,9 +219,9 @@ test(
       const result = await runRestore(config, { store, targetDatabaseUrl: targetUrl, confirmTarget: "localhost" });
       assert.equal(result.restoredToDatabase, true);
       assert.equal(result.databaseVerified, true);
-      assert.deepEqual(result.orphanedForeignKeys, expected);
+      assert.deepEqual(sorted(result.orphanedForeignKeys), expected);
       const fkCheck = result.databaseChecks.find((c) => c.name === "foreign keys");
-      assert.match(fkCheck.detail, /^1 added as NOT VALID because the snapshot holds rows that break them/);
+      assert.match(fkCheck.detail, /^3 added as NOT VALID because the snapshot holds rows that break them/);
 
       const constraints = await sql(
         targetUrl,
@@ -190,6 +230,17 @@ test(
       assert.deepEqual(constraints.rows, [
         { conname: "order_items_order_id_fkey", convalidated: false },
         { conname: "order_items_product_id_fkey", convalidated: true },
+        { conname: "stores_region_id_fkey", convalidated: false },
+        { conname: "swatches_color_fkey", convalidated: false },
+      ]);
+      const comments = await sql(
+        targetUrl,
+        "select conname, obj_description(oid, 'pg_constraint') as comment from pg_constraint " +
+          "where contype = 'f' and conname like 'order_items_%' order by 1"
+      );
+      assert.deepEqual(comments.rows, [
+        { conname: "order_items_order_id_fkey", comment: "every item belongs to an order" },
+        { conname: "order_items_product_id_fkey", comment: "catalog link" },
       ]);
       const rows = await sql(targetUrl, "select count(*)::int as n from public.order_items");
       assert.equal(rows.rows[0].n, 20, "every row, orphans included, is back");

@@ -138,6 +138,7 @@ export function sandboxOrphanFailure(orphaned: OrphanedForeignKey): string {
  * 从目录条目里挑出交给 addForeignKeys 的外键(isDeferrableForeignKey)。让 pg_restore 把全部外键条目
  * 写成 SQL,第 i 条语句对第 i 行(-L 按清单顺序输出)。对不上数或对不上名字(认不出的外键形态)
  * 就一条也不挪:全部留给 pg_restore,行为和以前一样。
+ * 这些外键上的 COMMENT 一起挪:它们依赖外键本身,留在原处会因为对象还不存在而失败(交叉审查复现)。
  */
 async function deferredForeignKeys(
   bin: string,
@@ -145,7 +146,7 @@ async function deferredForeignKeys(
   entries: string[],
   dumpedSchemas: string[],
   listDir: string
-): Promise<{ lines: Set<string>; fks: ForeignKeyDef[] }> {
+): Promise<{ lines: Set<string>; fks: ForeignKeyDef[]; commentSql?: string }> {
   const none = { lines: new Set<string>(), fks: [] };
   const fkEntries = entries.filter((line) => /^\d+; \d+ \d+ FK CONSTRAINT /.test(line));
   if (!fkEntries.length) return none;
@@ -162,7 +163,26 @@ async function deferredForeignKeys(
     lines.add(fkEntries[i]);
     fks.push(fk);
   });
-  return { lines, fks };
+  // 目录里的注释条目:`<id>; 0 0 COMMENT <schema> CONSTRAINT <名> ON <表> <属主>`。前缀撞名(多挪了
+  // 一条别的外键的注释)无害:那条外键已在主事务里建好,注释晚一点加照样成功
+  const commentLines = entries.filter(
+    (line) =>
+      /^\d+; \d+ \d+ COMMENT /.test(line) &&
+      fks.some((fk) => line.includes(` CONSTRAINT ${fk.constraint} ON ${fk.table.name}`))
+  );
+  if (!commentLines.length) return { lines, fks };
+  const commentList = join(listDir, "foreign-key-comments.list");
+  await writeFile(commentList, commentLines.join("\n") + "\n");
+  const comments = await pgRestoreOutput(bin, ["-f", "-", `--use-list=${commentList}`, dumpPath]);
+  if (comments.code !== 0) return none;
+  for (const line of commentLines) lines.add(line);
+  // 新版 pg_restore 的脚本带 psql 元命令(\restrict / \unrestrict),交给 node-pg 执行前去掉。
+  // 只认这两条:注释正文是字符串,里面换行后以反斜杠开头的行要原样保留
+  const commentSql = comments.stdout
+    .split("\n")
+    .filter((line) => !/^\\(?:un)?restrict\b/.test(line))
+    .join("\n");
+  return { lines, fks, commentSql };
 }
 
 /**
@@ -842,7 +862,11 @@ async function restoreInOneTransaction(
     try {
       const client = await connectPg(connString);
       try {
-        const added = await addForeignKeys(client, deferred.fks, { allow: NEVER_MATCH, stopOnError: true });
+        const added = await addForeignKeys(client, deferred.fks, {
+          allow: NEVER_MATCH,
+          stopOnError: true,
+          commentSql: deferred.commentSql,
+        });
         return { pass: { expectedSkips: 0, failures: [] }, orphaned: added.orphaned };
       } finally {
         await client.end();
@@ -1025,7 +1049,11 @@ export async function restoreDatabaseArtifact(opts: {
     if (deferred.fks.length) {
       const client = await connectPg(opts.connString);
       try {
-        const added = await addForeignKeys(client, deferred.fks, { allow: postDataAllow, stopOnError: false });
+        const added = await addForeignKeys(client, deferred.fks, {
+          allow: postDataAllow,
+          stopOnError: false,
+          commentSql: deferred.commentSql,
+        });
         // 演练仍判失败(用户该清理的数据问题),但说清真实恢复会怎样
         passes.push({
           expectedSkips: added.expectedSkips,
