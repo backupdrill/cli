@@ -13,6 +13,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import pg from "pg";
 import { runRestore } from "../dist/restore.js";
+import { resolvePgRestoreBin } from "../dist/pgbin.js";
 
 const x = promisify(execFile);
 const pgDump = process.env.BACKUPDRILL_PG_DUMP || "pg_dump";
@@ -339,7 +340,9 @@ test(
       await x(pgDump, ["--format=custom", "--no-owner", "--no-privileges", "--schema=public", "--dbname", sourceUrl, "-f", dumpPath]);
       const buf = readFileSync(dumpPath);
       // 模拟 COMMIT 的回复丢了:真 pg_restore 跑完(已提交),包装脚本再报一个连接断开的错
-      const realPgRestore = (await x("sh", ["-c", "command -v pg_restore"])).stdout.trim();
+      // 与引擎同一个解析:跟 BACKUPDRILL_PG_DUMP 同目录。直接取 PATH 上的会在两套客户端并存时
+      // 拿到旧版本(pg_dump 18 写的归档,PATH 上的 pg_restore 17 读不了)
+      const realPgRestore = resolvePgRestoreBin();
       const wrapper = join(work, "pg_restore");
       writeFileSync(
         wrapper,
