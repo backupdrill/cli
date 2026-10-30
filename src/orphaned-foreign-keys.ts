@@ -20,6 +20,9 @@ export interface OrphanedForeignKey {
   /** schema.name */
   table: string;
   referencedTable: string;
+  /** 外键列和被引用列,逐列对应:报告/邮件据此给出定位这些行的查询 */
+  columns: string[];
+  referencedColumns: string[];
   /** 违反约束的行数;数不出来(比如列类型没有可用的 = 运算符)时为 null */
   orphanRows: number | null;
 }
@@ -193,6 +196,8 @@ export async function addForeignKeys(
         constraint: fk.constraint,
         table: formatQualified(fk.table),
         referencedTable: formatQualified(fk.references),
+        columns: fk.columns,
+        referencedColumns: fk.referencedColumns,
         orphanRows,
       });
     }

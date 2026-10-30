@@ -235,10 +235,10 @@ test(
         storage: null,
       };
       const expected = [
-        { constraint: "Child FK", table: 'public."Child Table"', referencedTable: "public.orders", orphanRows: 1 },
-        { constraint: "order_items_order_id_fkey", table: "public.order_items", referencedTable: "public.orders", orphanRows: 8 },
-        { constraint: "stores_region_id_fkey", table: "public.stores", referencedTable: "public.regions", orphanRows: 1 },
-        { constraint: "swatches_color_fkey", table: "public.swatches", referencedTable: "public.colors", orphanRows: 1 },
+        { constraint: "Child FK", table: 'public."Child Table"', referencedTable: "public.orders", columns: ["order_id"], referencedColumns: ["id"], orphanRows: 1 },
+        { constraint: "order_items_order_id_fkey", table: "public.order_items", referencedTable: "public.orders", columns: ["order_id"], referencedColumns: ["id"], orphanRows: 8 },
+        { constraint: "stores_region_id_fkey", table: "public.stores", referencedTable: "public.regions", columns: ["region_id"], referencedColumns: ["id"], orphanRows: 1 },
+        { constraint: "swatches_color_fkey", table: "public.swatches", referencedTable: "public.colors", columns: ["color"], referencedColumns: ["name"], orphanRows: 1 },
       ];
       const sorted = (list) => [...(list ?? [])].sort((a, b) => a.constraint.localeCompare(b.constraint));
 
