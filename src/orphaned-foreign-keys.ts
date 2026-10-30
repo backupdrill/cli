@@ -85,7 +85,8 @@ export function orphanCountSql(fk: ForeignKeyDef, plan: ComparisonPlan): string 
 /** 一条孤儿外键给人看的说法(演练报告的失败项、真实恢复报告的说明共用)。 */
 export function describeOrphanedForeignKey(orphaned: OrphanedForeignKey): string {
   const rows = orphaned.orphanRows === null ? "Some rows" : `${orphaned.orphanRows} row(s)`;
-  return `${rows} in ${orphaned.table} point to rows missing from ${orphaned.referencedTable} (foreign key ${orphaned.constraint})`;
+  // 不说"指向不存在的行":MATCH FULL 下部分为空的行也算违反,它们未必缺对应的行(文案审查)
+  return `${rows} in ${orphaned.table} break foreign key ${orphaned.constraint}, which references ${orphaned.referencedTable}`;
 }
 
 export interface AddForeignKeysResult {

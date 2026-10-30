@@ -203,7 +203,7 @@ test(
       assert.deepEqual(sorted(report.orphanedForeignKeys), expected);
       const postData = report.checks.find((c) => c.name === "post-data objects");
       assert.equal(postData.pass, false);
-      assert.match(postData.detail, /^4 failed: \d+ row\(s\) in public\.(?:\w+|"[^"]+") point to rows missing from public\.\w+/);
+      assert.match(postData.detail, /^4 failed: \d+ row\(s\) in public\.(?:\w+|"[^"]+") break foreign key .+, which references public\.\w+/);
       assert.match(postData.detail, /adds this foreign key as NOT VALID/);
       assert.ok(report.checks.every((c) => c.pass || c.name === "post-data objects"), JSON.stringify(report.checks));
 
