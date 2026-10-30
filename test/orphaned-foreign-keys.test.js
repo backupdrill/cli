@@ -145,6 +145,11 @@ test(
          create table public.stores (id int primary key, region_id int references public.regions(id));
          insert into public.regions values (1);
          insert into public.stores values (1, 1);
+         -- 带引号的表名和约束名:目录里注释条目的名字带双引号,照样要跟着外键晚加
+         create table public."Child Table" (id int primary key, order_id int,
+           constraint "Child FK" foreign key (order_id) references public.orders(id));
+         insert into public."Child Table" values (1, 1), (2, 2);
+         comment on constraint "Child FK" on public."Child Table" is 'quoted names';
          set session_replication_role = replica;
          delete from public.orders where id in (2, 3);
          insert into public.swatches values (3, 'blue');
@@ -165,9 +170,10 @@ test(
           serverVersion: "17.6",
           pgDumpVersion: (await x(pgDump, ["--version"])).stdout.trim(),
           schemas: ["public"],
-          tableCount: 8,
-          estimatedRowTotal: 33,
+          tableCount: 9,
+          estimatedRowTotal: 35,
           tables: [
+            { schema: "public", name: "Child Table", estimatedRows: 2 },
             { schema: "public", name: "colors", estimatedRows: 1 },
             { schema: "public", name: "order_items", estimatedRows: 20 },
             { schema: "public", name: "orders", estimatedRows: 3 },
@@ -183,6 +189,7 @@ test(
         storage: null,
       };
       const expected = [
+        { constraint: "Child FK", table: 'public."Child Table"', referencedTable: "public.orders", orphanRows: 1 },
         { constraint: "order_items_order_id_fkey", table: "public.order_items", referencedTable: "public.orders", orphanRows: 8 },
         { constraint: "stores_region_id_fkey", table: "public.stores", referencedTable: "public.regions", orphanRows: 1 },
         { constraint: "swatches_color_fkey", table: "public.swatches", referencedTable: "public.colors", orphanRows: 1 },
@@ -196,7 +203,7 @@ test(
       assert.deepEqual(sorted(report.orphanedForeignKeys), expected);
       const postData = report.checks.find((c) => c.name === "post-data objects");
       assert.equal(postData.pass, false);
-      assert.match(postData.detail, /^3 failed: \d+ row\(s\) in public\.\w+ point to rows missing from public\.\w+/);
+      assert.match(postData.detail, /^4 failed: \d+ row\(s\) in public\.(?:\w+|"[^"]+") point to rows missing from public\.\w+/);
       assert.match(postData.detail, /adds this foreign key as NOT VALID/);
       assert.ok(report.checks.every((c) => c.pass || c.name === "post-data objects"), JSON.stringify(report.checks));
 
@@ -221,13 +228,14 @@ test(
       assert.equal(result.databaseVerified, true);
       assert.deepEqual(sorted(result.orphanedForeignKeys), expected);
       const fkCheck = result.databaseChecks.find((c) => c.name === "foreign keys");
-      assert.match(fkCheck.detail, /^3 added as NOT VALID because the snapshot holds rows that break them/);
+      assert.match(fkCheck.detail, /^4 added as NOT VALID because the snapshot holds rows that break them/);
 
       const constraints = await sql(
         targetUrl,
         "select conname, convalidated from pg_constraint where contype = 'f' and connamespace = 'public'::regnamespace order by 1"
       );
       assert.deepEqual(constraints.rows, [
+        { conname: "Child FK", convalidated: false },
         { conname: "order_items_order_id_fkey", convalidated: false },
         { conname: "order_items_product_id_fkey", convalidated: true },
         { conname: "stores_region_id_fkey", convalidated: false },
@@ -236,9 +244,10 @@ test(
       const comments = await sql(
         targetUrl,
         "select conname, obj_description(oid, 'pg_constraint') as comment from pg_constraint " +
-          "where contype = 'f' and conname like 'order_items_%' order by 1"
+          "where contype = 'f' and (conname like 'order_items_%' or conname = 'Child FK') order by 1"
       );
       assert.deepEqual(comments.rows, [
+        { conname: "Child FK", comment: "quoted names" },
         { conname: "order_items_order_id_fkey", comment: "every item belongs to an order" },
         { conname: "order_items_product_id_fkey", comment: "catalog link" },
       ]);

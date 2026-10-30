@@ -861,9 +861,9 @@ export async function runRestore(
         throw new Error(
           `database restore failed: ${failures.join(" | ")}.` +
             (engine.committed
-              ? " The tables and data were already committed to the target; only foreign keys between them " +
-                "are missing. Check the target before doing anything else; restore won't write into it again " +
-                "while those objects are there."
+              ? " The tables and data were already committed to the target; some or all of the foreign keys " +
+                "between them may be missing. Check the target before doing anything else; restore won't write " +
+                "into it again while those objects are there."
               : await targetStateAfterFailure(targetUrl, manifest.database.schemas)) +
             restoreFailureAdvice(failures.join(" "))
         );

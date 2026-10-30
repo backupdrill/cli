@@ -163,12 +163,18 @@ async function deferredForeignKeys(
     lines.add(fkEntries[i]);
     fks.push(fk);
   });
-  // 目录里的注释条目:`<id>; 0 0 COMMENT <schema> CONSTRAINT <名> ON <表> <属主>`。前缀撞名(多挪了
-  // 一条别的外键的注释)无害:那条外键已在主事务里建好,注释晚一点加照样成功
+  // 目录里的注释条目:`<id>; 0 0 COMMENT <schema> CONSTRAINT <名> ON <表> <属主>`。这里的名字经过 fmtId,
+  // 需要时带双引号(大写、空格、关键字),所以原样和加引号两种写法都认(交叉审查复现)。
+  // 多挪了一条别的外键的注释无害:那条外键已在主事务里建好,注释晚一点加照样成功
+  const spellings = (name: string) => [name, `"${name.replace(/"/g, '""')}"`];
   const commentLines = entries.filter(
     (line) =>
       /^\d+; \d+ \d+ COMMENT /.test(line) &&
-      fks.some((fk) => line.includes(` CONSTRAINT ${fk.constraint} ON ${fk.table.name}`))
+      fks.some((fk) =>
+        spellings(fk.constraint).some((constraint) =>
+          spellings(fk.table.name).some((table) => line.includes(` CONSTRAINT ${constraint} ON ${table}`))
+        )
+      )
   );
   if (!commentLines.length) return { lines, fks };
   const commentList = join(listDir, "foreign-key-comments.list");

@@ -119,6 +119,10 @@ export async function addForeignKeys(
     "set statement_timeout = 0; set lock_timeout = 0; set idle_in_transaction_session_timeout = 0; " +
       "set search_path = pg_catalog"
   );
+  // transaction_timeout 是 PostgreSQL 17 才有的参数,旧版本上 set 会报"无此参数",忽略即可
+  await client.query("set transaction_timeout = 0").catch((error: Error & { code?: string }) => {
+    if (error.code !== "42704") throw error;
+  });
   await client.query("begin");
   try {
     for (const fk of fks) {
