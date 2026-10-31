@@ -126,21 +126,13 @@ export interface EngineResult {
   preData: ClassifiedPass;
   postData: ClassifiedPass;
   ok: boolean;
-  /** 因源库自带孤儿行而以 NOT VALID 建成的外键(见 orphaned-foreign-keys.ts);沙箱里它们同时记为失败 */
+  /** 因源库自带孤儿行而以 NOT VALID 建成的外键(见 orphaned-foreign-keys.ts);沙箱和真实目标一样,不算失败 */
   orphanedForeignKeys?: OrphanedForeignKey[];
   /**
    * 真实目标:失败发生在主事务提交之后(外键那一步),表和数据已经在目标上。
    * 调用方据此如实说明,不能再说"已整体回滚"。
    */
   committed?: boolean;
-}
-
-/** 演练里孤儿外键记成失败项时的说法:数据问题出在源库,真实恢复会怎样。 */
-export function sandboxOrphanFailure(orphaned: OrphanedForeignKey): string {
-  return (
-    `${describeOrphanedForeignKey(orphaned)}. Your database already had these rows when it was backed up. ` +
-    `A restore brings them back and adds this foreign key as NOT VALID; clean up the rows to make the drill pass.`
-  );
 }
 
 /**
@@ -1086,11 +1078,8 @@ export async function restoreDatabaseArtifact(opts: {
           stopOnError: false,
           commentSql: deferred.commentSql,
         });
-        // 演练仍判失败(用户该清理的数据问题),但说清真实恢复会怎样
-        passes.push({
-          expectedSkips: added.expectedSkips,
-          failures: [...added.failures, ...added.orphaned.map(sandboxOrphanFailure)],
-        });
+        // 孤儿外键不算失败:真实恢复同样建成 NOT VALID、数据一行不少,演练报告里另列一项说明
+        passes.push({ expectedSkips: added.expectedSkips, failures: added.failures });
         orphanedForeignKeys = added.orphaned;
       } finally {
         await client.end();
