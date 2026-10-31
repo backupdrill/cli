@@ -335,7 +335,10 @@ test("recoveryGrantsSql: one DO block that revokes by the catalog, then grants w
   assert.ok(sql.includes('$g1$grant select on table "public"."odd$g$name" to "anon"$g1$'));
   assert.ok(!/revoke all on table "public"/.test(sql), "revokes come from the restored catalog, not the record");
   assert.match(recoveryGrantsSql({ schemas: ["public"] }), /^grant all on all tables in schema public to anon, authenticated, service_role;/);
-  assert.match(recoveryGrantsSql({ schemas: ["public"], grants: [] }), /foreach statement in array array\[\]::text\[\]/);
+  assert.match(recoveryGrantsSql({ schemas: ["public"], grants: [] }), /unnest\(array\[\]::text\[\]\)/);
+  // 2.9.0 的调用方式(授权数组 / undefined)要报错,不能被当成旧快照、给出笼统授权
+  assert.throws(() => recoveryGrantsSql([{ kind: "table", schema: "public", name: "t", privileges: {} }]), TypeError);
+  assert.throws(() => recoveryGrantsSql(undefined), TypeError);
 });
 
 test(
@@ -377,11 +380,12 @@ test(
         (error) => /errors ignored on restore: 1/.test(error.stderr) && /schema "public" already exists/.test(error.stderr)
       );
 
-      // 记录和转储对不上的两种情况:secret 在转储里、不在记录里(转储完、读授权前被删);
-      // notes.added_later 在记录里、不在转储里(转储完才加的列)
+      // 记录和转储对不上的几种情况:secret 在转储里、不在记录里(转储完、读授权前被删);
+      // notes.added_later 和 ghost(参数是转储里没有的枚举类型)在记录里、不在转储里(转储完才加的)
       const record = [
         ...source.filter((g) => g.name !== "secret"),
         { kind: "column", schema: "public", name: "notes", column: "added_later", privileges: { anon: ["SELECT"] } },
+        { kind: "routine", schema: "public", name: "ghost", args: "m public.mood", privileges: { anon: ["EXECUTE"] } },
       ];
       const similarityAcl = async () =>
         (await sql(targetUrl, "select proacl::text from pg_proc where proname = 'similarity' and pronamespace = 'public'::regnamespace"))
@@ -392,7 +396,8 @@ test(
         client.on("notice", (notice) => notices.push(notice.message));
         await client.query(recoveryGrantsSql({ schemas: ["public"], grants: record }));
       });
-      assert.ok(notices.some((n) => /skipped, not in this restore: .*added_later/.test(n)), notices.join(" | "));
+      assert.ok(notices.some((n) => /not granted .*added_later/.test(n)), notices.join(" | "));
+      assert.ok(notices.some((n) => /not granted .*ghost/.test(n)), notices.join(" | "));
 
       const restored = await withClient(targetUrl, (client) => captureGrants(client, ["public"]));
       const expected = source.map((g) => (g.name === "secret" ? { ...g, privileges: {} } : g));

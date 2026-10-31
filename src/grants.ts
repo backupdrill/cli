@@ -395,7 +395,9 @@ function sqlLiteral(value: string): string {
 /**
  * RECOVERY.md 手工恢复那一步的 SQL(CLI 的 S3 版和 worker 的 Drive 版共用),做法和 restoreGrants 一样:
  * 先按恢复后的目录,把快照里各 schema 下每个 schema、表、序列、函数上 PUBLIC 和三个角色的权限全部收走
- * (扩展自带的对象不碰),再逐条授回记录里的;记录里有、恢复出来没有的对象跳过并提示,不中断。
+ * (扩展自带的对象不碰),再逐条授回记录里的;授不上的(对象、列或参数类型不在这次恢复里)跳过并告警,
+ * 不中断:授权只会加权限,跳过一条最多让应用少一点访问,不会把该关的打开;收权那一步在异常处理之外,
+ * 失败就整段回滚、报错。
  * 授权是在转储完之后读的:两次读之间删掉的对象在转储里、不在记录里,只按记录逐个收权就会漏掉它,
  * 它会带着默认的 PUBLIC 执行权恢复出来(交叉审查 2026-10-31);反过来,之间新加的对象(列)在记录里、
  * 不在转储里,直接授权会报错,在 Supabase 的 SQL 编辑器里整段回滚。所以整段放进一个 DO 块。
@@ -403,6 +405,11 @@ function sqlLiteral(value: string): string {
  * MAINTAIN 只会出现在 PG17+ 源库的记录里,而恢复目标的版本不低于源库,所以照写。
  */
 export function recoveryGrantsSql(database: { schemas: string[]; grants?: GrantedObject[] }): string {
+  // 2.9.0 收的是授权数组(或 undefined):按旧方式调用时,这里会把它当成"没有记录"而给出笼统授权。
+  // 宁可报错也不默默开放
+  if (typeof database !== "object" || database === null || Array.isArray(database) || !Array.isArray(database.schemas)) {
+    throw new TypeError("recoveryGrantsSql takes manifest.database (schemas and grants), not the grants list");
+  }
   if (database.grants === undefined) {
     return [
       "grant all on all tables in schema public to anon, authenticated, service_role;",
@@ -451,13 +458,14 @@ begin
   loop
     execute statement;
   end loop;
-  -- 2. Grant back what the source had at backup time; skip what this restore didn't create
-  foreach statement in array ${grantArray}
+  -- 2. Grant back what the source had at backup time. A grant that fails (its object, column or
+  --    argument type isn't in this restore) is skipped with a warning: it can only leave less access
+  for statement in select pg_catalog.unnest(${grantArray})
   loop
     begin
       execute statement;
-    exception when undefined_table or undefined_column or undefined_function or invalid_schema_name then
-      raise notice 'skipped, not in this restore: %', statement;
+    exception when others then
+      raise warning 'not granted (%): %', sqlerrm, statement;
     end;
   end loop;
 end
