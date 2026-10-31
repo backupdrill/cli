@@ -42,12 +42,18 @@ test("parseForeignKeys:pg_dump 的外键语句,含分区父表(无 ONLY)、带�
     references: { schema: "auth", name: "users" },
     referencedColumns: ["id"],
     validatesRows: true,
+    matchFull: false,
+    onPartitionedTable: false,
+    statement: fks[2].statement,
   });
+  assert.match(fks[2].statement, /^ALTER TABLE ONLY public\.profiles\n {4}ADD CONSTRAINT profiles_id_fkey .*;$/);
   assert.deepEqual(fks[1].table, { schema: "public", name: "parted" }, "partitioned parent has no ONLY");
+  assert.equal(fks[1].onPartitionedTable, true);
   assert.equal(fks[3].constraint, "w fk");
   assert.deepEqual(fks[3].table, { schema: "public", name: "Weird Tab" });
   assert.deepEqual(fks[3].columns, ["User Id"]);
   assert.equal(fks[3].validatesRows, true, "MATCH FULL still validates rows");
+  assert.equal(fks[3].matchFull, true);
 });
 
 test("parseForeignKeys:多列、引号里带引号和逗号、NOT VALID / NOT ENFORCED 不校验已有行", () => {

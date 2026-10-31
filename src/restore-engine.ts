@@ -12,13 +12,30 @@
 // 真实目标(2.7.0 起)整份恢复放在一个事务里:失败就整体回滚,目标还是空的,修好原因可以在同一个
 // 项目上直接重跑。此前两遍恢复各自自动提交,post-data 里一条外键失败,表和数据已经落库,重跑被
 // 空目标门挡住(2026-10-22 实验:profiles → auth.users)。沙箱用完即毁,不需要事务,保留两遍 + 并行。
+// 两端都在备份里的外键(2.8.0 起)在主事务提交后另起一个事务加,源库自带孤儿行的建成 NOT VALID,
+// 沙箱走同一个函数(orphaned-foreign-keys.ts)。
 import { spawn } from "node:child_process";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Client } from "pg";
 import type { ExtensionInfo } from "./manifest.js";
-import { MAX_COPY_HEADER, parseCopyHeader, parseCreateSchemas } from "./dump-sql.js";
+import {
+  MAX_COPY_HEADER,
+  parseCopyHeader,
+  parseCreatedTables,
+  parseCreateSchemas,
+  parseForeignKeys,
+  type ForeignKeyDef,
+} from "./dump-sql.js";
+import {
+  addForeignKeys,
+  describeOrphanedForeignKey,
+  fullyDumpedTableEntries,
+  isDeferrableForeignKey,
+  tableKey,
+  type OrphanedForeignKey,
+} from "./orphaned-foreign-keys.js";
 import { resolvePgRestoreBin } from "./pgbin.js";
 import { dumpUrlFor, connectPg, isSupabaseHost } from "./supabase-ca.js";
 import { interrupted, onInterrupt, stopOnInterrupt } from "./interrupt.js";
@@ -109,6 +126,97 @@ export interface EngineResult {
   preData: ClassifiedPass;
   postData: ClassifiedPass;
   ok: boolean;
+  /** 因源库自带孤儿行而以 NOT VALID 建成的外键(见 orphaned-foreign-keys.ts);沙箱里它们同时记为失败 */
+  orphanedForeignKeys?: OrphanedForeignKey[];
+  /**
+   * 真实目标:失败发生在主事务提交之后(外键那一步),表和数据已经在目标上。
+   * 调用方据此如实说明,不能再说"已整体回滚"。
+   */
+  committed?: boolean;
+}
+
+/** 演练里孤儿外键记成失败项时的说法:数据问题出在源库,真实恢复会怎样。 */
+export function sandboxOrphanFailure(orphaned: OrphanedForeignKey): string {
+  return (
+    `${describeOrphanedForeignKey(orphaned)}. Your database already had these rows when it was backed up. ` +
+    `A restore brings them back and adds this foreign key as NOT VALID; clean up the rows to make the drill pass.`
+  );
+}
+
+/**
+ * 从目录条目里挑出交给 addForeignKeys 的外键(isDeferrableForeignKey)。让 pg_restore 把全部外键条目
+ * 写成 SQL,第 i 条语句对第 i 行(-L 按清单顺序输出)。对不上数或对不上名字(认不出的外键形态)
+ * 就一条也不挪:全部留给 pg_restore,行为和以前一样。
+ * 这些外键上的 COMMENT 一起挪:它们依赖外键本身,留在原处会因为对象还不存在而失败(交叉审查复现)。
+ */
+async function deferredForeignKeys(
+  bin: string,
+  dumpPath: string,
+  entries: string[],
+  listDir: string
+): Promise<{ lines: Set<string>; fks: ForeignKeyDef[]; commentSql?: string }> {
+  const none = { lines: new Set<string>(), fks: [] };
+  const fkEntries = entries.filter((line) => /^\d+; \d+ \d+ FK CONSTRAINT /.test(line));
+  if (!fkEntries.length) return none;
+  // 沙箱那边传进来的只有 post-data 条目,数据条目要看完整目录
+  const fullListing = await pgRestoreOutput(bin, ["--list", dumpPath]);
+  if (fullListing.code !== 0) return none;
+  const tableEntries = fullyDumpedTableEntries(fullListing.stdout);
+  if (!tableEntries.length) return none;
+  const tableList = join(listDir, "tables.list");
+  await writeFile(tableList, tableEntries.join("\n") + "\n");
+  const tableDdl = await pgRestoreOutput(bin, ["-f", "-", `--use-list=${tableList}`, dumpPath]);
+  if (tableDdl.code !== 0) return none;
+  const fullyDumped = new Set(parseCreatedTables(tableDdl.stdout).map(tableKey));
+  const listFile = join(listDir, "foreign-keys.list");
+  await writeFile(listFile, fkEntries.join("\n") + "\n");
+  const ddl = await pgRestoreOutput(bin, ["-f", "-", `--use-list=${listFile}`, dumpPath]);
+  const parsed = parseForeignKeys(ddl.stdout);
+  if (ddl.code !== 0 || parsed.length !== fkEntries.length) return none;
+  if (parsed.some((fk, i) => !fkEntries[i].includes(fk.constraint))) return none;
+  const lines = new Set<string>();
+  const fks: ForeignKeyDef[] = [];
+  parsed.forEach((fk, i) => {
+    if (!isDeferrableForeignKey(fk, fullyDumped)) return;
+    lines.add(fkEntries[i]);
+    fks.push(fk);
+  });
+  // 目录里的注释条目:`<id>; 0 0 COMMENT <schema> CONSTRAINT <名> ON <表> <属主>`。这里的名字经过 fmtId,
+  // 需要时带双引号(大写、空格、关键字),所以原样和加引号两种写法都认(交叉审查复现)。
+  // 多挪了一条别的外键的注释无害:那条外键已在主事务里建好,注释晚一点加照样成功
+  const spellings = (name: string) => [name, `"${name.replace(/"/g, '""')}"`];
+  const commentLines = entries.filter(
+    (line) =>
+      /^\d+; \d+ \d+ COMMENT /.test(line) &&
+      fks.some((fk) =>
+        spellings(fk.constraint).some((constraint) =>
+          spellings(fk.table.name).some((table) => line.includes(` CONSTRAINT ${constraint} ON ${table}`))
+        )
+      )
+  );
+  if (!commentLines.length) return { lines, fks };
+  const commentList = join(listDir, "foreign-key-comments.list");
+  await writeFile(commentList, commentLines.join("\n") + "\n");
+  const comments = await pgRestoreOutput(bin, ["-f", "-", `--use-list=${commentList}`, dumpPath]);
+  if (comments.code !== 0) return none;
+  for (const line of commentLines) lines.add(line);
+  return { lines, fks, commentSql: withoutRestrictWrapper(comments.stdout) };
+}
+
+/**
+ * 新版 pg_restore 的脚本首尾各有一条 psql 元命令(\restrict <key> / \unrestrict <key>),node-pg 执行不了。
+ * 只认位置:开头那条是第一行非空、非 -- 注释的行,结尾那条是最后一行非空行。注释正文是字符串,
+ * 里面换行后恰好以 \restrict 开头的行要原样保留(交叉审查)。
+ */
+export function withoutRestrictWrapper(script: string): string {
+  const lines = script.split("\n");
+  const opening = lines.findIndex((line) => line.trim() !== "" && !line.startsWith("--"));
+  let closing = lines.length - 1;
+  while (closing >= 0 && lines[closing].trim() === "") closing -= 1;
+  const drop = new Set<number>();
+  if (opening >= 0 && /^\\restrict \S+$/.test(lines[opening])) drop.add(opening);
+  if (closing > opening && /^\\unrestrict \S+$/.test(lines[closing])) drop.add(closing);
+  return lines.filter((_, i) => !drop.has(i)).join("\n");
 }
 
 /**
@@ -726,6 +834,11 @@ function mergePasses(passes: ClassifiedPass[]): ClassifiedPass {
  * 代价是锁:每张表连同索引、序列、TOAST 各占一个锁槽,直到提交。max_connections 60 的目标上实测
  * 900 张表能过、1200 张表报 out of shared memory(restore.ts restoreFailureAdvice 给出调参办法);
  * 撞上了也是整体回滚,不会留半截。
+ *
+ * 例外是两端都在备份里的外键(deferredForeignKeys):它们不进这个事务,提交之后在另一个事务里
+ * 逐条加(addForeignKeys),源库自带孤儿行的那几条建成 NOT VALID,恢复照样成功。代价是那一步
+ * 出别的错时表和数据已经提交(committed);可能的原因只剩连接断开、锁槽这类和数据无关的情况——
+ * 被引用的表和唯一索引都已在主事务里建好。
  */
 async function restoreInOneTransaction(
   bin: string,
@@ -734,8 +847,8 @@ async function restoreInOneTransaction(
   common: string[],
   env: NodeJS.ProcessEnv,
   childOpts: { supabaseHost: boolean; urlSslMode?: string | null }
-): Promise<ClassifiedPass> {
-  const fail = (failure: string): ClassifiedPass => ({ expectedSkips: 0, failures: [failure] });
+): Promise<{ pass: ClassifiedPass; orphaned?: OrphanedForeignKey[]; committed?: boolean }> {
+  const fail = (failure: string) => ({ pass: { expectedSkips: 0, failures: [failure] } });
   const listing = await pgRestoreOutput(bin, ["--list", dumpPath]);
   if (listing.code !== 0) {
     return fail(`pg_restore --list exited with code ${listing.code}: ${listing.stderr.trim().replace(/\s+/g, " ").slice(0, 200)}`);
@@ -769,12 +882,34 @@ async function restoreInOneTransaction(
         await client.end();
       }
     }
+    const deferred = await deferredForeignKeys(bin, dumpPath, entries, listDir);
     const listFile = join(listDir, "restore.list");
-    await writeFile(listFile, entries.filter((line) => !skip.has(line)).join("\n") + "\n");
+    await writeFile(
+      listFile,
+      entries.filter((line) => !skip.has(line) && !deferred.lines.has(line)).join("\n") + "\n"
+    );
     const run = await spawnPgRestore(bin, ["--single-transaction", `--use-list=${listFile}`, ...common], env, childOpts);
-    if (run.code === 0) return { expectedSkips: 0, failures: [] };
     if (run.code === null) return fail(`pg_restore was killed by a signal: ${firstRestoreError(run.stderr)}`);
-    return fail(firstRestoreError(run.stderr));
+    if (run.code !== 0) return fail(firstRestoreError(run.stderr));
+    if (!deferred.fks.length) return { pass: { expectedSkips: 0, failures: [] } };
+    try {
+      const client = await connectPg(connString);
+      try {
+        const added = await addForeignKeys(client, deferred.fks, {
+          allow: NEVER_MATCH,
+          stopOnError: true,
+          commentSql: deferred.commentSql,
+        });
+        return { pass: { expectedSkips: 0, failures: [] }, orphaned: added.orphaned };
+      } finally {
+        await client.end();
+      }
+    } catch (error) {
+      return {
+        pass: { expectedSkips: 0, failures: [`adding foreign keys failed: ${(error as Error).message}`] },
+        committed: true,
+      };
+    }
   } finally {
     await rm(listDir, { recursive: true, force: true });
   }
@@ -833,8 +968,21 @@ export async function restoreDatabaseArtifact(opts: {
   const common = ["--no-owner", "--no-privileges", "--dbname", url, opts.dumpPath];
   const childOpts = { supabaseHost: isSupabaseHost(opts.connString), urlSslMode: urlSslModeOf(url) };
   if (opts.target === "supabase") {
-    const pass = await restoreInOneTransaction(bin, opts.dumpPath, opts.connString, common, env, childOpts);
-    return { preData: pass, postData: { expectedSkips: 0, failures: [] }, ok: pass.failures.length === 0 };
+    const { pass, orphaned, committed } = await restoreInOneTransaction(
+      bin,
+      opts.dumpPath,
+      opts.connString,
+      common,
+      env,
+      childOpts
+    );
+    return {
+      preData: pass,
+      postData: { expectedSkips: 0, failures: [] },
+      ok: pass.failures.length === 0,
+      orphanedForeignKeys: orphaned,
+      committed,
+    };
   }
   const jobs = Math.max(1, Math.floor(opts.jobs ?? 1));
   const parallel = jobs > 1;
@@ -857,71 +1005,99 @@ export async function restoreDatabaseArtifact(opts: {
   }
 
   const postDataAllow = opts.target === "sandbox" ? sandboxManagedError(opts.dumpedSchemas ?? []) : NEVER_MATCH;
-  if (!parallel) {
-    const second = await spawnPgRestore(bin, ["--section=post-data", ...common], env, childOpts);
-    const postData = finalizePass(second.code, second.stderr, classifyBlocks(second.stderr, postDataAllow));
-    return { preData, postData, ok: postData.failures.length === 0 };
-  }
-
   const listing = await pgRestoreOutput(bin, ["--list", "--section=post-data", opts.dumpPath]);
   if (listing.code !== 0) {
     const detail = listing.stderr.trim().replace(/\s+/g, " ").slice(0, 200) || "(no stderr)";
     const postData = { expectedSkips: 0, failures: [`pg_restore --list exited with code ${listing.code}: ${detail}`] };
     return { preData, postData, ok: false };
   }
-  const { indexBuilds, rest } = splitPostDataList(listing.stdout);
   const listDir = await mkdtemp(join(tmpdir(), "backupdrill-restore-"));
   const forgetListDir = onInterrupt(() => rm(listDir, { recursive: true, force: true }).catch(() => {}));
+  let orphanedForeignKeys: OrphanedForeignKey[] | undefined;
   try {
+    const postEntries = listing.stdout.split("\n").filter((line) => /^\d+;/.test(line));
+    // 两端都在备份里的外键不交给 pg_restore,最后由 addForeignKeys 加:与真实恢复同一套判定
+    const deferred = await deferredForeignKeys(bin, opts.dumpPath, postEntries, listDir);
     const passes: ClassifiedPass[] = [];
-    if (indexBuilds.length) {
-      const listFile = join(listDir, "index-builds.list");
-      await writeFile(listFile, indexBuilds.join("\n") + "\n");
-      const run = await spawnPgRestore(
-        bin,
-        ["--section=post-data", `--use-list=${listFile}`, "--verbose", ...jobsArg, ...common],
-        env,
-        childOpts
-      );
-      // 退出码 0 = 一个错都没有。出过错时不读交错的报错正文,只取出错条目的 dumpId,把这些条目
-      // 单连接重跑、照单连接的规则分类:一条 CREATE INDEX / ADD CONSTRAINT 失败不留半成品,
-      // 重跑得到的就是 jobs=1 时的结论(交叉审查:引用托管 schema 函数的索引在单连接时是预期
-      // 跳过,并行时不能因此判失败;也不能靠忽略"已存在"去猜哪些建好了,沙箱里预装的扩展
-      // 对象会和用户索引撞名)。资源原因偶发失败的条目,重跑成功即通过,和单连接本来一样。
-      if (run.code !== 0) {
-        const failedIds = failedTocEntries(run.stderr);
-        const failed = indexBuilds.filter((line) => failedIds.has(line.slice(0, line.indexOf(";"))));
-        // 被信号杀死、没有汇总行(中途致命退出,后面的条目根本没跑)、或认不出任何出错条目:
-        // 都说明这一遍没走完或没法归因,直接失败,不重跑
-        // 出错条目的编号即使被用户 SQL 冒充,也只会多重跑一条、让它报"已存在"而判失败,不会漏掉真错误
-        const finished = run.code !== null && ignoredErrorTotal(run.stderr) !== null && failed.length > 0;
-        if (!finished) {
-          const detail = run.stderr.trim().replace(/\s+/g, " ").slice(-200) || "(no stderr)";
-          passes.push({
-            expectedSkips: 0,
-            failures: [`parallel index builds did not finish cleanly (exit ${run.code ?? "signal"}): ${detail}`],
-          });
-        } else {
-          const rerunFile = join(listDir, "index-builds-rerun.list");
-          await writeFile(rerunFile, failed.join("\n") + "\n");
-          const rerun = await spawnPgRestore(
-            bin,
-            ["--section=post-data", `--use-list=${rerunFile}`, ...common],
-            env,
-            childOpts
-          );
-          passes.push(finalizePass(rerun.code, rerun.stderr, classifyBlocks(rerun.stderr, postDataAllow)));
+    if (!parallel) {
+      const args = ["--section=post-data", ...common];
+      if (deferred.lines.size) {
+        const listFile = join(listDir, "post-data.list");
+        await writeFile(listFile, postEntries.filter((line) => !deferred.lines.has(line)).join("\n") + "\n");
+        args.splice(1, 0, `--use-list=${listFile}`);
+      }
+      const second = await spawnPgRestore(bin, args, env, childOpts);
+      passes.push(finalizePass(second.code, second.stderr, classifyBlocks(second.stderr, postDataAllow)));
+    } else {
+      const { indexBuilds, rest: allRest } = splitPostDataList(listing.stdout);
+      const rest = allRest.filter((line) => !deferred.lines.has(line));
+      if (indexBuilds.length) {
+        const listFile = join(listDir, "index-builds.list");
+        await writeFile(listFile, indexBuilds.join("\n") + "\n");
+        const run = await spawnPgRestore(
+          bin,
+          ["--section=post-data", `--use-list=${listFile}`, "--verbose", ...jobsArg, ...common],
+          env,
+          childOpts
+        );
+        // 退出码 0 = 一个错都没有。出过错时不读交错的报错正文,只取出错条目的 dumpId,把这些条目
+        // 单连接重跑、照单连接的规则分类:一条 CREATE INDEX / ADD CONSTRAINT 失败不留半成品,
+        // 重跑得到的就是 jobs=1 时的结论(交叉审查:引用托管 schema 函数的索引在单连接时是预期
+        // 跳过,并行时不能因此判失败;也不能靠忽略"已存在"去猜哪些建好了,沙箱里预装的扩展
+        // 对象会和用户索引撞名)。资源原因偶发失败的条目,重跑成功即通过,和单连接本来一样。
+        if (run.code !== 0) {
+          const failedIds = failedTocEntries(run.stderr);
+          const failed = indexBuilds.filter((line) => failedIds.has(line.slice(0, line.indexOf(";"))));
+          // 被信号杀死、没有汇总行(中途致命退出,后面的条目根本没跑)、或认不出任何出错条目:
+          // 都说明这一遍没走完或没法归因,直接失败,不重跑
+          // 出错条目的编号即使被用户 SQL 冒充,也只会多重跑一条、让它报"已存在"而判失败,不会漏掉真错误
+          const finished = run.code !== null && ignoredErrorTotal(run.stderr) !== null && failed.length > 0;
+          if (!finished) {
+            const detail = run.stderr.trim().replace(/\s+/g, " ").slice(-200) || "(no stderr)";
+            passes.push({
+              expectedSkips: 0,
+              failures: [`parallel index builds did not finish cleanly (exit ${run.code ?? "signal"}): ${detail}`],
+            });
+          } else {
+            const rerunFile = join(listDir, "index-builds-rerun.list");
+            await writeFile(rerunFile, failed.join("\n") + "\n");
+            const rerun = await spawnPgRestore(
+              bin,
+              ["--section=post-data", `--use-list=${rerunFile}`, ...common],
+              env,
+              childOpts
+            );
+            passes.push(finalizePass(rerun.code, rerun.stderr, classifyBlocks(rerun.stderr, postDataAllow)));
+          }
         }
       }
+      if (rest.length) {
+        const listFile = join(listDir, "rest.list");
+        await writeFile(listFile, rest.join("\n") + "\n");
+        const run = await spawnPgRestore(bin, ["--section=post-data", `--use-list=${listFile}`, ...common], env, childOpts);
+        passes.push(finalizePass(run.code, run.stderr, classifyBlocks(run.stderr, postDataAllow)));
+      }
     }
-    if (rest.length) {
-      const listFile = join(listDir, "rest.list");
-      await writeFile(listFile, rest.join("\n") + "\n");
-      const run = await spawnPgRestore(bin, ["--section=post-data", `--use-list=${listFile}`, ...common], env, childOpts);
-      passes.push(finalizePass(run.code, run.stderr, classifyBlocks(run.stderr, postDataAllow)));
+    if (deferred.fks.length) {
+      const client = await connectPg(opts.connString);
+      try {
+        const added = await addForeignKeys(client, deferred.fks, {
+          allow: postDataAllow,
+          stopOnError: false,
+          commentSql: deferred.commentSql,
+        });
+        // 演练仍判失败(用户该清理的数据问题),但说清真实恢复会怎样
+        passes.push({
+          expectedSkips: added.expectedSkips,
+          failures: [...added.failures, ...added.orphaned.map(sandboxOrphanFailure)],
+        });
+        orphanedForeignKeys = added.orphaned;
+      } finally {
+        await client.end();
+      }
     }
     const postData = mergePasses(passes);
-    return { preData, postData, ok: postData.failures.length === 0 };
+    return { preData, postData, ok: postData.failures.length === 0, orphanedForeignKeys };
   } finally {
     await rm(listDir, { recursive: true, force: true });
     forgetListDir();

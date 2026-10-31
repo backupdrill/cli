@@ -44,6 +44,12 @@ export interface ForeignKeyDef {
    * 都不校验,恢复不会因为缺行而失败,所以不用查。
    */
   validatesRows: boolean;
+  /** MATCH FULL:有一列为空、另一列不空的行同样违反约束(默认 MATCH SIMPLE 只查全非空的行) */
+  matchFull: boolean;
+  /** 不带 ONLY 的 ALTER TABLE = 分区父表上的外键 */
+  onPartitionedTable: boolean;
+  /** pg_dump 写出的整条语句,原样可执行 */
+  statement: string;
 }
 
 /**
@@ -68,8 +74,19 @@ export function parseForeignKeys(sql: string): ForeignKeyDef[] {
       references: { schema: unquoteIdent(match[5]), name: unquoteIdent(match[6]) },
       referencedColumns: splitColumns(match[7]),
       validatesRows: !/\bNOT (?:VALID|ENFORCED)\b/.test(options),
+      matchFull: /\bMATCH FULL\b/.test(options),
+      onPartitionedTable: !/^ALTER (?:FOREIGN )?TABLE ONLY /.test(match[0]),
+      statement: match[0],
     };
   });
+}
+
+/** pg_dump 的建表语句(dumpTableSchema)建的表:CREATE [UNLOGGED ]TABLE <表> (…) / OF <类型>… */
+export function parseCreatedTables(sql: string): QualifiedName[] {
+  return [...sql.matchAll(new RegExp(String.raw`^CREATE (?:UNLOGGED )?TABLE ${QUALIFIED} `, "gm"))].map((match) => ({
+    schema: unquoteIdent(match[1]),
+    name: unquoteIdent(match[2]),
+  }));
 }
 
 /** pg_dump 的挂分区语句(dumpTableAttach):ALTER TABLE ONLY <父> ATTACH PARTITION <子> <边界>; */

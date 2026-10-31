@@ -20,6 +20,7 @@ import {
   tableDataInDump,
 } from "./restore-engine.js";
 import { connectPg } from "./supabase-ca.js";
+import type { OrphanedForeignKey } from "./orphaned-foreign-keys.js";
 import { localPgRestoreMajor, restoreToolBreaksOnTarget, sandboxMajorFor } from "./pgbin.js";
 import { log } from "./log.js";
 import { onInterrupt, stopOnInterrupt, throwIfInterrupted } from "./interrupt.js";
@@ -73,6 +74,13 @@ export interface DrillReport {
   restoredRowTotal: number;
   /** --keep 且演练失败时:被保留的沙箱(供排查/脚本消费);其余情况不存在 */
   keptSandbox?: { containerId: string; connString: string };
+  /** 源库自带孤儿行的外键:演练把它们记为失败,真实恢复会把它们建成 NOT VALID。没有时不出现 */
+  orphanedForeignKeys?: OrphanedForeignKey[];
+  /**
+   * 失败的唯一原因是这些孤儿行:备份完整、恢复能成功,是用户库里的数据违反了自己的外键。
+   * worker 据此把失败报告直接发给用户,不当成我们要排查的故障。
+   */
+  failureCause?: "source-data";
 }
 
 // ── 临时 Postgres 容器编排 ──────────────────────────────────────────
@@ -367,6 +375,8 @@ async function startEphemeralPostgres(image: string, major: number, resourceName
 interface PostDataResult {
   supabaseSkipped: number;
   failures: string[];
+  /** 已同时计入 failures */
+  orphanedForeignKeys?: OrphanedForeignKey[];
 }
 
 // 只有这些特征说明恢复失败源于沙箱缺扩展(限定类型/schema 解析不到、扩展装不上)。
@@ -406,6 +416,7 @@ async function pgRestore(
   return {
     supabaseSkipped: result.postData.expectedSkips,
     failures: result.postData.failures,
+    orphanedForeignKeys: result.orphanedForeignKeys,
   };
 }
 
@@ -777,6 +788,15 @@ export async function drillDump(
       restoredTableCount: verify.tableCount,
       restoredRowTotal: verify.rowTotal,
     };
+    const orphaned = postData.orphanedForeignKeys ?? [];
+    if (orphaned.length) {
+      report.orphanedForeignKeys = orphaned;
+      // 孤儿外键是 post-data 里仅有的失败、其余检查全过 → 失败只因用户数据
+      const onlyOrphans = postData.failures.length === orphaned.length;
+      if (!pass && onlyOrphans && checks.every((c) => c.pass || c.name === "post-data objects")) {
+        report.failureCause = "source-data";
+      }
+    }
     if (opts.keepSandboxOnFailure && !pass) {
       // 写进报告让 --keep 可被脚本消费(拿连接串排查),不只靠人眼看日志
       report.keptSandbox = { containerId: pg.containerId, connString: pg.connString };

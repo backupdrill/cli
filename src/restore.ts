@@ -27,6 +27,7 @@ import {
   type StorageRestoreTarget,
 } from "./storage-restore.js";
 import { connectPg } from "./supabase-ca.js";
+import { describeOrphanedForeignKey, type OrphanedForeignKey } from "./orphaned-foreign-keys.js";
 import { localPgRestoreMajor, restoreToolTargetBlocker } from "./pgbin.js";
 import { parsePgDumpMajor } from "./backup.js";
 import { log } from "./log.js";
@@ -51,6 +52,8 @@ export interface RestoreResult {
    * 不能只看 restoredToDatabase——"恢复完成"与"恢复通过验证"是两个事实。
    */
   databaseVerified?: boolean;
+  /** 因快照自带孤儿行而以 NOT VALID 建成的外键(数据照样全部恢复);没有时不出现 */
+  orphanedForeignKeys?: OrphanedForeignKey[];
   /** Storage 回传摘要(提供了目标 Storage 凭据时);本地下载模式不存在 */
   storageSummary?: StorageRestoreSummary;
   storageFilesWritten: number;
@@ -852,17 +855,34 @@ export async function runRestore(
         const failures = [...engine.preData.failures, ...engine.postData.failures];
         throw new Error(
           `database restore failed: ${failures.join(" | ")}.` +
-            (await targetStateAfterFailure(targetUrl, manifest.database.schemas)) +
+            (engine.committed
+              ? " The tables and data were already committed to the target; some or all of the foreign keys " +
+                "between them may be missing. Check the target before doing anything else; restore won't write " +
+                "into it again while those objects are there."
+              : await targetStateAfterFailure(targetUrl, manifest.database.schemas)) +
             restoreFailureAdvice(failures.join(" "))
         );
       }
       result.restoredToDatabase = true;
+      const orphaned = engine.orphanedForeignKeys ?? [];
 
       // 与演练同一套表级验证:两条路径对同一快照必须同一结论(PRD §5.2 验收)
       log.step("Verifying restored tables…");
       const verified = await verifyRestored(targetUrl, manifest, dumpPath);
       result.databaseChecks = verified.checks;
       result.databaseVerified = verified.checks.every((c) => c.pass);
+      if (orphaned.length) {
+        result.orphanedForeignKeys = orphaned;
+        // 数据一行不少,外键也在(只是不回头查已有的行):算通过,但写进报告让人看见
+        result.databaseChecks.push({
+          name: "foreign keys",
+          pass: true,
+          detail:
+            `${orphaned.length} added as NOT VALID because the snapshot holds rows that break them: ` +
+            `${orphaned.map(describeOrphanedForeignKey).join("; ")}. New writes are still checked. ` +
+            `Clean up those rows, then run ALTER TABLE … VALIDATE CONSTRAINT to check the old ones too.`,
+        });
+      }
       for (const check of verified.checks) {
         (check.pass ? log.ok : log.warn)(`${check.name}: ${check.detail}`);
       }

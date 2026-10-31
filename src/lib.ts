@@ -36,5 +36,6 @@ export type {
 } from "./config.js";
 export type { BucketAttrs, ExtensionInfo, Manifest, StorageFile, TableStat } from "./manifest.js";
 export type { DrillReport, DrillCheck, DrillSupervision, DrillPhase } from "./drill.js";
+export type { OrphanedForeignKey } from "./orphaned-foreign-keys.js";
 export type { RestoreResult } from "./restore.js";
 export type { EgressPricing, EgressProjection } from "./estimate.js";
