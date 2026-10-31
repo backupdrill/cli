@@ -20,12 +20,20 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Client } from "pg";
 import type { ExtensionInfo } from "./manifest.js";
-import { MAX_COPY_HEADER, parseCopyHeader, parseCreateSchemas, parseForeignKeys, type ForeignKeyDef } from "./dump-sql.js";
+import {
+  MAX_COPY_HEADER,
+  parseCopyHeader,
+  parseCreatedTables,
+  parseCreateSchemas,
+  parseForeignKeys,
+  type ForeignKeyDef,
+} from "./dump-sql.js";
 import {
   addForeignKeys,
-  archiveTables,
   describeOrphanedForeignKey,
+  fullyDumpedTableEntries,
   isDeferrableForeignKey,
+  tableKey,
   type OrphanedForeignKey,
 } from "./orphaned-foreign-keys.js";
 import { resolvePgRestoreBin } from "./pgbin.js";
@@ -153,7 +161,13 @@ async function deferredForeignKeys(
   // 沙箱那边传进来的只有 post-data 条目,数据条目要看完整目录
   const fullListing = await pgRestoreOutput(bin, ["--list", dumpPath]);
   if (fullListing.code !== 0) return none;
-  const tables = archiveTables(fullListing.stdout);
+  const tableEntries = fullyDumpedTableEntries(fullListing.stdout);
+  if (!tableEntries.length) return none;
+  const tableList = join(listDir, "tables.list");
+  await writeFile(tableList, tableEntries.join("\n") + "\n");
+  const tableDdl = await pgRestoreOutput(bin, ["-f", "-", `--use-list=${tableList}`, dumpPath]);
+  if (tableDdl.code !== 0) return none;
+  const fullyDumped = new Set(parseCreatedTables(tableDdl.stdout).map(tableKey));
   const listFile = join(listDir, "foreign-keys.list");
   await writeFile(listFile, fkEntries.join("\n") + "\n");
   const ddl = await pgRestoreOutput(bin, ["-f", "-", `--use-list=${listFile}`, dumpPath]);
@@ -163,7 +177,7 @@ async function deferredForeignKeys(
   const lines = new Set<string>();
   const fks: ForeignKeyDef[] = [];
   parsed.forEach((fk, i) => {
-    if (!isDeferrableForeignKey(fk, tables)) return;
+    if (!isDeferrableForeignKey(fk, fullyDumped)) return;
     lines.add(fkEntries[i]);
     fks.push(fk);
   });

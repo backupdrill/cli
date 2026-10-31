@@ -81,6 +81,14 @@ export function parseForeignKeys(sql: string): ForeignKeyDef[] {
   });
 }
 
+/** pg_dump 的建表语句(dumpTableSchema)建的表:CREATE [UNLOGGED ]TABLE <表> (…) / OF <类型>… */
+export function parseCreatedTables(sql: string): QualifiedName[] {
+  return [...sql.matchAll(new RegExp(String.raw`^CREATE (?:UNLOGGED )?TABLE ${QUALIFIED} `, "gm"))].map((match) => ({
+    schema: unquoteIdent(match[1]),
+    name: unquoteIdent(match[2]),
+  }));
+}
+
 /** pg_dump 的挂分区语句(dumpTableAttach):ALTER TABLE ONLY <父> ATTACH PARTITION <子> <边界>; */
 export function parsePartitionAttachments(sql: string): Array<{ parent: QualifiedName; child: QualifiedName }> {
   const pattern = new RegExp(String.raw`^ALTER TABLE ONLY ${QUALIFIED} ATTACH PARTITION ${QUALIFIED} `, "gm");

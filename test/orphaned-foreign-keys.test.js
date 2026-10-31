@@ -9,8 +9,14 @@ import { copyFileSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import pg from "pg";
-import { parseForeignKeys } from "../dist/dump-sql.js";
-import { archiveTables, isDeferrableForeignKey, notValidStatement, orphanCountSql } from "../dist/orphaned-foreign-keys.js";
+import { parseCreatedTables, parseForeignKeys } from "../dist/dump-sql.js";
+import {
+  fullyDumpedTableEntries,
+  isDeferrableForeignKey,
+  notValidStatement,
+  orphanCountSql,
+  tableKey,
+} from "../dist/orphaned-foreign-keys.js";
 import { drillDump } from "../dist/drill.js";
 import { withoutRestrictWrapper } from "../dist/restore-engine.js";
 import { runRestore } from "../dist/restore.js";
@@ -39,51 +45,50 @@ test("notValidStatement:NOT VALID 加在选项之后、分号之前", () => {
   );
 });
 
-test("archiveTables:建表和数据条目分开存整串,名字和属主都可以带空格", () => {
+test("fullyDumpedTableEntries:按 oid 配对建表和数据条目,名字、属主带空格都不影响", () => {
   const listing = [
     "; Archive created at 2026-10-31",
     "3301; 1259 16390 TABLE public orders postgres",
+    "3302; 1259 16400 TABLE public Child Table review owner",
+    "3303; 1259 16410 TABLE public b_archive postgres",
     "3401; 0 16390 TABLE DATA public orders postgres",
     "3402; 0 16400 TABLE DATA public Child Table review owner",
-    "3501; 2606 16420 FK CONSTRAINT public orders orders_fk postgres",
+    // 扩展的配置表:CREATE EXTENSION 建表,dump 里只有过了扩展过滤条件的行
+    "3403; 0 16420 TABLE DATA public ext_config postgres",
+    "3501; 2606 16430 FK CONSTRAINT public orders orders_fk postgres",
   ].join("\n");
-  assert.deepEqual(archiveTables(listing), {
-    defined: ["public orders postgres"],
-    withData: ["public orders postgres", "public Child Table review owner"],
-  });
+  assert.deepEqual(fullyDumpedTableEntries(listing), [
+    "3301; 1259 16390 TABLE public orders postgres",
+    "3302; 1259 16400 TABLE public Child Table review owner",
+  ]);
 });
 
-test("isDeferrableForeignKey:只挪两端都由 dump 建表并带数据、会校验已有行、不在分区父表上的外键", () => {
-  const tables = archiveTables(
-    [
-      "1; 1259 1 TABLE public a postgres",
-      "2; 1259 2 TABLE public b review owner",
-      "3; 0 1 TABLE DATA public a postgres",
-      "4; 0 2 TABLE DATA public b review owner",
-      // 扩展的配置表:CREATE EXTENSION 建表,dump 里只有过了扩展过滤条件的行
-      "5; 0 3 TABLE DATA public ext_config postgres",
-      // 扩展的普通成员表:建表和数据都不在 dump 里
-      "6; 1259 4 TABLE public b_archive postgres",
-    ].join("\n")
-  );
+test("parseCreatedTables:建表语句里的确切表名,带引号的名字原样还原", () => {
+  const sql = [
+    "CREATE TABLE public.orders (\n    id integer NOT NULL\n);",
+    'CREATE UNLOGGED TABLE public."ext_items archive" (\n    id integer\n);',
+    "CREATE TABLE public.typed OF public.item_type (\n    id WITH OPTIONS NOT NULL\n);",
+    "ALTER TABLE public.orders OWNER TO postgres;",
+  ].join("\n");
+  assert.deepEqual(parseCreatedTables(sql), [
+    { schema: "public", name: "orders" },
+    { schema: "public", name: "ext_items archive" },
+    { schema: "public", name: "typed" },
+  ]);
+});
+
+test("isDeferrableForeignKey:只挪两端都完整在快照里、会校验已有行、不在分区父表上的外键", () => {
+  const fullyDumped = new Set([tableKey({ schema: "public", name: "a" }), tableKey({ schema: "public", name: "b" })]);
   const inside = fk("ALTER TABLE ONLY public.a\n    ADD CONSTRAINT a_fk FOREIGN KEY (x) REFERENCES public.b(id);");
-  assert.equal(isDeferrableForeignKey(inside, tables), true, "owner names with spaces still match");
+  assert.equal(isDeferrableForeignKey(inside, fullyDumped), true);
   const toAuth = fk("ALTER TABLE ONLY public.a\n    ADD CONSTRAINT a_fk FOREIGN KEY (x) REFERENCES auth.users(id);");
-  assert.equal(isDeferrableForeignKey(toAuth, tables), false, "keys into auth.users keep the preflight path");
-  // 恢复后是目标上扩展装出来的那份,缺行不能算源库的错
+  assert.equal(isDeferrableForeignKey(toAuth, fullyDumped), false, "keys into auth.users keep the preflight path");
   const toExtension = fk("ALTER TABLE ONLY public.a\n    ADD CONSTRAINT a_fk FOREIGN KEY (x) REFERENCES public.ext_items(id);");
-  assert.equal(isDeferrableForeignKey(toExtension, tables), false);
-  const toExtensionConfig = fk("ALTER TABLE ONLY public.a\n    ADD CONSTRAINT a_fk FOREIGN KEY (x) REFERENCES public.ext_config(id);");
-  assert.equal(isDeferrableForeignKey(toExtensionConfig, tables), false, "a config table's dump holds only the filtered rows");
-  const noData = fk("ALTER TABLE ONLY public.a\n    ADD CONSTRAINT a_fk FOREIGN KEY (x) REFERENCES public.b_archive(id);");
-  assert.equal(isDeferrableForeignKey(noData, tables), false, "a table dumped without its rows");
-  // 前缀比对不能把 public.b 的条目算到 public.b_archive 头上,反过来也一样
-  const fromPrefix = fk("ALTER TABLE ONLY public.b_archive\n    ADD CONSTRAINT x_fk FOREIGN KEY (x) REFERENCES public.a(id);");
-  assert.equal(isDeferrableForeignKey(fromPrefix, tables), false);
+  assert.equal(isDeferrableForeignKey(toExtension, fullyDumped), false);
   const notValid = fk("ALTER TABLE ONLY public.a\n    ADD CONSTRAINT a_fk FOREIGN KEY (x) REFERENCES public.b(id) NOT VALID;");
-  assert.equal(isDeferrableForeignKey(notValid, tables), false);
+  assert.equal(isDeferrableForeignKey(notValid, fullyDumped), false);
   const partitioned = fk("ALTER TABLE public.a\n    ADD CONSTRAINT a_fk FOREIGN KEY (x) REFERENCES public.b(id);");
-  assert.equal(isDeferrableForeignKey(partitioned, tables), false, "PostgreSQL has no NOT VALID foreign key on a partitioned table");
+  assert.equal(isDeferrableForeignKey(partitioned, fullyDumped), false, "PostgreSQL has no NOT VALID foreign key on a partitioned table");
 });
 
 test("withoutRestrictWrapper:只去掉脚本首尾那一对元命令,字符串里同样字样的行保留", () => {
@@ -408,7 +413,11 @@ test(
           ids,
           work,
           "create table ext_items (id int primary key);\ninsert into ext_items values (1), (2);\n",
+          // "ext_items archive" 由 dump 建表、带数据:目录里它的条目以 "public ext_items " 开头,
+          // 不能被当成 ext_items 的条目(交叉审查复现)
           `insert into public.ext_items values (3);
+           create table public."ext_items archive" (id int primary key);
+           insert into public."ext_items archive" values (3);
            create table public.refs (id int primary key, item_id int references public.ext_items(id));
            insert into public.refs values (1, 3);`
         )
@@ -441,6 +450,94 @@ test(
            insert into public.refs values (1, 2), (2, 3);`
         )
       );
+    } finally {
+      for (const id of ids) await x("docker", ["rm", "-fv", id]).catch(() => {});
+      rmSync(work, { recursive: true, force: true });
+    }
+  }
+);
+
+// 交叉审查复现:目标上用表属主(非超级用户、没有 BYPASSRLS)恢复,表开了 FORCE ROW LEVEL SECURITY。
+// 晚加外键时策略已经建好,PostgreSQL 的校验查询会被策略滤掉行,孤儿行照样被标成"已校验"。
+// 和 pg_restore 一样关掉 row_security:这种情况直接报错,不能悄悄建出一条带孤儿行的"已校验"外键
+test(
+  "a foreign key under FORCE ROW LEVEL SECURITY fails loudly instead of validating past hidden rows",
+  { skip: canRun ? false : "requires Docker + pg_dump", timeout: 300_000 },
+  async () => {
+    const ids = [];
+    const work = mkdtempSync(join(tmpdir(), "bd-rls-fk-"));
+    try {
+      const [sourcePort, targetPort] = await Promise.all([startPostgres(ids), startPostgres(ids)]);
+      const sourceUrl = `postgresql://postgres:pw@127.0.0.1:${sourcePort}/postgres`;
+      await sql(
+        `postgresql://postgres:pw@127.0.0.1:${targetPort}/postgres`,
+        "create role restorer login password 'pw' nobypassrls; alter schema public owner to restorer;"
+      );
+      const targetUrl = `postgresql://restorer:pw@localhost:${targetPort}/postgres`;
+      await sql(
+        sourceUrl,
+        `create table public.parents (id int primary key);
+         create table public.children (id int primary key, parent_id int references public.parents(id));
+         insert into public.parents values (1);
+         insert into public.children values (1, 1), (2, 1);
+         alter table public.parents enable row level security;
+         alter table public.parents force row level security;
+         alter table public.children enable row level security;
+         alter table public.children force row level security;
+         create policy hidden on public.parents using (false);
+         create policy hidden on public.children using (false);
+         set session_replication_role = replica;
+         insert into public.children values (3, 99);
+         set session_replication_role = origin;`
+      );
+      const dumpPath = join(work, "source.pgcustom");
+      await x(pgDump, ["--format=custom", "--no-owner", "--no-privileges", "--schema=public", "--dbname", sourceUrl, "-f", dumpPath]);
+      const buf = readFileSync(dumpPath);
+      const manifest = {
+        schemaVersion: 2,
+        tool: "backupdrill-cli",
+        toolVersion: "test",
+        createdAt: "2026-10-31T00:00:00.000Z",
+        projectName: "rls",
+        database: {
+          serverVersion: "17.6",
+          pgDumpVersion: (await x(pgDump, ["--version"])).stdout.trim(),
+          schemas: ["public"],
+          tableCount: 2,
+          estimatedRowTotal: 4,
+          tables: [
+            { schema: "public", name: "children", estimatedRows: 3 },
+            { schema: "public", name: "parents", estimatedRows: 1 },
+          ],
+          extensions: [],
+        },
+        dump: { key: "backupdrill/rls/snap/dump.pgcustom", format: "custom", bytes: buf.length, sha256: createHash("sha256").update(buf).digest("hex") },
+        storage: null,
+      };
+      const store = {
+        createSnapshot: async () => {
+          throw new Error("read-only test store");
+        },
+        openSnapshot: async () => ({
+          name: "snap",
+          readManifest: async () => JSON.stringify(manifest),
+          downloadDump: async (_m, dest) => {
+            copyFileSync(dumpPath, dest);
+            return { bytes: buf.length, sha256: manifest.dump.sha256 };
+          },
+          storageFiles: () => null,
+        }),
+      };
+      const config = { databaseUrl: sourceUrl, projectName: "rls", schemas: ["public"], storage: { bucket: "unused" } };
+      await assert.rejects(
+        runRestore(config, { store, targetDatabaseUrl: targetUrl, confirmTarget: "localhost" }),
+        /row-level security/
+      );
+      const validated = await sql(
+        `postgresql://postgres:pw@127.0.0.1:${targetPort}/postgres`,
+        "select count(*)::int as n from pg_constraint where conname = 'children_parent_id_fkey' and convalidated"
+      );
+      assert.equal(validated.rows[0].n, 0, "no validated key over rows the check could not see");
     } finally {
       for (const id of ids) await x("docker", ["rm", "-fv", id]).catch(() => {});
       rmSync(work, { recursive: true, force: true });

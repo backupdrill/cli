@@ -28,48 +28,39 @@ export interface OrphanedForeignKey {
 }
 
 /**
- * 归档目录里的建表条目和数据条目:`<id>; 1259 <oid> TABLE <schema> <名> <属主>`、
- * `<id>; 0 <oid> TABLE DATA <schema> <名> <属主>`。名字和属主都可以带空格、不加引号,拆不开,
- * 所以存 "<schema> <名> <属主>" 整串,查某张表时比前缀(交叉审查:属主带空格)。
+ * 归档目录里由 dump 自己建、又带着数据的表的建表条目:`<id>; 1259 <oid> TABLE …` 和
+ * `<id>; 0 <oid> TABLE DATA …` 的 oid 相同。只看 TABLE DATA 不够:扩展的配置表(pg_extension_config_dump)
+ * 由 CREATE EXTENSION 建、没有 TABLE 条目,数据条目里只有过了扩展过滤条件的行(交叉审查复现)。
+ * 按 oid 配对,不按名字:目录里的名字和属主都不加引号、可以带空格,拆不准(交叉审查复现)。
+ * 确切的表名由调用方让 pg_restore 把这些条目写成 SQL 再读(parseCreatedTables)。
  */
-export interface ArchiveTables {
-  defined: string[];
-  withData: string[];
-}
-
-export function archiveTables(listing: string): ArchiveTables {
-  const tables: ArchiveTables = { defined: [], withData: [] };
-  for (const line of listing.split("\n")) {
-    const match = /^\d+; \d+ \d+ TABLE (DATA )?(.*)$/.exec(line);
-    if (match) (match[1] ? tables.withData : tables.defined).push(match[2]);
+export function fullyDumpedTableEntries(listing: string): string[] {
+  const lines = listing.split("\n");
+  const withData = new Set<string>();
+  for (const line of lines) {
+    const match = /^\d+; 0 (\d+) TABLE DATA /.exec(line);
+    if (match) withData.add(match[1]);
   }
-  return tables;
+  return lines.filter((line) => {
+    const match = /^\d+; \d+ (\d+) TABLE (?!DATA )/.exec(line);
+    return match !== null && withData.has(match[1]);
+  });
 }
 
-function listed(entries: string[], table: QualifiedName): boolean {
-  const prefix = `${table.schema} ${table.name} `;
-  return entries.some((entry) => entry.startsWith(prefix));
-}
-
-/**
- * 两端的行是不是全在快照里:表由 dump 自己建(有 TABLE 条目)并且有 TABLE DATA。
- * 只看 TABLE DATA 不够:扩展的配置表(pg_extension_config_dump)由 CREATE EXTENSION 建、没有 TABLE 条目,
- * 数据条目里只有过了扩展过滤条件的行,缺的那些行不是源库的问题(交叉审查复现)。
- */
-function dumpedInFull(tables: ArchiveTables, table: QualifiedName): boolean {
-  return listed(tables.defined, table) && listed(tables.withData, table);
+export function tableKey(table: QualifiedName): string {
+  return `${table.schema}\u0000${table.name}`;
 }
 
 /**
- * 能交给 addForeignKeys 处理的外键:两端的数据都完整地在快照里、会校验已有行、不在分区父表上。
- * 指向分区表的外键也照旧严格:分区表自己没有 TABLE DATA,数据在各个分区上。
+ * 能交给 addForeignKeys 处理的外键:两端的行都完整地在快照里(fullyDumped,tableKey)、会校验已有行、
+ * 不在分区父表上。指向分区表的外键也照旧严格:分区表自己没有 TABLE DATA,数据在各个分区上。
  */
-export function isDeferrableForeignKey(fk: ForeignKeyDef, tables: ArchiveTables): boolean {
+export function isDeferrableForeignKey(fk: ForeignKeyDef, fullyDumped: Set<string>): boolean {
   return (
     fk.validatesRows &&
     !fk.onPartitionedTable &&
-    dumpedInFull(tables, fk.table) &&
-    dumpedInFull(tables, fk.references)
+    fullyDumped.has(tableKey(fk.table)) &&
+    fullyDumped.has(tableKey(fk.references))
   );
 }
 
@@ -155,10 +146,12 @@ export async function addForeignKeys(
   const result: AddForeignKeysResult = { orphaned: [], expectedSkips: 0, failures: [] };
   // 和 pg_restore 的脚本头一样关掉超时:角色上配的 statement_timeout 会让大表的外键校验中途被掐断。
   // search_path 钉在 pg_catalog:pg_dump 的语句都是全限定名,计数用的类型名和运算符也就不会被用户
-  // schema 里的同名对象截走(沙箱里这条连接是超级用户)
+  // schema 里的同名对象截走(沙箱里这条连接是超级用户)。
+  // row_security 也和 pg_restore 一样关掉:这时策略已经建好,表属主在 FORCE ROW LEVEL SECURITY 下
+  // 加外键,PostgreSQL 的校验查询会被策略滤掉行,孤儿行照样被标成已校验;关掉后改为直接报错(交叉审查复现)
   await client.query(
     "set statement_timeout = 0; set lock_timeout = 0; set idle_in_transaction_session_timeout = 0; " +
-      "set search_path = pg_catalog"
+      "set search_path = pg_catalog; set row_security = off"
   );
   // transaction_timeout 是 PostgreSQL 17 才有的参数,旧版本上 set 会报"无此参数",忽略即可
   await client.query("set transaction_timeout = 0").catch((error: Error & { code?: string }) => {
