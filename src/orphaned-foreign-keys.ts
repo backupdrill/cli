@@ -23,6 +23,8 @@ export interface OrphanedForeignKey {
   /** 外键列和被引用列,逐列对应:报告/邮件据此给出定位这些行的查询 */
   columns: string[];
   referencedColumns: string[];
+  /** MATCH FULL:引用列部分为空的行也算违反(定位查询要按这个口径写) */
+  matchFull: boolean;
   /** 违反约束的行数;数不出来(比如列类型没有可用的 = 运算符)时为 null */
   orphanRows: number | null;
 }
@@ -159,6 +161,17 @@ export async function addForeignKeys(
   });
   await client.query("begin");
   try {
+    // 这些外键在 pg_restore 那边本来排在启用行级安全之前;挪到这里时策略已经生效。表属主在
+    // FORCE ROW LEVEL SECURITY 下加外键会撞上 row_security = off(数据没问题也报错,交叉审查复现)。
+    // 在同一个事务里先 NO FORCE、加完再 FORCE 回去:属主不受策略约束,PostgreSQL 照常看全部行校验,
+    // 事务外看不到中间状态。超级用户和 BYPASSRLS 角色本来就不受影响,执行这两句也无害
+    const forced = await client.query<{ name: string }>(
+      // to_regclass:沙箱里某张表可能没建出来,那条外键自会记成失败,这里不该整体报错
+      "select oid::regclass::text as name from pg_class " +
+        "where oid in (select to_regclass(name) from unnest($1::text[]) as name) and relforcerowsecurity",
+      [[...new Set(fks.flatMap((fk) => [fk.table, fk.references]).map((t) => `${quoteIdent(t.schema)}.${quoteIdent(t.name)}`))]]
+    );
+    for (const { name } of forced.rows) await client.query(`alter table only ${name} no force row level security`);
     for (const fk of fks) {
       await client.query("savepoint add_fk");
       try {
@@ -214,6 +227,7 @@ export async function addForeignKeys(
         referencedTable: formatQualified(fk.references),
         columns: fk.columns,
         referencedColumns: fk.referencedColumns,
+        matchFull: fk.matchFull,
         orphanRows,
       });
     }
@@ -230,6 +244,7 @@ export async function addForeignKeys(
         else result.failures.push(`comments on foreign keys: ${message}`);
       }
     }
+    for (const { name } of forced.rows) await client.query(`alter table only ${name} force row level security`);
     await client.query("commit");
   } catch (error) {
     await client.query("rollback").catch(() => {});

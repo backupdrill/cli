@@ -262,10 +262,10 @@ test(
         storage: null,
       };
       const expected = [
-        { constraint: "Child FK", table: 'public."Child Table"', referencedTable: "public.orders", columns: ["order_id"], referencedColumns: ["id"], orphanRows: 1 },
-        { constraint: "order_items_order_id_fkey", table: "public.order_items", referencedTable: "public.orders", columns: ["order_id"], referencedColumns: ["id"], orphanRows: 8 },
-        { constraint: "stores_region_id_fkey", table: "public.stores", referencedTable: "public.regions", columns: ["region_id"], referencedColumns: ["id"], orphanRows: 1 },
-        { constraint: "swatches_color_fkey", table: "public.swatches", referencedTable: "public.colors", columns: ["color"], referencedColumns: ["name"], orphanRows: 1 },
+        { constraint: "Child FK", table: 'public."Child Table"', referencedTable: "public.orders", columns: ["order_id"], referencedColumns: ["id"], matchFull: false, orphanRows: 1 },
+        { constraint: "order_items_order_id_fkey", table: "public.order_items", referencedTable: "public.orders", columns: ["order_id"], referencedColumns: ["id"], matchFull: false, orphanRows: 8 },
+        { constraint: "stores_region_id_fkey", table: "public.stores", referencedTable: "public.regions", columns: ["region_id"], referencedColumns: ["id"], matchFull: false, orphanRows: 1 },
+        { constraint: "swatches_color_fkey", table: "public.swatches", referencedTable: "public.colors", columns: ["color"], referencedColumns: ["name"], matchFull: false, orphanRows: 1 },
       ];
       const sorted = (list) => [...(list ?? [])].sort((a, b) => a.constraint.localeCompare(b.constraint));
 
@@ -458,10 +458,11 @@ test(
 );
 
 // 交叉审查复现:目标上用表属主(非超级用户、没有 BYPASSRLS)恢复,表开了 FORCE ROW LEVEL SECURITY。
-// 晚加外键时策略已经建好,PostgreSQL 的校验查询会被策略滤掉行,孤儿行照样被标成"已校验"。
-// 和 pg_restore 一样关掉 row_security:这种情况直接报错,不能悄悄建出一条带孤儿行的"已校验"外键
+// 晚加外键时策略已经生效:不处理的话,PostgreSQL 的校验查询会被策略滤掉行,孤儿行照样被标成"已校验";
+// 只关 row_security 的话,数据没问题的外键也会报错。两种都不行:干净的外键照常校验,有孤儿行的建成 NOT VALID,
+// 恢复完 FORCE 还在
 test(
-  "a foreign key under FORCE ROW LEVEL SECURITY fails loudly instead of validating past hidden rows",
+  "foreign keys under FORCE ROW LEVEL SECURITY are checked against every row, and FORCE stays on",
   { skip: canRun ? false : "requires Docker + pg_dump", timeout: 300_000 },
   async () => {
     const ids = [];
@@ -469,26 +470,29 @@ test(
     try {
       const [sourcePort, targetPort] = await Promise.all([startPostgres(ids), startPostgres(ids)]);
       const sourceUrl = `postgresql://postgres:pw@127.0.0.1:${sourcePort}/postgres`;
-      await sql(
-        `postgresql://postgres:pw@127.0.0.1:${targetPort}/postgres`,
-        "create role restorer login password 'pw' nobypassrls; alter schema public owner to restorer;"
-      );
+      const adminTargetUrl = `postgresql://postgres:pw@127.0.0.1:${targetPort}/postgres`;
+      await sql(adminTargetUrl, "create role restorer login password 'pw' nobypassrls; alter schema public owner to restorer;");
       const targetUrl = `postgresql://restorer:pw@localhost:${targetPort}/postgres`;
       await sql(
         sourceUrl,
         `create table public.parents (id int primary key);
          create table public.children (id int primary key, parent_id int references public.parents(id));
+         create table public.notes (id int primary key, parent_id int references public.parents(id));
          insert into public.parents values (1);
          insert into public.children values (1, 1), (2, 1);
+         insert into public.notes values (1, 1);
+         set session_replication_role = replica;
+         insert into public.children values (3, 99);
+         set session_replication_role = origin;
          alter table public.parents enable row level security;
          alter table public.parents force row level security;
          alter table public.children enable row level security;
          alter table public.children force row level security;
+         alter table public.notes enable row level security;
+         alter table public.notes force row level security;
          create policy hidden on public.parents using (false);
          create policy hidden on public.children using (false);
-         set session_replication_role = replica;
-         insert into public.children values (3, 99);
-         set session_replication_role = origin;`
+         create policy hidden on public.notes using (false);`
       );
       const dumpPath = join(work, "source.pgcustom");
       await x(pgDump, ["--format=custom", "--no-owner", "--no-privileges", "--schema=public", "--dbname", sourceUrl, "-f", dumpPath]);
@@ -503,10 +507,11 @@ test(
           serverVersion: "17.6",
           pgDumpVersion: (await x(pgDump, ["--version"])).stdout.trim(),
           schemas: ["public"],
-          tableCount: 2,
-          estimatedRowTotal: 4,
+          tableCount: 3,
+          estimatedRowTotal: 5,
           tables: [
             { schema: "public", name: "children", estimatedRows: 3 },
+            { schema: "public", name: "notes", estimatedRows: 1 },
             { schema: "public", name: "parents", estimatedRows: 1 },
           ],
           extensions: [],
@@ -529,15 +534,28 @@ test(
         }),
       };
       const config = { databaseUrl: sourceUrl, projectName: "rls", schemas: ["public"], storage: { bucket: "unused" } };
-      await assert.rejects(
-        runRestore(config, { store, targetDatabaseUrl: targetUrl, confirmTarget: "localhost" }),
-        /row-level security/
+      const result = await runRestore(config, { store, targetDatabaseUrl: targetUrl, confirmTarget: "localhost" });
+      assert.equal(result.restoredToDatabase, true);
+      assert.deepEqual(result.orphanedForeignKeys, [
+        { constraint: "children_parent_id_fkey", table: "public.children", referencedTable: "public.parents", columns: ["parent_id"], referencedColumns: ["id"], matchFull: false, orphanRows: 1 },
+      ]);
+      const constraints = await sql(
+        adminTargetUrl,
+        "select conname, convalidated from pg_constraint where contype = 'f' and connamespace = 'public'::regnamespace order by 1"
       );
-      const validated = await sql(
-        `postgresql://postgres:pw@127.0.0.1:${targetPort}/postgres`,
-        "select count(*)::int as n from pg_constraint where conname = 'children_parent_id_fkey' and convalidated"
+      assert.deepEqual(constraints.rows, [
+        { conname: "children_parent_id_fkey", convalidated: false },
+        { conname: "notes_parent_id_fkey", convalidated: true },
+      ]);
+      const security = await sql(
+        adminTargetUrl,
+        "select relname, relrowsecurity, relforcerowsecurity from pg_class where relnamespace = 'public'::regnamespace and relkind = 'r' order by 1"
       );
-      assert.equal(validated.rows[0].n, 0, "no validated key over rows the check could not see");
+      assert.deepEqual(security.rows, [
+        { relname: "children", relrowsecurity: true, relforcerowsecurity: true },
+        { relname: "notes", relrowsecurity: true, relforcerowsecurity: true },
+        { relname: "parents", relrowsecurity: true, relforcerowsecurity: true },
+      ]);
     } finally {
       for (const id of ids) await x("docker", ["rm", "-fv", id]).catch(() => {});
       rmSync(work, { recursive: true, force: true });
