@@ -72,10 +72,10 @@ const CATALOG_OBJECTS_SQL = `
   ),
   objects as (
     select case when relkind = 'S' then 'sequence' else 'table' end as kind,
-           schema, name, null::text as column_name, null::text as args, acl
+           schema, name, null::text as column_name, null::text as args, oid::text as identity, acl
       from relations
     union all
-    select 'column', r.schema, r.name, a.attname::text, null, a.attacl
+    select 'column', r.schema, r.name, a.attname::text, null, r.oid::text || '.' || a.attnum::text, a.attacl
       from relations r
       join pg_catalog.pg_attribute a on a.attrelid = r.oid
      where a.attnum > 0 and not a.attisdropped and a.attacl is not null
@@ -84,6 +84,7 @@ const CATALOG_OBJECTS_SQL = `
     select 'routine', n.nspname::text, p.proname::text, null,
            case when p.prokind = 'a' then pg_catalog.oidvectortypes(p.proargtypes)
                 else pg_catalog.pg_get_function_identity_arguments(p.oid) end,
+           p.oid::text,
            coalesce(p.proacl, pg_catalog.acldefault('f', p.proowner))
       from pg_catalog.pg_proc p
       join pg_catalog.pg_namespace n on n.oid = p.pronamespace
@@ -91,17 +92,17 @@ const CATALOG_OBJECTS_SQL = `
        and not exists (select 1 from pg_catalog.pg_depend d
                         where d.classid = 'pg_catalog.pg_proc'::pg_catalog.regclass and d.objid = p.oid and d.deptype = 'e')
     union all
-    select 'schema', n.nspname::text, null, null, null, coalesce(n.nspacl, pg_catalog.acldefault('n', n.nspowner))
+    select 'schema', n.nspname::text, null, null, null, n.oid::text, coalesce(n.nspacl, pg_catalog.acldefault('n', n.nspowner))
       from pg_catalog.pg_namespace n
      where n.nspname = any($1::text[])
   )
-  select o.kind, o.schema, o.name, o.column_name, o.args, r.role,
+  select o.kind, o.schema, o.name, o.column_name, o.args, r.role, o.identity,
          -- distinct:同一权限可以由几个授权人各给一次,ACL 里就有几条
          pg_catalog.array_agg(distinct x.privilege_type::text order by x.privilege_type::text) filter (where r.role is not null) as privileges
     from objects o
     left join lateral pg_catalog.aclexplode(o.acl) x on true
     left join api_roles r on r.oid = x.grantee
-   group by 1, 2, 3, 4, 5, 6
+   group by 1, 2, 3, 4, 5, 6, 7
    order by 1, 2, 3, 4, 5, 6`;
 
 interface CatalogRow {
@@ -111,7 +112,17 @@ interface CatalogRow {
   column_name: string | null;
   args: string | null;
   role: GrantRole | null;
+  identity: string;
   privileges: string[] | null;
+}
+
+/**
+ * 一次读取里的一个对象,带上它在这个库里的身份(oid;列是表的 oid 加 attnum)。
+ * 只在备份端比较转储前后两次读取时用,不进 manifest:换个库 oid 就不一样了。
+ */
+export interface IdentifiedGrants {
+  identity: string;
+  object: GrantedObject;
 }
 
 function objectKey(o: Pick<GrantedObject, "kind" | "schema" | "name" | "column" | "args">): string {
@@ -119,9 +130,9 @@ function objectKey(o: Pick<GrantedObject, "kind" | "schema" | "name" | "column" 
 }
 
 /** 在已开的事务里调用:search_path 必须为空(见 CATALOG_OBJECTS_SQL)。 */
-async function catalogObjects(client: Client, schemas: string[]): Promise<GrantedObject[]> {
+async function catalogEntries(client: Client, schemas: string[]): Promise<IdentifiedGrants[]> {
   const res = await client.query<CatalogRow>(CATALOG_OBJECTS_SQL, [schemas, [...API_ROLES]]);
-  const objects = new Map<string, GrantedObject>();
+  const entries = new Map<string, IdentifiedGrants>();
   for (const row of res.rows) {
     const object: GrantedObject = {
       kind: row.kind,
@@ -132,12 +143,18 @@ async function catalogObjects(client: Client, schemas: string[]): Promise<Grante
       privileges: {},
     };
     const key = objectKey(object);
-    const existing = objects.get(key) ?? object;
-    objects.set(key, existing);
-    if (row.role && row.privileges?.length) existing.privileges[row.role] = row.privileges;
+    const existing = entries.get(key) ?? { identity: row.identity, object };
+    entries.set(key, existing);
+    if (row.role && row.privileges?.length) existing.object.privileges[row.role] = row.privileges;
   }
   // 列级授权只给别的角色时,这一列对我们没有意义
-  return [...objects.values()].filter((o) => o.kind !== "column" || Object.keys(o.privileges).length > 0);
+  return [...entries.values()].filter(
+    ({ object }) => object.kind !== "column" || Object.keys(object.privileges).length > 0
+  );
+}
+
+async function catalogObjects(client: Client, schemas: string[]): Promise<GrantedObject[]> {
+  return (await catalogEntries(client, schemas)).map((entry) => entry.object);
 }
 
 async function withEmptySearchPath<T>(client: Client, work: () => Promise<T>): Promise<T> {
@@ -158,6 +175,11 @@ export async function captureGrants(client: Client, schemas: string[]): Promise<
   return withEmptySearchPath(client, () => catalogObjects(client, schemas));
 }
 
+/** 同 captureGrants,另带每个对象的身份,供 grantsHeldThroughout 比较前后两次读取。 */
+export async function captureIdentifiedGrants(client: Client, schemas: string[]): Promise<IdentifiedGrants[]> {
+  return withEmptySearchPath(client, () => catalogEntries(client, schemas));
+}
+
 /**
  * 备份端:转储前后各读一次授权,只记两次都有的。
  *
@@ -166,14 +188,17 @@ export async function captureGrants(client: Client, schemas: string[]): Promise<
  * 再开放给 anon,转储里是抹之前的数据,记下的却是"开放",恢复出来 anon 就能读到原始数据。
  * 转储前读:先收回授权、再写进敏感数据,同样会开放出去。两次都有的权限,转储开始前和结束后都
  * 开着,拿它配转储里的数据不会比源库开得更多;只有中途收回、写进数据、抹掉、再开放这种来回漏得过去。
+ * 比的是同一个对象,不只是同名:两次读之间删掉重建的表(oid 变了)、删掉重加的列(attnum 变了),
+ * 转储里是新对象的数据,旧对象的授权不能算到它头上,按转储期间新建处理(交叉审查 2026-10-31)。
  * 代价:转储期间新开放的权限要等下一次备份才记上,在那之前恢复,应用对这些对象会报 42501。
  * 转储期间新建的对象(转储前没有)记成没有授权;转储期间删掉的不记,恢复端同样按没有授权处理。
  */
-export function grantsHeldThroughout(before: GrantedObject[], after: GrantedObject[]): GrantedObject[] {
-  const privilegesBefore = new Map(before.map((o) => [objectKey(o), o.privileges]));
+export function grantsHeldThroughout(before: IdentifiedGrants[], after: IdentifiedGrants[]): GrantedObject[] {
+  const readBefore = new Map(before.map((entry) => [objectKey(entry.object), entry]));
   const held: GrantedObject[] = [];
-  for (const object of after) {
-    const earlier = privilegesBefore.get(objectKey(object)) ?? {};
+  for (const { identity, object } of after) {
+    const previous = readBefore.get(objectKey(object));
+    const earlier = previous?.identity === identity ? previous.object.privileges : {};
     const privileges: GrantedObject["privileges"] = {};
     for (const role of GRANT_ROLES) {
       const inBoth = (object.privileges[role] ?? []).filter((privilege) => earlier[role]?.includes(privilege));
@@ -426,7 +451,7 @@ function sqlLiteral(value: string): string {
  * 再把各 schema 下每个 schema、表、序列、函数上 PUBLIC 和三个角色的权限全部收走(扩展自带的对象不碰)、
  * 回读确认收干净,最后逐条授回记录里的。授不上的(对象、列或参数类型不在这次恢复里)跳过并告警、不中断:
  * 授权只会加权限,跳过一条最多让应用少一点访问,不会把该关的打开。前面几步出错就整段回滚、报错。
- * 授权是在转储完之后读的:两次读之间删掉的对象在转储里、不在记录里,只按记录逐个收权就会漏掉它,
+ * 2.9.0/2.9.1 的授权是在转储完之后读的:两次读之间删掉的对象在转储里、不在记录里,只按记录逐个收权就会漏掉它,
  * 它会带着默认的 PUBLIC 执行权恢复出来(交叉审查 2026-10-31);反过来,之间新加的对象(列)在记录里、
  * 不在转储里,直接授权会报错,在 Supabase 的 SQL 编辑器里整段回滚。所以整段放进一个 DO 块。
  * 旧快照没有记录,给 Supabase 以前的默认授权。

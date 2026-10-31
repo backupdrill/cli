@@ -8,7 +8,7 @@ import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { createHash } from "node:crypto";
-import { copyFileSync, createWriteStream, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { chmodSync, copyFileSync, createWriteStream, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { finished } from "node:stream/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -281,29 +281,37 @@ test(
   }
 );
 
-test("grantsHeldThroughout: only privileges both reads agree on are recorded", () => {
-  const before = [
-    { kind: "table", schema: "public", name: "kept", privileges: { anon: ["INSERT", "SELECT"], authenticated: ["SELECT"] } },
-    { kind: "table", schema: "public", name: "opened", privileges: {} },
-    { kind: "table", schema: "public", name: "closed", privileges: { anon: ["SELECT"] } },
-    { kind: "table", schema: "public", name: "dropped", privileges: { anon: ["SELECT"] } },
-    { kind: "column", schema: "public", name: "kept", column: "a", privileges: { anon: ["UPDATE"] } },
-    { kind: "routine", schema: "public", name: "f", args: "x integer", privileges: { PUBLIC: ["EXECUTE"] } },
-  ];
-  const after = [
-    { kind: "table", schema: "public", name: "kept", privileges: { anon: ["SELECT"], authenticated: ["SELECT"] } },
-    { kind: "table", schema: "public", name: "opened", privileges: { anon: ["SELECT"] } },
-    { kind: "table", schema: "public", name: "closed", privileges: {} },
-    { kind: "table", schema: "public", name: "created", privileges: { anon: ["SELECT"] } },
-    { kind: "column", schema: "public", name: "kept", column: "b", privileges: { anon: ["UPDATE"] } },
+test("grantsHeldThroughout: only privileges both reads agree on, on the same object, are recorded", () => {
+  const read = (entries) => entries.map(([identity, object]) => ({ identity, object }));
+  const before = read([
+    ["1", { kind: "table", schema: "public", name: "kept", privileges: { anon: ["INSERT", "SELECT"], authenticated: ["SELECT"] } }],
+    ["2", { kind: "table", schema: "public", name: "opened", privileges: {} }],
+    ["3", { kind: "table", schema: "public", name: "closed", privileges: { anon: ["SELECT"] } }],
+    ["4", { kind: "table", schema: "public", name: "dropped", privileges: { anon: ["SELECT"] } }],
+    ["5", { kind: "table", schema: "public", name: "replaced", privileges: { anon: ["SELECT"] } }],
+    ["1.1", { kind: "column", schema: "public", name: "kept", column: "a", privileges: { anon: ["UPDATE"] } }],
+    ["1.2", { kind: "column", schema: "public", name: "kept", column: "re-added", privileges: { anon: ["UPDATE"] } }],
+    ["9", { kind: "routine", schema: "public", name: "f", args: "x integer", privileges: { PUBLIC: ["EXECUTE"] } }],
+  ]);
+  const after = read([
+    ["1", { kind: "table", schema: "public", name: "kept", privileges: { anon: ["SELECT"], authenticated: ["SELECT"] } }],
+    ["2", { kind: "table", schema: "public", name: "opened", privileges: { anon: ["SELECT"] } }],
+    ["3", { kind: "table", schema: "public", name: "closed", privileges: {} }],
+    ["6", { kind: "table", schema: "public", name: "created", privileges: { anon: ["SELECT"] } }],
+    // 同名,但两次读之间删掉重建了:旧表的授权不算
+    ["7", { kind: "table", schema: "public", name: "replaced", privileges: { anon: ["SELECT"] } }],
+    ["1.1", { kind: "column", schema: "public", name: "kept", column: "a", privileges: { anon: ["UPDATE"] } }],
+    ["1.3", { kind: "column", schema: "public", name: "kept", column: "re-added", privileges: { anon: ["UPDATE"] } }],
     // 函数换了签名 = 另一个对象
-    { kind: "routine", schema: "public", name: "f", args: "x bigint", privileges: { PUBLIC: ["EXECUTE"] } },
-  ];
+    ["10", { kind: "routine", schema: "public", name: "f", args: "x bigint", privileges: { PUBLIC: ["EXECUTE"] } }],
+  ]);
   assert.deepEqual(grantsHeldThroughout(before, after), [
     { kind: "table", schema: "public", name: "kept", privileges: { anon: ["SELECT"], authenticated: ["SELECT"] } },
     { kind: "table", schema: "public", name: "opened", privileges: {} },
     { kind: "table", schema: "public", name: "closed", privileges: {} },
     { kind: "table", schema: "public", name: "created", privileges: {} },
+    { kind: "table", schema: "public", name: "replaced", privileges: {} },
+    { kind: "column", schema: "public", name: "kept", column: "a", privileges: { anon: ["UPDATE"] } },
     { kind: "routine", schema: "public", name: "f", args: "x bigint", privileges: {} },
   ]);
 });
@@ -315,7 +323,10 @@ test(
     const ids = [];
     const work = mkdtempSync(join(tmpdir(), "bd-grants-race-"));
     try {
-      const [sourcePort, targetPort] = await Promise.all([startPostgres(ids), startPostgres(ids)]);
+      // 先起源库:包 pg_dump 的脚本要用它的容器 id
+      const sourcePort = await startPostgres(ids);
+      const sourceContainer = ids[0];
+      const targetPort = await startPostgres(ids);
       const sourceUrl = `postgresql://postgres:pw@127.0.0.1:${sourcePort}/postgres`;
       const targetUrl = `postgresql://postgres:pw@localhost:${targetPort}/postgres`;
       await sql(
@@ -325,8 +336,35 @@ test(
          insert into public.notes values (1, 'public note');
          grant select on public.notes to anon;
          create table public.secrets (id int primary key, body text);
-         insert into public.secrets values (1, 'plaintext');`
+         insert into public.secrets values (1, 'plaintext');
+         create table public.profile (id int primary key, body text);
+         insert into public.profile values (1, 'public profile');
+         grant select on public.profile to anon;`
       );
+
+      // 第一次读授权之后、pg_dump 拿快照之前:把开放的 profile 换成一张同名的私有表。
+      // 借一个包着 pg_dump 的脚本插进这个时间点
+      const realPgDump = (await x("sh", ["-c", `command -v "${pgDump}"`])).stdout.trim();
+      const replaceSql = join(work, "replace.sql");
+      writeFileSync(
+        replaceSql,
+        `drop table public.profile;
+         create table public.profile (id int primary key, body text);
+         insert into public.profile values (1, 'plaintext');`
+      );
+      const wrapper = join(work, "pg_dump");
+      writeFileSync(
+        wrapper,
+        [
+          "#!/bin/sh",
+          'if [ "$1" != "--version" ]; then',
+          `  docker exec -i ${sourceContainer} psql -q -U postgres -d postgres -v ON_ERROR_STOP=1 < '${replaceSql}' || exit 1`,
+          "fi",
+          `exec '${realPgDump}' "$@"`,
+          "",
+        ].join("\n")
+      );
+      chmodSync(wrapper, 0o755);
 
       // 转储第一块数据到达时 pg_dump 已经拿到快照:这时抹掉数据、再开放给 anon,转储里仍是原始数据
       const dumpPath = join(work, "dump.pgcustom");
@@ -343,7 +381,11 @@ test(
               for await (const chunk of body) {
                 if (!changedSource) {
                   changedSource = true;
-                  await sql(sourceUrl, "update public.secrets set body = 'redacted'; grant select on public.secrets to anon;");
+                  await sql(
+                    sourceUrl,
+                    `update public.secrets set body = 'redacted'; grant select on public.secrets to anon;
+                     update public.profile set body = 'redacted'; grant select on public.profile to anon;`
+                  );
                 }
                 out.write(chunk);
               }
@@ -362,10 +404,18 @@ test(
         },
       };
       const config = { databaseUrl: sourceUrl, projectName: "race", schemas: ["public"] };
-      await runBackup(config, { store });
+      const previousPgDump = process.env.BACKUPDRILL_PG_DUMP;
+      process.env.BACKUPDRILL_PG_DUMP = wrapper;
+      try {
+        await runBackup(config, { store });
+      } finally {
+        if (previousPgDump === undefined) delete process.env.BACKUPDRILL_PG_DUMP;
+        else process.env.BACKUPDRILL_PG_DUMP = previousPgDump;
+      }
 
       const recorded = manifest.database.grants;
       assert.deepEqual(find(recorded, "table", "secrets").privileges, {}, "granted mid-dump: not recorded");
+      assert.deepEqual(find(recorded, "table", "profile").privileges, {}, "replaced before the dump: the old table's grant is not carried over");
       assert.deepEqual(find(recorded, "table", "notes").privileges, { anon: ["SELECT"] });
       // 源库现在确实开放了 secrets,只是里面已经没有原始数据
       assert.deepEqual(find(await withClient(sourceUrl, (c) => captureGrants(c, ["public"])), "table", "secrets").privileges, {
@@ -381,11 +431,20 @@ test(
       });
       const restored = await sql(
         targetUrl,
-        `select (select body from public.secrets) as body,
+        `select (select body from public.secrets) as secrets_body,
+                (select body from public.profile) as profile_body,
                 has_table_privilege('anon', 'public.secrets', 'select') as anon_reads_secrets,
+                has_table_privilege('anon', 'public.profile', 'select') as anon_reads_profile,
                 has_table_privilege('anon', 'public.notes', 'select') as anon_reads_notes`
       );
-      assert.deepEqual(restored.rows[0], { body: "plaintext", anon_reads_secrets: false, anon_reads_notes: true });
+      // 转储里是改动之前的原始数据(竞态确实发生了),anon 却读不到
+      assert.deepEqual(restored.rows[0], {
+        secrets_body: "plaintext",
+        profile_body: "plaintext",
+        anon_reads_secrets: false,
+        anon_reads_profile: false,
+        anon_reads_notes: true,
+      });
     } finally {
       await Promise.all(ids.map((id) => x("docker", ["rm", "-f", id]).catch(() => {})));
       rmSync(work, { recursive: true, force: true });

@@ -13,7 +13,7 @@ import { log } from "./log.js";
 import { TOOL_VERSION } from "./version.js";
 import { parsePgDumpMajor } from "./pgbin.js";
 import { relationBytes } from "./estimate.js";
-import { captureGrants, grantsHeldThroughout, type GrantedObject } from "./grants.js";
+import { captureIdentifiedGrants, grantsHeldThroughout, type IdentifiedGrants } from "./grants.js";
 
 // 解析函数搬到了 pgbin(演练与恢复都要读 pg_restore 版本,放这里会成环);保留旧出口
 export { parsePgDumpMajor };
@@ -125,10 +125,10 @@ async function inspectDatabase(
   }
 }
 
-async function readGrants(databaseUrl: string, schemas: string[]): Promise<GrantedObject[]> {
+async function readGrants(databaseUrl: string, schemas: string[]): Promise<IdentifiedGrants[]> {
   const client = await connectPg(databaseUrl);
   try {
-    return await captureGrants(client, schemas);
+    return await captureIdentifiedGrants(client, schemas);
   } finally {
     await client.end();
   }
