@@ -126,7 +126,7 @@ export interface EngineResult {
   preData: ClassifiedPass;
   postData: ClassifiedPass;
   ok: boolean;
-  /** 因源库自带孤儿行而以 NOT VALID 建成的外键(见 orphaned-foreign-keys.ts);沙箱里它们同时记为失败 */
+  /** 因源库自带孤儿行而以 NOT VALID 建成的外键(见 orphaned-foreign-keys.ts);沙箱和真实目标一样,不算失败 */
   orphanedForeignKeys?: OrphanedForeignKey[];
   /**
    * 真实目标:失败发生在主事务提交之后(外键那一步),表和数据已经在目标上。
@@ -135,7 +135,6 @@ export interface EngineResult {
   committed?: boolean;
 }
 
-/** 演练里孤儿外键记成失败项时的说法:数据问题出在源库,真实恢复会怎样。 */
 /**
  * 从目录条目里挑出交给 addForeignKeys 的外键(isDeferrableForeignKey)。让 pg_restore 把全部外键条目
  * 写成 SQL,第 i 条语句对第 i 行(-L 按清单顺序输出)。对不上数或对不上名字(认不出的外键形态)
