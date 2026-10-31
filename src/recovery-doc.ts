@@ -150,15 +150,17 @@ it drops and recreates \`public\`, and the grants Supabase put on it go with it.
    carries none. With Supabase's new defaults, supabase-js requests to restored
    tables in \`public\` fail with \`42501 permission denied\` until you grant access. ${
      db.grants
-       ? `These statements put back exactly what the source had at backup time (also in
-   manifest.json under \`database.grants\`):`
+       ? `Run this block in the SQL editor or psql. It first takes access away from
+   these roles (and \`PUBLIC\`) on everything the restore created, then grants back
+   what the source had at backup time (the same list is in manifest.json under
+   \`database.grants\`). A grant whose object isn't in this restore is skipped with a warning:`
        : `This snapshot was taken before BackupDrill recorded grants. The statements below
    give the three roles Supabase's old default access to everything in \`public\`;
    afterwards, revoke it on any table you had kept private:`
    }
 
 \`\`\`sql
-${recoveryGrantsSql(db.grants)}
+${recoveryGrantsSql(db)}
 \`\`\`
 
 ## Restore Storage files

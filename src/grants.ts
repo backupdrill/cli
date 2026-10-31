@@ -188,18 +188,19 @@ function roleName(role: GrantRole): string {
  * 把一组对象的授权写成 SQL:schema、表、序列、函数先清掉这几个角色的全部权限再照记录授,
  * 列级授权放在最后(清表权限会连带清掉列权限)。schema 也要清:源库可能靠不给 USAGE 把整个
  * schema 关起来,目标上的 public 却是 Supabase 默认开放的。
- * roles:目标上实际存在的角色(PUBLIC 恒在);maintain:目标是否认 MAINTAIN。
+ * roles:目标上实际存在的角色(PUBLIC 恒在);maintain:目标是否认 MAINTAIN;
+ * revoke: false = 只出授权语句(RECOVERY.md 的清权限按目标目录来,见 recoveryGrantsSql)。
  */
 export function grantStatements(
   objects: GrantedObject[],
-  opts: { roles: readonly GrantRole[]; maintain: boolean }
+  opts: { roles: readonly GrantRole[]; maintain: boolean; revoke?: boolean }
 ): string[] {
   const roles = GRANT_ROLES.filter((role) => opts.roles.includes(role));
   const revokeFrom = roles.map(roleName).join(", ");
   const statements: string[] = [];
   const columns: string[] = [];
   for (const o of objects) {
-    if (o.kind !== "column") {
+    if (o.kind !== "column" && opts.revoke !== false) {
       statements.push(`revoke all on ${objectClause(o)} from ${revokeFrom}`);
     }
     for (const role of roles) {
@@ -379,19 +380,139 @@ export function grantsCheck(outcome: GrantRestore, context: "drill" | "restore")
   };
 }
 
+/** 选一个不出现在任何内容里的 dollar-quote 标签,内容原样放进去不用转义。 */
+function dollarQuoteTag(base: string, contents: string[]): string {
+  for (let i = 0; ; i++) {
+    const tag = `$${base}${i || ""}$`;
+    if (!contents.some((text) => text.includes(tag))) return tag;
+  }
+}
+
+function sqlLiteral(value: string): string {
+  return `'${value.replace(/'/g, "''")}'`;
+}
+
 /**
- * RECOVERY.md 手工恢复那一步的 SQL(CLI 的 S3 版和 worker 的 Drive 版共用)。有记录就逐个对象照记录重建,
- * 和 restoreGrants 同一套语句;旧快照没有记录,给 Supabase 以前的默认授权。
+ * RECOVERY.md 手工恢复那一步的 SQL(CLI 的 S3 版和 worker 的 Drive 版共用),做法和 restoreGrants 一样:
+ * 按恢复后的目录,先确认执行的角色是这些对象的属主(不是属主时 GRANT/REVOKE 只告警、不生效或只生效一半),
+ * 再把各 schema 下每个 schema、表、序列、函数上 PUBLIC 和三个角色的权限全部收走(扩展自带的对象不碰)、
+ * 回读确认收干净,最后逐条授回记录里的。授不上的(对象、列或参数类型不在这次恢复里)跳过并告警、不中断:
+ * 授权只会加权限,跳过一条最多让应用少一点访问,不会把该关的打开。前面几步出错就整段回滚、报错。
+ * 授权是在转储完之后读的:两次读之间删掉的对象在转储里、不在记录里,只按记录逐个收权就会漏掉它,
+ * 它会带着默认的 PUBLIC 执行权恢复出来(交叉审查 2026-10-31);反过来,之间新加的对象(列)在记录里、
+ * 不在转储里,直接授权会报错,在 Supabase 的 SQL 编辑器里整段回滚。所以整段放进一个 DO 块。
+ * 旧快照没有记录,给 Supabase 以前的默认授权。
  * MAINTAIN 只会出现在 PG17+ 源库的记录里,而恢复目标的版本不低于源库,所以照写。
+ *
+ * 2.9.0 收的是授权数组(旧快照传 undefined),照旧接受:记录里每个备份的 schema 都有一条 schema 条目,
+ * 范围从它取。
  */
-export function recoveryGrantsSql(grants: GrantedObject[] | undefined): string {
-  if (grants === undefined) {
+export function recoveryGrantsSql(
+  database: { schemas: string[]; grants?: GrantedObject[] } | GrantedObject[] | undefined
+): string {
+  const recorded = Array.isArray(database) ? database : database?.grants;
+  if (recorded === undefined) {
     return [
       "grant all on all tables in schema public to anon, authenticated, service_role;",
       "grant all on all sequences in schema public to anon, authenticated, service_role;",
       "grant execute on all functions in schema public to anon, authenticated, service_role;",
     ].join("\n");
   }
-  const statements = grantStatements(grants, { roles: GRANT_ROLES, maintain: true });
-  return statements.length ? statements.map((s) => `${s};`).join("\n") : "-- (nothing to grant in this snapshot)";
+  const schemaNames = Array.isArray(database) ? [...new Set(database.map((g) => g.schema))] : database!.schemas;
+  const grants = grantStatements(recorded, { roles: GRANT_ROLES, maintain: true, revoke: false });
+  const inner = dollarQuoteTag("g", grants);
+  const outer = dollarQuoteTag("grants", [...grants, ...schemaNames, inner]);
+  const schemas = `array[${schemaNames.map(sqlLiteral).join(", ")}]::text[]`;
+  const grantArray = grants.length
+    ? `array[\n${grants.map((g) => `    ${inner}${g}${inner}`).join(",\n")}\n  ]`
+    : "array[]::text[]";
+  const notFromExtension = (catalog: string, alias: string) =>
+    `not exists (select 1 from pg_catalog.pg_depend d where d.classid = '${catalog}'::pg_catalog.regclass ` +
+    `and d.objid = ${alias}.oid and d.deptype = 'e')`;
+  const from = "public, anon, authenticated, service_role";
+  // 恢复出来的对象(扩展自带的除外):名字、收权语句(列没有,清表权限会连带清掉)、属主、当前 ACL。
+  // 下面三处都用它,每次现查
+  const restoredObjects = `
+      select pg_catalog.format('schema %I', n.nspname) as object,
+             pg_catalog.format('revoke all on schema %I from ${from}', n.nspname) as revoke_sql,
+             n.nspowner as owner,
+             coalesce(n.nspacl, pg_catalog.acldefault('n', n.nspowner)) as acl
+        from pg_catalog.pg_namespace n
+       where n.nspname = any (${schemas})
+      union all
+      select pg_catalog.format('%I.%I', n.nspname, c.relname),
+             pg_catalog.format('revoke all on %s %I.%I from ${from}',
+               case when c.relkind = 'S' then 'sequence' else 'table' end, n.nspname, c.relname),
+             c.relowner,
+             coalesce(c.relacl, pg_catalog.acldefault(case when c.relkind = 'S' then 's' else 'r' end::"char", c.relowner))
+        from pg_catalog.pg_class c
+        join pg_catalog.pg_namespace n on n.oid = c.relnamespace
+       where n.nspname = any (${schemas})
+         and c.relkind in ('r', 'p', 'v', 'm', 'f', 'S')
+         and ${notFromExtension("pg_catalog.pg_class", "c")}
+      union all
+      select pg_catalog.format('%I.%I.%I', n.nspname, c.relname, a.attname), null, c.relowner, a.attacl
+        from pg_catalog.pg_attribute a
+        join pg_catalog.pg_class c on c.oid = a.attrelid
+        join pg_catalog.pg_namespace n on n.oid = c.relnamespace
+       where n.nspname = any (${schemas})
+         and a.attnum > 0 and not a.attisdropped and a.attacl is not null
+         and ${notFromExtension("pg_catalog.pg_class", "c")}
+      union all
+      select pg_catalog.format('%I.%I(%s)', n.nspname, p.proname, sig.args),
+             pg_catalog.format('revoke all on routine %I.%I(%s) from ${from}', n.nspname, p.proname, sig.args),
+             p.proowner,
+             coalesce(p.proacl, pg_catalog.acldefault('f', p.proowner))
+        from pg_catalog.pg_proc p
+        join pg_catalog.pg_namespace n on n.oid = p.pronamespace
+        cross join lateral (
+          select case when p.prokind = 'a' then pg_catalog.oidvectortypes(p.proargtypes)
+                      else pg_catalog.pg_get_function_identity_arguments(p.oid) end as args
+        ) sig
+       where n.nspname = any (${schemas})
+         and ${notFromExtension("pg_catalog.pg_proc", "p")}`;
+  return `do ${outer}
+declare
+  statement text;
+  problem text;
+begin
+  perform pg_catalog.set_config('search_path', '', true);
+  -- 0. Run as the role that owns what the restore created: for anyone else, GRANT and REVOKE
+  --    only warn and change nothing, or only part of it
+  select pg_catalog.string_agg(o.object, ', ') into problem
+    from (${restoredObjects}
+    ) o
+   where not pg_catalog.pg_has_role(current_user, o.owner, 'USAGE');
+  if problem is not null then
+    raise exception 'run this as the role that ran pg_restore, which owns the restored objects; % does not own: %',
+      current_user, pg_catalog.left(problem, 500);
+  end if;
+  -- 1. Take PUBLIC, anon, authenticated and service_role off everything the restore created
+  --    (objects that belong to an extension are left alone), then check nothing is left
+  for statement in select o.revoke_sql from (${restoredObjects}
+    ) o where o.revoke_sql is not null
+  loop
+    execute statement;
+  end loop;
+  select pg_catalog.string_agg(distinct o.object, ', ') into problem
+    from (${restoredObjects}
+    ) o
+    cross join lateral pg_catalog.aclexplode(o.acl) x
+   where x.grantee = 0
+      or x.grantee in (select r.oid from pg_catalog.pg_roles r where r.rolname in ('anon', 'authenticated', 'service_role'));
+  if problem is not null then
+    raise exception 'could not take access away on: %', pg_catalog.left(problem, 500);
+  end if;
+  -- 2. Grant back what the source had at backup time. A grant that fails (its object, column or
+  --    argument type isn't in this restore) is skipped with a warning: it can only leave less access
+  for statement in select pg_catalog.unnest(${grantArray})
+  loop
+    begin
+      execute statement;
+    exception when others then
+      raise warning 'not granted (%): %', sqlerrm, statement;
+    end;
+  end loop;
+end
+${outer};`;
 }

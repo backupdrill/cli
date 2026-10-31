@@ -16,6 +16,7 @@ import { runRestore } from "../dist/restore.js";
 import { captureGrants, grantStatements, recoveryGrantsSql, restoreGrants, revokeApiAccess } from "../dist/grants.js";
 import { parseManifest } from "../dist/manifest.js";
 import { installSandboxShim, restoreDatabaseArtifact } from "../dist/restore-engine.js";
+import { resolvePgRestoreBin } from "../dist/pgbin.js";
 
 const x = promisify(execFile);
 const pgDump = process.env.BACKUPDRILL_PG_DUMP || "pg_dump";
@@ -318,16 +319,102 @@ test("manifest: grants entries are validated before anything is restored", () =>
   assert.throws(() => parseManifest(withGrants([{ kind: "routine", schema: "public", name: "f", privileges: {} }])), /args/);
 });
 
-test("recoveryGrantsSql: exact statements when the snapshot recorded grants, Supabase's old defaults when it didn't", () => {
-  const recorded = recoveryGrantsSql([{ kind: "table", schema: "public", name: "t", privileges: { anon: ["SELECT"] } }]);
-  assert.equal(
-    recorded,
-    'revoke all on table "public"."t" from public, "anon", "authenticated", "service_role";\n' +
-      'grant select on table "public"."t" to "anon";'
-  );
-  assert.match(recoveryGrantsSql(undefined), /^grant all on all tables in schema public to anon, authenticated, service_role;/);
-  assert.match(recoveryGrantsSql([]), /nothing to grant/);
+test("recoveryGrantsSql: one DO block that revokes by the catalog, then grants what was recorded", () => {
+  const sql = recoveryGrantsSql({
+    schemas: ["public", "it's"],
+    grants: [
+      { kind: "table", schema: "public", name: "t", privileges: { anon: ["SELECT"] } },
+      // 标识符里恰好有 $g$:换一个标签,不用转义
+      { kind: "table", schema: "public", name: "odd$g$name", privileges: { anon: ["SELECT"] } },
+    ],
+  });
+  assert.match(sql, /^do \$grants\$\n/);
+  assert.match(sql, /\$grants\$;$/);
+  assert.ok(sql.includes("array['public', 'it''s']::text[]"));
+  assert.ok(sql.includes('$g1$grant select on table "public"."t" to "anon"$g1$'));
+  assert.ok(sql.includes('$g1$grant select on table "public"."odd$g$name" to "anon"$g1$'));
+  assert.ok(!/revoke all on table "public"/.test(sql), "revokes come from the restored catalog, not the record");
+  assert.match(recoveryGrantsSql({ schemas: ["public"] }), /^grant all on all tables in schema public to anon, authenticated, service_role;/);
+  assert.match(recoveryGrantsSql({ schemas: ["public"], grants: [] }), /unnest\(array\[\]::text\[\]\)/);
+  // 2.9.0 的调用方式照旧可用:授权数组得到同样的 DO 块(范围取记录里的 schema 条目),undefined 是旧快照
+  const record = [
+    { kind: "schema", schema: "public", privileges: { anon: ["USAGE"] } },
+    { kind: "table", schema: "public", name: "t", privileges: { anon: ["SELECT"] } },
+  ];
+  assert.equal(recoveryGrantsSql(record), recoveryGrantsSql({ schemas: ["public"], grants: record }));
+  assert.equal(recoveryGrantsSql(undefined), recoveryGrantsSql({ schemas: ["public"] }));
 });
+
+test(
+  "recoveryGrantsSql after a plain pg_restore: grants match the source, and drift between dump and record is handled",
+  { skip: canRun ? false : "requires Docker + pg_dump", timeout: 180_000 },
+  async () => {
+    const ids = [];
+    const work = mkdtempSync(join(tmpdir(), "bd-manual-grants-"));
+    try {
+      const [sourcePort, targetPort] = await Promise.all([startPostgres(ids), startPostgres(ids)]);
+      const sourceUrl = `postgresql://postgres:pw@127.0.0.1:${sourcePort}/postgres`;
+      const targetUrl = `postgresql://postgres:pw@127.0.0.1:${targetPort}/postgres`;
+      await sql(
+        sourceUrl,
+        `${ROLES} ${OLD_SUPABASE_DEFAULTS}
+         create extension pg_trgm schema public;
+         create table public.notes (id bigint generated always as identity primary key, body text);
+         create table public.audit_log (id int);
+         revoke all on public.audit_log from anon, authenticated, service_role;
+         create table public.profiles (id int, name text);
+         revoke all on public.profiles from anon;
+         grant select (id) on public.profiles to anon;
+         create function public.secret() returns int language sql security definer as 'select 1';
+         revoke execute on function public.secret() from public, anon, authenticated;
+         create aggregate public.pick(float8 order by anyelement) (
+           sfunc = ordered_set_transition, stype = internal, finalfunc = percentile_disc_final, finalfunc_extra);
+         revoke all on function public.pick(float8, anyelement) from public, anon, service_role;`
+      );
+      const source = await withClient(sourceUrl, (client) => captureGrants(client, ["public"]));
+      const dumpPath = join(work, "dump.pgcustom");
+      await x(pgDump, ["--format=custom", "--no-owner", "--no-privileges", "--schema=public", "--dbname", sourceUrl, "-f", dumpPath]);
+
+      // 目标:旧默认授权(恢复出来的对象都是开放的,最坏情况),扩展先装好
+      await sql(targetUrl, `${ROLES} ${OLD_SUPABASE_DEFAULTS} create extension pg_trgm schema public;`);
+      await assert.rejects(
+        x(resolvePgRestoreBin(), ["--no-owner", "--no-privileges", "--dbname", targetUrl, dumpPath], {
+          env: { ...process.env, LC_ALL: "C" }, // 断言英文报错,不随本机语言变
+        }),
+        (error) => /errors ignored on restore: 1/.test(error.stderr) && /schema "public" already exists/.test(error.stderr)
+      );
+
+      // 记录和转储对不上的几种情况:secret 在转储里、不在记录里(转储完、读授权前被删);
+      // notes.added_later 和 ghost(参数是转储里没有的枚举类型)在记录里、不在转储里(转储完才加的)
+      const record = [
+        ...source.filter((g) => g.name !== "secret"),
+        { kind: "column", schema: "public", name: "notes", column: "added_later", privileges: { anon: ["SELECT"] } },
+        { kind: "routine", schema: "public", name: "ghost", args: "m public.mood", privileges: { anon: ["EXECUTE"] } },
+      ];
+      const similarityAcl = async () =>
+        (await sql(targetUrl, "select proacl::text from pg_proc where proname = 'similarity' and pronamespace = 'public'::regnamespace"))
+          .rows[0].proacl;
+      const extensionAclBefore = await similarityAcl();
+      const notices = [];
+      await withClient(targetUrl, async (client) => {
+        client.on("notice", (notice) => notices.push(notice.message));
+        await client.query(recoveryGrantsSql({ schemas: ["public"], grants: record }));
+      });
+      assert.ok(notices.some((n) => /not granted .*added_later/.test(n)), notices.join(" | "));
+      assert.ok(notices.some((n) => /not granted .*ghost/.test(n)), notices.join(" | "));
+
+      const restored = await withClient(targetUrl, (client) => captureGrants(client, ["public"]));
+      const expected = source.map((g) => (g.name === "secret" ? { ...g, privileges: {} } : g));
+      assert.deepEqual(restored, expected);
+      // 扩展自带的函数不碰(它的 ACL 是建扩展时按目标默认授权给的)
+      assert.ok(extensionAclBefore, "the target's defaults gave the extension function an ACL");
+      assert.equal(await similarityAcl(), extensionAclBefore);
+    } finally {
+      await Promise.all(ids.map((id) => x("docker", ["rm", "-f", id]).catch(() => {})));
+      rmSync(work, { recursive: true, force: true });
+    }
+  }
+);
 
 test(
   "restoreGrants: a GRANT that only warns (the restoring role doesn't own the object) fails instead of passing silently",
@@ -347,6 +434,17 @@ test(
          grant all on public.t to anon;`
       );
       const asRestorer = `postgresql://restorer:pw@127.0.0.1:${port}/postgres`;
+      // RECOVERY.md 那段 SQL 同样不能在收不掉权限时照常成功:整段回滚、报出是哪个对象
+      await sql(admin, "grant usage on schema public to restorer");
+      await assert.rejects(
+        withClient(asRestorer, (client) => client.query(recoveryGrantsSql({ schemas: ["public"], grants: [] }))),
+        /run this as the role that ran pg_restore, which owns the restored objects; restorer does not own: .*public\.t/
+      );
+      assert.deepEqual(
+        find(await withClient(admin, (client) => captureGrants(client, ["public"])), "table", "t").privileges.anon,
+        ["DELETE", "INSERT", "MAINTAIN", "REFERENCES", "SELECT", "TRIGGER", "TRUNCATE", "UPDATE"],
+        "the failed block rolled back"
+      );
       await assert.rejects(
         withClient(asRestorer, (client) => restoreGrants(client, { schemas: ["public"], recorded: [] })),
         /didn't take effect on .*table public\.t/
