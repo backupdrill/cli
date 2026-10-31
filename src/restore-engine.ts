@@ -23,9 +23,9 @@ import type { ExtensionInfo } from "./manifest.js";
 import { MAX_COPY_HEADER, parseCopyHeader, parseCreateSchemas, parseForeignKeys, type ForeignKeyDef } from "./dump-sql.js";
 import {
   addForeignKeys,
+  archiveTables,
   describeOrphanedForeignKey,
   isDeferrableForeignKey,
-  tablesWithData,
   type OrphanedForeignKey,
 } from "./orphaned-foreign-keys.js";
 import { resolvePgRestoreBin } from "./pgbin.js";
@@ -153,7 +153,7 @@ async function deferredForeignKeys(
   // 沙箱那边传进来的只有 post-data 条目,数据条目要看完整目录
   const fullListing = await pgRestoreOutput(bin, ["--list", dumpPath]);
   if (fullListing.code !== 0) return none;
-  const withData = tablesWithData(fullListing.stdout);
+  const tables = archiveTables(fullListing.stdout);
   const listFile = join(listDir, "foreign-keys.list");
   await writeFile(listFile, fkEntries.join("\n") + "\n");
   const ddl = await pgRestoreOutput(bin, ["-f", "-", `--use-list=${listFile}`, dumpPath]);
@@ -163,7 +163,7 @@ async function deferredForeignKeys(
   const lines = new Set<string>();
   const fks: ForeignKeyDef[] = [];
   parsed.forEach((fk, i) => {
-    if (!isDeferrableForeignKey(fk, withData)) return;
+    if (!isDeferrableForeignKey(fk, tables)) return;
     lines.add(fkEntries[i]);
     fks.push(fk);
   });

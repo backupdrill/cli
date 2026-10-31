@@ -10,7 +10,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import pg from "pg";
 import { parseForeignKeys } from "../dist/dump-sql.js";
-import { isDeferrableForeignKey, notValidStatement, orphanCountSql, tablesWithData } from "../dist/orphaned-foreign-keys.js";
+import { archiveTables, isDeferrableForeignKey, notValidStatement, orphanCountSql } from "../dist/orphaned-foreign-keys.js";
 import { drillDump } from "../dist/drill.js";
 import { withoutRestrictWrapper } from "../dist/restore-engine.js";
 import { runRestore } from "../dist/restore.js";
@@ -39,29 +39,51 @@ test("notValidStatement:NOT VALID 加在选项之后、分号之前", () => {
   );
 });
 
-test("tablesWithData:TABLE DATA 条目里的表名可以带空格,去掉末尾属主后整串比对", () => {
+test("archiveTables:建表和数据条目分开存整串,名字和属主都可以带空格", () => {
   const listing = [
     "; Archive created at 2026-10-31",
+    "3301; 1259 16390 TABLE public orders postgres",
     "3401; 0 16390 TABLE DATA public orders postgres",
-    "3402; 0 16400 TABLE DATA public Child Table postgres",
-    "3403; 1259 16410 TABLE public ext_items postgres",
+    "3402; 0 16400 TABLE DATA public Child Table review owner",
+    "3501; 2606 16420 FK CONSTRAINT public orders orders_fk postgres",
   ].join("\n");
-  assert.deepEqual([...tablesWithData(listing)], ["public orders", "public Child Table"]);
+  assert.deepEqual(archiveTables(listing), {
+    defined: ["public orders postgres"],
+    withData: ["public orders postgres", "public Child Table review owner"],
+  });
 });
 
-test("isDeferrableForeignKey:只挪两端数据都在快照里、会校验已有行、不在分区父表上的外键", () => {
-  const withData = new Set(["public a", "public b"]);
+test("isDeferrableForeignKey:只挪两端都由 dump 建表并带数据、会校验已有行、不在分区父表上的外键", () => {
+  const tables = archiveTables(
+    [
+      "1; 1259 1 TABLE public a postgres",
+      "2; 1259 2 TABLE public b review owner",
+      "3; 0 1 TABLE DATA public a postgres",
+      "4; 0 2 TABLE DATA public b review owner",
+      // 扩展的配置表:CREATE EXTENSION 建表,dump 里只有过了扩展过滤条件的行
+      "5; 0 3 TABLE DATA public ext_config postgres",
+      // 扩展的普通成员表:建表和数据都不在 dump 里
+      "6; 1259 4 TABLE public b_archive postgres",
+    ].join("\n")
+  );
   const inside = fk("ALTER TABLE ONLY public.a\n    ADD CONSTRAINT a_fk FOREIGN KEY (x) REFERENCES public.b(id);");
-  assert.equal(isDeferrableForeignKey(inside, withData), true);
+  assert.equal(isDeferrableForeignKey(inside, tables), true, "owner names with spaces still match");
   const toAuth = fk("ALTER TABLE ONLY public.a\n    ADD CONSTRAINT a_fk FOREIGN KEY (x) REFERENCES auth.users(id);");
-  assert.equal(isDeferrableForeignKey(toAuth, withData), false, "keys into auth.users keep the preflight path");
-  // 扩展自带的表在 public 里,但数据不在 dump 里:恢复后是目标上的那份,缺行不能算源库的错
+  assert.equal(isDeferrableForeignKey(toAuth, tables), false, "keys into auth.users keep the preflight path");
+  // 恢复后是目标上扩展装出来的那份,缺行不能算源库的错
   const toExtension = fk("ALTER TABLE ONLY public.a\n    ADD CONSTRAINT a_fk FOREIGN KEY (x) REFERENCES public.ext_items(id);");
-  assert.equal(isDeferrableForeignKey(toExtension, withData), false);
+  assert.equal(isDeferrableForeignKey(toExtension, tables), false);
+  const toExtensionConfig = fk("ALTER TABLE ONLY public.a\n    ADD CONSTRAINT a_fk FOREIGN KEY (x) REFERENCES public.ext_config(id);");
+  assert.equal(isDeferrableForeignKey(toExtensionConfig, tables), false, "a config table's dump holds only the filtered rows");
+  const noData = fk("ALTER TABLE ONLY public.a\n    ADD CONSTRAINT a_fk FOREIGN KEY (x) REFERENCES public.b_archive(id);");
+  assert.equal(isDeferrableForeignKey(noData, tables), false, "a table dumped without its rows");
+  // 前缀比对不能把 public.b 的条目算到 public.b_archive 头上,反过来也一样
+  const fromPrefix = fk("ALTER TABLE ONLY public.b_archive\n    ADD CONSTRAINT x_fk FOREIGN KEY (x) REFERENCES public.a(id);");
+  assert.equal(isDeferrableForeignKey(fromPrefix, tables), false);
   const notValid = fk("ALTER TABLE ONLY public.a\n    ADD CONSTRAINT a_fk FOREIGN KEY (x) REFERENCES public.b(id) NOT VALID;");
-  assert.equal(isDeferrableForeignKey(notValid, withData), false);
+  assert.equal(isDeferrableForeignKey(notValid, tables), false);
   const partitioned = fk("ALTER TABLE public.a\n    ADD CONSTRAINT a_fk FOREIGN KEY (x) REFERENCES public.b(id);");
-  assert.equal(isDeferrableForeignKey(partitioned, withData), false, "PostgreSQL has no NOT VALID foreign key on a partitioned table");
+  assert.equal(isDeferrableForeignKey(partitioned, tables), false, "PostgreSQL has no NOT VALID foreign key on a partitioned table");
 });
 
 test("withoutRestrictWrapper:只去掉脚本首尾那一对元命令,字符串里同样字样的行保留", () => {
@@ -308,6 +330,70 @@ test(
   }
 );
 
+// 装一个测试用扩展(两边各装一次,脚本内容相同),在源库上执行 sourceSql,把 public 导出后恢复到空目标上。
+// 返回 runRestore 的 promise 和目标库连接串。
+async function restoreWithTestExtension(ids, work, extensionScript, sourceSql) {
+  const [sourcePort, targetPort] = await Promise.all([startPostgres(ids), startPostgres(ids)]);
+  const sourceUrl = `postgresql://postgres:pw@127.0.0.1:${sourcePort}/postgres`;
+  const targetUrl = `postgresql://postgres:pw@localhost:${targetPort}/postgres`;
+  for (const port of [sourcePort, targetPort]) {
+    const id = (await x("docker", ["ps", "-q", "--filter", `publish=${port}`])).stdout.trim();
+    await x("docker", ["exec", "-u", "root", id, "sh", "-c",
+      "d=$(pg_config --sharedir)/extension; " +
+      "printf \"default_version = '1.0'\\nrelocatable = false\\n\" > $d/bdtest_items.control; " +
+      `printf '%s' "$1" > $d/bdtest_items--1.0.sql`, "sh", extensionScript]);
+  }
+  await sql(sourceUrl, `create extension bdtest_items schema public;\n${sourceSql}`);
+  const dumpPath = join(work, "source.pgcustom");
+  await x(pgDump, ["--format=custom", "--no-owner", "--no-privileges", "--schema=public", "--dbname", sourceUrl, "-f", dumpPath]);
+  const buf = readFileSync(dumpPath);
+  const manifest = {
+    schemaVersion: 2,
+    tool: "backupdrill-cli",
+    toolVersion: "test",
+    createdAt: "2026-10-31T00:00:00.000Z",
+    projectName: "ext",
+    database: {
+      serverVersion: "17.6",
+      pgDumpVersion: (await x(pgDump, ["--version"])).stdout.trim(),
+      schemas: ["public"],
+      tableCount: 1,
+      estimatedRowTotal: 1,
+      tables: [{ schema: "public", name: "refs", estimatedRows: 1 }],
+      extensions: [{ name: "bdtest_items", version: "1.0", schema: "public" }],
+    },
+    dump: { key: "backupdrill/ext/snap/dump.pgcustom", format: "custom", bytes: buf.length, sha256: createHash("sha256").update(buf).digest("hex") },
+    storage: null,
+  };
+  const store = {
+    createSnapshot: async () => {
+      throw new Error("read-only test store");
+    },
+    openSnapshot: async () => ({
+      name: "snap",
+      readManifest: async () => JSON.stringify(manifest),
+      downloadDump: async (_m, dest) => {
+        copyFileSync(dumpPath, dest);
+        return { bytes: buf.length, sha256: manifest.dump.sha256 };
+      },
+      storageFiles: () => null,
+    }),
+  };
+  const config = { databaseUrl: sourceUrl, projectName: "ext", schemas: ["public"], storage: { bucket: "unused" } };
+  return { restore: runRestore(config, { store, targetDatabaseUrl: targetUrl, confirmTarget: "localhost" }), targetUrl };
+}
+
+async function assertStrictFailure({ restore, targetUrl }) {
+  await assert.rejects(restore, (error) => {
+    assert.doesNotMatch(error.message, /NOT VALID/);
+    return true;
+  });
+  const leftover = await sql(targetUrl, "select count(*)::int as n from pg_constraint where conname = 'refs_item_id_fkey'");
+  assert.equal(leftover.rows[0].n, 0, "the key was not relaxed to NOT VALID");
+  const refs = await sql(targetUrl, "select to_regclass('public.refs') is null as gone");
+  assert.equal(refs.rows[0].gone, true, "nothing from the snapshot stays on the target");
+}
+
 // 交叉审查复现:扩展自带的表在 public 里,数据却不在 dump 里(恢复后是目标上扩展装出来的那份)。
 // 缺行是目标的事,不能被放宽成 NOT VALID 再算到源库头上——这条外键必须照旧严格校验
 test(
@@ -317,70 +403,44 @@ test(
     const ids = [];
     const work = mkdtempSync(join(tmpdir(), "bd-ext-fk-"));
     try {
-      const [sourcePort, targetPort] = await Promise.all([startPostgres(ids), startPostgres(ids)]);
-      const sourceUrl = `postgresql://postgres:pw@127.0.0.1:${sourcePort}/postgres`;
-      const targetUrl = `postgresql://postgres:pw@localhost:${targetPort}/postgres`;
-      for (const port of [sourcePort, targetPort]) {
-        const id = (await x("docker", ["ps", "-q", "--filter", `publish=${port}`])).stdout.trim();
-        await x("docker", ["exec", "-u", "root", id, "sh", "-c",
-          "d=$(pg_config --sharedir)/extension; " +
-          "printf \"default_version = '1.0'\\nrelocatable = false\\n\" > $d/bdtest_items.control; " +
-          "printf \"create table ext_items (id int primary key);\\ninsert into ext_items values (1), (2);\\n\" > $d/bdtest_items--1.0.sql"]);
-      }
-      await sql(
-        sourceUrl,
-        `create extension bdtest_items schema public;
-         insert into public.ext_items values (3);
-         create table public.refs (id int primary key, item_id int references public.ext_items(id));
-         insert into public.refs values (1, 3);`
+      await assertStrictFailure(
+        await restoreWithTestExtension(
+          ids,
+          work,
+          "create table ext_items (id int primary key);\ninsert into ext_items values (1), (2);\n",
+          `insert into public.ext_items values (3);
+           create table public.refs (id int primary key, item_id int references public.ext_items(id));
+           insert into public.refs values (1, 3);`
+        )
       );
-      const dumpPath = join(work, "source.pgcustom");
-      await x(pgDump, ["--format=custom", "--no-owner", "--no-privileges", "--schema=public", "--dbname", sourceUrl, "-f", dumpPath]);
-      const buf = readFileSync(dumpPath);
-      const manifest = {
-        schemaVersion: 2,
-        tool: "backupdrill-cli",
-        toolVersion: "test",
-        createdAt: "2026-10-31T00:00:00.000Z",
-        projectName: "ext",
-        database: {
-          serverVersion: "17.6",
-          pgDumpVersion: (await x(pgDump, ["--version"])).stdout.trim(),
-          schemas: ["public"],
-          tableCount: 1,
-          estimatedRowTotal: 1,
-          tables: [{ schema: "public", name: "refs", estimatedRows: 1 }],
-          extensions: [{ name: "bdtest_items", version: "1.0", schema: "public" }],
-        },
-        dump: { key: "backupdrill/ext/snap/dump.pgcustom", format: "custom", bytes: buf.length, sha256: createHash("sha256").update(buf).digest("hex") },
-        storage: null,
-      };
-      const store = {
-        createSnapshot: async () => {
-          throw new Error("read-only test store");
-        },
-        openSnapshot: async () => ({
-          name: "snap",
-          readManifest: async () => JSON.stringify(manifest),
-          downloadDump: async (_m, dest) => {
-            copyFileSync(dumpPath, dest);
-            return { bytes: buf.length, sha256: manifest.dump.sha256 };
-          },
-          storageFiles: () => null,
-        }),
-      };
-      const config = { databaseUrl: sourceUrl, projectName: "ext", schemas: ["public"], storage: { bucket: "unused" } };
-      await assert.rejects(
-        runRestore(config, { store, targetDatabaseUrl: targetUrl, confirmTarget: "localhost" }),
-        (error) => {
-          assert.doesNotMatch(error.message, /NOT VALID/);
-          return true;
-        }
+    } finally {
+      for (const id of ids) await x("docker", ["rm", "-fv", id]).catch(() => {});
+      rmSync(work, { recursive: true, force: true });
+    }
+  }
+);
+
+// 交叉审查复现:扩展的配置表有 TABLE DATA,但里面只有过了 pg_extension_config_dump 过滤条件的行。
+// 被滤掉的行恢复后不在,同样不能算源库的孤儿行
+test(
+  "a foreign key into an extension's config table stays strict: rows the extension filters out are not orphans",
+  { skip: canRun ? false : "requires Docker + pg_dump", timeout: 300_000 },
+  async () => {
+    const ids = [];
+    const work = mkdtempSync(join(tmpdir(), "bd-ext-config-fk-"));
+    try {
+      await assertStrictFailure(
+        await restoreWithTestExtension(
+          ids,
+          work,
+          "create table ext_items (id int primary key, builtin bool not null default false);\n" +
+            "insert into ext_items values (1, true);\n" +
+            "select pg_catalog.pg_extension_config_dump('ext_items', 'where not builtin');\n",
+          `insert into public.ext_items values (2, true), (3, false);
+           create table public.refs (id int primary key, item_id int references public.ext_items(id));
+           insert into public.refs values (1, 2), (2, 3);`
+        )
       );
-      const leftover = await sql(targetUrl, "select count(*)::int as n from pg_constraint where conname = 'refs_item_id_fkey'");
-      assert.equal(leftover.rows[0].n, 0, "the key was not relaxed to NOT VALID");
-      const refs = await sql(targetUrl, "select to_regclass('public.refs') is null as gone");
-      assert.equal(refs.rows[0].gone, true, "nothing from the snapshot stays on the target");
     } finally {
       for (const id of ids) await x("docker", ["rm", "-fv", id]).catch(() => {});
       rmSync(work, { recursive: true, force: true });

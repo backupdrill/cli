@@ -7,12 +7,12 @@
 // 与源库的实际状态一致,数据一行不丢。真实恢复因此成功并在报告里列出这些外键;演练仍判失败,
 // 因为这是用户该清理的数据问题(创始人决策 2026-10-31,起因是 2026-10-30 一个 Team 项目的演练)。
 //
-// 只处理两端的数据都在本次快照里的外键(归档里有两张表的 TABLE DATA 条目):孤儿行这时只能来自源库。
-// 指向备份之外(如 auth.users)或扩展自带的表(数据不在 dump 里,恢复后是目标上扩展装出来的那份)的外键
-// 照旧严格校验,另有预检(external-refs.ts)和沙箱托管豁免。分区父表上的外键也不处理,PostgreSQL
-// 不允许给分区表加 NOT VALID 外键。
+// 只处理两端的数据都完整地在本次快照里的外键(两张表都由 dump 建、都有 TABLE DATA):孤儿行这时只能来自源库。
+// 指向备份之外(如 auth.users)或扩展自带的表(数据不在 dump 里或只有一部分,恢复后是目标上扩展装出来的那份)
+// 的外键照旧严格校验,另有预检(external-refs.ts)和沙箱托管豁免。分区表两端的外键也不处理:分区父表上
+// PostgreSQL 不允许加 NOT VALID 外键;被引用的是分区表时,数据挂在各分区上,这里不去追。
 import type { Client } from "pg";
-import { formatQualified, type ForeignKeyDef } from "./dump-sql.js";
+import { formatQualified, type ForeignKeyDef, type QualifiedName } from "./dump-sql.js";
 import { quoteIdent } from "./restore-engine.js";
 
 export interface OrphanedForeignKey {
@@ -28,25 +28,48 @@ export interface OrphanedForeignKey {
 }
 
 /**
- * 归档目录里 TABLE DATA 条目对应的表:`<id>; 0 <oid> TABLE DATA <schema> <名> <属主>`。
- * 名字可以带空格、不加引号,所以去掉末尾的属主后整串比对,不拆分。
+ * 归档目录里的建表条目和数据条目:`<id>; 1259 <oid> TABLE <schema> <名> <属主>`、
+ * `<id>; 0 <oid> TABLE DATA <schema> <名> <属主>`。名字和属主都可以带空格、不加引号,拆不开,
+ * 所以存 "<schema> <名> <属主>" 整串,查某张表时比前缀(交叉审查:属主带空格)。
  */
-export function tablesWithData(listing: string): Set<string> {
-  const tables = new Set<string>();
+export interface ArchiveTables {
+  defined: string[];
+  withData: string[];
+}
+
+export function archiveTables(listing: string): ArchiveTables {
+  const tables: ArchiveTables = { defined: [], withData: [] };
   for (const line of listing.split("\n")) {
-    const match = /^\d+; \d+ \d+ TABLE DATA (.*)$/.exec(line);
-    if (match) tables.add(match[1].slice(0, match[1].lastIndexOf(" ")));
+    const match = /^\d+; \d+ \d+ TABLE (DATA )?(.*)$/.exec(line);
+    if (match) (match[1] ? tables.withData : tables.defined).push(match[2]);
   }
   return tables;
 }
 
-/** 能交给 addForeignKeys 处理的外键:两端的数据都在快照里、会校验已有行、不在分区父表上。 */
-export function isDeferrableForeignKey(fk: ForeignKeyDef, withData: Set<string>): boolean {
+function listed(entries: string[], table: QualifiedName): boolean {
+  const prefix = `${table.schema} ${table.name} `;
+  return entries.some((entry) => entry.startsWith(prefix));
+}
+
+/**
+ * 两端的行是不是全在快照里:表由 dump 自己建(有 TABLE 条目)并且有 TABLE DATA。
+ * 只看 TABLE DATA 不够:扩展的配置表(pg_extension_config_dump)由 CREATE EXTENSION 建、没有 TABLE 条目,
+ * 数据条目里只有过了扩展过滤条件的行,缺的那些行不是源库的问题(交叉审查复现)。
+ */
+function dumpedInFull(tables: ArchiveTables, table: QualifiedName): boolean {
+  return listed(tables.defined, table) && listed(tables.withData, table);
+}
+
+/**
+ * 能交给 addForeignKeys 处理的外键:两端的数据都完整地在快照里、会校验已有行、不在分区父表上。
+ * 指向分区表的外键也照旧严格:分区表自己没有 TABLE DATA,数据在各个分区上。
+ */
+export function isDeferrableForeignKey(fk: ForeignKeyDef, tables: ArchiveTables): boolean {
   return (
     fk.validatesRows &&
     !fk.onPartitionedTable &&
-    withData.has(`${fk.table.schema} ${fk.table.name}`) &&
-    withData.has(`${fk.references.schema} ${fk.references.name}`)
+    dumpedInFull(tables, fk.table) &&
+    dumpedInFull(tables, fk.references)
   );
 }
 
