@@ -1,3 +1,5 @@
+import { GRANT_PRIVILEGES, GRANT_ROLES, GRANTED_OBJECT_KINDS, type GrantedObject } from "./grants.js";
+
 /**
  * manifest.json —— 每次快照的自描述清单。
  * 云版演练靠它做校验(表数量、行数对比、体积异常告警);开源侧至少让用户能核对
@@ -60,6 +62,8 @@ export interface ExtensionInfo {
  *  - 2(恢复闭环 PRD §5.1):storage 增加 buckets 属性清单(public/大小/MIME 限制),
  *    files 增加 contentType/cacheControl/metadata 等恢复所需元数据;tables 预留
  *    验证升级字段(本期不生成)。全部为**可加字段**——v2 读取端兼容 v1 快照。
+ *  - (仍是 2)2.9.0 加 database.grants:可加字段,旧读取端忽略它、照旧恢复,不升版本,
+ *    免得还没升级的 CLI 和 worker 拒读新快照。
  */
 export const MANIFEST_SCHEMA_VERSION = 2;
 
@@ -82,6 +86,9 @@ export interface Manifest {
     tables: TableStat[];
     // 可选 = 向后兼容:0.1.1 及更早的 manifest 没有这个字段,演练行为保持原样
     extensions?: ExtensionInfo[];
+    // 可选:2.9.0 之前的快照没有,或者备份时没读到。缺席 = 恢复端按 Supabase 以前的默认授权补 public
+    // (见 grants.ts);在场就照它重建 PUBLIC 和 API 角色的授权。空数组也是"读到了"
+    grants?: GrantedObject[];
   };
   dump: {
     key: string; // 桶内对象键
@@ -132,6 +139,23 @@ function optionalString(value: unknown, what: string): void {
   if (value !== undefined && typeof value !== "string") malformed(what);
 }
 
+// 名字会拼进 GRANT(标识符一律加引号);函数的参数表只用来和目标目录比对,SQL 里用的是目标目录自己的
+function assertGrantedObject(g: GrantedObject): void {
+  const what = "database.grants[]";
+  if (typeof g !== "object" || g === null) malformed(what);
+  if (!GRANTED_OBJECT_KINDS.includes(g.kind) || typeof g.schema !== "string" || !g.schema) malformed(what);
+  if (g.kind !== "schema" && (typeof g.name !== "string" || !g.name)) malformed(`${what}.name`);
+  if (g.kind === "column" && (typeof g.column !== "string" || !g.column)) malformed(`${what}.column`);
+  if (g.kind === "routine" && typeof g.args !== "string") malformed(`${what}.args`);
+  if (typeof g.privileges !== "object" || g.privileges === null || Array.isArray(g.privileges)) malformed(`${what}.privileges`);
+  for (const [role, privileges] of Object.entries(g.privileges)) {
+    if (!(GRANT_ROLES as readonly string[]).includes(role)) malformed(`${what}.privileges (unknown role)`);
+    if (!Array.isArray(privileges) || privileges.some((p) => !(GRANT_PRIVILEGES as readonly string[]).includes(p))) {
+      malformed(`${what}.privileges (unknown privilege)`);
+    }
+  }
+}
+
 function assertManifestShape(m: Manifest): void {
   // ref 驱动同源安全门:malformed 值会被当"身份已知"却永远匹配不上 = 保护静默失效
   if (m.sourceProjectRef !== undefined && !/^[a-z0-9]{16,}$/.test(m.sourceProjectRef)) {
@@ -163,6 +187,10 @@ function assertManifestShape(m: Manifest): void {
         malformed("database.extensions[]");
       }
     }
+  }
+  if (m.database.grants !== undefined) {
+    if (!Array.isArray(m.database.grants)) malformed("database.grants");
+    for (const g of m.database.grants) assertGrantedObject(g);
   }
   if (typeof m.database.tableCount !== "number") malformed("database.tableCount");
   if (!Array.isArray(m.database.tables)) malformed("database.tables");

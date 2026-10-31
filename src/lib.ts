@@ -6,6 +6,8 @@ export { runBackup } from "./backup.js";
 export { SUPABASE_ROOT_CA, pgConnectOptions, PG_CLIENT_OPTIONS, normalizeConnectionTarget } from "./supabase-ca.js";
 export { runDrill, drillDump } from "./drill.js";
 export { runRestore } from "./restore.js";
+// RECOVERY.md 的授权那一步:worker 的 Drive 版手册和这里的 S3 版用同一份 SQL
+export { recoveryGrantsSql } from "./grants.js";
 // 身份判定三件套对外导出:托管 worker 用它们与 app 侧 shared 的副本做同规则回归(交叉审查)
 export { projectRefOf, assertNoHostOverride, libpqChildEnv } from "./restore-engine.js";
 export { sameDatabaseTarget } from "./restore.js";
@@ -35,6 +37,7 @@ export type {
   SupabaseStorageConfig,
 } from "./config.js";
 export type { BucketAttrs, ExtensionInfo, Manifest, StorageFile, TableStat } from "./manifest.js";
+export type { GrantedObject, GrantRestore } from "./grants.js";
 export type { DrillReport, DrillCheck, DrillSupervision, DrillPhase } from "./drill.js";
 export type { OrphanedForeignKey } from "./orphaned-foreign-keys.js";
 export type { RestoreResult } from "./restore.js";

@@ -1,0 +1,321 @@
+// 恢复后把 Data API 角色的授权照源库原样补回。
+//
+// 为什么要这一步:转储和恢复都带 --no-privileges(平台角色的 ACL、ALTER DEFAULT PRIVILEGES
+// 会在沙箱和目标上报错),恢复出来的对象拿到什么授权全看目标库的默认授权。Supabase 从
+// 2026-05-30(新项目)/2026-10-30(老项目)起不再给 public 里的新表默认授权给 anon /
+// authenticated / service_role,于是恢复出来的表数据都在,supabase-js 读写却全部 42501。
+// 反过来,还没切换的老项目会给每张恢复出来的表都开放授权,包括源库里刻意不开放的表。
+// 两个方向都靠"照源库原样"来修:备份时记下这几个角色(加 PUBLIC)在每个对象上的授权,
+// 恢复完先清掉目标给的,再按记录补回。
+//
+// 只管 PUBLIC 和 Supabase 的三个 API 角色:别的角色(supabase_admin、自建角色)不一定在目标上,
+// 而 Data API 能不能读写只看这几个。演练沙箱里这三个角色由 sandboxShimSql 预建,所以演练和真实
+// 恢复走的是同一段代码。
+//
+// 旧快照(manifest 里没有 grants)没有记录可依:public 里的对象按 Supabase 以前的默认授权补
+// (拍这些快照时源项目基本都还是这套默认,和改动前恢复进老项目的结果一致),报告里写明。
+import type { Client } from "pg";
+
+export const API_ROLES = ["anon", "authenticated", "service_role"] as const;
+export type GrantRole = "PUBLIC" | (typeof API_ROLES)[number];
+export const GRANT_ROLES: readonly GrantRole[] = ["PUBLIC", ...API_ROLES];
+
+export type GrantedObjectKind = "schema" | "table" | "sequence" | "routine" | "column";
+export const GRANTED_OBJECT_KINDS: readonly GrantedObjectKind[] = ["schema", "table", "sequence", "routine", "column"];
+
+// aclexplode 吐出的权限名。MAINTAIN 只有 PG17+ 有,恢复进旧版本时跳过
+export const GRANT_PRIVILEGES = [
+  "SELECT", "INSERT", "UPDATE", "DELETE", "TRUNCATE", "REFERENCES", "TRIGGER", "MAINTAIN",
+  "USAGE", "EXECUTE", "CREATE",
+] as const;
+
+/**
+ * 一个对象上 PUBLIC 和三个 API 角色的授权。表、视图、序列、函数一律记下(没有授权也记,
+ * privileges 为空 = 源库没给这几个角色任何权限);列只记有列级授权的;schema 一律记。
+ */
+export interface GrantedObject {
+  kind: GrantedObjectKind;
+  schema: string;
+  /** table / sequence / routine 的名字;column 是它所在的表;schema 没有 */
+  name?: string;
+  column?: string;
+  /** routine:pg_get_function_identity_arguments(search_path 为空时取,类型都带 schema) */
+  args?: string;
+  privileges: Partial<Record<GrantRole, string[]>>;
+}
+
+export interface GrantRestore {
+  /** recorded = 照快照记录;legacy-defaults = 旧快照,按 Supabase 以前的默认授权补 public */
+  mode: "recorded" | "legacy-defaults";
+  /** 处理过的对象数 */
+  objects: number;
+}
+
+// 表、视图、物化视图、外部表、分区表、序列;函数和过程;schema;有列级授权的列。
+// 扩展自带的对象不在转储里,恢复时由扩展自己建,不碰。
+// search_path 由调用方设成空:identity arguments 里的类型才会都带 schema,两端比得上。
+const CATALOG_OBJECTS_SQL = `
+  with api_roles(oid, role) as (
+    select 0::oid, 'PUBLIC'
+    union all
+    select oid, rolname::text from pg_catalog.pg_roles where rolname = any($2::text[])
+  ),
+  relations as (
+    select c.oid, n.nspname::text as schema, c.relname::text as name, c.relkind,
+           coalesce(c.relacl, pg_catalog.acldefault(case when c.relkind = 'S' then 's' else 'r' end::"char", c.relowner)) as acl
+      from pg_catalog.pg_class c
+      join pg_catalog.pg_namespace n on n.oid = c.relnamespace
+     where n.nspname = any($1::text[])
+       and c.relkind in ('r', 'p', 'v', 'm', 'f', 'S')
+       and not exists (select 1 from pg_catalog.pg_depend d
+                        where d.classid = 'pg_catalog.pg_class'::pg_catalog.regclass and d.objid = c.oid and d.deptype = 'e')
+  ),
+  objects as (
+    select case when relkind = 'S' then 'sequence' else 'table' end as kind,
+           schema, name, null::text as column_name, null::text as args, acl
+      from relations
+    union all
+    select 'column', r.schema, r.name, a.attname::text, null, a.attacl
+      from relations r
+      join pg_catalog.pg_attribute a on a.attrelid = r.oid
+     where a.attnum > 0 and not a.attisdropped and a.attacl is not null
+    union all
+    select 'routine', n.nspname::text, p.proname::text, null, pg_catalog.pg_get_function_identity_arguments(p.oid),
+           coalesce(p.proacl, pg_catalog.acldefault('f', p.proowner))
+      from pg_catalog.pg_proc p
+      join pg_catalog.pg_namespace n on n.oid = p.pronamespace
+     where n.nspname = any($1::text[])
+       and not exists (select 1 from pg_catalog.pg_depend d
+                        where d.classid = 'pg_catalog.pg_proc'::pg_catalog.regclass and d.objid = p.oid and d.deptype = 'e')
+    union all
+    select 'schema', n.nspname::text, null, null, null, coalesce(n.nspacl, pg_catalog.acldefault('n', n.nspowner))
+      from pg_catalog.pg_namespace n
+     where n.nspname = any($1::text[])
+  )
+  select o.kind, o.schema, o.name, o.column_name, o.args, r.role,
+         pg_catalog.array_agg(x.privilege_type::text order by x.privilege_type) filter (where r.role is not null) as privileges
+    from objects o
+    left join lateral pg_catalog.aclexplode(o.acl) x on true
+    left join api_roles r on r.oid = x.grantee
+   group by 1, 2, 3, 4, 5, 6
+   order by 1, 2, 3, 4, 5, 6`;
+
+interface CatalogRow {
+  kind: GrantedObjectKind;
+  schema: string;
+  name: string | null;
+  column_name: string | null;
+  args: string | null;
+  role: GrantRole | null;
+  privileges: string[] | null;
+}
+
+function objectKey(o: Pick<GrantedObject, "kind" | "schema" | "name" | "column" | "args">): string {
+  return JSON.stringify([o.kind, o.schema, o.name ?? null, o.column ?? null, o.args ?? null]);
+}
+
+/** 在已开的事务里调用:search_path 必须为空(见 CATALOG_OBJECTS_SQL)。 */
+async function catalogObjects(client: Client, schemas: string[]): Promise<GrantedObject[]> {
+  const res = await client.query<CatalogRow>(CATALOG_OBJECTS_SQL, [schemas, [...API_ROLES]]);
+  const objects = new Map<string, GrantedObject>();
+  for (const row of res.rows) {
+    const object: GrantedObject = {
+      kind: row.kind,
+      schema: row.schema,
+      ...(row.name !== null ? { name: row.name } : {}),
+      ...(row.column_name !== null ? { column: row.column_name } : {}),
+      ...(row.args !== null ? { args: row.args } : {}),
+      privileges: {},
+    };
+    const key = objectKey(object);
+    const existing = objects.get(key) ?? object;
+    objects.set(key, existing);
+    if (row.role && row.privileges?.length) existing.privileges[row.role] = row.privileges;
+  }
+  // 列级授权只给别的角色时,这一列对我们没有意义
+  return [...objects.values()].filter((o) => o.kind !== "column" || Object.keys(o.privileges).length > 0);
+}
+
+async function withEmptySearchPath<T>(client: Client, work: () => Promise<T>): Promise<T> {
+  await client.query("begin");
+  try {
+    await client.query("set local search_path = ''");
+    const result = await work();
+    await client.query("commit");
+    return result;
+  } catch (error) {
+    await client.query("rollback").catch(() => {});
+    throw error;
+  }
+}
+
+/** 备份端:读源库里这几个 schema 下每个对象给 PUBLIC 和 API 角色的授权。 */
+export async function captureGrants(client: Client, schemas: string[]): Promise<GrantedObject[]> {
+  return withEmptySearchPath(client, () => catalogObjects(client, schemas));
+}
+
+function quoteIdent(name: string): string {
+  return `"${name.replace(/"/g, '""')}"`;
+}
+
+function qualifiedName(o: GrantedObject): string {
+  return `${quoteIdent(o.schema)}.${quoteIdent(o.name ?? "")}`;
+}
+
+function objectClause(o: GrantedObject): string {
+  switch (o.kind) {
+    case "schema":
+      return `schema ${quoteIdent(o.schema)}`;
+    case "sequence":
+      return `sequence ${qualifiedName(o)}`;
+    case "routine":
+      // ROUTINE 同时认函数、聚合、过程(PG11+)
+      return `routine ${qualifiedName(o)}(${o.args ?? ""})`;
+    default:
+      return `table ${qualifiedName(o)}`;
+  }
+}
+
+function roleName(role: GrantRole): string {
+  return role === "PUBLIC" ? "public" : quoteIdent(role);
+}
+
+/**
+ * 把一组对象的授权写成 SQL:表、序列、函数先清掉这几个角色的全部权限再照记录授,
+ * 列级授权放在最后(清表权限会连带清掉列权限);schema 只授不清,目标上已有的 schema
+ * (比如 public)的权限由平台管,我们只补源库有而目标没有的。
+ * roles:目标上实际存在的角色(PUBLIC 恒在);maintain:目标是否认 MAINTAIN。
+ */
+export function grantStatements(
+  objects: GrantedObject[],
+  opts: { roles: readonly GrantRole[]; maintain: boolean }
+): string[] {
+  const roles = GRANT_ROLES.filter((role) => opts.roles.includes(role));
+  const revokeFrom = roles.map(roleName).join(", ");
+  const statements: string[] = [];
+  const columns: string[] = [];
+  for (const o of objects) {
+    if (o.kind !== "schema" && o.kind !== "column") {
+      statements.push(`revoke all on ${objectClause(o)} from ${revokeFrom}`);
+    }
+    for (const role of roles) {
+      const privileges = (o.privileges[role] ?? []).filter(
+        (p) => (GRANT_PRIVILEGES as readonly string[]).includes(p) && (opts.maintain || p !== "MAINTAIN")
+      );
+      if (!privileges.length) continue;
+      if (o.kind === "column") {
+        const column = quoteIdent(o.column ?? "");
+        columns.push(
+          `grant ${privileges.map((p) => `${p.toLowerCase()} (${column})`).join(", ")} on table ${qualifiedName(o)} to ${roleName(role)}`
+        );
+      } else {
+        statements.push(`grant ${privileges.map((p) => p.toLowerCase()).join(", ")} on ${objectClause(o)} to ${roleName(role)}`);
+      }
+    }
+  }
+  return [...statements, ...columns];
+}
+
+/** Supabase 以前给 public 里新对象的默认授权(pg_default_acl 实测:表 arwdDxtm、序列 rwU、函数 X)。 */
+function legacyDefaultGrants(objects: GrantedObject[]): GrantedObject[] {
+  const all = (privileges: string[]) => Object.fromEntries(API_ROLES.map((role) => [role, privileges]));
+  return objects
+    .filter((o) => o.schema === "public" && (o.kind === "table" || o.kind === "sequence" || o.kind === "routine"))
+    .map((o) => ({
+      ...o,
+      privileges: {
+        ...o.privileges,
+        ...all(
+          o.kind === "table"
+            ? ["SELECT", "INSERT", "UPDATE", "DELETE", "TRUNCATE", "REFERENCES", "TRIGGER", "MAINTAIN"]
+            : o.kind === "sequence"
+              ? ["SELECT", "UPDATE", "USAGE"]
+              : ["EXECUTE"]
+        ),
+      },
+    }));
+}
+
+// 一次发太多条会让单条查询文本过大;几百条一批足够快
+const STATEMENTS_PER_QUERY = 200;
+
+/**
+ * 恢复端:在恢复出来的对象上照记录重建授权,一个事务内完成。
+ * 目标上的对象以目标目录为准:记录里有、目标上没有的(沙箱跳过的托管对象)略过;
+ * 目标上有、记录里没有的(备份读授权之后才建的)按"没有授权"处理,只清不授。
+ * recorded 为 undefined = 旧快照:public 里的表、序列、函数在目标已有授权之上补齐 Supabase 以前的默认授权。
+ */
+export async function restoreGrants(
+  client: Client,
+  opts: { schemas: string[]; recorded: GrantedObject[] | undefined }
+): Promise<GrantRestore> {
+  return withEmptySearchPath(client, async () => {
+    const version = await client.query<{ server_version_num: string }>("show server_version_num");
+    const maintain = Number(version.rows[0].server_version_num) >= 170000;
+    const roleRows = await client.query<{ rolname: GrantRole }>(
+      "select rolname from pg_catalog.pg_roles where rolname = any($1::text[])",
+      [[...API_ROLES]]
+    );
+    const roles: GrantRole[] = ["PUBLIC", ...roleRows.rows.map((r) => r.rolname)];
+    const onTarget = await catalogObjects(client, opts.schemas);
+
+    let planned: GrantedObject[];
+    if (opts.recorded === undefined) {
+      planned = legacyDefaultGrants(onTarget);
+    } else {
+      const recorded = new Map(opts.recorded.map((o) => [objectKey(o), o]));
+      const present = new Set(onTarget.map(objectKey));
+      // 目标上没有列级授权时目录里不会出现那一列,列按所在的表在不在判断
+      const tables = new Set(onTarget.filter((o) => o.kind === "table").map((o) => objectKey(o)));
+      const isPresent = (o: GrantedObject) =>
+        o.kind === "column" ? tables.has(objectKey({ ...o, kind: "table", column: undefined })) : present.has(objectKey(o));
+      planned = [
+        // 目标上的表、序列、函数都要过一遍:记录里没有的按"源库没给授权"处理
+        ...onTarget
+          .filter((o) => o.kind !== "schema" && o.kind !== "column")
+          .map((o) => ({ ...o, privileges: recorded.get(objectKey(o))?.privileges ?? {} })),
+        // schema 只授不清,列只授:只处理记录里有、目标上也在的
+        ...opts.recorded.filter((o) => (o.kind === "schema" || o.kind === "column") && isPresent(o)),
+      ];
+    }
+    const statements = grantStatements(planned, { roles, maintain });
+    for (let i = 0; i < statements.length; i += STATEMENTS_PER_QUERY) {
+      await client.query(statements.slice(i, i + STATEMENTS_PER_QUERY).join(";\n"));
+    }
+    return { mode: opts.recorded === undefined ? "legacy-defaults" : "recorded", objects: planned.length };
+  });
+}
+
+/** 演练和恢复报告里的一行。旧快照那句按场合说:恢复是已经开放了要收回,演练是提醒真恢复时会这样。 */
+export function grantsCheck(outcome: GrantRestore, context: "drill" | "restore"): { name: string; pass: boolean; detail: string } {
+  const legacyScope = `Supabase's old default access to the ${outcome.objects} table(s), sequence(s) and function(s) in public`;
+  return {
+    name: "API grants",
+    pass: true,
+    detail:
+      outcome.mode === "recorded"
+        ? `access for anon, authenticated and service_role set as it was at backup time on ${outcome.objects} object(s)`
+        : context === "restore"
+          ? `this snapshot was taken before BackupDrill recorded grants, so anon, authenticated and service_role got ` +
+            `${legacyScope}. Revoke it on anything you kept private`
+          : `this snapshot was taken before BackupDrill recorded grants, so restoring it gives anon, authenticated and ` +
+            `service_role ${legacyScope}. Newer backups record the grants`,
+  };
+}
+
+/**
+ * RECOVERY.md 手工恢复那一步的 SQL(CLI 的 S3 版和 worker 的 Drive 版共用)。有记录就逐个对象照记录重建,
+ * 和 restoreGrants 同一套语句;旧快照没有记录,给 Supabase 以前的默认授权。
+ * MAINTAIN 只会出现在 PG17+ 源库的记录里,而恢复目标的版本不低于源库,所以照写。
+ */
+export function recoveryGrantsSql(grants: GrantedObject[] | undefined): string {
+  if (grants === undefined) {
+    return [
+      "grant all on all tables in schema public to anon, authenticated, service_role;",
+      "grant all on all sequences in schema public to anon, authenticated, service_role;",
+      "grant execute on all functions in schema public to anon, authenticated, service_role;",
+    ].join("\n");
+  }
+  const statements = grantStatements(grants, { roles: GRANT_ROLES, maintain: true });
+  return statements.length ? statements.map((s) => `${s};`).join("\n") : "-- (nothing to grant in this snapshot)";
+}

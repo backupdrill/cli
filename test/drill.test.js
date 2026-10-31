@@ -601,6 +601,7 @@ test(
           await x("docker", ["exec", target.id, "psql", "-U", "postgres", "-c", "create extension pg_stat_statements"]);
           const result = await restoreDatabaseArtifact({
             dumpPath, connString: target.url, target: "sandbox", dumpedSchemas: ["public"], jobs,
+            grants: { schemas: ["public"], recorded: [] },
           });
           verdicts.push({
             jobs,

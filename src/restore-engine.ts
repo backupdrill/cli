@@ -4,8 +4,8 @@
 // R0 spike 的三条实证直接塑造了这里的形状:
 //  1. 裸退出码在真实目标上永远不干净 → 成功判定 = 零未分类错误(版本化 allowlist);
 //  2. 不用 --clean:与"只允许空目标"(D5)冲突、制造伪错,且在真实 Supabase 上
-//     DROP/CREATE public 会抹掉 anon/authenticated 的默认授权(--no-privileges 转储
-//     不会带回来),恢复出的 API 直接 401;
+//     DROP/CREATE public 会抹掉 anon/authenticated 的默认授权,恢复出的 API 直接 401;
+//  (转储不带授权,表的授权在恢复完由 grants.ts 照快照记录补回,见那里的头注)
 //  3. dump 自带 CREATE SCHEMA,而目标(新容器或 Supabase)恒有同名 schema →
 //     pre-data 阶段的 schema "already exists" 是两类目标共同的预期冲突。
 //
@@ -37,6 +37,7 @@ import {
   type OrphanedForeignKey,
 } from "./orphaned-foreign-keys.js";
 import { resolvePgRestoreBin } from "./pgbin.js";
+import { restoreGrants, type GrantRestore, type GrantedObject } from "./grants.js";
 import { dumpUrlFor, connectPg, isSupabaseHost } from "./supabase-ca.js";
 import { interrupted, onInterrupt, stopOnInterrupt } from "./interrupt.js";
 
@@ -128,11 +129,29 @@ export interface EngineResult {
   ok: boolean;
   /** 因源库自带孤儿行而以 NOT VALID 建成的外键(见 orphaned-foreign-keys.ts);沙箱和真实目标一样,不算失败 */
   orphanedForeignKeys?: OrphanedForeignKey[];
+  /** 授权重建的结果(grants.ts);恢复没走到这一步时不存在 */
+  grants?: GrantRestore;
   /**
-   * 真实目标:失败发生在主事务提交之后(外键那一步),表和数据已经在目标上。
+   * 真实目标:失败发生在主事务提交之后(授权或外键那一步),表和数据已经在目标上。
    * 调用方据此如实说明,不能再说"已整体回滚"。
    */
   committed?: boolean;
+}
+
+/** 恢复完要重建授权的范围与依据:manifest.database.schemas 和 manifest.database.grants。 */
+export interface GrantsToRestore {
+  schemas: string[];
+  /** undefined = 旧快照没有记录,按 Supabase 以前的默认授权补 public */
+  recorded: GrantedObject[] | undefined;
+}
+
+async function applyGrants(connString: string, grants: GrantsToRestore): Promise<GrantRestore> {
+  const client = await connectPg(connString);
+  try {
+    return await restoreGrants(client, grants);
+  } finally {
+    await client.end();
+  }
 }
 
 /**
@@ -531,7 +550,7 @@ export async function installExtensions(
  *   auth.uid() → uuid、auth.jwt() → jsonb、auth.role() → text、auth.email() → text,
  *   全部返回 null(恢复过程中不会真调它们:COPY 不求值列默认,策略/函数体不执行);
  *   角色 anon / authenticated / service_role(nologin):RLS 策略的 `to authenticated`
- *   要它们在场才能建。转储带 --no-privileges,不会有 GRANT 引用这些角色。
+ *   要它们在场才能建;恢复完重建授权(grants.ts)也要它们,演练因此和真实恢复走同一段。
  * 刻意不建 auth.users 之类的表:空的 auth.users 会让 FK 校验在 post-data 真失败,
  * 比"缺表跳过"更糟。FK → auth.users 仍按 SANDBOX_MANAGED_ERROR 的 relation 形态跳过。
  *
@@ -838,8 +857,9 @@ async function restoreInOneTransaction(
   connString: string,
   common: string[],
   env: NodeJS.ProcessEnv,
-  childOpts: { supabaseHost: boolean; urlSslMode?: string | null }
-): Promise<{ pass: ClassifiedPass; orphaned?: OrphanedForeignKey[]; committed?: boolean }> {
+  childOpts: { supabaseHost: boolean; urlSslMode?: string | null },
+  grantsToRestore: GrantsToRestore
+): Promise<{ pass: ClassifiedPass; orphaned?: OrphanedForeignKey[]; committed?: boolean; grants?: GrantRestore }> {
   const fail = (failure: string) => ({ pass: { expectedSkips: 0, failures: [failure] } });
   const listing = await pgRestoreOutput(bin, ["--list", dumpPath]);
   if (listing.code !== 0) {
@@ -883,7 +903,17 @@ async function restoreInOneTransaction(
     const run = await spawnPgRestore(bin, ["--single-transaction", `--use-list=${listFile}`, ...common], env, childOpts);
     if (run.code === null) return fail(`pg_restore was killed by a signal: ${firstRestoreError(run.stderr)}`);
     if (run.code !== 0) return fail(firstRestoreError(run.stderr));
-    if (!deferred.fks.length) return { pass: { expectedSkips: 0, failures: [] } };
+    // 授权放在外键前面:它不依赖外键,而外键那一步更可能失败,失败了表也已经能通过 API 用
+    let grants: GrantRestore;
+    try {
+      grants = await applyGrants(connString, grantsToRestore);
+    } catch (error) {
+      return {
+        pass: { expectedSkips: 0, failures: [`setting grants for the Data API roles failed: ${(error as Error).message}`] },
+        committed: true,
+      };
+    }
+    if (!deferred.fks.length) return { pass: { expectedSkips: 0, failures: [] }, grants };
     try {
       const client = await connectPg(connString);
       try {
@@ -892,7 +922,7 @@ async function restoreInOneTransaction(
           stopOnError: true,
           commentSql: deferred.commentSql,
         });
-        return { pass: { expectedSkips: 0, failures: [] }, orphaned: added.orphaned };
+        return { pass: { expectedSkips: 0, failures: [] }, orphaned: added.orphaned, grants };
       } finally {
         await client.end();
       }
@@ -900,6 +930,7 @@ async function restoreInOneTransaction(
       return {
         pass: { expectedSkips: 0, failures: [`adding foreign keys failed: ${(error as Error).message}`] },
         committed: true,
+        grants,
       };
     }
   } finally {
@@ -951,6 +982,8 @@ export async function restoreDatabaseArtifact(opts: {
   dumpedSchemas?: string[];
   /** pg_restore 并行路数;不传或 ≤1 = 单连接两遍。 */
   jobs?: number;
+  /** 恢复完照它重建 PUBLIC 和 API 角色的授权;沙箱和真实目标一样做 */
+  grants: GrantsToRestore;
 }): Promise<EngineResult> {
   const bin = resolvePgRestoreBin();
   // TLS 全链路 verify-full(创始人承诺项):pg_restore 与 pg_dump 同一改写——
@@ -960,13 +993,14 @@ export async function restoreDatabaseArtifact(opts: {
   const common = ["--no-owner", "--no-privileges", "--dbname", url, opts.dumpPath];
   const childOpts = { supabaseHost: isSupabaseHost(opts.connString), urlSslMode: urlSslModeOf(url) };
   if (opts.target === "supabase") {
-    const { pass, orphaned, committed } = await restoreInOneTransaction(
+    const { pass, orphaned, committed, grants } = await restoreInOneTransaction(
       bin,
       opts.dumpPath,
       opts.connString,
       common,
       env,
-      childOpts
+      childOpts,
+      opts.grants
     );
     return {
       preData: pass,
@@ -974,6 +1008,7 @@ export async function restoreDatabaseArtifact(opts: {
       ok: pass.failures.length === 0,
       orphanedForeignKeys: orphaned,
       committed,
+      grants,
     };
   }
   const jobs = Math.max(1, Math.floor(opts.jobs ?? 1));
@@ -1085,8 +1120,17 @@ export async function restoreDatabaseArtifact(opts: {
         await client.end();
       }
     }
+    let grants: GrantRestore | undefined;
+    try {
+      grants = await applyGrants(opts.connString, opts.grants);
+    } catch (error) {
+      passes.push({
+        expectedSkips: 0,
+        failures: [`setting grants for the Data API roles failed: ${(error as Error).message}`],
+      });
+    }
     const postData = mergePasses(passes);
-    return { preData, postData, ok: postData.failures.length === 0, orphanedForeignKeys };
+    return { preData, postData, ok: postData.failures.length === 0, orphanedForeignKeys, grants };
   } finally {
     await rm(listDir, { recursive: true, force: true });
     forgetListDir();

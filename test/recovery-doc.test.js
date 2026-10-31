@@ -58,7 +58,26 @@ test("恢复命令是引擎口径:无 --clean,写明 schema public 预期错误�
   const pgRestoreBlock = doc.slice(doc.indexOf("pg_restore --no-owner"));
   assert.ok(!pgRestoreBlock.slice(0, 200).includes("--clean"), "手动命令不得含 --clean");
   assert.ok(doc.includes('schema "public" already exists'), "预期错误说明");
-  assert.ok(doc.includes("401"), "授权抹除后果说明");
+  assert.ok(doc.includes("42501"), "不补授权的后果说明");
+});
+
+test("授权那一步:有记录照记录给语句,旧快照给 Supabase 以前的默认授权并提醒收回", () => {
+  const legacy = renderRecoveryDoc(manifest, ctx);
+  assert.ok(legacy.includes("grant all on all tables in schema public to anon, authenticated, service_role;"));
+  assert.ok(legacy.includes("revoke it on any table you had kept private"));
+  const recorded = renderRecoveryDoc(
+    {
+      ...manifest,
+      database: {
+        ...manifest.database,
+        grants: [{ kind: "table", schema: "public", name: "customers", privileges: { authenticated: ["SELECT"] } }],
+      },
+    },
+    ctx
+  );
+  assert.ok(recorded.includes('revoke all on table "public"."customers" from public, "anon", "authenticated", "service_role";'));
+  assert.ok(recorded.includes('grant select on table "public"."customers" to "authenticated";'));
+  assert.ok(!recorded.includes("grant all on all tables"), "有记录时不给笼统授权");
 });
 
 test("诚实边界:未覆盖项明示;零秘密(占位符而非真实连接串)", () => {

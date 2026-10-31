@@ -28,6 +28,7 @@ import {
 } from "./storage-restore.js";
 import { connectPg } from "./supabase-ca.js";
 import { orphanedForeignKeysCheck, type OrphanedForeignKey } from "./orphaned-foreign-keys.js";
+import { grantsCheck } from "./grants.js";
 import { localPgRestoreMajor, restoreToolTargetBlocker } from "./pgbin.js";
 import { parsePgDumpMajor } from "./backup.js";
 import { log } from "./log.js";
@@ -850,15 +851,24 @@ export async function runRestore(
       }
 
       log.step("Restoring database into target…");
-      const engine = await restoreDatabaseArtifact({ dumpPath, connString: targetUrl, target: "supabase" });
+      const engine = await restoreDatabaseArtifact({
+        dumpPath,
+        connString: targetUrl,
+        target: "supabase",
+        grants: { schemas: manifest.database.schemas, recorded: manifest.database.grants },
+      });
       if (!engine.ok) {
         const failures = [...engine.preData.failures, ...engine.postData.failures];
         throw new Error(
           `database restore failed: ${failures.join(" | ")}.` +
             (engine.committed
-              ? " The tables and data were already committed to the target; some or all of the foreign keys " +
-                "between them may be missing. Check the target before doing anything else; restore won't write " +
-                "into it again while those objects are there."
+              ? " The tables and data were already committed to the target, but the step after that failed" +
+                (engine.grants
+                  ? ": some or all of the foreign keys between the tables may be missing."
+                  : ": the grants for anon, authenticated and service_role weren't set, and the foreign keys " +
+                    "between the tables that are added after them may be missing too.") +
+                " Check the target before doing anything else; restore won't write into it again while those " +
+                "objects are there."
               : await targetStateAfterFailure(targetUrl, manifest.database.schemas)) +
             restoreFailureAdvice(failures.join(" "))
         );
@@ -870,6 +880,7 @@ export async function runRestore(
       log.step("Verifying restored tables…");
       const verified = await verifyRestored(targetUrl, manifest, dumpPath);
       result.databaseChecks = verified.checks;
+      if (engine.grants) result.databaseChecks.push(grantsCheck(engine.grants, "restore"));
       result.databaseVerified = verified.checks.every((c) => c.pass);
       if (orphaned.length) {
         result.orphanedForeignKeys = orphaned;
