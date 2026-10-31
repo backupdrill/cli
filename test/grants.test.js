@@ -8,12 +8,21 @@ import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { createHash } from "node:crypto";
-import { copyFileSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { copyFileSync, createWriteStream, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { finished } from "node:stream/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import pg from "pg";
 import { runRestore } from "../dist/restore.js";
-import { captureGrants, grantStatements, recoveryGrantsSql, restoreGrants, revokeApiAccess } from "../dist/grants.js";
+import { runBackup } from "../dist/backup.js";
+import {
+  captureGrants,
+  grantStatements,
+  grantsHeldThroughout,
+  recoveryGrantsSql,
+  restoreGrants,
+  revokeApiAccess,
+} from "../dist/grants.js";
 import { parseManifest } from "../dist/manifest.js";
 import { installSandboxShim, restoreDatabaseArtifact } from "../dist/restore-engine.js";
 import { resolvePgRestoreBin } from "../dist/pgbin.js";
@@ -265,6 +274,118 @@ test(
       assert.equal(drill.ok, true, JSON.stringify(drill.postData));
       assert.equal(drill.grants.mode, "recorded");
       assert.deepEqual(await grantsOf(target(sandboxPort)), source);
+    } finally {
+      await Promise.all(ids.map((id) => x("docker", ["rm", "-f", id]).catch(() => {})));
+      rmSync(work, { recursive: true, force: true });
+    }
+  }
+);
+
+test("grantsHeldThroughout: only privileges both reads agree on are recorded", () => {
+  const before = [
+    { kind: "table", schema: "public", name: "kept", privileges: { anon: ["INSERT", "SELECT"], authenticated: ["SELECT"] } },
+    { kind: "table", schema: "public", name: "opened", privileges: {} },
+    { kind: "table", schema: "public", name: "closed", privileges: { anon: ["SELECT"] } },
+    { kind: "table", schema: "public", name: "dropped", privileges: { anon: ["SELECT"] } },
+    { kind: "column", schema: "public", name: "kept", column: "a", privileges: { anon: ["UPDATE"] } },
+    { kind: "routine", schema: "public", name: "f", args: "x integer", privileges: { PUBLIC: ["EXECUTE"] } },
+  ];
+  const after = [
+    { kind: "table", schema: "public", name: "kept", privileges: { anon: ["SELECT"], authenticated: ["SELECT"] } },
+    { kind: "table", schema: "public", name: "opened", privileges: { anon: ["SELECT"] } },
+    { kind: "table", schema: "public", name: "closed", privileges: {} },
+    { kind: "table", schema: "public", name: "created", privileges: { anon: ["SELECT"] } },
+    { kind: "column", schema: "public", name: "kept", column: "b", privileges: { anon: ["UPDATE"] } },
+    // 函数换了签名 = 另一个对象
+    { kind: "routine", schema: "public", name: "f", args: "x bigint", privileges: { PUBLIC: ["EXECUTE"] } },
+  ];
+  assert.deepEqual(grantsHeldThroughout(before, after), [
+    { kind: "table", schema: "public", name: "kept", privileges: { anon: ["SELECT"], authenticated: ["SELECT"] } },
+    { kind: "table", schema: "public", name: "opened", privileges: {} },
+    { kind: "table", schema: "public", name: "closed", privileges: {} },
+    { kind: "table", schema: "public", name: "created", privileges: {} },
+    { kind: "routine", schema: "public", name: "f", args: "x bigint", privileges: {} },
+  ]);
+});
+
+test(
+  "backup: data redacted and then opened to anon while pg_dump runs stays closed after restore",
+  { skip: canRun ? false : "requires Docker + pg_dump", timeout: 180_000 },
+  async () => {
+    const ids = [];
+    const work = mkdtempSync(join(tmpdir(), "bd-grants-race-"));
+    try {
+      const [sourcePort, targetPort] = await Promise.all([startPostgres(ids), startPostgres(ids)]);
+      const sourceUrl = `postgresql://postgres:pw@127.0.0.1:${sourcePort}/postgres`;
+      const targetUrl = `postgresql://postgres:pw@localhost:${targetPort}/postgres`;
+      await sql(
+        sourceUrl,
+        `${ROLES}
+         create table public.notes (id int primary key, body text);
+         insert into public.notes values (1, 'public note');
+         grant select on public.notes to anon;
+         create table public.secrets (id int primary key, body text);
+         insert into public.secrets values (1, 'plaintext');`
+      );
+
+      // 转储第一块数据到达时 pg_dump 已经拿到快照:这时抹掉数据、再开放给 anon,转储里仍是原始数据
+      const dumpPath = join(work, "dump.pgcustom");
+      let manifest;
+      const store = {
+        createSnapshot: async () => ({
+          dumpKey: "backupdrill/race/snap/dump.pgcustom",
+          storageFiles: null,
+          describe: (file) => file,
+          uploadDump: (body) => ({
+            done: (async () => {
+              const out = createWriteStream(dumpPath);
+              let changedSource = false;
+              for await (const chunk of body) {
+                if (!changedSource) {
+                  changedSource = true;
+                  await sql(sourceUrl, "update public.secrets set body = 'redacted'; grant select on public.secrets to anon;");
+                }
+                out.write(chunk);
+              }
+              out.end();
+              await finished(out);
+            })(),
+            abort: async () => {},
+          }),
+          writeRecoveryDoc: async () => {},
+          writeManifest: async (written) => {
+            manifest = written;
+          },
+        }),
+        openSnapshot: async () => {
+          throw new Error("write-only test store");
+        },
+      };
+      const config = { databaseUrl: sourceUrl, projectName: "race", schemas: ["public"] };
+      await runBackup(config, { store });
+
+      const recorded = manifest.database.grants;
+      assert.deepEqual(find(recorded, "table", "secrets").privileges, {}, "granted mid-dump: not recorded");
+      assert.deepEqual(find(recorded, "table", "notes").privileges, { anon: ["SELECT"] });
+      // 源库现在确实开放了 secrets,只是里面已经没有原始数据
+      assert.deepEqual(find(await withClient(sourceUrl, (c) => captureGrants(c, ["public"])), "table", "secrets").privileges, {
+        anon: ["SELECT"],
+      });
+
+      await sql(targetUrl, ROLES);
+      const buf = readFileSync(dumpPath);
+      await runRestore(config, {
+        store: localStore(JSON.parse(JSON.stringify(manifest)), dumpPath, buf),
+        targetDatabaseUrl: targetUrl,
+        confirmTarget: "localhost",
+      });
+      const restored = await sql(
+        targetUrl,
+        `select (select body from public.secrets) as body,
+                has_table_privilege('anon', 'public.secrets', 'select') as anon_reads_secrets,
+                has_table_privilege('anon', 'public.notes', 'select') as anon_reads_notes`
+      );
+      assert.deepEqual(restored.rows[0], { body: "plaintext", anon_reads_secrets: false, anon_reads_notes: true });
     } finally {
       await Promise.all(ids.map((id) => x("docker", ["rm", "-f", id]).catch(() => {})));
       rmSync(work, { recursive: true, force: true });

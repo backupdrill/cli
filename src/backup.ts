@@ -13,7 +13,7 @@ import { log } from "./log.js";
 import { TOOL_VERSION } from "./version.js";
 import { parsePgDumpMajor } from "./pgbin.js";
 import { relationBytes } from "./estimate.js";
-import { captureGrants, type GrantedObject } from "./grants.js";
+import { captureGrants, grantsHeldThroughout, type GrantedObject } from "./grants.js";
 
 // 解析函数搬到了 pgbin(演练与恢复都要读 pg_restore 版本,放这里会成环);保留旧出口
 export { parsePgDumpMajor };
@@ -267,14 +267,16 @@ export async function runBackup(
   }
   const dumpKey = writer.dumpKey;
 
+  // 授权在转储前后各读一次,只记两次都有的(为什么见 grantsHeldThroughout)。
+  // 哪次读不到都让备份失败,不留一份缺授权记录的快照:恢复端把"没有记录"当成 2.9.0 之前的旧快照,
+  // 按 Supabase 以前的默认授权开放 public,会把源库关着的表打开
+  const grantsBeforeDump = await readGrants(config.databaseUrl, config.schemas);
+
   log.step(`Dumping → ${writer.describe("dump.pgcustom")}`);
   const { bytes, sha256 } = await dumpToSnapshot(config, writer, pgDumpBin, db.relationBytes);
   log.ok(`Database dumped (${(bytes / 1024 / 1024).toFixed(1)} MB, sha256 ${sha256.slice(0, 12)}…)`);
 
-  // 授权在转储之后读:转储期间有人收回权限,记下的是收回之后的,不会拿旧的开放授权去配新数据。
-  // 读不到就让备份失败,不留一份缺授权记录的快照:恢复端把"没有记录"当成 2.9.0 之前的旧快照,
-  // 按 Supabase 以前的默认授权开放 public,会把源库关着的表打开
-  const grants = await readGrants(config.databaseUrl, config.schemas);
+  const grants = grantsHeldThroughout(grantsBeforeDump, await readGrants(config.databaseUrl, config.schemas));
 
   // Storage 文件同步(源配置存在才做;否则只备数据库)
   let storageResult: Manifest["storage"] = null;

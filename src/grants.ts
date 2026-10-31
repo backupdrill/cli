@@ -158,6 +158,34 @@ export async function captureGrants(client: Client, schemas: string[]): Promise<
   return withEmptySearchPath(client, () => catalogObjects(client, schemas));
 }
 
+/**
+ * 备份端:转储前后各读一次授权,只记两次都有的。
+ *
+ * 为什么要读两次:授权读不进 pg_dump 的快照(共用快照会拉长 TRUNCATE 的竞态窗口,函数体也不按
+ * 快照读),只读一次,转储期间的授权变动总有一个方向会出错。转储后读:先抹掉私有表里的数据、
+ * 再开放给 anon,转储里是抹之前的数据,记下的却是"开放",恢复出来 anon 就能读到原始数据。
+ * 转储前读:先收回授权、再写进敏感数据,同样会开放出去。两次都有的权限,转储开始前和结束后都
+ * 开着,拿它配转储里的数据不会比源库开得更多;只有中途收回、写进数据、抹掉、再开放这种来回漏得过去。
+ * 代价:转储期间新开放的权限要等下一次备份才记上,在那之前恢复,应用对这些对象会报 42501。
+ * 转储期间新建的对象(转储前没有)记成没有授权;转储期间删掉的不记,恢复端同样按没有授权处理。
+ */
+export function grantsHeldThroughout(before: GrantedObject[], after: GrantedObject[]): GrantedObject[] {
+  const privilegesBefore = new Map(before.map((o) => [objectKey(o), o.privileges]));
+  const held: GrantedObject[] = [];
+  for (const object of after) {
+    const earlier = privilegesBefore.get(objectKey(object)) ?? {};
+    const privileges: GrantedObject["privileges"] = {};
+    for (const role of GRANT_ROLES) {
+      const inBoth = (object.privileges[role] ?? []).filter((privilege) => earlier[role]?.includes(privilege));
+      if (inBoth.length > 0) privileges[role] = inBoth;
+    }
+    // 和 catalogObjects 一样,列只在有授权时记
+    if (object.kind === "column" && Object.keys(privileges).length === 0) continue;
+    held.push({ ...object, privileges });
+  }
+  return held;
+}
+
 function quoteIdent(name: string): string {
   return `"${name.replace(/"/g, '""')}"`;
 }
@@ -263,7 +291,7 @@ export async function restoreGrants(
       planned = legacyDefaultGrants(onTarget);
     } else {
       const recorded = new Map(opts.recorded.map((o) => [objectKey(o), o]));
-      // 授权在转储之后才读,转储期间新加的列不在归档里:只处理目标上真有的列
+      // 2.9.0/2.9.1 的授权在转储之后才读,转储期间新加的列在记录里、不在归档里:只处理目标上真有的列
       const columns = await targetColumns(client, opts.schemas);
       planned = [
         // 目标上的 schema、表、序列、函数都要过一遍:记录里没有的按"源库没给授权"处理
