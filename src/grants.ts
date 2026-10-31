@@ -188,18 +188,19 @@ function roleName(role: GrantRole): string {
  * 把一组对象的授权写成 SQL:schema、表、序列、函数先清掉这几个角色的全部权限再照记录授,
  * 列级授权放在最后(清表权限会连带清掉列权限)。schema 也要清:源库可能靠不给 USAGE 把整个
  * schema 关起来,目标上的 public 却是 Supabase 默认开放的。
- * roles:目标上实际存在的角色(PUBLIC 恒在);maintain:目标是否认 MAINTAIN。
+ * roles:目标上实际存在的角色(PUBLIC 恒在);maintain:目标是否认 MAINTAIN;
+ * revoke: false = 只出授权语句(RECOVERY.md 的清权限按目标目录来,见 recoveryGrantsSql)。
  */
 export function grantStatements(
   objects: GrantedObject[],
-  opts: { roles: readonly GrantRole[]; maintain: boolean }
+  opts: { roles: readonly GrantRole[]; maintain: boolean; revoke?: boolean }
 ): string[] {
   const roles = GRANT_ROLES.filter((role) => opts.roles.includes(role));
   const revokeFrom = roles.map(roleName).join(", ");
   const statements: string[] = [];
   const columns: string[] = [];
   for (const o of objects) {
-    if (o.kind !== "column") {
+    if (o.kind !== "column" && opts.revoke !== false) {
       statements.push(`revoke all on ${objectClause(o)} from ${revokeFrom}`);
     }
     for (const role of roles) {
@@ -379,19 +380,86 @@ export function grantsCheck(outcome: GrantRestore, context: "drill" | "restore")
   };
 }
 
+/** 选一个不出现在任何内容里的 dollar-quote 标签,内容原样放进去不用转义。 */
+function dollarQuoteTag(base: string, contents: string[]): string {
+  for (let i = 0; ; i++) {
+    const tag = `$${base}${i || ""}$`;
+    if (!contents.some((text) => text.includes(tag))) return tag;
+  }
+}
+
+function sqlLiteral(value: string): string {
+  return `'${value.replace(/'/g, "''")}'`;
+}
+
 /**
- * RECOVERY.md 手工恢复那一步的 SQL(CLI 的 S3 版和 worker 的 Drive 版共用)。有记录就逐个对象照记录重建,
- * 和 restoreGrants 同一套语句;旧快照没有记录,给 Supabase 以前的默认授权。
+ * RECOVERY.md 手工恢复那一步的 SQL(CLI 的 S3 版和 worker 的 Drive 版共用),做法和 restoreGrants 一样:
+ * 先按恢复后的目录,把快照里各 schema 下每个 schema、表、序列、函数上 PUBLIC 和三个角色的权限全部收走
+ * (扩展自带的对象不碰),再逐条授回记录里的;记录里有、恢复出来没有的对象跳过并提示,不中断。
+ * 授权是在转储完之后读的:两次读之间删掉的对象在转储里、不在记录里,只按记录逐个收权就会漏掉它,
+ * 它会带着默认的 PUBLIC 执行权恢复出来(交叉审查 2026-10-31);反过来,之间新加的对象(列)在记录里、
+ * 不在转储里,直接授权会报错,在 Supabase 的 SQL 编辑器里整段回滚。所以整段放进一个 DO 块。
+ * 旧快照没有记录,给 Supabase 以前的默认授权。
  * MAINTAIN 只会出现在 PG17+ 源库的记录里,而恢复目标的版本不低于源库,所以照写。
  */
-export function recoveryGrantsSql(grants: GrantedObject[] | undefined): string {
-  if (grants === undefined) {
+export function recoveryGrantsSql(database: { schemas: string[]; grants?: GrantedObject[] }): string {
+  if (database.grants === undefined) {
     return [
       "grant all on all tables in schema public to anon, authenticated, service_role;",
       "grant all on all sequences in schema public to anon, authenticated, service_role;",
       "grant execute on all functions in schema public to anon, authenticated, service_role;",
     ].join("\n");
   }
-  const statements = grantStatements(grants, { roles: GRANT_ROLES, maintain: true });
-  return statements.length ? statements.map((s) => `${s};`).join("\n") : "-- (nothing to grant in this snapshot)";
+  const grants = grantStatements(database.grants, { roles: GRANT_ROLES, maintain: true, revoke: false });
+  const inner = dollarQuoteTag("g", grants);
+  const outer = dollarQuoteTag("grants", [...grants, ...database.schemas, inner]);
+  const schemas = `array[${database.schemas.map(sqlLiteral).join(", ")}]::text[]`;
+  const grantArray = grants.length
+    ? `array[\n${grants.map((g) => `    ${inner}${g}${inner}`).join(",\n")}\n  ]`
+    : "array[]::text[]";
+  const notFromExtension = (catalog: string, alias: string) =>
+    `not exists (select 1 from pg_catalog.pg_depend d where d.classid = '${catalog}'::pg_catalog.regclass ` +
+    `and d.objid = ${alias}.oid and d.deptype = 'e')`;
+  return `do ${outer}
+declare
+  statement text;
+begin
+  perform pg_catalog.set_config('search_path', '', true);
+  -- 1. Take PUBLIC, anon, authenticated and service_role off everything the restore created
+  --    (objects that belong to an extension are left alone)
+  for statement in
+    select pg_catalog.format('revoke all on schema %I from public, anon, authenticated, service_role', n.nspname)
+      from pg_catalog.pg_namespace n
+     where n.nspname = any (${schemas})
+    union all
+    select pg_catalog.format('revoke all on %s %I.%I from public, anon, authenticated, service_role',
+             case when c.relkind = 'S' then 'sequence' else 'table' end, n.nspname, c.relname)
+      from pg_catalog.pg_class c
+      join pg_catalog.pg_namespace n on n.oid = c.relnamespace
+     where n.nspname = any (${schemas})
+       and c.relkind in ('r', 'p', 'v', 'm', 'f', 'S')
+       and ${notFromExtension("pg_catalog.pg_class", "c")}
+    union all
+    select pg_catalog.format('revoke all on routine %I.%I(%s) from public, anon, authenticated, service_role',
+             n.nspname, p.proname,
+             case when p.prokind = 'a' then pg_catalog.oidvectortypes(p.proargtypes)
+                  else pg_catalog.pg_get_function_identity_arguments(p.oid) end)
+      from pg_catalog.pg_proc p
+      join pg_catalog.pg_namespace n on n.oid = p.pronamespace
+     where n.nspname = any (${schemas})
+       and ${notFromExtension("pg_catalog.pg_proc", "p")}
+  loop
+    execute statement;
+  end loop;
+  -- 2. Grant back what the source had at backup time; skip what this restore didn't create
+  foreach statement in array ${grantArray}
+  loop
+    begin
+      execute statement;
+    exception when undefined_table or undefined_column or undefined_function or invalid_schema_name then
+      raise notice 'skipped, not in this restore: %', statement;
+    end;
+  end loop;
+end
+${outer};`;
 }

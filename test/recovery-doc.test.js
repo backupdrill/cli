@@ -75,8 +75,10 @@ test("授权那一步:有记录照记录给语句,旧快照给 Supabase 以前�
     },
     ctx
   );
-  assert.ok(recorded.includes('revoke all on table "public"."customers" from public, "anon", "authenticated", "service_role";'));
-  assert.ok(recorded.includes('grant select on table "public"."customers" to "authenticated";'));
+  // 先按恢复后的目录收权,再逐条授回;整段是一个 DO 块(SQL 编辑器里一条出错不至于整段回滚)
+  assert.ok(recorded.includes("revoke all on %s %I.%I from public, anon, authenticated, service_role"));
+  assert.ok(recorded.includes('$g$grant select on table "public"."customers" to "authenticated"$g$'));
+  assert.ok(recorded.includes("array['public']::text[]"));
   assert.ok(!recorded.includes("grant all on all tables"), "有记录时不给笼统授权");
 });
 

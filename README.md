@@ -227,7 +227,7 @@ So each backup also records, in `manifest.json` under `database.grants`, what `a
 
 Snapshots taken before 2.9.0 have no record. Restoring one of those, the CLI gives the three roles Supabase's old default access to every table, sequence and function in `public`, which is what those projects had unless you revoked it, and the `API grants` line says so. Revoke it on anything you had kept private. For tables in your own schemas, the CLI leaves the target's default grants as they are.
 
-By hand, to get back Supabase's old defaults in `public` (then revoke on the tables you keep private):
+Restoring by hand: each snapshot's `RECOVERY.md` has the SQL to run after `pg_restore`. For a snapshot from 2.9.0 or later, it's one `do` block that does what `restore` does: it takes those roles off everything the restore created, then grants back what the source had and skips anything that isn't there. For an older snapshot, it's Supabase's old defaults in `public` (then revoke on the tables you keep private):
 
 ```sql
 grant all on all tables in schema public to anon, authenticated, service_role;
