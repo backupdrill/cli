@@ -27,7 +27,7 @@ import {
   type StorageRestoreTarget,
 } from "./storage-restore.js";
 import { connectPg } from "./supabase-ca.js";
-import { describeOrphanedForeignKey, type OrphanedForeignKey } from "./orphaned-foreign-keys.js";
+import { orphanedForeignKeysCheck, type OrphanedForeignKey } from "./orphaned-foreign-keys.js";
 import { localPgRestoreMajor, restoreToolTargetBlocker } from "./pgbin.js";
 import { parsePgDumpMajor } from "./backup.js";
 import { log } from "./log.js";
@@ -874,14 +874,7 @@ export async function runRestore(
       if (orphaned.length) {
         result.orphanedForeignKeys = orphaned;
         // 数据一行不少,外键也在(只是不回头查已有的行):算通过,但写进报告让人看见
-        result.databaseChecks.push({
-          name: "foreign keys",
-          pass: true,
-          detail:
-            `${orphaned.length} added as NOT VALID because the snapshot holds rows that break them: ` +
-            `${orphaned.map(describeOrphanedForeignKey).join("; ")}. New writes are still checked. ` +
-            `Clean up those rows, then run ALTER TABLE … VALIDATE CONSTRAINT to check the old ones too.`,
-        });
+        result.databaseChecks.push(orphanedForeignKeysCheck(orphaned));
       }
       for (const check of verified.checks) {
         (check.pass ? log.ok : log.warn)(`${check.name}: ${check.detail}`);

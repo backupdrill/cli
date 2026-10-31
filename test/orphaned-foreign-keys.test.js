@@ -1,5 +1,6 @@
-// 源库自带孤儿行的外键(2026-10-30 生产演练):演练判失败并标明是数据问题,真实恢复把外键建成
-// NOT VALID、数据全部恢复。两条路径走同一个 addForeignKeys,结论必须一致。
+// 源库自带孤儿行的外键(2026-10-30 生产演练):演练和真实恢复都把外键建成 NOT VALID、数据全部恢复,
+// 都算通过并在报告里列出(创始人 2026-10-31:我们管备份完整、能完整恢复,不让用户改自己的数据)。
+// 两条路径走同一个 addForeignKeys,结论必须一致。
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
@@ -180,7 +181,7 @@ async function sql(url, text) {
 }
 
 test(
-  "orphaned foreign key: the drill fails as a source-data problem; a real restore brings every row back with the key NOT VALID",
+  "orphaned foreign key: the drill passes and a real restore brings every row back, both with the key NOT VALID",
   { skip: canRun ? false : "requires Docker + pg_dump", timeout: 300_000 },
   async () => {
     const ids = [];
@@ -269,16 +270,15 @@ test(
       ];
       const sorted = (list) => [...(list ?? [])].sort((a, b) => a.constraint.localeCompare(b.constraint));
 
-      // 1. 演练:判失败,失败只因数据,报告说清真实恢复会怎样
+      // 1. 演练:通过,报告里列出这些外键,不叫用户去改数据
       const report = await drillDump(dumpPath, manifest, "orphans");
-      assert.equal(report.pass, false);
-      assert.equal(report.failureCause, "source-data");
+      assert.equal(report.pass, true, JSON.stringify(report.checks));
       assert.deepEqual(sorted(report.orphanedForeignKeys), expected);
-      const postData = report.checks.find((c) => c.name === "post-data objects");
-      assert.equal(postData.pass, false);
-      assert.match(postData.detail, /^4 failed: \d+ row\(s\) in public\.(?:\w+|"[^"]+") break foreign key .+, which references public\.\w+/);
-      assert.match(postData.detail, /adds this foreign key as NOT VALID/);
-      assert.ok(report.checks.every((c) => c.pass || c.name === "post-data objects"), JSON.stringify(report.checks));
+      const drillFkCheck = report.checks.find((c) => c.name === "foreign keys");
+      assert.equal(drillFkCheck.pass, true);
+      assert.match(drillFkCheck.detail, /^4 added as NOT VALID: \d+ row\(s\) in public\.(?:\w+|"[^"]+") break foreign key .+, which references public\.\w+/);
+      assert.match(drillFkCheck.detail, /restored as they are\. New writes are still checked\.$/);
+      assert.doesNotMatch(drillFkCheck.detail, /clean up|VALIDATE/i);
 
       // 2. 真实恢复:成功、通过验证,孤儿外键是 NOT VALID,另一条照常校验
       const store = {
@@ -301,7 +301,7 @@ test(
       assert.equal(result.databaseVerified, true);
       assert.deepEqual(sorted(result.orphanedForeignKeys), expected);
       const fkCheck = result.databaseChecks.find((c) => c.name === "foreign keys");
-      assert.match(fkCheck.detail, /^4 added as NOT VALID because the snapshot holds rows that break them/);
+      assert.equal(fkCheck.detail, drillFkCheck.detail, "drill and restore report the keys the same way");
 
       const constraints = await sql(
         targetUrl,
@@ -611,7 +611,6 @@ test(
 
       const report = await drillDump(dumpPath, manifest, "generated");
       assert.equal(report.pass, false);
-      assert.equal(report.failureCause, undefined, "not blamed on the source data");
       assert.deepEqual(report.orphanedForeignKeys ?? [], []);
 
       const store = {

@@ -136,13 +136,6 @@ export interface EngineResult {
 }
 
 /** 演练里孤儿外键记成失败项时的说法:数据问题出在源库,真实恢复会怎样。 */
-export function sandboxOrphanFailure(orphaned: OrphanedForeignKey): string {
-  return (
-    `${describeOrphanedForeignKey(orphaned)}. Your database already had these rows when it was backed up. ` +
-    `A restore brings them back and adds this foreign key as NOT VALID; clean up the rows to make the drill pass.`
-  );
-}
-
 /**
  * 从目录条目里挑出交给 addForeignKeys 的外键(isDeferrableForeignKey)。让 pg_restore 把全部外键条目
  * 写成 SQL,第 i 条语句对第 i 行(-L 按清单顺序输出)。对不上数或对不上名字(认不出的外键形态)
@@ -1086,11 +1079,8 @@ export async function restoreDatabaseArtifact(opts: {
           stopOnError: false,
           commentSql: deferred.commentSql,
         });
-        // 演练仍判失败(用户该清理的数据问题),但说清真实恢复会怎样
-        passes.push({
-          expectedSkips: added.expectedSkips,
-          failures: [...added.failures, ...added.orphaned.map(sandboxOrphanFailure)],
-        });
+        // 孤儿外键不算失败:真实恢复同样建成 NOT VALID、数据一行不少,演练报告里另列一项说明
+        passes.push({ expectedSkips: added.expectedSkips, failures: added.failures });
         orphanedForeignKeys = added.orphaned;
       } finally {
         await client.end();

@@ -20,7 +20,7 @@ import {
   tableDataInDump,
 } from "./restore-engine.js";
 import { connectPg } from "./supabase-ca.js";
-import type { OrphanedForeignKey } from "./orphaned-foreign-keys.js";
+import { orphanedForeignKeysCheck, type OrphanedForeignKey } from "./orphaned-foreign-keys.js";
 import { localPgRestoreMajor, restoreToolBreaksOnTarget, sandboxMajorFor } from "./pgbin.js";
 import { log } from "./log.js";
 import { onInterrupt, stopOnInterrupt, throwIfInterrupted } from "./interrupt.js";
@@ -74,13 +74,8 @@ export interface DrillReport {
   restoredRowTotal: number;
   /** --keep 且演练失败时:被保留的沙箱(供排查/脚本消费);其余情况不存在 */
   keptSandbox?: { containerId: string; connString: string };
-  /** 源库自带孤儿行的外键:演练把它们记为失败,真实恢复会把它们建成 NOT VALID。没有时不出现 */
+  /** 源库自带孤儿行的外键:演练和真实恢复都把它们建成 NOT VALID,不算失败。没有时不出现 */
   orphanedForeignKeys?: OrphanedForeignKey[];
-  /**
-   * 失败的唯一原因是这些孤儿行:备份完整、恢复能成功,是用户库里的数据违反了自己的外键。
-   * worker 据此把失败报告直接发给用户,不当成我们要排查的故障。
-   */
-  failureCause?: "source-data";
 }
 
 // ── 临时 Postgres 容器编排 ──────────────────────────────────────────
@@ -770,6 +765,8 @@ export async function drillDump(
     await opts.supervision?.observe({ phase: "verify" });
     const verify = await verifyRestored(pg.connString, manifest, dumpPath);
     checks.push(...verify.checks);
+    const orphaned = postData.orphanedForeignKeys ?? [];
+    if (orphaned.length) checks.push(orphanedForeignKeysCheck(orphaned));
 
     // 语义层钩子:只在结构层全绿时才跑——结构已失败时再跑应用检查,只会把
     // 一次失败报成两层失败,误导排查方向。没配置则不跑、报告里不出现该行。
@@ -788,15 +785,7 @@ export async function drillDump(
       restoredTableCount: verify.tableCount,
       restoredRowTotal: verify.rowTotal,
     };
-    const orphaned = postData.orphanedForeignKeys ?? [];
-    if (orphaned.length) {
-      report.orphanedForeignKeys = orphaned;
-      // 孤儿外键是 post-data 里仅有的失败、其余检查全过 → 失败只因用户数据
-      const onlyOrphans = postData.failures.length === orphaned.length;
-      if (!pass && onlyOrphans && checks.every((c) => c.pass || c.name === "post-data objects")) {
-        report.failureCause = "source-data";
-      }
-    }
+    if (orphaned.length) report.orphanedForeignKeys = orphaned;
     if (opts.keepSandboxOnFailure && !pass) {
       // 写进报告让 --keep 可被脚本消费(拿连接串排查),不只靠人眼看日志
       report.keptSandbox = { containerId: pg.containerId, connString: pg.connString };

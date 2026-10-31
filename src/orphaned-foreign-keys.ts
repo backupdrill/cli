@@ -4,8 +4,8 @@
 //
 // 演练和真实恢复对它的处理一致:先照原样加外键;失败原因是 23503 时,改成 NOT VALID 再加一次,
 // 并数出孤儿行。NOT VALID 的外键照样约束之后写入的行,只是不回头检查已有的行——恢复出的库
-// 与源库的实际状态一致,数据一行不丢。真实恢复因此成功并在报告里列出这些外键;演练仍判失败,
-// 因为这是用户该清理的数据问题(创始人决策 2026-10-31,起因是 2026-10-30 一个 Team 项目的演练)。
+// 与源库的实际状态一致,数据一行不丢。真实恢复和演练因此都成功,报告里列出这些外键。我们管的是
+// 备份完整、能完整恢复,不让用户去改自己的数据(创始人决策 2026-10-31,起因是 2026-10-30 一个 Team 项目的演练)。
 //
 // 只处理两端的数据都完整地在本次快照里的外键(两张表都由 dump 建、都有 TABLE DATA):孤儿行这时只能来自源库。
 // 指向备份之外(如 auth.users)或扩展自带的表(数据不在 dump 里或只有一部分,恢复后是目标上扩展装出来的那份)
@@ -115,7 +115,7 @@ export function orphanCountSql(fk: ForeignKeyDef, plan: ComparisonPlan): string 
   return `select count(*)::bigint as n from only ${quoteIdent(fk.table.schema)}.${quoteIdent(fk.table.name)} c where ${where}`;
 }
 
-/** 一条孤儿外键给人看的说法(演练报告的失败项、真实恢复报告的说明共用)。 */
+/** 一条孤儿外键给人看的说法。 */
 export function describeOrphanedForeignKey(orphaned: OrphanedForeignKey): string {
   const rows = orphaned.orphanRows === null ? "Some rows" : `${orphaned.orphanRows} row(s)`;
   // 不说"指向不存在的行":MATCH FULL 下部分为空的行也算违反,它们未必缺对应的行(文案审查)
@@ -135,6 +135,21 @@ async function hasGeneratedKeyColumn(client: Client, fk: ForeignKeyDef): Promise
     [qualified(fk.table), fk.columns, qualified(fk.references), fk.referencedColumns]
   );
   return rows[0].generated;
+}
+
+/**
+ * 演练和真实恢复报告里共用的一项:算通过。我们管的是备份完整、能完整恢复;源库里本来就有的这些行
+ * 原样回来,不让用户去改自己的数据(创始人 2026-10-31)。
+ */
+export function orphanedForeignKeysCheck(orphaned: OrphanedForeignKey[]): { name: string; pass: boolean; detail: string } {
+  return {
+    name: "foreign keys",
+    pass: true,
+    detail:
+      `${orphaned.length} added as NOT VALID: ${orphaned.map(describeOrphanedForeignKey).join("; ")}. ` +
+      `Those rows were already in the database when it was backed up and are restored as they are. ` +
+      `New writes are still checked.`,
+  };
 }
 
 export interface AddForeignKeysResult {
