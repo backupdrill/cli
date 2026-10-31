@@ -122,6 +122,21 @@ export function describeOrphanedForeignKey(orphaned: OrphanedForeignKey): string
   return `${rows} in ${orphaned.table} break foreign key ${orphaned.constraint}, which references ${orphaned.referencedTable}`;
 }
 
+/** 外键两端的键列里有没有生成列(attgenerated:存储型 's',PostgreSQL 18 起还有虚拟型 'v') */
+async function hasGeneratedKeyColumn(client: Client, fk: ForeignKeyDef): Promise<boolean> {
+  const qualified = (table: QualifiedName) => `${quoteIdent(table.schema)}.${quoteIdent(table.name)}`;
+  const { rows } = await client.query<{ generated: boolean }>(
+    `select exists (
+       select 1 from pg_attribute
+        where ((attrelid = to_regclass($1) and attname = any($2::text[]))
+            or (attrelid = to_regclass($3) and attname = any($4::text[])))
+          and attgenerated <> ''
+     ) as generated`,
+    [qualified(fk.table), fk.columns, qualified(fk.references), fk.referencedColumns]
+  );
+  return rows[0].generated;
+}
+
 export interface AddForeignKeysResult {
   orphaned: OrphanedForeignKey[];
   /** 沙箱托管豁免命中数(与 classifyBlocks 同口径) */
@@ -181,7 +196,9 @@ export async function addForeignKeys(
       } catch (error) {
         await client.query("rollback to savepoint add_fk");
         const pgError = error as Error & { code?: string };
-        if (pgError.code !== "23503") {
+        // 生成列的值是恢复时重算的,不是快照里的原值:生成函数改过定义,重算出的键就可能对不上,
+        // 这种违反不是源库带来的,不能放宽(交叉审查复现)
+        if (pgError.code !== "23503" || (await hasGeneratedKeyColumn(client, fk))) {
           if (opts.stopOnError) throw error;
           if (opts.allow.test(pgError.message)) result.expectedSkips += 1;
           else result.failures.push(`foreign key ${fk.constraint} on ${formatQualified(fk.table)}: ${pgError.message}`);

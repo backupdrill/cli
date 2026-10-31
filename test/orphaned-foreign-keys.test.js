@@ -562,3 +562,82 @@ test(
     }
   }
 );
+
+// 交叉审查复现:生成列的值恢复时重算,不是快照里的原值。生成函数后来改了定义(标着 IMMUTABLE,其实变了),
+// 重算出的键就对不上。源库本来没有孤儿行,这种违反不能算到源库头上:演练不判成数据问题,真实恢复照旧失败
+test(
+  "a foreign key over a generated key column stays strict: recomputed values are not source orphans",
+  { skip: canRun ? false : "requires Docker + pg_dump", timeout: 300_000 },
+  async () => {
+    const ids = [];
+    const work = mkdtempSync(join(tmpdir(), "bd-generated-fk-"));
+    try {
+      const [sourcePort, targetPort] = await Promise.all([startPostgres(ids), startPostgres(ids)]);
+      const sourceUrl = `postgresql://postgres:pw@127.0.0.1:${sourcePort}/postgres`;
+      const targetUrl = `postgresql://postgres:pw@localhost:${targetPort}/postgres`;
+      await sql(
+        sourceUrl,
+        `create function public.shifted(int) returns int immutable language sql as 'select $1';
+         create table public.parents (base int not null, id int generated always as (public.shifted(base)) stored primary key);
+         create table public.children (id int primary key, parent_id int references public.parents(id));
+         insert into public.parents (base) values (1);
+         insert into public.children values (1, 1);
+         create or replace function public.shifted(int) returns int immutable language sql as 'select $1 + 100';`
+      );
+      const dumpPath = join(work, "source.pgcustom");
+      await x(pgDump, ["--format=custom", "--no-owner", "--no-privileges", "--schema=public", "--dbname", sourceUrl, "-f", dumpPath]);
+      const buf = readFileSync(dumpPath);
+      const manifest = {
+        schemaVersion: 2,
+        tool: "backupdrill-cli",
+        toolVersion: "test",
+        createdAt: "2026-10-31T00:00:00.000Z",
+        projectName: "generated",
+        database: {
+          serverVersion: "17.6",
+          pgDumpVersion: (await x(pgDump, ["--version"])).stdout.trim(),
+          schemas: ["public"],
+          tableCount: 2,
+          estimatedRowTotal: 2,
+          tables: [
+            { schema: "public", name: "children", estimatedRows: 1 },
+            { schema: "public", name: "parents", estimatedRows: 1 },
+          ],
+          extensions: [],
+        },
+        dump: { key: "backupdrill/generated/snap/dump.pgcustom", format: "custom", bytes: buf.length, sha256: createHash("sha256").update(buf).digest("hex") },
+        storage: null,
+      };
+
+      const report = await drillDump(dumpPath, manifest, "generated");
+      assert.equal(report.pass, false);
+      assert.equal(report.failureCause, undefined, "not blamed on the source data");
+      assert.deepEqual(report.orphanedForeignKeys ?? [], []);
+
+      const store = {
+        createSnapshot: async () => {
+          throw new Error("read-only test store");
+        },
+        openSnapshot: async () => ({
+          name: "snap",
+          readManifest: async () => JSON.stringify(manifest),
+          downloadDump: async (_m, dest) => {
+            copyFileSync(dumpPath, dest);
+            return { bytes: buf.length, sha256: manifest.dump.sha256 };
+          },
+          storageFiles: () => null,
+        }),
+      };
+      const config = { databaseUrl: sourceUrl, projectName: "generated", schemas: ["public"], storage: { bucket: "unused" } };
+      await assert.rejects(runRestore(config, { store, targetDatabaseUrl: targetUrl, confirmTarget: "localhost" }), (error) => {
+        assert.doesNotMatch(error.message, /NOT VALID/);
+        return true;
+      });
+      const relaxed = await sql(targetUrl, "select count(*)::int as n from pg_constraint where conname = 'children_parent_id_fkey'");
+      assert.equal(relaxed.rows[0].n, 0, "the key was not relaxed to NOT VALID");
+    } finally {
+      for (const id of ids) await x("docker", ["rm", "-fv", id]).catch(() => {});
+      rmSync(work, { recursive: true, force: true });
+    }
+  }
+);
