@@ -397,7 +397,7 @@ function sqlLiteral(value: string): string {
  * 先按恢复后的目录,把快照里各 schema 下每个 schema、表、序列、函数上 PUBLIC 和三个角色的权限全部收走
  * (扩展自带的对象不碰),再逐条授回记录里的;授不上的(对象、列或参数类型不在这次恢复里)跳过并告警,
  * 不中断:授权只会加权限,跳过一条最多让应用少一点访问,不会把该关的打开;收权那一步在异常处理之外,
- * 失败就整段回滚、报错。
+ * 收完回读核对(REVOKE 对不归自己管的对象只告警、不生效),还有残留就整段回滚、报错。
  * 授权是在转储完之后读的:两次读之间删掉的对象在转储里、不在记录里,只按记录逐个收权就会漏掉它,
  * 它会带着默认的 PUBLIC 执行权恢复出来(交叉审查 2026-10-31);反过来,之间新加的对象(列)在记录里、
  * 不在转储里,直接授权会报错,在 Supabase 的 SQL 编辑器里整段回滚。所以整段放进一个 DO 块。
@@ -430,6 +430,7 @@ export function recoveryGrantsSql(database: { schemas: string[]; grants?: Grante
   return `do ${outer}
 declare
   statement text;
+  still_open text;
 begin
   perform pg_catalog.set_config('search_path', '', true);
   -- 1. Take PUBLIC, anon, authenticated and service_role off everything the restore created
@@ -458,6 +459,44 @@ begin
   loop
     execute statement;
   end loop;
+  -- Check it took: REVOKE only warns, and does nothing, on objects this role doesn't own
+  select pg_catalog.string_agg(distinct o.object, ', ') into still_open
+    from (
+      select pg_catalog.format('schema %I', n.nspname) as object,
+             coalesce(n.nspacl, pg_catalog.acldefault('n', n.nspowner)) as acl
+        from pg_catalog.pg_namespace n
+       where n.nspname = any (${schemas})
+      union all
+      select pg_catalog.format('%I.%I', n.nspname, c.relname),
+             coalesce(c.relacl, pg_catalog.acldefault(case when c.relkind = 'S' then 's' else 'r' end::"char", c.relowner))
+        from pg_catalog.pg_class c
+        join pg_catalog.pg_namespace n on n.oid = c.relnamespace
+       where n.nspname = any (${schemas})
+         and c.relkind in ('r', 'p', 'v', 'm', 'f', 'S')
+         and ${notFromExtension("pg_catalog.pg_class", "c")}
+      union all
+      select pg_catalog.format('%I.%I.%I', n.nspname, c.relname, a.attname), a.attacl
+        from pg_catalog.pg_attribute a
+        join pg_catalog.pg_class c on c.oid = a.attrelid
+        join pg_catalog.pg_namespace n on n.oid = c.relnamespace
+       where n.nspname = any (${schemas})
+         and a.attnum > 0 and not a.attisdropped and a.attacl is not null
+         and ${notFromExtension("pg_catalog.pg_class", "c")}
+      union all
+      select pg_catalog.format('%I.%I(%s)', n.nspname, p.proname, pg_catalog.pg_get_function_identity_arguments(p.oid)),
+             coalesce(p.proacl, pg_catalog.acldefault('f', p.proowner))
+        from pg_catalog.pg_proc p
+        join pg_catalog.pg_namespace n on n.oid = p.pronamespace
+       where n.nspname = any (${schemas})
+         and ${notFromExtension("pg_catalog.pg_proc", "p")}
+    ) o
+    cross join lateral pg_catalog.aclexplode(o.acl) x
+   where x.grantee = 0
+      or x.grantee in (select r.oid from pg_catalog.pg_roles r where r.rolname in ('anon', 'authenticated', 'service_role'));
+  if still_open is not null then
+    raise exception 'could not take access away on: % (run this as the role that ran pg_restore: it owns them)',
+      pg_catalog.left(still_open, 500);
+  end if;
   -- 2. Grant back what the source had at backup time. A grant that fails (its object, column or
   --    argument type isn't in this restore) is skipped with a warning: it can only leave less access
   for statement in select pg_catalog.unnest(${grantArray})

@@ -430,6 +430,17 @@ test(
          grant all on public.t to anon;`
       );
       const asRestorer = `postgresql://restorer:pw@127.0.0.1:${port}/postgres`;
+      // RECOVERY.md 那段 SQL 同样不能在收不掉权限时照常成功:整段回滚、报出是哪个对象
+      await sql(admin, "grant usage on schema public to restorer");
+      await assert.rejects(
+        withClient(asRestorer, (client) => client.query(recoveryGrantsSql({ schemas: ["public"], grants: [] }))),
+        /could not take access away on: .*public\.t/
+      );
+      assert.deepEqual(
+        find(await withClient(admin, (client) => captureGrants(client, ["public"])), "table", "t").privileges.anon,
+        ["DELETE", "INSERT", "MAINTAIN", "REFERENCES", "SELECT", "TRIGGER", "TRUNCATE", "UPDATE"],
+        "the failed block rolled back"
+      );
       await assert.rejects(
         withClient(asRestorer, (client) => restoreGrants(client, { schemas: ["public"], recorded: [] })),
         /didn't take effect on .*table public\.t/
