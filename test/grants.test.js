@@ -336,9 +336,13 @@ test("recoveryGrantsSql: one DO block that revokes by the catalog, then grants w
   assert.ok(!/revoke all on table "public"/.test(sql), "revokes come from the restored catalog, not the record");
   assert.match(recoveryGrantsSql({ schemas: ["public"] }), /^grant all on all tables in schema public to anon, authenticated, service_role;/);
   assert.match(recoveryGrantsSql({ schemas: ["public"], grants: [] }), /unnest\(array\[\]::text\[\]\)/);
-  // 2.9.0 的调用方式(授权数组 / undefined)要报错,不能被当成旧快照、给出笼统授权
-  assert.throws(() => recoveryGrantsSql([{ kind: "table", schema: "public", name: "t", privileges: {} }]), TypeError);
-  assert.throws(() => recoveryGrantsSql(undefined), TypeError);
+  // 2.9.0 的调用方式照旧可用:授权数组得到同样的 DO 块(范围取记录里的 schema 条目),undefined 是旧快照
+  const record = [
+    { kind: "schema", schema: "public", privileges: { anon: ["USAGE"] } },
+    { kind: "table", schema: "public", name: "t", privileges: { anon: ["SELECT"] } },
+  ];
+  assert.equal(recoveryGrantsSql(record), recoveryGrantsSql({ schemas: ["public"], grants: record }));
+  assert.equal(recoveryGrantsSql(undefined), recoveryGrantsSql({ schemas: ["public"] }));
 });
 
 test(
@@ -434,7 +438,7 @@ test(
       await sql(admin, "grant usage on schema public to restorer");
       await assert.rejects(
         withClient(asRestorer, (client) => client.query(recoveryGrantsSql({ schemas: ["public"], grants: [] }))),
-        /could not take access away on: .*public\.t/
+        /run this as the role that ran pg_restore, which owns the restored objects; restorer does not own: .*public\.t/
       );
       assert.deepEqual(
         find(await withClient(admin, (client) => captureGrants(client, ["public"])), "table", "t").privileges.anon,
