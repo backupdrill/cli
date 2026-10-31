@@ -7,6 +7,7 @@
 //  - 诚实边界:未覆盖项(Auth/秘密值/Edge Functions/平台配置)必须写明,
 //    不把部分恢复表述成完整项目恢复(PRD §2.2 禁用表述)。
 import type { Manifest } from "./manifest.js";
+import { recoveryGrantsSql } from "./grants.js";
 
 /** 生成手册所需的非秘密快照坐标。刻意不收连接串/密钥类型——签名即防线。 */
 export interface RecoveryDocContext {
@@ -142,9 +143,23 @@ unset PGPASSWORD
 
 One error is expected and harmless: \`schema "public" already exists\` (the
 target always has it). A foreign key error mentioning \`auth.users\` means the
-Auth users were not copied in first (see "Not covered" above). Do **not** use \`--clean\` against a Supabase project —
-dropping and recreating \`public\` silently wipes Supabase's default grants for
-\`anon\`/\`authenticated\`, and the restored API answers 401.
+Auth users were not copied in first (see "Not covered" above). Do **not** use \`--clean\` against a Supabase project:
+it drops and recreates \`public\`, and the grants Supabase put on it go with it.
+
+5. Set the grants for \`anon\`, \`authenticated\` and \`service_role\`. The dump
+   carries none. With Supabase's new defaults, supabase-js requests to restored
+   tables in \`public\` fail with \`42501 permission denied\` until you grant access. ${
+     db.grants
+       ? `These statements put back exactly what the source had at backup time (also in
+   manifest.json under \`database.grants\`):`
+       : `This snapshot was taken before BackupDrill recorded grants. The statements below
+   give the three roles Supabase's old default access to everything in \`public\`;
+   afterwards, revoke it on any table you had kept private:`
+   }
+
+\`\`\`sql
+${recoveryGrantsSql(db.grants)}
+\`\`\`
 
 ## Restore Storage files
 
@@ -166,7 +181,7 @@ referenced outside the snapshot (such as \`auth.users\`) are on the target, inst
 the extensions, restores the database in a single transaction through the same
 engine the weekly drills use (an SQL error rolls it back and the extensions stay
 installed; if the connection drops while it commits, check the target before
-retrying), verifies table counts and row presence afterwards, then rebuilds buckets, uploads the
+retrying), sets the grants above, verifies table counts and row presence afterwards, then rebuilds buckets, uploads the
 Storage files back and reconciles every one against the target.
 
 More: https://backupdrill.com/docs/restore

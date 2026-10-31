@@ -21,6 +21,7 @@ import {
 } from "./restore-engine.js";
 import { connectPg } from "./supabase-ca.js";
 import { orphanedForeignKeysCheck, type OrphanedForeignKey } from "./orphaned-foreign-keys.js";
+import { grantsCheck, type GrantRestore, type GrantedObject } from "./grants.js";
 import { localPgRestoreMajor, restoreToolBreaksOnTarget, sandboxMajorFor } from "./pgbin.js";
 import { log } from "./log.js";
 import { onInterrupt, stopOnInterrupt, throwIfInterrupted } from "./interrupt.js";
@@ -372,6 +373,8 @@ interface PostDataResult {
   failures: string[];
   /** 已同时计入 failures */
   orphanedForeignKeys?: OrphanedForeignKey[];
+  /** 授权重建结果;失败时不存在,原因在 failures 里 */
+  grants?: GrantRestore;
 }
 
 // 只有这些特征说明恢复失败源于沙箱缺扩展(限定类型/schema 解析不到、扩展装不上)。
@@ -402,9 +405,17 @@ async function pgRestore(
   dumpPath: string,
   connString: string,
   dumpedSchemas: string[],
-  jobs: number
+  jobs: number,
+  grants: GrantedObject[] | undefined
 ): Promise<PostDataResult> {
-  const result = await restoreDatabaseArtifact({ dumpPath, connString, target: "sandbox", dumpedSchemas, jobs });
+  const result = await restoreDatabaseArtifact({
+    dumpPath,
+    connString,
+    target: "sandbox",
+    dumpedSchemas,
+    jobs,
+    grants: { schemas: dumpedSchemas, recorded: grants },
+  });
   if (result.preData.failures.length) {
     throw new Error(`pg_restore failed: ${result.preData.failures.join(" | ")}`);
   }
@@ -412,6 +423,7 @@ async function pgRestore(
     supabaseSkipped: result.postData.expectedSkips,
     failures: result.postData.failures,
     orphanedForeignKeys: result.orphanedForeignKeys,
+    grants: result.grants,
   };
 }
 
@@ -726,7 +738,13 @@ export async function drillDump(
     log.step("Restoring into ephemeral Postgres…");
     let postData: PostDataResult;
     try {
-      postData = await pgRestore(dumpPath, pg.connString, manifest.database.schemas, pg.restoreJobs);
+      postData = await pgRestore(
+        dumpPath,
+        pg.connString,
+        manifest.database.schemas,
+        pg.restoreJobs,
+        manifest.database.grants
+      );
     } catch (error) {
       // 沙箱装不上扩展 + 错误特征命中"缺类型/schema/扩展" → 假设式归因到沙箱环境
       // (不对备份健康下断言);其余失败与扩展无关,必须原样抛出
@@ -765,6 +783,7 @@ export async function drillDump(
     await opts.supervision?.observe({ phase: "verify" });
     const verify = await verifyRestored(pg.connString, manifest, dumpPath);
     checks.push(...verify.checks);
+    if (postData.grants) checks.push(grantsCheck(postData.grants, "drill"));
     const orphaned = postData.orphanedForeignKeys ?? [];
     if (orphaned.length) checks.push(orphanedForeignKeysCheck(orphaned));
 
