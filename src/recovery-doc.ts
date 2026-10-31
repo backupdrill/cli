@@ -146,10 +146,9 @@ target always has it). A foreign key error mentioning \`auth.users\` means the
 Auth users were not copied in first (see "Not covered" above). Do **not** use \`--clean\` against a Supabase project:
 it drops and recreates \`public\`, and the grants Supabase put on it go with it.
 
-5. Set the grants for the Data API roles. The dump carries none, and Supabase
-   no longer grants new tables to \`anon\`/\`authenticated\`/\`service_role\` by
-   default, so without this step every supabase-js call on a restored table
-   fails with \`42501 permission denied\`. ${
+5. Set the grants for \`anon\`, \`authenticated\` and \`service_role\`. The dump
+   carries none. With Supabase's new defaults, supabase-js requests to restored
+   tables in \`public\` fail with \`42501 permission denied\` until you grant access. ${
      db.grants
        ? `These statements put back exactly what the source had at backup time (also in
    manifest.json under \`database.grants\`):`

@@ -96,7 +96,8 @@ const CATALOG_OBJECTS_SQL = `
      where n.nspname = any($1::text[])
   )
   select o.kind, o.schema, o.name, o.column_name, o.args, r.role,
-         pg_catalog.array_agg(x.privilege_type::text order by x.privilege_type) filter (where r.role is not null) as privileges
+         -- distinct:同一权限可以由几个授权人各给一次,ACL 里就有几条
+         pg_catalog.array_agg(distinct x.privilege_type::text order by x.privilege_type::text) filter (where r.role is not null) as privileges
     from objects o
     left join lateral pg_catalog.aclexplode(o.acl) x on true
     left join api_roles r on r.oid = x.grantee
@@ -261,16 +262,14 @@ export async function restoreGrants(
       planned = legacyDefaultGrants(onTarget);
     } else {
       const recorded = new Map(opts.recorded.map((o) => [objectKey(o), o]));
-      // 目标上没有列级授权时目录里不会出现那一列,列按所在的表在不在判断
-      const tables = new Set(onTarget.filter((o) => o.kind === "table").map(objectKey));
+      // 授权在转储之后才读,转储期间新加的列不在归档里:只处理目标上真有的列
+      const columns = await targetColumns(client, opts.schemas);
       planned = [
         // 目标上的 schema、表、序列、函数都要过一遍:记录里没有的按"源库没给授权"处理
         ...onTarget
           .filter((o) => o.kind !== "column")
           .map((o) => ({ ...o, privileges: recorded.get(objectKey(o))?.privileges ?? {} })),
-        ...opts.recorded.filter(
-          (o) => o.kind === "column" && tables.has(objectKey({ ...o, kind: "table", column: undefined }))
-        ),
+        ...opts.recorded.filter((o) => o.kind === "column" && columns.has(objectKey(o))),
       ];
     }
     await execute(client, grantStatements(planned, target));
@@ -292,6 +291,19 @@ export async function revokeApiAccess(client: Client, schemas: string[]): Promis
     await execute(client, grantStatements(planned, target));
     await assertGrantsTookEffect(client, schemas, planned, target);
   });
+}
+
+async function targetColumns(client: Client, schemas: string[]): Promise<Set<string>> {
+  const res = await client.query<{ schema: string; name: string; column_name: string }>(
+    `select n.nspname::text as schema, c.relname::text as name, a.attname::text as column_name
+       from pg_catalog.pg_attribute a
+       join pg_catalog.pg_class c on c.oid = a.attrelid
+       join pg_catalog.pg_namespace n on n.oid = c.relnamespace
+      where n.nspname = any($1::text[]) and c.relkind in ('r', 'p', 'v', 'm', 'f')
+        and a.attnum > 0 and not a.attisdropped`,
+    [schemas]
+  );
+  return new Set(res.rows.map((r) => objectKey({ kind: "column", schema: r.schema, name: r.name, column: r.column_name })));
 }
 
 interface TargetFacts {

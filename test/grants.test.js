@@ -144,7 +144,11 @@ test(
          grant usage on schema api to anon, authenticated;
          create table api.things (id int);
          insert into api.things values (1);
-         grant select on api.things to anon;`
+         grant select on api.things to anon;
+         -- 两个授权人各给一次 SELECT:ACL 里两条,记录里一条
+         create role helper; grant usage on schema public to helper;
+         grant select on public.notes to helper with grant option;
+         set role helper; grant select on public.notes to anon; reset role;`
       );
       const source = await grantsOf(sourceUrl);
       // 读到的东西先对一遍,后面的"目标与源一致"才有意义
@@ -160,6 +164,7 @@ test(
       assert.equal(find(source, "routine", "similarity"), undefined, "extension functions are not ours to record");
       assert.equal(find(source, "routine", "pick").args, "double precision, anyelement");
       assert.deepEqual(find(source, "routine", "pick").privileges, { authenticated: ["EXECUTE"] });
+      assert.equal(find(source, "table", "notes").privileges.anon.filter((p) => p === "SELECT").length, 1);
       assert.deepEqual(find(source, "schema", undefined, { schema: "public" }).privileges, {
         authenticated: ["USAGE"],
         service_role: ["USAGE"],
@@ -210,7 +215,12 @@ test(
 
       // 1. Supabase 新默认:角色在,没有默认授权
       await sql(target(newDefaultsPort), ROLES);
-      const newDefaults = await restoreInto(newDefaultsPort, manifestWith(source));
+      // 转储之后才加的列:记录里有,归档里没有,恢复要略过它而不是失败
+      const withLateColumn = [
+        ...source,
+        { kind: "column", schema: "public", name: "notes", column: "added_later", privileges: { anon: ["SELECT"] } },
+      ];
+      const newDefaults = await restoreInto(newDefaultsPort, manifestWith(withLateColumn));
       assert.equal(newDefaults.databaseVerified, true);
       assert.match(newDefaults.databaseChecks.find((c) => c.name === "API grants").detail, /as it was at backup time/);
       assert.deepEqual(await grantsOf(target(newDefaultsPort)), source);
