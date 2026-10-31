@@ -37,7 +37,7 @@ import {
   type OrphanedForeignKey,
 } from "./orphaned-foreign-keys.js";
 import { resolvePgRestoreBin } from "./pgbin.js";
-import { restoreGrants, type GrantRestore, type GrantedObject } from "./grants.js";
+import { restoreGrants, revokeApiAccess, type GrantRestore, type GrantedObject } from "./grants.js";
 import { dumpUrlFor, connectPg, isSupabaseHost } from "./supabase-ca.js";
 import { interrupted, onInterrupt, stopOnInterrupt } from "./interrupt.js";
 
@@ -151,6 +151,24 @@ async function applyGrants(connString: string, grants: GrantsToRestore): Promise
     return await restoreGrants(client, grants);
   } finally {
     await client.end();
+  }
+}
+
+/**
+ * 真实目标补授权失败后的退路:数据已经提交,目标的默认授权可能把源库关着的表开着。先把这几个角色的
+ * 权限全部收走,宁可应用 42501,也不让该关的开着;返回给用户看的一句话。
+ */
+async function lockDownAfterGrantFailure(connString: string, schemas: string[]): Promise<string> {
+  try {
+    const client = await connectPg(connString);
+    try {
+      await revokeApiAccess(client, schemas);
+    } finally {
+      await client.end();
+    }
+    return "anon, authenticated and service_role were then given no access to the restored objects, so nothing is open that shouldn't be; grant what your app needs by hand";
+  } catch (error) {
+    return `taking access away from anon, authenticated and service_role failed as well (${(error as Error).message}): the target's default grants still apply to the restored objects, check them before the app goes live`;
   }
 }
 
@@ -903,13 +921,18 @@ async function restoreInOneTransaction(
     const run = await spawnPgRestore(bin, ["--single-transaction", `--use-list=${listFile}`, ...common], env, childOpts);
     if (run.code === null) return fail(`pg_restore was killed by a signal: ${firstRestoreError(run.stderr)}`);
     if (run.code !== 0) return fail(firstRestoreError(run.stderr));
-    // 授权放在外键前面:它不依赖外键,而外键那一步更可能失败,失败了表也已经能通过 API 用
+    // 授权紧跟着主事务、放在外键前面:提交到这里之间,恢复出来的对象用的是目标的默认授权(pg_restore
+    // 在子进程里,插不进它的事务)。外键那一步更可能失败,不能让它拖住授权
     let grants: GrantRestore;
     try {
       grants = await applyGrants(connString, grantsToRestore);
     } catch (error) {
+      const fallback = await lockDownAfterGrantFailure(connString, grantsToRestore.schemas);
       return {
-        pass: { expectedSkips: 0, failures: [`setting grants for the Data API roles failed: ${(error as Error).message}`] },
+        pass: {
+          expectedSkips: 0,
+          failures: [`setting grants for the Data API roles failed: ${(error as Error).message}; ${fallback}`],
+        },
         committed: true,
       };
     }

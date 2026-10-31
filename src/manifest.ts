@@ -86,7 +86,7 @@ export interface Manifest {
     tables: TableStat[];
     // 可选 = 向后兼容:0.1.1 及更早的 manifest 没有这个字段,演练行为保持原样
     extensions?: ExtensionInfo[];
-    // 可选:2.9.0 之前的快照没有,或者备份时没读到。缺席 = 恢复端按 Supabase 以前的默认授权补 public
+    // 可选:2.9.0 之前的快照没有(2.9.0 起读不到就让备份失败)。缺席 = 恢复端按 Supabase 以前的默认授权补 public
     // (见 grants.ts);在场就照它重建 PUBLIC 和 API 角色的授权。空数组也是"读到了"
     grants?: GrantedObject[];
   };

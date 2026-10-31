@@ -54,8 +54,6 @@ interface DbFacts {
   extensions: ExtensionInfo[];
   /** 要转储的表的磁盘占用;量不出来时为 null(只影响分片大小,不影响备份本身) */
   relationBytes: number | null;
-  /** PUBLIC 和 API 角色的授权(转储不带授权,恢复靠它补回);读不到时为 undefined */
-  grants: GrantedObject[] | undefined;
 }
 
 async function inspectDatabase(
@@ -111,17 +109,6 @@ async function inspectDatabase(
           `uploading with the baseline part size, which fits a dump of up to 200 GiB.`
       );
     }
-    // 读不到授权不让备份失败:没有备份比授权不准更糟。缺席时恢复端按 Supabase 以前的默认授权补,
-    // 并在报告里写明
-    let grants: GrantedObject[] | undefined;
-    try {
-      grants = await captureGrants(client, schemas);
-    } catch (error) {
-      log.warn(
-        `Could not read table grants (${(error as Error).message}); a restore of this snapshot will give ` +
-          `anon, authenticated and service_role Supabase's old default access to everything in public.`
-      );
-    }
     return {
       serverVersion: version.rows[0].server_version,
       serverVersionNum: Number(versionNum.rows[0].server_version_num),
@@ -132,8 +119,16 @@ async function inspectDatabase(
       })),
       extensions: extensions.rows,
       relationBytes: measuredBytes,
-      grants,
     };
+  } finally {
+    await client.end();
+  }
+}
+
+async function readGrants(databaseUrl: string, schemas: string[]): Promise<GrantedObject[]> {
+  const client = await connectPg(databaseUrl);
+  try {
+    return await captureGrants(client, schemas);
   } finally {
     await client.end();
   }
@@ -276,6 +271,11 @@ export async function runBackup(
   const { bytes, sha256 } = await dumpToSnapshot(config, writer, pgDumpBin, db.relationBytes);
   log.ok(`Database dumped (${(bytes / 1024 / 1024).toFixed(1)} MB, sha256 ${sha256.slice(0, 12)}…)`);
 
+  // 授权在转储之后读:转储期间有人收回权限,记下的是收回之后的,不会拿旧的开放授权去配新数据。
+  // 读不到就让备份失败,不留一份缺授权记录的快照:恢复端把"没有记录"当成 2.9.0 之前的旧快照,
+  // 按 Supabase 以前的默认授权开放 public,会把源库关着的表打开
+  const grants = await readGrants(config.databaseUrl, config.schemas);
+
   // Storage 文件同步(源配置存在才做;否则只备数据库)
   let storageResult: Manifest["storage"] = null;
   if (config.supabaseStorage && storageFiles) {
@@ -325,7 +325,7 @@ export async function runBackup(
       estimatedRowTotal: db.tables.reduce((n, t) => n + t.estimatedRows, 0),
       tables: db.tables,
       extensions: db.extensions,
-      ...(db.grants ? { grants: db.grants } : {}),
+      grants,
     },
     dump: { key: dumpKey, format: "custom", bytes, sha256 },
     storage: storageResult,

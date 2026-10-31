@@ -13,7 +13,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import pg from "pg";
 import { runRestore } from "../dist/restore.js";
-import { captureGrants, grantStatements, recoveryGrantsSql } from "../dist/grants.js";
+import { captureGrants, grantStatements, recoveryGrantsSql, restoreGrants, revokeApiAccess } from "../dist/grants.js";
 import { parseManifest } from "../dist/manifest.js";
 import { installSandboxShim, restoreDatabaseArtifact } from "../dist/restore-engine.js";
 
@@ -60,10 +60,12 @@ async function withClient(url, work) {
 }
 const sql = (url, text) => withClient(url, (c) => c.query(text));
 
+// 和 Supabase 一样:三个角色,public 上给它们 USAGE
 const ROLES = `do $$ declare r text; begin
   foreach r in array array['anon', 'authenticated', 'service_role'] loop
     if not exists (select 1 from pg_roles where rolname = r) then execute format('create role %I nologin', r); end if;
-  end loop; end $$;`;
+  end loop; end $$;
+  grant usage on schema public to anon, authenticated, service_role;`;
 
 // Supabase 以前给 public 的默认授权(pg_default_acl 实测)
 const OLD_SUPABASE_DEFAULTS = `
@@ -129,6 +131,14 @@ test(
          create function public.admin_only(p_user uuid default null) returns int language sql security definer as 'select 1';
          revoke execute on function public.admin_only(uuid) from public, anon, authenticated;
          create function public.add(a int, b int) returns int language sql as 'select a + b';
+         -- 聚合:有序集聚合的 identity arguments 带 ORDER BY,GRANT 不认
+         create aggregate public.total(int) (sfunc = int4pl, stype = int);
+         create aggregate public.pick(float8 order by anyelement) (
+           sfunc = ordered_set_transition, stype = internal, finalfunc = percentile_disc_final, finalfunc_extra);
+         revoke execute on function public.pick(float8, anyelement) from public, anon, authenticated, service_role;
+         grant execute on function public.pick(float8, anyelement) to authenticated;
+         -- 靠 schema 关门:anon 对 public 没有 USAGE,表上的授权它也用不上;目标的 public 却是开放的
+         revoke usage on schema public from public, anon;
          -- 自定义 schema:没有默认授权,源库显式开放
          create schema api;
          grant usage on schema api to anon, authenticated;
@@ -148,6 +158,12 @@ test(
       assert.deepEqual(find(source, "routine", "add").privileges.PUBLIC, ["EXECUTE"]);
       assert.deepEqual(find(source, "schema", undefined, { schema: "api" }).privileges, { anon: ["USAGE"], authenticated: ["USAGE"] });
       assert.equal(find(source, "routine", "similarity"), undefined, "extension functions are not ours to record");
+      assert.equal(find(source, "routine", "pick").args, "double precision, anyelement");
+      assert.deepEqual(find(source, "routine", "pick").privileges, { authenticated: ["EXECUTE"] });
+      assert.deepEqual(find(source, "schema", undefined, { schema: "public" }).privileges, {
+        authenticated: ["USAGE"],
+        service_role: ["USAGE"],
+      });
 
       const dumpPath = join(work, "source.pgcustom");
       await x(pgDump, [
@@ -215,6 +231,8 @@ test(
       const legacy = await restoreInto(legacyPort, manifestWith(undefined));
       assert.match(legacy.databaseChecks.find((c) => c.name === "API grants").detail, /old default access/);
       const legacyGrants = await grantsOf(target(legacyPort));
+      // 旧快照不碰 schema:目标的 public 照旧
+      assert.deepEqual(find(legacyGrants, "schema", undefined, { schema: "public" }).privileges.anon, ["USAGE"]);
       const all = ["DELETE", "INSERT", "MAINTAIN", "REFERENCES", "SELECT", "TRIGGER", "TRUNCATE", "UPDATE"];
       for (const name of ["notes", "audit_log", "User Profiles", "note_ids"]) {
         assert.deepEqual(find(legacyGrants, "table", name).privileges.anon, all, name);
@@ -258,6 +276,7 @@ test("grantStatements: revoke first, column grants last, unknown roles and MAINT
     'grant select on table "public"."t" to "anon"',
     'revoke all on routine "public"."f"(x integer) from public, "anon"',
     'grant execute on routine "public"."f"(x integer) to public',
+    'revoke all on schema "api" from public, "anon"',
     'grant usage on schema "api" to "anon"',
     'grant select ("a""b") on table "public"."t" to "anon"',
   ]);
@@ -299,3 +318,39 @@ test("recoveryGrantsSql: exact statements when the snapshot recorded grants, Sup
   assert.match(recoveryGrantsSql(undefined), /^grant all on all tables in schema public to anon, authenticated, service_role;/);
   assert.match(recoveryGrantsSql([]), /nothing to grant/);
 });
+
+test(
+  "restoreGrants: a GRANT that only warns (the restoring role doesn't own the object) fails instead of passing silently",
+  { skip: canRun ? false : "requires Docker", timeout: 120_000 },
+  async () => {
+    const ids = [];
+    try {
+      const port = await startPostgres(ids);
+      const admin = `postgresql://postgres:pw@127.0.0.1:${port}/postgres`;
+      await sql(
+        admin,
+        `${ROLES}
+         create role restorer login password 'pw';
+         create table public.t (id int);
+         -- 有一点权限、但不是属主:GRANT/REVOKE 只给 WARNING
+         grant select on public.t to restorer;
+         grant all on public.t to anon;`
+      );
+      const asRestorer = `postgresql://restorer:pw@127.0.0.1:${port}/postgres`;
+      await assert.rejects(
+        withClient(asRestorer, (client) => restoreGrants(client, { schemas: ["public"], recorded: [] })),
+        /didn't take effect on .*table public\.t/
+      );
+      await assert.rejects(
+        withClient(asRestorer, (client) => revokeApiAccess(client, ["public"])),
+        /didn't take effect/
+      );
+      // 属主自己来就能收走
+      await withClient(admin, (client) => revokeApiAccess(client, ["public"]));
+      const after = await withClient(admin, (client) => captureGrants(client, ["public"]));
+      assert.deepEqual(find(after, "table", "t").privileges, {});
+    } finally {
+      await Promise.all(ids.map((id) => x("docker", ["rm", "-f", id]).catch(() => {})));
+    }
+  }
+);
