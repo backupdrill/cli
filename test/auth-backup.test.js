@@ -250,6 +250,9 @@ esac
 case "$args" in
   *--schema=*) if [ -n "$BD_TEST_FAIL_MAIN" ]; then echo "pg_dump: error: connection lost" >&2; exit 1; fi ;;
 esac
+case "$args" in
+  *--snapshot=*--schema=*) if [ -n "$BD_TEST_MAIN_QUEUED_SECONDS" ]; then sleep "$BD_TEST_MAIN_QUEUED_SECONDS"; fi ;;
+esac
 exec "${realPgDump}" "$@"
 `
   );
@@ -518,6 +521,25 @@ test(
         assert.ok(r.manifest.dump.bytes > 0);
         assert.equal(r.files.get("dump.pgcustom").length, r.manifest.dump.bytes);
         assert.notEqual(r.manifest.auth.status, "included");
+      });
+
+      await t.test("a main dump stuck behind the Auth connections: Auth makes way, the backup finishes within seconds", async () => {
+        // 模拟连接池排队:带共享快照的主 dump 要"排"3 秒才轮到;Auth 的上传卡住、占着名额不放
+        const previous = AUTH_TIMEOUTS.mainStartGraceMs;
+        AUTH_TIMEOUTS.mainStartGraceMs = 500;
+        try {
+          const started = Date.now();
+          const r = await run("queued", { databaseUrl: okUrl, auth: "default" }, {
+            env: { BD_TEST_MAIN_QUEUED_SECONDS: "3" },
+            stallAuth: true,
+          });
+          assert.ok(Date.now() - started < 15_000, `took ${Date.now() - started} ms`);
+          assert.ok(r.manifest.dump.bytes > 0);
+          assert.equal(r.files.get("dump.pgcustom").length, r.manifest.dump.bytes);
+          assert.notEqual(r.manifest.auth.status, "included");
+        } finally {
+          AUTH_TIMEOUTS.mainStartGraceMs = previous;
+        }
       });
 
       await t.test("a schema pattern that can't match auth doesn't stop the Auth backup", async () => {

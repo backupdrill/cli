@@ -282,7 +282,16 @@ type ReadableAuth = Extract<Awaited<ReturnType<typeof inspectAuth>>, { readable:
  *  - waitAfterMainMs:主 dump 完成后还肯等 Auth 导出多久
  *  - prepareDeadlineMs:主 dump 开始前,导出快照 + 统计最多花多久(连接、锁、查询都算在内)
  */
-export const AUTH_TIMEOUTS = { waitAfterMainMs: 10 * 60 * 1000, prepareDeadlineMs: 2 * 60 * 1000 };
+export const AUTH_TIMEOUTS = {
+  waitAfterMainMs: 10 * 60 * 1000,
+  prepareDeadlineMs: 2 * 60 * 1000,
+  /**
+   * 两份 dump 一起启动后,主 dump 最迟多久要吐出第一个字节。连接池会排队的环境里(例如名额只有两个),
+   * 导出快照的连接和 Auth dump 可能占满名额、让主 dump 一直排在后面——到点就放掉 Auth 这两条连接,
+   * 把名额让给主 dump(它若还没导入快照,稍后会在写出任何东西之前失败,再按今天的方式重导)
+   */
+  mainStartGraceMs: 60 * 1000,
+};
 
 /** 做不了 Auth 备份时记什么:默认开启记 skipped(不算失败);显式要求记 failed */
 function authNotDone(mode: AuthMode, reason: string): AuthSection {
@@ -411,6 +420,14 @@ async function dumpWithAuth(
   );
   void authRun.finally(() => markAuthStarted());
 
+  // 看门狗:主 dump 迟迟没开始,就是被 Auth 的连接挤住了,先让路(见 AUTH_TIMEOUTS.mainStartGraceMs)
+  const mainStartWatchdog = setTimeout(() => {
+    if (mainStarted) return;
+    log.warn("The database dump hasn't started yet; stopping the Auth export to free its connections.");
+    authAbort.abort();
+    void shared.release();
+  }, AUTH_TIMEOUTS.mainStartGraceMs);
+
   let main: { bytes: number; sha256: string };
   try {
     main = await streamPgDump({
@@ -420,6 +437,7 @@ async function dumpWithAuth(
       upload: (body) => writer.uploadDump(body, relationBytes),
       onFirstByte: () => {
         mainStarted = true;
+        clearTimeout(mainStartWatchdog);
         markMainStarted();
       },
       // 这一次可能因导入快照失败而重来,重来写的是同一个键:失败的这次绝不能"正常结束"上传——
@@ -427,6 +445,7 @@ async function dumpWithAuth(
       endOnlyOnSuccess: true,
     });
   } catch (error) {
+    clearTimeout(mainStartWatchdog);
     markMainStarted();
     authAbort.abort();
     await authRun;
@@ -442,6 +461,7 @@ async function dumpWithAuth(
     throw error;
   }
 
+  clearTimeout(mainStartWatchdog);
   // 主 dump 已经完成:Auth 两张表通常几秒就导完。万一那边卡住,最多再等这么久就放弃,
   // 不能让整份备份(以及 worker 的串行队列)陪着它挂住。到点就立刻判失败往下走,
   // 不再等 authRun 收尾——卡住的可能正是它
