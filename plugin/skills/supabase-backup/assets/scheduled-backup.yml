@@ -31,6 +31,9 @@
 #                                     restores find these snapshots.
 #   BACKUPDRILL_S3_FORCE_PATH_STYLE   "true" for S3-compatible stores that need
 #                                     path-style URLs (e.g. MinIO).
+#   BACKUPDRILL_AUTH                  "off" to skip the Supabase Auth users backup;
+#                                     "on" to fail the run when it can't be done.
+#                                     Unset: done when the role can read them.
 #
 #   To also back up Supabase Storage FILES (not just the DB), set all four:
 #   BACKUPDRILL_SUPABASE_STORAGE_ENDPOINT
@@ -109,6 +112,7 @@ jobs:
           BACKUPDRILL_SCHEMAS: ${{ secrets.BACKUPDRILL_SCHEMAS }}
           BACKUPDRILL_S3_PREFIX: ${{ secrets.BACKUPDRILL_S3_PREFIX }}
           BACKUPDRILL_S3_FORCE_PATH_STYLE: ${{ secrets.BACKUPDRILL_S3_FORCE_PATH_STYLE }}
+          BACKUPDRILL_AUTH: ${{ secrets.BACKUPDRILL_AUTH }}
           # --- optional: also back up Supabase Storage files (set all four) ---
           BACKUPDRILL_SUPABASE_STORAGE_ENDPOINT: ${{ secrets.BACKUPDRILL_SUPABASE_STORAGE_ENDPOINT }}
           BACKUPDRILL_SUPABASE_STORAGE_REGION: ${{ secrets.BACKUPDRILL_SUPABASE_STORAGE_REGION }}

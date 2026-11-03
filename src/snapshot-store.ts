@@ -42,6 +42,12 @@ export interface SnapshotWriter {
   describe(file: string): string;
   /** relationBytes = 要转储的表的磁盘占用(量不出为 null),实现可据此决定分块 */
   uploadDump(body: Readable, relationBytes: number | null): DumpUpload;
+  /**
+   * 可选(2.10.0 起):Auth 用户归档 auth.dump 写到哪、记进 manifest.auth.dump.key 的值。
+   * 没实现的存储(例如还没适配的托管目标)备份时自动跳过 Auth,其余行为不变。
+   */
+  readonly authDumpKey?: string;
+  uploadAuthDump?(body: Readable): DumpUpload;
   /** RECOVERY.md 写的是"从这个位置怎么恢复",所以由各实现自己渲染 */
   writeRecoveryDoc(manifest: Manifest): Promise<void>;
   /** manifest 是快照的"完成标记",调用方保证最后写 */
@@ -53,6 +59,8 @@ export interface SnapshotReader {
   readManifest(): Promise<string>;
   /** 断点续传下载转储到本地文件,返回实际落盘的字节数与 sha256 */
   downloadDump(manifest: Manifest, dest: string): Promise<{ bytes: number; sha256: string }>;
+  /** 可选(2.10.0 起):下载 auth.dump。没实现时,带 Auth 的快照按不带 Auth 处理 */
+  downloadAuthDump?(manifest: Manifest, dest: string): Promise<{ bytes: number; sha256: string }>;
   /** 这份快照的 Storage 文件从哪读;实现不支持 Storage 文件时为 null */
   storageFiles(manifest: Manifest): StorageFilesLocation | null;
 }
@@ -93,6 +101,25 @@ export function s3SnapshotStore(config: BackupConfig): SnapshotStore {
             abort: () => upload.abort(),
           };
         },
+        authDumpKey: `${base}/auth.dump`,
+        uploadAuthDump(body) {
+          // 两张表通常几 MB;分片用保底大小即可(上限 2 GiB,见 AUTH_DUMP_MAX_BYTES)
+          const upload = new Upload({
+            client: s3(),
+            partSize: dumpPartSizeFor(null),
+            params: {
+              Bucket: storage.bucket,
+              Key: `${base}/auth.dump`,
+              Body: body,
+              ContentType: "application/octet-stream",
+            },
+          });
+          return {
+            done: upload.done().then(() => {}),
+            // 只中止没完成的分片上传;不去删已经写完的对象(我们从不删用户桶里的对象)
+            abort: () => upload.abort(),
+          };
+        },
         async writeRecoveryDoc(manifest) {
           await s3().send(
             new PutObjectCommand({
@@ -129,6 +156,12 @@ export function s3SnapshotStore(config: BackupConfig): SnapshotStore {
         name: prefix.replace(/\/$/, "").split("/").pop()!,
         readManifest: () => getObjectText(s3(), storage.bucket, `${prefix}manifest.json`),
         downloadDump: (manifest, dest) => downloadToFile(s3(), storage.bucket, manifest.dump.key, dest),
+        downloadAuthDump: (manifest, dest) => {
+          if (manifest.auth?.status !== "included" || !manifest.auth.dump) {
+            throw new Error("this snapshot has no Auth archive");
+          }
+          return downloadToFile(s3(), storage.bucket, manifest.auth.dump.key, dest);
+        },
         storageFiles: (manifest) => ({ s3: s3(), bucket: storage.bucket, base: storageBaseOf(manifest) }),
       };
     },

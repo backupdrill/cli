@@ -1,11 +1,21 @@
 import { spawn, execFile } from "node:child_process";
 import { createHash } from "node:crypto";
-import { Transform } from "node:stream";
+import { Transform, type Readable } from "node:stream";
 import { promisify } from "node:util";
 import type { BackupConfig } from "./config.js";
 import { s3SnapshotStore, type DumpUpload, type SnapshotStore, type SnapshotWriter } from "./snapshot-store.js";
 import { MANIFEST_SCHEMA_VERSION } from "./manifest.js";
-import type { BucketAttrs, ExtensionInfo, Manifest, TableStat } from "./manifest.js";
+import type { AuthSection, BucketAttrs, ExtensionInfo, Manifest, TableStat } from "./manifest.js";
+import {
+  AUTH_DUMP_MAX_BYTES,
+  authDumpArgs,
+  exportSharedSnapshot,
+  inspectAuth,
+  schemasMayIncludeAuth,
+  unbackedAuthDependencies,
+  type AuthMode,
+  type SharedSnapshot,
+} from "./auth-backup.js";
 import { syncStorage } from "./storage.js";
 import { inspectBucketAttrs } from "./storage-catalog.js";
 import { projectRefOf, refFromStorageEndpoint, assertNoHostOverride } from "./restore-engine.js";
@@ -134,53 +144,82 @@ async function readGrants(databaseUrl: string, schemas: string[]): Promise<Ident
   }
 }
 
-/** 流式跑 pg_dump,边写快照边算 sha256 与字节数。返回校验和与大小。 */
-async function dumpToSnapshot(
-  config: BackupConfig,
-  writer: SnapshotWriter,
-  pgDumpBin: string,
-  dumpRelationBytes: number | null
-): Promise<{ bytes: number; sha256: string }> {
+/** 主 dump 的 pg_dump 参数。snapshotId 省略时与 2.10.0 之前逐字一致(Auth 关闭时就是这样) */
+export function mainDumpArgs(schemas: string[], snapshotId?: string): string[] {
+  return [
+    "--format=custom",
+    "--no-owner",
+    "--no-privileges",
+    ...(snapshotId ? [`--snapshot=${snapshotId}`] : []),
+    ...schemas.map((s) => `--schema=${s}`),
+  ];
+}
+
+class AuthDumpTooLarge extends Error {}
+
+/**
+ * 流式跑 pg_dump,边写快照边算 sha256 与字节数。返回校验和与大小。
+ * onFirstByte:pg_dump 先导入快照才会吐出第一个字节,调用方据此尽早释放导出快照的连接。
+ * maxBytes:超过就中止(只用于 auth.dump)。
+ */
+async function streamPgDump(opts: {
+  databaseUrl: string;
+  pgDumpBin: string;
+  args: string[];
+  upload: (body: Readable) => DumpUpload;
+  onFirstByte?: () => void;
+  maxBytes?: number;
+  signal?: AbortSignal;
+  endOnlyOnSuccess?: boolean;
+}): Promise<{ bytes: number; sha256: string }> {
   const hash = createHash("sha256");
   let bytes = 0;
   const meter = new Transform({
     transform(chunk: Buffer, _enc, cb) {
+      if (bytes === 0) opts.onFirstByte?.();
       hash.update(chunk);
       bytes += chunk.length;
+      if (opts.maxBytes !== undefined && bytes > opts.maxBytes) {
+        cb(new AuthDumpTooLarge(`archive is larger than ${opts.maxBytes} bytes`));
+        return;
+      }
       cb(null, chunk);
     },
   });
 
-  const schemaArgs = config.schemas.map((s) => `--schema=${s}`);
   // pg_dump(libpq):Supabase 主机才改写成 sslmode=verify-full + sslrootcert=<打包CA临时文件>
   // 凭据不进 argv(D6):argv 对同机任何进程的 `ps` 可见。与恢复路径同一个函数——
   // 先改写 SSL 再拆密码,密码经 PGPASSWORD 交给 libpq
-  const { url: dumpDbUrl, env: credentialEnv } = credentialSafeDbArgs(dumpUrlFor(config.databaseUrl));
+  const { url: dumpDbUrl, env: credentialEnv } = credentialSafeDbArgs(dumpUrlFor(opts.databaseUrl));
   const dump = spawn(
-    pgDumpBin,
-    [
-      "--format=custom",
-      "--no-owner",
-      "--no-privileges",
-      ...schemaArgs,
-      "--dbname",
-      dumpDbUrl,
-    ],
+    opts.pgDumpBin,
+    [...opts.args, "--dbname", dumpDbUrl],
     // 环境剔除改写目标/身份的 PG* 变量:pg_dump 只认 --dbname 里的 URL(TLS 策略等保留)
     {
       stdio: ["ignore", "pipe", "pipe"],
       env: libpqChildEnv(credentialEnv, process.env, {
-        supabaseHost: isSupabaseHost(config.databaseUrl),
+        supabaseHost: isSupabaseHost(opts.databaseUrl),
         urlSslMode: urlSslModeOf(dumpDbUrl),
       }),
     }
   );
+  // 调用方要求停下(例如主 dump 失败了,并行的 auth dump 不必再跑):杀掉 pg_dump,下面的 catch 负责中止上传
+  const onAbort = () => dump.kill("SIGKILL");
+  opts.signal?.addEventListener("abort", onAbort, { once: true });
 
   let stderr = "";
   dump.stderr.on("data", (d: Buffer) => {
     stderr += d.toString();
   });
-  dump.stdout.pipe(meter);
+  // endOnlyOnSuccess(auth.dump 用):pg_dump 成功退出才结束上传流,失败就带错中断,上传因此完不成——
+  // 不在用户桶里留下一个空的或半截的 auth.dump。主 dump 不传这个选项,行为与之前一致
+  dump.stdout.pipe(meter, { end: !opts.endOnlyOnSuccess });
+  if (opts.endOnlyOnSuccess) {
+    dump.on("close", (code) => {
+      if (code === 0) meter.end();
+      else meter.destroy(new Error(`pg_dump exited with code ${code}`));
+    });
+  }
 
   const dumpDone = new Promise<void>((resolve, reject) => {
     dump.on("error", reject); // 启动失败(如 ENOENT)
@@ -198,17 +237,223 @@ async function dumpToSnapshot(
   // 开始上传也放进 try:实现可能在建上传时就同步抛错,那时 pg_dump 已经在跑,同样要杀掉。
   let upload: DumpUpload | null = null;
   try {
-    upload = writer.uploadDump(meter, dumpRelationBytes);
+    upload = opts.upload(meter);
     await Promise.all([dumpDone, upload.done]);
   } catch (error) {
     dumpDone.catch(() => {}); // 没走到 Promise.all 时,被杀的 pg_dump 的退出也得有人接住
     dump.kill("SIGKILL");
     meter.destroy();
     await upload?.abort().catch(() => {});
+    // 超限时先失败的往往是上传那一侧(流被 meter 报错中断),原因统一报成超限
+    if (opts.maxBytes !== undefined && bytes > opts.maxBytes) {
+      throw new AuthDumpTooLarge(`archive is larger than ${opts.maxBytes} bytes`);
+    }
     throw error;
+  } finally {
+    opts.signal?.removeEventListener("abort", onAbort);
   }
 
   return { bytes, sha256: hash.digest("hex") };
+}
+
+type ReadableAuth = Extract<Awaited<ReturnType<typeof inspectAuth>>, { readable: true }>;
+
+/** 主 dump 完成后还肯等 Auth 导出多久 */
+const AUTH_WAIT_AFTER_MAIN_MS = 10 * 60 * 1000;
+
+/** 做不了 Auth 备份时记什么:默认开启记 skipped(不算失败);显式要求记 failed */
+function authNotDone(mode: AuthMode, reason: string): AuthSection {
+  return mode === "on" ? { status: "failed", reason } : { status: "skipped", reason };
+}
+
+const AUTH_SKIP_TEXT: Record<string, string> = {
+  no_permission:
+    "the backup role can't read every row of auth.users and auth.identities (it needs BYPASSRLS or superuser, plus read access)",
+  no_auth_schema: "this database has no Supabase auth schema",
+  unsupported_destination: "this backup destination can't hold the Auth archive yet",
+  schemas_may_include_auth: "your schema list already includes auth (or a pattern), so it is in the main dump",
+  too_large: "the Auth archive is larger than 2 GiB",
+  snapshot_unavailable: "a consistent snapshot for the Auth export couldn't be set up",
+};
+
+/** 报错只留第一行、截短:pg_dump / 上传的错误不该把大段原文(更不能是行值)带进 manifest 和告警 */
+function shortReason(error: unknown): string {
+  return String((error as Error)?.message ?? error).split("\n")[0].slice(0, 300);
+}
+
+type AuthPlan =
+  | { kind: "none" }
+  | { kind: "settled"; section: AuthSection }
+  | { kind: "dump"; shared: SharedSnapshot; inspection: ReadableAuth; key: string; upload: (body: Readable) => DumpUpload };
+
+/**
+ * 决定这次要不要、能不能另外备 Auth。任何"不能"都在这里落成 skipped/failed,不抛错——
+ * 主 dump 永远不因 Auth 受影响。返回 dump 时,共享快照已经导出,调用方负责释放。
+ */
+async function planAuth(config: BackupConfig, writer: SnapshotWriter, mode: AuthMode): Promise<AuthPlan> {
+  if (mode === "off") return { kind: "none" };
+  // schemas 已经(可能)把 auth 带进主 dump:今天怎样以后还怎样,不另备一份,也不算失败
+  if (schemasMayIncludeAuth(config.schemas)) {
+    return { kind: "settled", section: { status: "skipped", reason: "schemas_may_include_auth" } };
+  }
+  if (!writer.uploadAuthDump || !writer.authDumpKey) {
+    return { kind: "settled", section: authNotDone(mode, "unsupported_destination") };
+  }
+  const shared = await exportSharedSnapshot(config.databaseUrl);
+  if (!shared) return { kind: "settled", section: authNotDone(mode, "snapshot_unavailable") };
+  let inspection: Awaited<ReturnType<typeof inspectAuth>>;
+  try {
+    inspection = await inspectAuth(config.databaseUrl, shared.id);
+  } catch (error) {
+    await shared.release();
+    // 导入快照失败(经连接池时最可能)按"快照不可用"跳过;其余是统计查询本身出错
+    const section = /snapshot/i.test(shortReason(error))
+      ? authNotDone(mode, "snapshot_unavailable")
+      : ({ status: "failed", reason: `could not inspect the Auth tables: ${shortReason(error)}` } as AuthSection);
+    return { kind: "settled", section };
+  }
+  if (!inspection.readable) {
+    await shared.release();
+    return { kind: "settled", section: authNotDone(mode, inspection.reason) };
+  }
+  const uploadAuthDump = writer.uploadAuthDump.bind(writer);
+  return { kind: "dump", shared, inspection, key: writer.authDumpKey, upload: (body) => uploadAuthDump(body) };
+}
+
+/**
+ * 主 dump 和 auth dump 并行,都导入同一个共享快照。两份都吐出第一个字节(= 都已导入快照)后
+ * 立刻释放导出快照的连接,所以它只占几秒,和主 dump 多大无关。
+ * Auth 一侧失败只影响 Auth 段;主 dump 因导入快照失败而一个字节都没写出时,按今天的方式重导一次。
+ */
+async function dumpWithAuth(
+  config: BackupConfig,
+  writer: SnapshotWriter,
+  pgDumpBin: string,
+  relationBytes: number | null,
+  mode: AuthMode,
+  plan: Extract<AuthPlan, { kind: "dump" }>
+): Promise<{ main: { bytes: number; sha256: string }; auth: AuthSection }> {
+  const { shared, inspection } = plan;
+  let mainStarted = false;
+  let markMainStarted!: () => void;
+  let markAuthStarted!: () => void;
+  const mainStartedP = new Promise<void>((resolve) => (markMainStarted = resolve));
+  const authStartedP = new Promise<void>((resolve) => (markAuthStarted = resolve));
+  void Promise.all([mainStartedP, authStartedP]).then(() => shared.release());
+
+  const authAbort = new AbortController();
+  const authRun = streamPgDump({
+    databaseUrl: config.databaseUrl,
+    pgDumpBin,
+    args: authDumpArgs(shared.id),
+    upload: plan.upload,
+    onFirstByte: () => markAuthStarted(),
+    maxBytes: AUTH_DUMP_MAX_BYTES,
+    signal: authAbort.signal,
+    endOnlyOnSuccess: true,
+  }).then(
+    (result) => ({ ok: true as const, ...result }),
+    (error: unknown) => ({ ok: false as const, error })
+  );
+  void authRun.finally(() => markAuthStarted());
+
+  let main: { bytes: number; sha256: string };
+  try {
+    main = await streamPgDump({
+      databaseUrl: config.databaseUrl,
+      pgDumpBin,
+      args: mainDumpArgs(config.schemas, shared.id),
+      upload: (body) => writer.uploadDump(body, relationBytes),
+      onFirstByte: () => {
+        mainStarted = true;
+        markMainStarted();
+      },
+    });
+  } catch (error) {
+    markMainStarted();
+    authAbort.abort();
+    await authRun;
+    await shared.release();
+    // 主 dump 导入快照失败、一个字节都没写出:Auth 不做了,主 dump 按今天的方式重导
+    if (!mainStarted && /snapshot/i.test(shortReason(error))) {
+      log.warn(`Couldn't share a snapshot with the main dump (${shortReason(error)}); dumping it the usual way.`);
+      const plain = await streamPgDump({
+        databaseUrl: config.databaseUrl,
+        pgDumpBin,
+        args: mainDumpArgs(config.schemas),
+        upload: (body) => writer.uploadDump(body, relationBytes),
+      });
+      return { main: plain, auth: authNotDone(mode, "snapshot_unavailable") };
+    }
+    throw error;
+  }
+
+  // 主 dump 已经完成:Auth 两张表通常几秒就导完。万一那边卡住,最多再等这么久就放弃,
+  // 不能让整份备份(以及 worker 的串行队列)陪着它挂住
+  let authTimer: NodeJS.Timeout | undefined;
+  const authResult = await Promise.race([
+    authRun,
+    new Promise<Awaited<typeof authRun>>((resolve) => {
+      authTimer = setTimeout(() => {
+        authAbort.abort();
+        void authRun.then(() =>
+          resolve({ ok: false, error: new Error(`timed out ${AUTH_WAIT_AFTER_MAIN_MS / 60000} minutes after the main dump`) })
+        );
+      }, AUTH_WAIT_AFTER_MAIN_MS);
+    }),
+  ]);
+  clearTimeout(authTimer);
+  await shared.release();
+  if (!authResult.ok) {
+    const auth =
+      authResult.error instanceof AuthDumpTooLarge
+        ? authNotDone(mode, "too_large")
+        : ({ status: "failed", reason: `Auth archive not written: ${shortReason(authResult.error)}` } as AuthSection);
+    return { main, auth };
+  }
+  return {
+    main,
+    auth: {
+      status: "included",
+      dump: { key: plan.key, format: "custom", bytes: authResult.bytes, sha256: authResult.sha256 },
+      rows: { users: inspection.users, identities: inspection.identities },
+      passwordHashes: inspection.passwordHashes,
+      anonymousUsers: inspection.anonymousUsers,
+      ssoUsers: inspection.ssoUsers,
+      mfaUsers: inspection.mfaUsers,
+      triggers: inspection.triggers,
+      policies: inspection.policies,
+    },
+  };
+}
+
+/** 备份结束时把 Auth 段的结果说给人听;warn 的都是不影响数据库备份的事 */
+function logAuthOutcome(auth: AuthSection, schemas: string[]): void {
+  if (auth.status === "included") {
+    log.ok(
+      `Auth users backed up (${auth.rows!.users.toLocaleString("en-US")} users, ` +
+        `${auth.rows!.identities.toLocaleString("en-US")} sign-in identities, ` +
+        `${(auth.dump!.bytes / 1024 / 1024).toFixed(1)} MB)`
+    );
+    if (auth.passwordHashes!.encrypted > 0) {
+      log.warn(
+        `${auth.passwordHashes!.encrypted} password hash(es) are encrypted with this project's key; ` +
+          `after a restore into a new project those users can't sign in with their old password.`
+      );
+    }
+    for (const note of unbackedAuthDependencies({ triggers: auth.triggers!, policies: auth.policies! }, schemas)) {
+      log.warn(`${note}. Add that schema to the backup to keep it.`);
+    }
+    return;
+  }
+  const why = AUTH_SKIP_TEXT[auth.reason ?? ""] ?? auth.reason ?? "unknown reason";
+  if (auth.status === "skipped") {
+    // 不是 Supabase 库时这是正常情况,不该显得像个问题
+    if (auth.reason === "no_auth_schema") log.step(`Auth users: skipped (${why}).`);
+    else log.warn(`Auth users not backed up: ${why}. The database backup itself is complete.`);
+  } else {
+    log.warn(`Auth users backup failed: ${why}. The database backup itself is complete.`);
+  }
 }
 
 export async function runBackup(
@@ -272,9 +517,29 @@ export async function runBackup(
   // 按 Supabase 以前的默认授权开放 public,会把源库关着的表打开
   const grantsBeforeDump = await readGrants(config.databaseUrl, config.schemas);
 
+  // Auth 用户另备一份(2.10.0 起,见 auth-backup.ts)。库调用方没传 = 关闭,下面走的就是之前的那条路,
+  // 参数、文件、manifest 都和之前一样。共享快照在转储前一刻才导出,尽量少占连接
+  const authMode: AuthMode = config.auth ?? "off";
+  const authPlan = await planAuth(config, writer, authMode);
+  let auth: AuthSection | undefined = authPlan.kind === "settled" ? authPlan.section : undefined;
+
   log.step(`Dumping → ${writer.describe("dump.pgcustom")}`);
-  const { bytes, sha256 } = await dumpToSnapshot(config, writer, pgDumpBin, db.relationBytes);
+  let bytes: number;
+  let sha256: string;
+  if (authPlan.kind === "dump") {
+    const result = await dumpWithAuth(config, writer, pgDumpBin, db.relationBytes, authMode, authPlan);
+    ({ bytes, sha256 } = result.main);
+    auth = result.auth;
+  } else {
+    ({ bytes, sha256 } = await streamPgDump({
+      databaseUrl: config.databaseUrl,
+      pgDumpBin,
+      args: mainDumpArgs(config.schemas),
+      upload: (body) => writer.uploadDump(body, db.relationBytes),
+    }));
+  }
   log.ok(`Database dumped (${(bytes / 1024 / 1024).toFixed(1)} MB, sha256 ${sha256.slice(0, 12)}…)`);
+  if (auth) logAuthOutcome(auth, config.schemas);
 
   const grants = grantsHeldThroughout(grantsBeforeDump, await readGrants(config.databaseUrl, config.schemas));
 
@@ -330,6 +595,8 @@ export async function runBackup(
       grants,
     },
     dump: { key: dumpKey, format: "custom", bytes, sha256 },
+    // 关闭时不写这个字段:manifest 与之前逐字节一致
+    ...(auth ? { auth } : {}),
     storage: storageResult,
   };
 

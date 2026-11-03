@@ -1,4 +1,5 @@
 import { readFile } from "node:fs/promises";
+import type { AuthMode } from "./auth-backup.js";
 
 /**
  * 目标对象存储(S3 兼容:AWS S3 / Cloudflare R2 / Backblaze B2 / Supabase Storage 的 S3 端点均可)。
@@ -36,6 +37,12 @@ export interface BackupConfig {
   // 恢复传入自己的 SnapshotStore(如托管服务的 Google Drive 目标)时可以省略
   storage?: StorageConfig;
   supabaseStorage?: SupabaseStorageConfig; // 备份读取源(Supabase Storage 文件)
+  /**
+   * 2.10.0 起:是否另外备份 Supabase Auth 用户(auth.users + auth.identities,见 auth-backup.ts)。
+   * 库调用方不传 = "off",备份与之前逐字节一致;托管 worker 显式传值才打开。
+   * CLI 的 loadConfig 默认给 "default":做得了就备,做不了只打警告、不让备份失败。
+   */
+  auth?: AuthMode;
 }
 
 /** CLI 读出来的配置一定带桶:loadConfig 缺了桶直接报错,所以返回类型里 storage 是必填 */
@@ -56,6 +63,17 @@ interface RawConfig {
   storage?: Partial<StorageConfig>;
   supabaseStorage?: Partial<SupabaseStorageConfig>;
   pingUrl?: string;
+  /** 配置文件里写 true / false;CLI 是 --auth / --no-auth,环境变量 BACKUPDRILL_AUTH=on|off */
+  auth?: boolean;
+}
+
+/** BACKUPDRILL_AUTH:on/true/1 = 显式要求,off/false/0 = 不备;空串算没设(GitHub Actions 里没配的 secret) */
+function authFromEnv(value: string | undefined): boolean | undefined {
+  const v = value?.trim().toLowerCase();
+  if (!v) return undefined;
+  if (["on", "true", "1", "yes"].includes(v)) return true;
+  if (["off", "false", "0", "no"].includes(v)) return false;
+  throw new Error(`BACKUPDRILL_AUTH must be "on" or "off" (got "${value}")`);
 }
 
 /** "a, b" → ["a", "b"]。只有逗号和空白时算没设:空列表会盖掉配置文件里的值。 */
@@ -98,6 +116,7 @@ function fromEnv(): RawConfig {
     schemas: listFromEnv(env.BACKUPDRILL_SCHEMAS),
     storage,
     supabaseStorage,
+    auth: authFromEnv(env.BACKUPDRILL_AUTH),
   };
 }
 
@@ -208,9 +227,14 @@ export async function loadConfig(opts: {
     };
   }
 
+  // 显式 flag > 环境变量 > 配置文件;都没说 = "default"(做得了就备,做不了只警告)
+  const authChoice = [o.auth, env.auth, file.auth].find((v) => typeof v === "boolean");
+  const auth: AuthMode = authChoice === undefined ? "default" : authChoice ? "on" : "off";
+
   return {
     databaseUrl: databaseUrl!,
     projectName,
+    auth,
     schemas: schemas.length ? schemas : ["public"],
     storage: {
       endpoint: storage.endpoint,

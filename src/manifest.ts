@@ -64,6 +64,7 @@ export interface ExtensionInfo {
  *    验证升级字段(本期不生成)。全部为**可加字段**——v2 读取端兼容 v1 快照。
  *  - (仍是 2)2.9.0 加 database.grants:可加字段,旧读取端忽略它、照旧恢复,不升版本,
  *    免得还没升级的 CLI 和 worker 拒读新快照。
+ *  - (仍是 2)2.10.0 加 auth:同样是可加字段。旧读取端忽略它和 auth.dump,演练和恢复与之前完全一样。
  */
 export const MANIFEST_SCHEMA_VERSION = 2;
 
@@ -96,6 +97,9 @@ export interface Manifest {
     bytes: number;
     sha256: string;
   };
+  // 可选:2.10.0 起的 Supabase Auth 用户备份(auth.users + auth.identities,见 auth-backup.ts)。
+  // 缺席 = 没做这一项(旧快照,或调用方关着),恢复与演练按之前的方式处理
+  auth?: AuthSection;
   // Storage 文件清单:每个文件的桶/键/大小/校验和(PRD US-2 要求"文件清单+校验和")
   storage: null | {
     // v2:恢复端重建 bucket 用(含空 bucket)。v1 快照无此字段 → 恢复端标 not captured
@@ -104,6 +108,56 @@ export interface Manifest {
     totalBytes: number;
     files: StorageFile[];
   };
+}
+
+/**
+ * Auth 用户备份的结果。只有 included 的快照带 dump 和统计;其余状态说明为什么没备上。
+ *  - included:auth.dump 在快照里,行数可以合法为 0
+ *  - skipped:默认开启但做不了(无权读取、没有 auth schema、存储不支持、schemas 可能已含 auth、太大),不算失败
+ *  - failed:权限够、却在导出或上传时出错;只有显式要求时备份才因此失败
+ */
+export const AUTH_STATUSES = ["included", "skipped", "failed"] as const;
+export const AUTH_SKIP_REASONS = [
+  "no_permission",
+  "no_auth_schema",
+  "unsupported_destination",
+  "schemas_may_include_auth",
+  "too_large",
+  "snapshot_unavailable",
+] as const;
+
+export interface AuthTriggerInfo {
+  table: string;
+  name: string;
+  // pg_trigger.tgenabled:O 启用、D 停用、R 只在复制会话里触发、A 总是触发
+  enabled: "O" | "D" | "R" | "A";
+  functionSchema: string;
+  functionName: string;
+}
+
+export interface AuthPolicyInfo {
+  table: string;
+  name: string;
+  /** 策略表达式里引用的函数所在的非平台 schema;不在备份里的,恢复时建不出来 */
+  functionSchemas: string[];
+}
+
+export interface AuthSection {
+  status: (typeof AUTH_STATUSES)[number];
+  /** skipped 时是 AUTH_SKIP_REASONS 之一;failed 时是一句不带行值的说明 */
+  reason?: string;
+  // ---- 以下只在 included 时出现
+  dump?: { key: string; format: "custom"; bytes: number; sha256: string };
+  /** 两张表在共享快照里的精确行数;演练恢复后拿它核对 */
+  rows?: { users: number; identities: number };
+  /** 密码哈希分类计数:none = 没有密码(OAuth、魔法链接、匿名);encrypted = 用项目密钥加密过,换项目后不能用原密码登录 */
+  passwordHashes?: { none: number; portable: number; encrypted: number; unrecognized: number };
+  anonymousUsers?: number;
+  ssoUsers?: number;
+  /** 有已验证 MFA 因子的用户数;读不到时为 null */
+  mfaUsers?: number | null;
+  triggers?: AuthTriggerInfo[];
+  policies?: AuthPolicyInfo[];
 }
 
 export interface StorageFile {
@@ -152,6 +206,45 @@ function assertGrantedObject(g: GrantedObject): void {
     if (!(GRANT_ROLES as readonly string[]).includes(role)) malformed(`${what}.privileges (unknown role)`);
     if (!Array.isArray(privileges) || privileges.some((p) => !(GRANT_PRIVILEGES as readonly string[]).includes(p))) {
       malformed(`${what}.privileges (unknown privilege)`);
+    }
+  }
+}
+
+const isCount = (n: unknown): n is number => typeof n === "number" && Number.isInteger(n) && n >= 0;
+const isName = (s: unknown): s is string => typeof s === "string" && s.length > 0;
+
+/**
+ * auth 段的结构校验。included 的快照会驱动恢复往目标的 auth 表里写数据——错型或缺字段要在这里拦下,
+ * 不能到写目标时才炸;也不能把一个坏掉的 included 静默当成"没备 Auth"。
+ */
+function assertAuthSection(a: AuthSection): void {
+  if (typeof a !== "object" || a === null || Array.isArray(a)) malformed("auth");
+  if (!isName(a.status)) malformed("auth.status");
+  optionalString(a.reason, "auth.reason");
+  // 只有 included 会驱动往目标写数据,所以只对它严格。其余状态(包括以后版本新增的状态和原因)
+  // 读端一律当"这份快照没有 Auth",不能因为不认识就把整份快照判成坏的、让演练失败
+  if (a.status !== "included") return;
+  const d = a.dump as unknown;
+  if (typeof d !== "object" || d === null) malformed("auth.dump");
+  if (!isName(a.dump!.key) || !isName(a.dump!.sha256) || !isCount(a.dump!.bytes) || a.dump!.format !== "custom") {
+    malformed("auth.dump");
+  }
+  if (!a.rows || !isCount(a.rows.users) || !isCount(a.rows.identities)) malformed("auth.rows");
+  const h = a.passwordHashes;
+  if (!h || ![h.none, h.portable, h.encrypted, h.unrecognized].every(isCount)) malformed("auth.passwordHashes");
+  if (!isCount(a.anonymousUsers) || !isCount(a.ssoUsers)) malformed("auth.anonymousUsers/ssoUsers");
+  if (a.mfaUsers !== null && !isCount(a.mfaUsers)) malformed("auth.mfaUsers");
+  if (!Array.isArray(a.triggers)) malformed("auth.triggers");
+  for (const t of a.triggers) {
+    if (!isName(t?.table) || !isName(t?.name) || !isName(t?.functionSchema) || !isName(t?.functionName)) {
+      malformed("auth.triggers[]");
+    }
+    if (!["O", "D", "R", "A"].includes(t.enabled)) malformed("auth.triggers[].enabled");
+  }
+  if (!Array.isArray(a.policies)) malformed("auth.policies");
+  for (const p of a.policies) {
+    if (!isName(p?.table) || !isName(p?.name) || !Array.isArray(p.functionSchemas) || !p.functionSchemas.every(isName)) {
+      malformed("auth.policies[]");
     }
   }
 }
@@ -207,6 +300,7 @@ function assertManifestShape(m: Manifest): void {
       malformed("database.tables[].estimatedRows");
     }
   }
+  if (m.auth !== undefined) assertAuthSection(m.auth);
   // 写入端恒写 storage: null(DB-only)或对象——字段整体缺失只可能是截断/损坏,
   // 静默当成 DB-only 会跳过全部 Storage 验证与恢复
   if (m.storage === undefined) malformed("storage section missing (null means DB-only)");

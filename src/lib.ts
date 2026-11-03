@@ -36,7 +36,18 @@ export type {
   StorageConfig,
   SupabaseStorageConfig,
 } from "./config.js";
-export type { BucketAttrs, ExtensionInfo, Manifest, StorageFile, TableStat } from "./manifest.js";
+export type {
+  AuthPolicyInfo,
+  AuthSection,
+  AuthTriggerInfo,
+  BucketAttrs,
+  ExtensionInfo,
+  Manifest,
+  StorageFile,
+  TableStat,
+} from "./manifest.js";
+// 2.10.0:Auth 用户备份。库调用方在 BackupConfig.auth 里显式传值才打开(不传 = 关闭,备份与之前一致)
+export type { AuthMode } from "./auth-backup.js";
 export type { GrantedObject, GrantRestore } from "./grants.js";
 export type { DrillReport, DrillCheck, DrillSupervision, DrillPhase } from "./drill.js";
 export type { OrphanedForeignKey } from "./orphaned-foreign-keys.js";

@@ -139,6 +139,7 @@ export function backupSummary(manifest: Manifest): string {
   return (
     `backupdrill ${TOOL_VERSION}: backup complete, ${manifest.database.tableCount} tables` +
     (manifest.storage ? ` + ${manifest.storage.fileCount} Storage files` : " (database only)") +
+    (manifest.auth?.status === "included" ? ` + ${manifest.auth.rows!.users} Auth users` : "") +
     `, snapshot ${manifest.dump.key.split("/").at(-2) ?? manifest.createdAt}`
   );
 }
