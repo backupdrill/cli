@@ -1,5 +1,5 @@
-import type pg from "pg";
-import { connectPg } from "./supabase-ca.js";
+import pg from "pg";
+import { attachPgErrorGuard, pgConnectOptions } from "./supabase-ca.js";
 import type { AuthSection, AuthTriggerInfo, AuthPolicyInfo } from "./manifest.js";
 
 /**
@@ -71,6 +71,30 @@ export function schemasMayIncludeAuth(schemas: string[]): boolean {
   });
 }
 
+/**
+ * 连库,但能被 signal 随时打断:到点时直接断开连接,不管它还在连接池里排队、还是正在跑查询。
+ * Auth 这两条连接都在主 dump 之前用,绝不能让它们占着连接、把数据库备份堵在后面。
+ */
+async function connectCancellable(databaseUrl: string, signal?: AbortSignal): Promise<pg.Client> {
+  if (signal?.aborted) throw new Error("stopped by the caller");
+  const client = new pg.Client(pgConnectOptions(databaseUrl));
+  attachPgErrorGuard(client);
+  const onAbort = () => void client.end().catch(() => {});
+  signal?.addEventListener("abort", onAbort, { once: true });
+  try {
+    await client.connect();
+  } catch (error) {
+    signal?.removeEventListener("abort", onAbort);
+    throw error;
+  }
+  // 连上之后仍然听着:查询进行中被叫停也立刻断开;client 结束时把监听摘掉
+  client.once("end", () => signal?.removeEventListener("abort", onAbort));
+  // 服务端在等锁时察觉不到客户端已经走了,会一直占着连接等到锁超时。PG 14 起可以让它每秒查一次,
+  // 断开后很快收手、把连接还回连接池;更老的服务端不认这个参数,忽略即可
+  await client.query("set client_connection_check_interval = '1s'").catch(() => {});
+  return client;
+}
+
 /** 共享快照:导出快照的连接 + 快照号。导出连接只需活到两份 pg_dump 都导入快照为止 */
 export interface SharedSnapshot {
   id: string;
@@ -83,10 +107,10 @@ export interface SharedSnapshot {
  * 两份归档看到的是同一时刻的库(否则两次导出之间的注册、删号会让两份对不上)。
  * 失败就返回 null:调用方按今天的方式导出主 dump,只把 Auth 段标掉。
  */
-export async function exportSharedSnapshot(databaseUrl: string): Promise<SharedSnapshot | null> {
+export async function exportSharedSnapshot(databaseUrl: string, signal?: AbortSignal): Promise<SharedSnapshot | null> {
   let client: pg.Client | null = null;
   try {
-    client = await connectPg(databaseUrl);
+    client = await connectCancellable(databaseUrl, signal);
     // 兜底:进程卡住时也不让这个空闲事务一直挂着(正常情况几秒内就释放);语句本身也不许久等
     await client.query("set idle_in_transaction_session_timeout = '10min'");
     await client.query("set statement_timeout = '30s'");
@@ -124,6 +148,7 @@ export type AuthInspection =
       mfaUsers: number | null;
       triggers: AuthTriggerInfo[];
       policies: AuthPolicyInfo[];
+      grants: Array<{ table: string; grantee: string; privilege: string }>;
     };
 
 // Supabase 平台自己的 schema。触发器函数或策略引用的函数在这些 schema 里时算平台对象
@@ -137,8 +162,12 @@ const PLATFORM_SCHEMAS = [
  * 能不能读到全部行要先确认:auth.users 开着 RLS,角色既不是超级用户、又没有 BYPASSRLS 时,
  * pg_dump 照样"成功",导出的却是空表——看着干净,其实什么都没备上。
  */
-export async function inspectAuth(databaseUrl: string, snapshotId: string): Promise<AuthInspection> {
-  const client = await connectPg(databaseUrl);
+export async function inspectAuth(
+  databaseUrl: string,
+  snapshotId: string,
+  signal?: AbortSignal
+): Promise<AuthInspection> {
+  const client = await connectCancellable(databaseUrl, signal);
   try {
     // 这些统计跑在主 dump 之前:auth 表上有别人的锁(例如正在跑的 Auth 迁移)时不能陪着等,
     // 超时就让 Auth 这次不备,主 dump 照常
@@ -232,9 +261,19 @@ export async function inspectAuth(databaseUrl: string, snapshotId: string): Prom
         order by 1, 2`
     );
 
+    const grants = await client.query<{ table: string; grantee: string; privilege: string }>(
+      `select c.relname as table,
+              case when a.grantee = 0 then 'PUBLIC' else a.grantee::regrole::text end as grantee,
+              a.privilege_type as privilege
+         from pg_class c, aclexplode(c.relacl) a
+        where c.oid in ('auth.users'::regclass, 'auth.identities'::regclass)
+        order by 1, 2, 3`
+    );
+
     await client.query("commit");
     return {
       readable: true,
+      grants: grants.rows,
       users: Number(c.users),
       identities: Number(c.identities),
       passwordHashes: {
@@ -264,51 +303,69 @@ export async function inspectAuth(databaseUrl: string, snapshotId: string): Prom
   }
 }
 
-/**
- * 触发器或策略依赖的函数不在这次备份的 schema 里(也不是平台 schema):恢复时建不出来。
- * 返回给人看的句子,备份时就提示,好让用户把那个 schema 加进备份。
- */
-export function unbackedAuthDependencies(
-  inspection: { triggers: AuthTriggerInfo[]; policies: AuthPolicyInfo[] },
-  backedUpSchemas: string[]
-): string[] {
-  const covered = (schema: string) => backedUpSchemas.includes(schema) || PLATFORM_SCHEMAS.includes(schema);
-  const notes: string[] = [];
-  for (const t of inspection.triggers) {
-    if (!covered(t.functionSchema)) {
-      notes.push(
-        `trigger ${t.name} on auth.${t.table} calls ${t.functionSchema}.${t.functionName}(), ` +
-          `but schema ${t.functionSchema} is not in this backup — after a restore the trigger can't be created`
-      );
-    }
-  }
-  for (const p of inspection.policies) {
-    const missing = p.functionSchemas.filter((s) => !covered(s));
-    if (missing.length) {
-      notes.push(
-        `policy ${p.name} on auth.${p.table} uses functions in ${missing.join(", ")}, ` +
-          `which ${missing.length === 1 ? "is" : "are"} not in this backup — after a restore the policy can't be created`
-      );
-    }
-  }
-  return notes;
+/** schema 是否在这次备份里:按 pg_dump 读模式的规则匹配 schemas(含通配),或是平台 schema(新项目里本来就有) */
+function schemaCovered(schema: string, backedUpSchemas: string[]): boolean {
+  if (PLATFORM_SCHEMAS.includes(schema)) return true;
+  return backedUpSchemas.some((pattern) => schemaPatternRegex(pattern)?.test(schema) ?? false);
 }
 
+// 自动补建的对象名只收普通标识符:名字会进 pg_restore -l 的筛选,也会出现在给人复制的命令里,
+// 带引号、空格之类的名字一律交给手工步骤,杜绝任何拼接注入
+const PLAIN_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/;
+
 /**
- * 恢复(含 RECOVERY.md 的手工步骤)要补建的 Auth 表对象。只建:
- *  - 源库里会触发的触发器(O 启用、A 总是);D 停用和 R 只在复制会话触发的在普通会话里本来就不起作用;
- *  - 依赖都在的对象:函数所在的 schema 在这次备份里(或是平台 schema)。
- * 依赖不在的建不出来——把它放进单事务恢复,会让整个恢复回滚。跳过它们,另行写进报告和手工步骤。
+ * 恢复(含 RECOVERY.md 的手工步骤)自动补建的 Auth 表对象。只建同时满足下面几条的触发器:
+ *  - 源库里是普通启用状态(O)。D 停用、R 只在复制会话触发的,在普通会话里本来就不起作用;
+ *    A(总是触发)恢复时 pg_dump 会带一句 ENABLE ALWAYS,那需要表的属主身份,新项目里做不到。
+ *  - 触发函数所在的 schema 在这次备份里(或是平台 schema),否则建不出来。
+ *  - 名字是普通标识符。
+ * 策略一律不自动建:CREATE POLICY 需要表的属主身份,新项目里 auth 两张表的属主是平台角色;
+ * 放进单事务恢复里建不出来,会让整个恢复回滚。少了它们,这两张开着 RLS 的表对 API 角色一律拒绝,
+ * 是收紧而不是放开。
  */
 export function restorableAuthObjects(
   auth: { triggers: AuthTriggerInfo[]; policies: AuthPolicyInfo[] },
   backedUpSchemas: string[]
-): { triggers: AuthTriggerInfo[]; policies: AuthPolicyInfo[] } {
-  const covered = (schema: string) => backedUpSchemas.includes(schema) || PLATFORM_SCHEMAS.includes(schema);
+): { triggers: AuthTriggerInfo[] } {
   return {
-    triggers: auth.triggers.filter((t) => (t.enabled === "O" || t.enabled === "A") && covered(t.functionSchema)),
-    policies: auth.policies.filter((p) => p.functionSchemas.every(covered)),
+    triggers: auth.triggers.filter(
+      (t) => t.enabled === "O" && schemaCovered(t.functionSchema, backedUpSchemas) && PLAIN_NAME.test(t.name)
+    ),
   };
+}
+
+/**
+ * 恢复时不会自动补建、需要人手处理的 Auth 表对象,写成给人看的句子。备份时提示一次(好让用户把缺的
+ * schema 加进备份),RECOVERY.md 和恢复报告里列成手工步骤。
+ */
+export function manualAuthObjects(
+  auth: { triggers: AuthTriggerInfo[]; policies: AuthPolicyInfo[] },
+  backedUpSchemas: string[]
+): string[] {
+  const notes: string[] = [];
+  for (const t of auth.triggers) {
+    const on = `trigger ${JSON.stringify(t.name)} on auth.${t.table}`;
+    if (t.enabled === "D" || t.enabled === "R") {
+      notes.push(`${on} was ${t.enabled === "D" ? "disabled" : "replica-only"} at the source, so it isn't recreated`);
+    } else if (!schemaCovered(t.functionSchema, backedUpSchemas)) {
+      notes.push(
+        `${on} calls ${t.functionSchema}.${t.functionName}(), but schema ${t.functionSchema} is not in this backup, ` +
+          `so it can't be recreated until that schema exists on the target`
+      );
+    } else if (t.enabled === "A") {
+      notes.push(`${on} fires in every session (ENABLE ALWAYS), which needs the table owner to set; recreate it by hand`);
+    } else if (!PLAIN_NAME.test(t.name)) {
+      notes.push(`${on} has a name that needs quoting; recreate it by hand`);
+    }
+  }
+  for (const p of auth.policies) {
+    const missing = p.functionSchemas.filter((s) => !schemaCovered(s, backedUpSchemas));
+    notes.push(
+      `policy ${JSON.stringify(p.name)} on auth.${p.table} isn't recreated automatically (creating a policy needs the table owner)` +
+        (missing.length ? `; it also uses functions in ${missing.join(", ")}, which ${missing.length === 1 ? "is" : "are"} not in this backup` : "")
+    );
+  }
+  return notes;
 }
 
 /** pg_dump 参数:只导两张表(结构 + 数据 + 它们上的索引、约束、触发器、策略),同一个共享快照 */

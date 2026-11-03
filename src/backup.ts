@@ -12,7 +12,7 @@ import {
   exportSharedSnapshot,
   inspectAuth,
   schemasMayIncludeAuth,
-  unbackedAuthDependencies,
+  manualAuthObjects,
   type AuthMode,
   type SharedSnapshot,
 } from "./auth-backup.js";
@@ -244,14 +244,25 @@ async function streamPgDump(opts: {
   // 写入上,调用方(worker 的串行队列)随之永久挂起。Promise.all 会订阅两侧,
   // 先失败的一方抛出后,另一方稍后的 rejection 也已被视为 handled。
   // 开始上传也放进 try:实现可能在建上传时就同步抛错,那时 pg_dump 已经在跑,同样要杀掉。
+  // 调用方要求停下时立刻以失败收场,不等 pg_dump 和上传各自收尾——卡住的可能正是它们之一。
+  // 没传 signal(主 dump)时这个 Promise 永不 settle,行为与之前一致
+  const stopped = new Promise<never>((_, reject) => {
+    if (opts.signal?.aborted) reject(new Error("stopped by the caller"));
+    opts.signal?.addEventListener("abort", () => reject(new Error("stopped by the caller")), { once: true });
+  });
+  stopped.catch(() => {});
   try {
     upload = opts.upload(meter);
-    await Promise.all([dumpDone, upload.done]);
+    const finished = Promise.all([dumpDone, upload.done]);
+    finished.catch(() => {}); // 被叫停后它可能才失败,不能变成没人接的 rejection
+    await Promise.race([finished, stopped]);
   } catch (error) {
     dumpDone.catch(() => {}); // 没走到 Promise.all 时,被杀的 pg_dump 的退出也得有人接住
     dump.kill("SIGKILL");
     meter.destroy();
-    await upload?.abort().catch(() => {});
+    // 被叫停时中止上传但不等它(可能正卡在那);其余情况照旧等中止完成
+    if (opts.signal?.aborted) void upload?.abort().catch(() => {});
+    else await upload?.abort().catch(() => {});
     // 超限时先失败的往往是上传那一侧(流被 meter 报错中断),原因统一报成超限
     if (opts.maxBytes !== undefined && bytes > opts.maxBytes) {
       throw new AuthDumpTooLarge(`archive is larger than ${opts.maxBytes} bytes`);
@@ -312,11 +323,15 @@ async function planAuth(config: BackupConfig, writer: SnapshotWriter, mode: Auth
     return { kind: "settled", section: authNotDone(mode, "unsupported_destination") };
   }
   // 导出快照和统计都发生在主 dump 之前,必须有总时限:连接池满时新连接会一直排队,
-  // 不能让数据库备份陪着等。到点就按"快照不可用"放弃,晚到的快照连接回头自己释放
-  const prepared = prepareAuthDump(config, writer, mode);
+  // 不能让数据库备份陪着等。到点就按"快照不可用"放弃,并立刻断开 Auth 的两条连接
+  // (不管它们还在排队还是在跑查询),把连接让给主 dump
+  const stop = new AbortController();
+  const prepared = prepareAuthDump(config, writer, mode, stop.signal);
+  prepared.catch(() => {});
   let deadline: NodeJS.Timeout | undefined;
   const timedOut = new Promise<AuthPlan>((resolve) => {
     deadline = setTimeout(() => {
+      stop.abort();
       void prepared.then((late) => (late.kind === "dump" ? late.shared.release() : undefined)).catch(() => {});
       resolve({ kind: "settled", section: authNotDone(mode, "snapshot_unavailable") });
     }, AUTH_TIMEOUTS.prepareDeadlineMs);
@@ -326,12 +341,17 @@ async function planAuth(config: BackupConfig, writer: SnapshotWriter, mode: Auth
   return plan;
 }
 
-async function prepareAuthDump(config: BackupConfig, writer: SnapshotWriter, mode: AuthMode): Promise<AuthPlan> {
-  const shared = await exportSharedSnapshot(config.databaseUrl);
+async function prepareAuthDump(
+  config: BackupConfig,
+  writer: SnapshotWriter,
+  mode: AuthMode,
+  signal: AbortSignal
+): Promise<AuthPlan> {
+  const shared = await exportSharedSnapshot(config.databaseUrl, signal);
   if (!shared) return { kind: "settled", section: authNotDone(mode, "snapshot_unavailable") };
   let inspection: Awaited<ReturnType<typeof inspectAuth>>;
   try {
-    inspection = await inspectAuth(config.databaseUrl, shared.id);
+    inspection = await inspectAuth(config.databaseUrl, shared.id, signal);
   } catch (error) {
     await shared.release();
     // 导入快照失败(经连接池时最可能)按"快照不可用"跳过;其余是统计查询本身出错
@@ -450,6 +470,7 @@ async function dumpWithAuth(
       mfaUsers: inspection.mfaUsers,
       triggers: inspection.triggers,
       policies: inspection.policies,
+      grants: inspection.grants,
     },
   };
 }
@@ -468,8 +489,9 @@ function logAuthOutcome(auth: AuthSection, schemas: string[]): void {
           `after a restore into a new project those users can't sign in with their old password.`
       );
     }
-    for (const note of unbackedAuthDependencies({ triggers: auth.triggers!, policies: auth.policies! }, schemas)) {
-      log.warn(`${note}. Add that schema to the backup to keep it.`);
+    // 备份时只提示用户自己能补救的(把缺的 schema 加进备份);其余在 RECOVERY.md 和恢复报告里列成手工步骤
+    for (const note of manualAuthObjects({ triggers: auth.triggers!, policies: auth.policies! }, schemas)) {
+      if (note.includes("not in this backup")) log.warn(`The ${note}. Add that schema to the backup to keep it.`);
     }
     return;
   }

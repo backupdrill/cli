@@ -158,6 +158,11 @@ export interface AuthSection {
   mfaUsers?: number | null;
   triggers?: AuthTriggerInfo[];
   policies?: AuthPolicyInfo[];
+  /**
+   * 两张表上的授权(aclexplode),新项目由平台另设一套;用户自己加的(例如给 authenticated 授 SELECT)
+   * 恢复时拿它比对、列成手工步骤。2.10.0 起写入;缺席 = 当时没记
+   */
+  grants?: Array<{ table: string; grantee: string; privilege: string }>;
 }
 
 export interface StorageFile {
@@ -240,6 +245,12 @@ function assertAuthSection(a: AuthSection): void {
       malformed("auth.triggers[]");
     }
     if (!["O", "D", "R", "A"].includes(t.enabled)) malformed("auth.triggers[].enabled");
+  }
+  if (a.grants !== undefined) {
+    if (!Array.isArray(a.grants)) malformed("auth.grants");
+    for (const g of a.grants) {
+      if (!isName(g?.table) || !isName(g?.grantee) || !isName(g?.privilege)) malformed("auth.grants[]");
+    }
   }
   if (!Array.isArray(a.policies)) malformed("auth.policies");
   for (const p of a.policies) {

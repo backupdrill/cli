@@ -8,7 +8,7 @@
 //    不把部分恢复表述成完整项目恢复(PRD §2.2 禁用表述)。
 import type { Manifest } from "./manifest.js";
 import { recoveryGrantsSql } from "./grants.js";
-import { restorableAuthObjects, unbackedAuthDependencies } from "./auth-backup.js";
+import { manualAuthObjects, restorableAuthObjects } from "./auth-backup.js";
 
 /** 生成手册所需的非秘密快照坐标。刻意不收连接串/密钥类型——签名即防线。 */
 export interface RecoveryDocContext {
@@ -84,14 +84,10 @@ export function renderRecoveryDoc(manifest: Manifest, ctx: RecoveryDocContext): 
       ? `- **Supabase Auth users**: not in this snapshot (${AUTH_NOT_INCLUDED_TEXT[manifest.auth.reason ?? ""] ?? manifest.auth.reason ?? "not captured"})
 `
       : "";
-  // 只补建会触发、依赖也都在备份里的触发器和策略(规则见 restorableAuthObjects);建不出来的写进下面的说明
+  // 自动补建的只有 restorableAuthObjects 认可的触发器(名字都是普通标识符,拼进命令也安全);
+  // 其余写进下面的手工步骤
   const restorable = auth ? restorableAuthObjects({ triggers: auth.triggers!, policies: auth.policies! }, db.schemas) : null;
-  const authObjects = restorable
-    ? [
-        ...restorable.triggers.map((t) => `TRIGGER auth ${t.table} ${t.name}`),
-        ...restorable.policies.map((p) => `POLICY auth ${p.table} ${p.name}`),
-      ]
-    : [];
+  const authObjects = restorable ? restorable.triggers.map((t) => `TRIGGER auth ${t.table} ${t.name}`) : [];
   const authObjectsGrep = authObjects.map((o) => ereEscape(o)).join("|");
   const authNotes = auth
     ? [
@@ -105,11 +101,17 @@ export function renderRecoveryDoc(manifest: Manifest, ctx: RecoveryDocContext): 
           ? `- ${auth.anonymousUsers} anonymous user(s): restored, but an anonymous user can only sign in with the session they had, and sessions aren't in this snapshot.`
           : "",
         auth.mfaUsers ? `- ${auth.mfaUsers} user(s) had MFA. MFA factors aren't in this snapshot; those users sign in with one factor until they enroll again. Check what your app allows a user at \`aal1\`.` : "",
-        ...auth.triggers!
-          .filter((t) => t.enabled === "D" || t.enabled === "R")
-          .map((t) => `- Trigger \`${t.name}\` on \`auth.${t.table}\` was disabled (or replica-only) at the source and isn't recreated.`),
-        ...unbackedAuthDependencies({ triggers: auth.triggers!, policies: auth.policies! }, db.schemas).map(
-          (note) => `- The ${note}. Create it by hand once that schema exists on the target.`
+        (auth.grants ?? []).some((g) => ["anon", "authenticated", "service_role", "PUBLIC"].includes(g.grantee))
+          ? `- At backup time the Auth tables had grants to API roles (${[
+              ...new Set(
+                (auth.grants ?? [])
+                  .filter((g) => ["anon", "authenticated", "service_role", "PUBLIC"].includes(g.grantee))
+                  .map((g) => `${g.privilege} on auth.${g.table} to ${g.grantee}`)
+              ),
+            ].join(", ")}). A new project sets its own grants on these tables; add back any you had added yourself.`
+          : "",
+        ...manualAuthObjects({ triggers: auth.triggers!, policies: auth.policies! }, db.schemas).map(
+          (note) => `- The ${note}. Its definition is in \`auth.dump\` (\`pg_restore --section=post-data -f - auth.dump\`).`
         ),
       ].filter(Boolean)
     : [];
@@ -173,15 +175,22 @@ shasum -a 256 auth.dump       # must print ${auth.dump!.sha256}
    \`restore.sql is complete\` (a half-written file would otherwise be committed):
 
 \`\`\`bash
-pg_restore -l dump.pgcustom | grep -v ' SCHEMA - public ' > database.list
-${authObjects.length ? `pg_restore -l auth.dump | grep -E ' (${authObjectsGrep}) ' > auth-objects.list\n` : ""}{
-  pg_restore --data-only --no-owner --no-privileges -n auth -t users -f - auth.dump &&
-  pg_restore --data-only --no-owner --no-privileges -n auth -t identities -f - auth.dump &&
-  echo "${CLEAR_PENDING_AUTH_SQL}" &&
-  pg_restore --no-owner --no-privileges -L database.list -f - dump.pgcustom${
-    authObjects.length ? ` &&\n  pg_restore --no-owner --no-privileges -L auth-objects.list -f - auth.dump` : ""
-  }
-} > restore.sql && echo "restore.sql is complete"
+(
+  set -euo pipefail
+  pg_restore -l dump.pgcustom > database.full.list
+  grep -v ' SCHEMA - public ' database.full.list > database.list
+${authObjects.length ? `  pg_restore -l auth.dump > auth.full.list
+  grep -E ' (${authObjectsGrep}) ' auth.full.list > auth-objects.list
+  test "$(wc -l < auth-objects.list)" -eq ${authObjects.length}
+` : ""}  {
+    pg_restore --data-only --no-owner --no-privileges -n auth -t users -f - auth.dump
+    pg_restore --data-only --no-owner --no-privileges -n auth -t identities -f - auth.dump
+    echo "${CLEAR_PENDING_AUTH_SQL}"
+    pg_restore --no-owner --no-privileges -L database.list -f - dump.pgcustom
+${authObjects.length ? `    pg_restore --no-owner --no-privileges -L auth-objects.list -f - auth.dump
+` : ""}  } > restore.sql
+  echo "restore.sql is complete"
+)
 \`\`\`
 
    Then run it against the empty target. Enter the password at a hidden prompt so
@@ -198,8 +207,8 @@ The Auth users go in first, so foreign keys into \`auth.users\` resolve. Links
 and codes for password resets, email confirmations and email or phone changes
 that were pending at backup time are cleared. ${
         authObjects.length
-          ? "The triggers and policies on the Auth tables are recreated at the end."
-          : "There were no triggers or policies of your own on the Auth tables."
+          ? "Your triggers on the Auth tables are recreated at the end."
+          : "There are no triggers of your own on the Auth tables to recreate."
       } Do **not** use \`--clean\` against a Supabase project: it drops and
 recreates \`public\`, and the grants Supabase put on it go with it.
 `

@@ -12,7 +12,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import pg from "pg";
 import { runBackup, mainDumpArgs, AUTH_TIMEOUTS } from "../dist/backup.js";
-import { schemasMayIncludeAuth } from "../dist/auth-backup.js";
+import { schemasMayIncludeAuth, restorableAuthObjects, manualAuthObjects } from "../dist/auth-backup.js";
 import { parseManifest } from "../dist/manifest.js";
 import { renderRecoveryDoc } from "../dist/recovery-doc.js";
 
@@ -49,6 +49,37 @@ test("mainDumpArgs: without a snapshot the arguments are exactly the pre-2.10 on
   assert.deepEqual(mainDumpArgs(["public", "audit"], "00000003-1"), [
     "--format=custom", "--no-owner", "--no-privileges", "--snapshot=00000003-1", "--schema=public", "--schema=audit",
   ]);
+});
+
+test("restorable Auth objects: only enabled triggers with plain names whose function schema is backed up; never policies", () => {
+  const trig = (name, enabled, functionSchema = "public") => ({ table: "users", name, enabled, functionSchema, functionName: "f" });
+  const auth = {
+    triggers: [trig("ok", "O"), trig("always", "A"), trig("off", "D"), trig("replica", "R"), trig("priv", "O", "private"), trig("it's", "O")],
+    policies: [{ table: "users", name: "p", functionSchemas: [] }],
+  };
+  assert.deepEqual(restorableAuthObjects(auth, ["public"]).triggers.map((t) => t.name), ["ok"]);
+  // 按模式算覆盖:pub* 覆盖 public
+  assert.deepEqual(restorableAuthObjects(auth, ["pub*"]).triggers.map((t) => t.name), ["ok"]);
+  assert.deepEqual(restorableAuthObjects(auth, ["public", "private"]).triggers.map((t) => t.name), ["ok", "priv"]);
+  const notes = manualAuthObjects(auth, ["public"]).join("\n");
+  for (const name of ["always", "off", "replica", "priv", "it's"]) assert.ok(notes.includes(JSON.stringify(name)), name);
+  assert.match(notes, /policy "p" on auth\.users isn't recreated automatically/);
+});
+
+test("RECOVERY.md never puts an object name into a shell command unless it is a plain identifier", () => {
+  const evil = "x' ; touch /tmp/pwned ; '";
+  const auth = {
+    ...includedAuth(),
+    triggers: [
+      { table: "users", name: "on_signup", enabled: "O", functionSchema: "public", functionName: "f" },
+      { table: "users", name: evil, enabled: "O", functionSchema: "public", functionName: "f" },
+    ],
+  };
+  const doc = renderRecoveryDoc({ ...baseManifest(), auth }, { snapshot: "s", bucket: "b", prefix: "p", projectName: "p" });
+  const bash = [...doc.matchAll(/```bash\n([\s\S]*?)```/g)].map((m) => m[1]).join("\n");
+  assert.ok(bash.includes("TRIGGER auth users on_signup"));
+  assert.equal(bash.includes("pwned"), false);
+  assert.ok(doc.includes(JSON.stringify(evil)), "the odd name is listed as a manual step instead");
 });
 
 const baseManifest = () => ({
@@ -174,6 +205,8 @@ ${AUTH_DDL}
     ('22222222-2222-2222-2222-222222222222', 'google', '1000001'),
     ('22222222-2222-2222-2222-222222222222', 'github', '2000002'),
     ('33333333-3333-3333-3333-333333333333', 'email', '33333333-3333-3333-3333-333333333333');
+  create role authenticated nologin;
+  grant select on auth.users to authenticated;
   create role reader_ok login password 'r' bypassrls;
   grant pg_read_all_data to reader_ok;
   create role reader_norls login password 'r';
@@ -198,6 +231,9 @@ echo "$args" >> "${log}"
 case "$args" in
   *--table=auth.users*) if [ -n "$BD_TEST_FAIL_AUTH" ]; then echo "pg_dump: error: injected auth failure" >&2; exit 1; fi ;;
   *--snapshot=*--schema=*) if [ -n "$BD_TEST_FAIL_MAIN_SNAPSHOT" ]; then echo "pg_dump: error: query failed: ERROR:  invalid snapshot identifier" >&2; exit 1; fi ;;
+esac
+case "$args" in
+  *--schema=*) if [ -n "$BD_TEST_FAIL_MAIN" ]; then echo "pg_dump: error: connection lost" >&2; exit 1; fi ;;
 esac
 exec "${realPgDump}" "$@"
 `
@@ -302,6 +338,7 @@ test(
           { table: "users", name: "on_auth_user_created", enabled: "O", functionSchema: "public", functionName: "handle_new_user" },
         ]);
         assert.deepEqual(a.policies, [{ table: "users", name: "self_read", functionSchemas: ["private"] }]);
+        assert.ok(a.grants.some((g) => g.table === "users" && g.grantee === "authenticated" && g.privilege === "SELECT"), JSON.stringify(a.grants));
         assert.ok(r.files.get("auth.dump").length > 0);
         assert.equal(a.dump.bytes, r.files.get("auth.dump").length);
         // 两份 dump 用的是同一个快照
@@ -334,7 +371,13 @@ test(
         const dir = mkdtempSync(join(work, "runbook-"));
         writeFileSync(join(dir, "dump.pgcustom"), r.files.get("dump.pgcustom"));
         writeFileSync(join(dir, "auth.dump"), r.files.get("auth.dump"));
-        const generated = await x("sh", ["-c", blocks[0]], { cwd: dir });
+        // 先拿一个坏掉的 auth.dump 试:任何一步失败都不能打印 complete
+        const broken = mkdtempSync(join(work, "runbook-broken-"));
+        writeFileSync(join(broken, "dump.pgcustom"), r.files.get("dump.pgcustom"));
+        writeFileSync(join(broken, "auth.dump"), r.files.get("auth.dump").subarray(0, 64));
+        const bad = await x("bash", ["-c", blocks[0]], { cwd: broken }).catch((e) => e);
+        assert.equal(/restore\.sql is complete/.test(bad.stdout ?? ""), false, "a failed generation must not say complete");
+        const generated = await x("bash", ["-c", blocks[0]], { cwd: dir });
         assert.match(generated.stdout, /restore\.sql is complete/);
 
         // 目标 = 一个新项目:平台建好的空 auth 两张表,public 是空的
@@ -358,7 +401,8 @@ test(
                   (select bool_and(convalidated) from pg_constraint where conrelid = 'public.profiles'::regclass and contype = 'f') as fk_valid`
         );
         assert.deepEqual(after.rows[0], { users: 4, identities: 4, profiles: 4, pending: 0, trig: 1, policies: 0, fk_valid: true });
-        assert.match(doc, /policy self_read on auth\.users uses functions in private/);
+        assert.match(doc, /policy "self_read" on auth\.users isn't recreated automatically/);
+        assert.match(doc, /SELECT on auth\.users to authenticated/);
 
         // 再跑一次会撞上已有的行:整个事务回滚,目标原样不动
         await assert.rejects(restoreOnce());
@@ -449,6 +493,41 @@ test(
         } finally {
           AUTH_TIMEOUTS.waitAfterMainMs = previous;
         }
+      });
+
+      await t.test("the preparation deadline drops the Auth connections at once and lets the database backup go ahead", async () => {
+        const locker = new pg.Client({ connectionString: admin });
+        await locker.connect();
+        const previous = AUTH_TIMEOUTS.prepareDeadlineMs;
+        AUTH_TIMEOUTS.prepareDeadlineMs = 500;
+        try {
+          await locker.query("begin; lock table auth.users in access exclusive mode");
+          const started = Date.now();
+          const r = await run("deadline", { databaseUrl: okUrl, auth: "default" });
+          assert.ok(Date.now() - started < 4000, `took ${Date.now() - started} ms`);
+          assert.deepEqual(r.manifest.auth, { status: "skipped", reason: "snapshot_unavailable" });
+          assert.ok(r.files.get("dump.pgcustom").length > 0);
+          // 客户端已断开;服务端在等锁的那个进程每秒检查一次,很快就会收手
+          let left = 1;
+          for (let i = 0; i < 30 && left > 0; i++) {
+            left = (await sql(admin, "select count(*)::int as n from pg_stat_activity where usename = 'reader_ok'")).rows[0].n;
+            if (left > 0) await new Promise((r) => setTimeout(r, 100));
+          }
+          assert.equal(left, 0, "no Auth connection is left behind (well before the 5 s lock timeout)");
+        } finally {
+          AUTH_TIMEOUTS.prepareDeadlineMs = previous;
+          await locker.query("rollback").catch(() => {});
+          await locker.end();
+        }
+      });
+
+      await t.test("the main dump failing while the Auth upload is stuck reports the failure promptly", async () => {
+        const started = Date.now();
+        await assert.rejects(
+          run("main-fails", { databaseUrl: okUrl, auth: "default" }, { env: { BD_TEST_FAIL_MAIN: "1" }, stallAuth: true }),
+          /connection lost/
+        );
+        assert.ok(Date.now() - started < 10_000, `took ${Date.now() - started} ms`);
       });
 
       await t.test("the snapshot connection is gone once both dumps have started", async () => {

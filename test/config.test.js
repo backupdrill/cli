@@ -265,7 +265,7 @@ test("empty optional variables from an unset secret leave every default in place
   assert.equal(config.supabaseStorage, undefined);
 });
 
-// 2.10.0 Auth 用户备份:CLI 不说就是 "default"(做得了就备、做不了只警告);flag > 环境变量 > 配置文件
+// 2.10.0 Auth 用户备份:CLI 不说就关着(读端就绪前);flag > 环境变量 > 配置文件
 const REQUIRED_ENV = {
   BACKUPDRILL_DATABASE_URL: "postgresql://u:p@h/db",
   BACKUPDRILL_S3_BUCKET: "b",
@@ -273,12 +273,14 @@ const REQUIRED_ENV = {
   BACKUPDRILL_S3_SECRET_ACCESS_KEY: "s",
 };
 
-test("auth: CLI default is 'default'; --auth / --no-auth / BACKUPDRILL_AUTH / config file override it in that order", async () => {
+test("auth: off unless asked; --auth / --no-auth / BACKUPDRILL_AUTH / config file override it in that order", async () => {
   Object.assign(process.env, REQUIRED_ENV);
   const configPath = join(dir, "c.json");
   const load = (extra = {}) => loadConfig({ configPath, overrides: cliOverrides(extra) });
 
-  assert.equal((await load()).auth, "default");
+  assert.equal((await load()).auth, "off");
+  writeFileSync(configPath, JSON.stringify({ auth: true }));
+  assert.equal((await load()).auth, "on");
   writeFileSync(configPath, JSON.stringify({ auth: false }));
   assert.equal((await load()).auth, "off");
   process.env.BACKUPDRILL_AUTH = "on";
