@@ -234,6 +234,32 @@ Auth users were not copied in first (see "Not covered" above). Do **not** use \`
 it drops and recreates \`public\`, and the grants Supabase put on it go with it.
 `;
 
+  const cliSection = auth
+    ? `## The BackupDrill CLI
+
+This snapshot holds Auth users, and this version of \`backupdrill restore\` doesn't
+restore them yet: use the steps above.
+
+`
+    : `## Easiest path — the BackupDrill CLI
+
+\`\`\`bash
+npm install -g backupdrill
+${cliRestoreCommand}
+\`\`\`
+
+Add \`--dry-run\` first to preview every check without writing anything. (Skip the
+\`read\` lines to have the CLI prompt you itself; \`unset\` both variables afterwards.)
+The CLI verifies the archive checksum, refuses non-empty targets, checks that rows
+referenced outside the snapshot (such as \`auth.users\`) are on the target, installs
+the extensions, restores the database in a single transaction through the same
+engine the weekly drills use (an SQL error rolls it back and the extensions stay
+installed; if the connection drops while it commits, check the target before
+retrying), sets the grants above, verifies table counts and row presence afterwards, then rebuilds buckets, uploads the
+Storage files back and reconciles every one against the target.
+
+`;
+
   return `# BackupDrill recovery runbook — ${ctx.projectName} @ ${ctx.snapshot}
 
 This file was written next to the snapshot it describes and is **self-contained**:
@@ -295,23 +321,6 @@ Files live at \`${base}/storage/<original-bucket>/<original-key>\` in this
 bucket. Recreate each bucket in the target project, then re-upload the files
 ${storage?.buckets ? "(bucket attributes — public flag, size and MIME limits — are recorded in manifest.json under `storage.buckets`)" : "(bucket attributes were not captured for this snapshot; recreate buckets with the settings you know)"}.
 
-## Easiest path — the BackupDrill CLI
-
-\`\`\`bash
-npm install -g backupdrill
-${cliRestoreCommand}
-\`\`\`
-
-Add \`--dry-run\` first to preview every check without writing anything. (Skip the
-\`read\` lines to have the CLI prompt you itself; \`unset\` both variables afterwards.)
-The CLI verifies the archive checksum, refuses non-empty targets, checks that rows
-referenced outside the snapshot (such as \`auth.users\`) are on the target, installs
-the extensions, restores the database in a single transaction through the same
-engine the weekly drills use (an SQL error rolls it back and the extensions stay
-installed; if the connection drops while it commits, check the target before
-retrying), sets the grants above, verifies table counts and row presence afterwards, then rebuilds buckets, uploads the
-Storage files back and reconciles every one against the target.
-
-More: https://backupdrill.com/docs/restore
+${cliSection}More: https://backupdrill.com/docs/restore
 `;
 }

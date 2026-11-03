@@ -34,6 +34,7 @@ test("schemasMayIncludeAuth: true only when a schema pattern really matches auth
   for (const schemas of [
     ["public", "auth"], ["AUTH"], ['"auth"'], ["*"], ["a*"], ["au?h"], ["public", "[a]uth"], ["(auth|audit)"],
     ["mydb.auth"], // "库.schema" 的写法算不清,按"会"处理
+    ["[[:alpha:]]uth"], // PostgreSQL 的 POSIX 字符类,JavaScript 正则不认:按"会"处理
   ]) {
     assert.equal(schemasMayIncludeAuth(schemas), true, JSON.stringify(schemas));
   }
@@ -54,7 +55,10 @@ test("mainDumpArgs: without a snapshot the arguments are exactly the pre-2.10 on
 test("restorable Auth objects: only enabled triggers with plain names whose function schema is backed up; never policies", () => {
   const trig = (name, enabled, functionSchema = "public") => ({ table: "users", name, enabled, functionSchema, functionName: "f" });
   const auth = {
-    triggers: [trig("ok", "O"), trig("always", "A"), trig("off", "D"), trig("replica", "R"), trig("priv", "O", "private"), trig("it's", "O")],
+    triggers: [
+      trig("ok", "O"), trig("always", "A"), trig("off", "D"), trig("replica", "R"), trig("priv", "O", "private"), trig("it's", "O"),
+      trig("ext", "O", "extensions"), // 平台 schema 里的函数可能是用户自己建的,新项目里没有
+    ],
     policies: [{ table: "users", name: "p", functionSchemas: [] }],
   };
   assert.deepEqual(restorableAuthObjects(auth, ["public"]).triggers.map((t) => t.name), ["ok"]);
@@ -62,7 +66,7 @@ test("restorable Auth objects: only enabled triggers with plain names whose func
   assert.deepEqual(restorableAuthObjects(auth, ["pub*"]).triggers.map((t) => t.name), ["ok"]);
   assert.deepEqual(restorableAuthObjects(auth, ["public", "private"]).triggers.map((t) => t.name), ["ok", "priv"]);
   const notes = manualAuthObjects(auth, ["public"]).join("\n");
-  for (const name of ["always", "off", "replica", "priv", "it's"]) assert.ok(notes.includes(JSON.stringify(name)), name);
+  for (const name of ["always", "off", "replica", "priv", "it's", "ext"]) assert.ok(notes.includes(JSON.stringify(name)), name);
   assert.match(notes, /policy "p" on auth\.users isn't recreated automatically/);
 });
 
@@ -80,6 +84,7 @@ test("RECOVERY.md never puts an object name into a shell command unless it is a 
   assert.ok(bash.includes("TRIGGER auth users on_signup"));
   assert.equal(bash.includes("pwned"), false);
   assert.ok(doc.includes(JSON.stringify(evil)), "the odd name is listed as a manual step instead");
+  assert.equal(doc.includes("backupdrill restore \\"), false, "no CLI restore recipe until the CLI restores Auth users");
 });
 
 const baseManifest = () => ({
@@ -211,6 +216,8 @@ ${AUTH_DDL}
   grant pg_read_all_data to reader_ok;
   create role reader_norls login password 'r';
   grant pg_read_all_data to reader_norls;
+  create role reader_nousage login password 'r';
+  grant select on all tables in schema public to reader_nousage;
 `;
 
 /** 记下每次 pg_dump 的参数(--dbname 后面的连接串去掉),按环境变量注入失败,然后交给真的 pg_dump */
@@ -415,6 +422,12 @@ test(
         assert.deepEqual(r.manifest.auth, { status: "skipped", reason: "no_permission" });
         assert.deepEqual(r.argv, [LEGACY]);
         assert.deepEqual([...r.files.keys()], ["dump.pgcustom"]);
+      });
+
+      await t.test("default + a role that can't even see the auth schema: skipped (no permission), not failed", async () => {
+        const r = await run("nousage", { databaseUrl: `postgresql://reader_nousage:r@127.0.0.1:${port}/postgres`, auth: "default" });
+        assert.deepEqual(r.manifest.auth, { status: "skipped", reason: "no_permission" });
+        assert.deepEqual(r.argv, [LEGACY]);
       });
 
       await t.test("on + a role without BYPASSRLS: failed, but the database backup still completes", async () => {

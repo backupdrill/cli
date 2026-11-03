@@ -23,10 +23,11 @@ export const AUTH_TABLES = ["users", "identities"] as const;
 export const AUTH_DUMP_MAX_BYTES = 2 * 1024 * 1024 * 1024;
 
 /**
- * 把一个 pg_dump 的 --schema 模式转成正则,规则照 psql 的模式写法(pg_dump 用的是同一套):
- *  - 双引号外:字母折成小写,* = 任意串,? = 任意一个字符,$ 按字面,其余正则字符保留正则含义;
- *  - 双引号内:按字面、保留大小写,"" 表示一个双引号;
- *  - 双引号外的 "." 是"库.schema"的分隔符——这种写法极少见,算不出就返回 null(调用方按"可能包含"处理)。
+ * 把一个 pg_dump 的 --schema 模式转成正则。只解析最简单、两边规则一定一致的写法:
+ *  - 双引号外:普通字符(字母折成小写、数字、_、$)和 * 任意串、? 任意一个字符;
+ *  - 双引号内:按字面、保留大小写,"" 表示一个双引号。
+ * 其余写法(方括号、括号、|、+、{}、^、反斜杠,以及"库.schema"的点)走的是 PostgreSQL 自己的正则,
+ * 和 JavaScript 不完全一样(例如 [[:alpha:]] 这类字符类),一律返回 null,调用方按"可能包含"处理。
  */
 function schemaPatternRegex(pattern: string): RegExp | null {
   let re = "";
@@ -46,17 +47,13 @@ function schemaPatternRegex(pattern: string): RegExp | null {
       re += ch.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
       continue;
     }
-    if (ch === ".") return null;
     if (ch === "*") re += ".*";
     else if (ch === "?") re += ".";
     else if (ch === "$") re += "\\$";
-    else re += ch.toLowerCase();
+    else if (/[A-Za-z0-9_]/.test(ch)) re += ch.toLowerCase();
+    else return null;
   }
-  try {
-    return new RegExp(`^(?:${re})$`);
-  } catch {
-    return null;
-  }
+  return new RegExp(`^(?:${re})$`);
 }
 
 /**
@@ -177,22 +174,21 @@ export async function inspectAuth(
     // 快照号来自 pg_export_snapshot(),格式固定;仍按字面量转义,不拼裸值
     await client.query(`set transaction snapshot ${client.escapeLiteral(snapshotId)}`);
 
-    const schema = await client.query<{ present: boolean }>(
-      `select to_regclass('auth.users') is not null and to_regclass('auth.identities') is not null as present`
+    // 存在与权限都按 OID 从系统目录查:对 auth schema 没有 USAGE 的角色,按名字解析
+    // (to_regclass、'auth.users'::regclass、has_table_privilege('auth.users', …))会直接报错,
+    // 而这种情况该记"无权读取、跳过",不是"失败"
+    const found = await client.query<{ tables: string; ok: boolean }>(
+      `select count(*) as tables,
+              coalesce(bool_and(has_schema_privilege(n.oid, 'USAGE')
+                            and has_table_privilege(c.oid, 'SELECT')
+                            and (r.rolsuper or r.rolbypassrls or not c.relrowsecurity)), false) as ok
+         from pg_class c
+         join pg_namespace n on n.oid = c.relnamespace
+         join pg_roles r on r.rolname = current_user
+        where n.nspname = 'auth' and c.relname in ('users', 'identities') and c.relkind in ('r', 'p')`
     );
-    if (!schema.rows[0]?.present) return { readable: false, reason: "no_auth_schema" };
-
-    const access = await client.query<{ ok: boolean }>(
-      `select has_schema_privilege('auth', 'USAGE')
-          and has_table_privilege('auth.users', 'SELECT')
-          and has_table_privilege('auth.identities', 'SELECT')
-          and (r.rolsuper or r.rolbypassrls
-               or not exists (select 1 from pg_class c
-                               where c.oid in ('auth.users'::regclass, 'auth.identities'::regclass)
-                                 and c.relrowsecurity)) as ok
-         from pg_roles r where r.rolname = current_user`
-    );
-    if (!access.rows[0]?.ok) return { readable: false, reason: "no_permission" };
+    if (Number(found.rows[0]?.tables) !== 2) return { readable: false, reason: "no_auth_schema" };
+    if (!found.rows[0]?.ok) return { readable: false, reason: "no_permission" };
 
     const counts = await client.query<{
       users: string; identities: string; none: string; portable: string; encrypted: string;
@@ -303,9 +299,11 @@ export async function inspectAuth(
   }
 }
 
-/** schema 是否在这次备份里:按 pg_dump 读模式的规则匹配 schemas(含通配),或是平台 schema(新项目里本来就有) */
+/**
+ * schema 是否在这次备份里:按 pg_dump 读模式的规则匹配 schemas(含通配)。平台 schema 不算:
+ * 用户自己建在 extensions 之类里的函数不在任何一份归档里,新项目里也没有。
+ */
 function schemaCovered(schema: string, backedUpSchemas: string[]): boolean {
-  if (PLATFORM_SCHEMAS.includes(schema)) return true;
   return backedUpSchemas.some((pattern) => schemaPatternRegex(pattern)?.test(schema) ?? false);
 }
 
