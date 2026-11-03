@@ -178,9 +178,9 @@ shasum -a 256 auth.dump       # must print ${auth.dump!.sha256}
 (
   set -euo pipefail
   pg_restore -l dump.pgcustom > database.full.list
-  grep -v ' SCHEMA - public ' database.full.list > database.list
+  grep -Ev '^[0-9]+; [0-9]+ [0-9]+ SCHEMA - public ' database.full.list > database.list
 ${authObjects.length ? `  pg_restore -l auth.dump > auth.full.list
-  grep -E ' (${authObjectsGrep}) ' auth.full.list > auth-objects.list
+  grep -E '^[0-9]+; [0-9]+ [0-9]+ (${authObjectsGrep}) ' auth.full.list > auth-objects.list
   test "$(wc -l < auth-objects.list)" -eq ${authObjects.length}
 ` : ""}  {
     cat <<'SQL'

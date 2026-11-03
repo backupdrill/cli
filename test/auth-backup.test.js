@@ -214,6 +214,10 @@ ${AUTH_DDL}
     ('22222222-2222-2222-2222-222222222222', 'google', '1000001'),
     ('22222222-2222-2222-2222-222222222222', 'github', '2000002'),
     ('33333333-3333-3333-3333-333333333333', 'email', '33333333-3333-3333-3333-333333333333');
+  create table public."archived SCHEMA - public data" (x int);
+  insert into public."archived SCHEMA - public data" values (1);
+  create role reader_limited login password 'r' bypassrls connection limit 2;
+  grant pg_read_all_data to reader_limited;
   create role authenticated nologin;
   grant select on auth.users to authenticated;
   create role reader_ok login password 'r' bypassrls;
@@ -414,9 +418,13 @@ test(
                   (select count(*)::int from auth.users where recovery_token <> '' or recovery_sent_at is not null) as pending,
                   (select count(*)::int from pg_trigger where tgrelid = 'auth.users'::regclass and tgname = 'on_auth_user_created') as trig,
                   (select count(*)::int from pg_policy where polrelid = 'auth.users'::regclass) as policies,
-                  (select bool_and(convalidated) from pg_constraint where conrelid = 'public.profiles'::regclass and contype = 'f') as fk_valid`
+                  (select bool_and(convalidated) from pg_constraint where conrelid = 'public.profiles'::regclass and contype = 'f') as fk_valid,
+                  (select count(*)::int from public."archived SCHEMA - public data") as odd_table`
         );
-        assert.deepEqual(after.rows[0], { users: 4, identities: 4, profiles: 4, pending: 0, trig: 1, policies: 0, fk_valid: true });
+        assert.deepEqual(after.rows[0], {
+          users: 4, identities: 4, profiles: 4, pending: 0, trig: 1, policies: 0, fk_valid: true,
+          odd_table: 1, // 名字里恰好带 "SCHEMA - public" 的表不能被筛掉
+        });
         assert.match(doc, /policy "self_read" on auth\.users isn't recreated automatically/);
         assert.match(doc, /SELECT on auth\.users to authenticated/);
 
@@ -499,6 +507,16 @@ test(
         await new Promise((resolve) => setTimeout(resolve, 800)); // 等所有晚到的写入落定
         assert.ok(r.manifest.dump.bytes > 0);
         assert.equal(r.files.get("dump.pgcustom").length, r.manifest.dump.bytes);
+      });
+
+      await t.test("a connection limit the Auth export exhausts: the database backup still succeeds the usual way", async () => {
+        const r = await run("limited", { databaseUrl: `postgresql://reader_limited:r@127.0.0.1:${port}/postgres`, auth: "default" }, {
+          stallAuth: true,
+        });
+        assert.ok(r.manifest.dump.bytes > 0);
+        assert.equal(r.files.get("dump.pgcustom").length, r.manifest.dump.bytes);
+        assert.notEqual(r.manifest.auth.status, "included");
+        assert.ok(r.argv.includes(LEGACY), r.argv.join("\n"));
       });
 
       await t.test("a schema pattern that can't match auth doesn't stop the Auth backup", async () => {

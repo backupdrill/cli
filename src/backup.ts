@@ -431,9 +431,11 @@ async function dumpWithAuth(
     authAbort.abort();
     await authRun;
     await shared.release();
-    // 主 dump 导入快照失败、一个字节都没写出:Auth 不做了,主 dump 按今天的方式重导
-    if (!mainStarted && /snapshot/i.test(shortReason(error))) {
-      log.warn(`Couldn't share a snapshot with the main dump (${shortReason(error)}); dumping it the usual way.`);
+    // 主 dump 一个字节都没写出就失败了(导入快照失败、连接名额被 Auth 的两条连接占满……原因不限):
+    // Auth 的连接上面已经全部放掉,Auth 这次不做,主 dump 按今天的方式重导一次。
+    // 重导再失败,就是今天也会失败的情况,照常报错
+    if (!mainStarted) {
+      log.warn(`The database dump couldn't start alongside the Auth export (${shortReason(error)}); dumping it the usual way.`);
       const plain = await streamPgDump({
         databaseUrl: config.databaseUrl,
         pgDumpBin,
