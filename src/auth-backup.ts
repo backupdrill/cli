@@ -229,9 +229,18 @@ export async function inspectAuth(
 
     const triggers = await client.query<{
       table: string; name: string; enabled: string; function_schema: string; function_name: string;
+      dependency_schemas: string[];
     }>(
+      // dependency_schemas:触发器依赖的全部函数(触发函数本身 + WHEN 条件里调用的)所在 schema
       `select c.relname as table, t.tgname as name, t.tgenabled::text as enabled,
-              fn.nspname as function_schema, p.proname as function_name
+              fn.nspname as function_schema, p.proname as function_name,
+              coalesce(array(
+                select distinct dn.nspname::text
+                  from pg_depend d
+                  join pg_proc dp on dp.oid = d.refobjid and d.refclassid = 'pg_proc'::regclass
+                  join pg_namespace dn on dn.oid = dp.pronamespace
+                 where d.classid = 'pg_trigger'::regclass and d.objid = t.oid
+                 order by 1), '{}'::text[]) as dependency_schemas
          from pg_trigger t
          join pg_class c on c.oid = t.tgrelid
          join pg_proc p on p.oid = t.tgfoid
@@ -287,6 +296,7 @@ export async function inspectAuth(
         enabled: t.enabled as AuthTriggerInfo["enabled"],
         functionSchema: t.function_schema,
         functionName: t.function_name,
+        dependencySchemas: t.dependency_schemas,
       })),
       policies: policies.rows.map((p) => ({
         table: p.table,
@@ -305,6 +315,11 @@ export async function inspectAuth(
  */
 function schemaCovered(schema: string, backedUpSchemas: string[]): boolean {
   return backedUpSchemas.some((pattern) => schemaPatternRegex(pattern)?.test(schema) ?? false);
+}
+
+/** 触发器依赖的函数所在的全部 schema(触发函数 + WHEN 里调用的);旧记录没有 dependencySchemas 时只看触发函数 */
+function triggerDependencies(t: AuthTriggerInfo): string[] {
+  return [...new Set([t.functionSchema, ...(t.dependencySchemas ?? [])])];
 }
 
 // 自动补建的对象名只收普通标识符:名字会进 pg_restore -l 的筛选,也会出现在给人复制的命令里,
@@ -327,7 +342,10 @@ export function restorableAuthObjects(
 ): { triggers: AuthTriggerInfo[] } {
   return {
     triggers: auth.triggers.filter(
-      (t) => t.enabled === "O" && schemaCovered(t.functionSchema, backedUpSchemas) && PLAIN_NAME.test(t.name)
+      (t) =>
+        t.enabled === "O" &&
+        triggerDependencies(t).every((schema) => schemaCovered(schema, backedUpSchemas)) &&
+        PLAIN_NAME.test(t.name)
     ),
   };
 }
@@ -345,10 +363,13 @@ export function manualAuthObjects(
     const on = `trigger ${JSON.stringify(t.name)} on auth.${t.table}`;
     if (t.enabled === "D" || t.enabled === "R") {
       notes.push(`${on} was ${t.enabled === "D" ? "disabled" : "replica-only"} at the source, so it isn't recreated`);
-    } else if (!schemaCovered(t.functionSchema, backedUpSchemas)) {
+    } else if (triggerDependencies(t).some((schema) => !schemaCovered(schema, backedUpSchemas))) {
+      const missing = triggerDependencies(t).filter((schema) => !schemaCovered(schema, backedUpSchemas));
       notes.push(
-        `${on} calls ${t.functionSchema}.${t.functionName}(), but schema ${t.functionSchema} is not in this backup, ` +
-          `so it can't be recreated until that schema exists on the target`
+        `${on} calls ${t.functionSchema}.${t.functionName}()` +
+          `${missing.length === 1 && missing[0] === t.functionSchema ? "" : ` and depends on functions in ${missing.join(", ")}`}, ` +
+          `but ${missing.length === 1 ? `schema ${missing[0]} is` : `schemas ${missing.join(", ")} are`} not in this backup, ` +
+          `so it can't be recreated until ${missing.length === 1 ? "that schema exists" : "those schemas exist"} on the target`
       );
     } else if (t.enabled === "A") {
       notes.push(`${on} fires in every session (ENABLE ALWAYS), which needs the table owner to set; recreate it by hand`);

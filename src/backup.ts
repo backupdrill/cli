@@ -416,6 +416,9 @@ async function dumpWithAuth(
         mainStarted = true;
         markMainStarted();
       },
+      // 这一次可能因导入快照失败而重来,重来写的是同一个键:失败的这次绝不能"正常结束"上传——
+      // 否则它那份空的 PutObject 可能晚于重来的那份完成,把好的备份盖掉
+      endOnlyOnSuccess: true,
     });
   } catch (error) {
     markMainStarted();

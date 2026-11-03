@@ -133,6 +133,8 @@ export interface AuthTriggerInfo {
   enabled: "O" | "D" | "R" | "A";
   functionSchema: string;
   functionName: string;
+  /** 触发器依赖的全部函数所在 schema(触发函数 + WHEN 条件里调用的) */
+  dependencySchemas?: string[];
 }
 
 export interface AuthPolicyInfo {
@@ -245,6 +247,9 @@ function assertAuthSection(a: AuthSection): void {
       malformed("auth.triggers[]");
     }
     if (!["O", "D", "R", "A"].includes(t.enabled)) malformed("auth.triggers[].enabled");
+    if (t.dependencySchemas !== undefined && !(Array.isArray(t.dependencySchemas) && t.dependencySchemas.every(isName))) {
+      malformed("auth.triggers[].dependencySchemas");
+    }
   }
   if (a.grants !== undefined) {
     if (!Array.isArray(a.grants)) malformed("auth.grants");

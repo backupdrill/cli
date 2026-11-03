@@ -58,15 +58,19 @@ test("restorable Auth objects: only enabled triggers with plain names whose func
     triggers: [
       trig("ok", "O"), trig("always", "A"), trig("off", "D"), trig("replica", "R"), trig("priv", "O", "private"), trig("it's", "O"),
       trig("ext", "O", "extensions"), // 平台 schema 里的函数可能是用户自己建的,新项目里没有
+      { ...trig("when_private", "O"), dependencySchemas: ["public", "private"] }, // WHEN 里调了 private 的函数
     ],
     policies: [{ table: "users", name: "p", functionSchemas: [] }],
   };
   assert.deepEqual(restorableAuthObjects(auth, ["public"]).triggers.map((t) => t.name), ["ok"]);
   // 按模式算覆盖:pub* 覆盖 public
   assert.deepEqual(restorableAuthObjects(auth, ["pub*"]).triggers.map((t) => t.name), ["ok"]);
-  assert.deepEqual(restorableAuthObjects(auth, ["public", "private"]).triggers.map((t) => t.name), ["ok", "priv"]);
+  // private 也备了:触发函数在 private 的、WHEN 里调 private 函数的,都能建了
+  assert.deepEqual(restorableAuthObjects(auth, ["public", "private"]).triggers.map((t) => t.name), ["ok", "priv", "when_private"]);
   const notes = manualAuthObjects(auth, ["public"]).join("\n");
-  for (const name of ["always", "off", "replica", "priv", "it's", "ext"]) assert.ok(notes.includes(JSON.stringify(name)), name);
+  for (const name of ["always", "off", "replica", "priv", "it's", "ext", "when_private"]) {
+    assert.ok(notes.includes(JSON.stringify(name)), name);
+  }
   assert.match(notes, /policy "p" on auth\.users isn't recreated automatically/);
 });
 
@@ -250,7 +254,7 @@ exec "${realPgDump}" "$@"
 }
 
 /** 内存快照存储:记下写了哪些文件;authCapable=false 模拟还没适配 auth.dump 的存储;stallAuth=上传永远完不成 */
-function memoryStore({ authCapable = true, stallAuth = false } = {}) {
+function memoryStore({ authCapable = true, stallAuth = false, lateWrites = false } = {}) {
   const files = new Map();
   let manifest;
   const stalled = () => ({ done: new Promise(() => {}), abort: async () => {} });
@@ -258,7 +262,9 @@ function memoryStore({ authCapable = true, stallAuth = false } = {}) {
     done: (async () => {
       const chunks = [];
       for await (const chunk of body) chunks.push(chunk);
-      files.set(name, Buffer.concat(chunks));
+      const data = Buffer.concat(chunks);
+      if (lateWrites) setTimeout(() => files.set(name, data), 300); // 晚到的写入会盖掉之前的
+      else files.set(name, data);
     })(),
     abort: async () => {},
   });
@@ -316,9 +322,9 @@ test(
       const { wrapper, log } = writeWrapper(work);
       const LEGACY = " --format=custom --no-owner --no-privileges --schema=public";
 
-      const run = async (name, config, { env = {}, authCapable = true, stallAuth = false } = {}) => {
+      const run = async (name, config, { env = {}, authCapable = true, stallAuth = false, lateWrites = false } = {}) => {
         writeFileSync(log, "");
-        const mem = memoryStore({ authCapable, stallAuth });
+        const mem = memoryStore({ authCapable, stallAuth, lateWrites });
         const manifest = await withEnv({ BACKUPDRILL_PG_DUMP: wrapper, ...env }, () =>
           runBackup({ projectName: name, schemas: ["public"], ...config }, { store: mem.store })
         );
@@ -342,7 +348,10 @@ test(
         assert.equal(a.ssoUsers, 0);
         assert.equal(a.mfaUsers, null, "no auth.mfa_factors table → unknown, not a failure");
         assert.deepEqual(a.triggers, [
-          { table: "users", name: "on_auth_user_created", enabled: "O", functionSchema: "public", functionName: "handle_new_user" },
+          {
+            table: "users", name: "on_auth_user_created", enabled: "O",
+            functionSchema: "public", functionName: "handle_new_user", dependencySchemas: ["public"],
+          },
         ]);
         assert.deepEqual(a.policies, [{ table: "users", name: "self_read", functionSchemas: ["private"] }]);
         assert.ok(a.grants.some((g) => g.table === "users" && g.grantee === "authenticated" && g.privilege === "SELECT"), JSON.stringify(a.grants));
@@ -411,8 +420,8 @@ test(
         assert.match(doc, /policy "self_read" on auth\.users isn't recreated automatically/);
         assert.match(doc, /SELECT on auth\.users to authenticated/);
 
-        // 再跑一次会撞上已有的行:整个事务回滚,目标原样不动
-        await assert.rejects(restoreOnce());
+        // 再跑一次:目标里已经有 Auth 用户,脚本在写任何东西之前就拒绝,整个事务回滚,目标原样不动
+        await assert.rejects(restoreOnce(), /auth\.users is not empty/);
         const again = await sql(targetUrl, "select (select count(*)::int from auth.users) as users, (select count(*)::int from public.profiles) as profiles");
         assert.deepEqual(again.rows[0], { users: 4, profiles: 4 });
       });
@@ -471,6 +480,16 @@ test(
         assert.ok(r.argv.includes(LEGACY), r.argv.join("\n"));
         assert.ok(r.files.get("dump.pgcustom").length > 0);
         assert.equal(r.manifest.dump.bytes, r.files.get("dump.pgcustom").length);
+      });
+
+      await t.test("the failed snapshot attempt never writes the dump, so it can't overwrite the redone one", async () => {
+        const r = await run("late", { databaseUrl: okUrl, auth: "default" }, {
+          env: { BD_TEST_FAIL_MAIN_SNAPSHOT: "1" },
+          lateWrites: true,
+        });
+        await new Promise((resolve) => setTimeout(resolve, 800)); // 等所有晚到的写入落定
+        assert.ok(r.manifest.dump.bytes > 0);
+        assert.equal(r.files.get("dump.pgcustom").length, r.manifest.dump.bytes);
       });
 
       await t.test("a schema pattern that can't match auth doesn't stop the Auth backup", async () => {
