@@ -181,6 +181,8 @@ async function streamPgDump(opts: {
   maxBytes?: number;
   signal?: AbortSignal;
   endOnlyOnSuccess?: boolean;
+  /** 失败时等上传中止最多 5 秒(Auth 那些新路径用;主 dump 的老路径不传,照旧等到中止完成) */
+  boundedCleanup?: boolean;
 }): Promise<{ bytes: number; sha256: string }> {
   const hash = createHash("sha256");
   let bytes = 0;
@@ -273,7 +275,7 @@ async function streamPgDump(opts: {
     // 被叫停时中止上传但不等它(可能正卡在那)。可叫停的调用(Auth、共享快照那次)自己失败时,
     // 等中止最多 5 秒——中止本身也可能卡住,不能让调用方跟着卡。主 dump 的老路径照旧等中止完成
     if (opts.signal?.aborted) void upload?.abort().catch(() => {});
-    else if (opts.signal) await waitAtMost(upload?.abort() ?? Promise.resolve(), 5000);
+    else if (opts.signal || opts.boundedCleanup) await waitAtMost(upload?.abort() ?? Promise.resolve(), 5000);
     else await upload?.abort().catch(() => {});
     // 超限时先失败的往往是上传那一侧(流被 meter 报错中断),原因统一报成超限
     if (opts.maxBytes !== undefined && bytes > opts.maxBytes) {
@@ -455,6 +457,7 @@ async function dumpWithAuth(
       // 这一次可能因导入快照失败而重来,重来写的是同一个键:失败的这次绝不能"正常结束"上传——
       // 否则它那份空的 PutObject 可能晚于重来的那份完成,把好的备份盖掉
       endOnlyOnSuccess: true,
+      boundedCleanup: true,
     });
   } catch (error) {
     clearTimeout(mainStartWatchdog);
@@ -536,6 +539,7 @@ async function plainDumpAfterAuthReleased(
         upload: (body) => writer.uploadDump(body, relationBytes),
         onFirstByte: () => (started = true),
         endOnlyOnSuccess: true,
+        boundedCleanup: true,
       });
     } catch (error) {
       const connectionsFull = /too many connections|remaining connection slots|connection limit/i.test(shortReason(error));

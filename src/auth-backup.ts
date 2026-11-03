@@ -57,19 +57,30 @@ function schemaPatternRegex(pattern: string): RegExp | null {
 }
 
 /**
- * schemas 配置会不会已经把 auth 带进主 dump:
- *  - "yes":确定会(明写了 auth,或某个模式确定匹配得到 auth,例如 "*")。今天就是这么备的,不另备一份;
- *  - "maybe":有模式用到了 JavaScript 判断不了的写法,说不准;
- *  - "no":确定不会。
+ * schemas 配置和 Auth 备份的关系。单独的 Auth 备份只在每一项都是普通 schema 名字时才做:
+ * 模式写法(通配、正则、"库.schema")由 PostgreSQL 自己解析,我们在这里算不准它最终选中哪些 schema,
+ * 也就没法可靠地判断"会不会重复导出"和"恢复时目标里哪些 schema 该是空的"——干脆不做。
+ *  - "yes":明写了 auth(主 dump 里已经有),或某个模式确定匹配得到 auth(例如 "*");
+ *  - "maybe":有模式写法,而又不能确定它包含 auth;
+ *  - "no":全是普通名字,且没有 auth。
  */
 export function authInSchemas(schemas: string[]): "yes" | "maybe" | "no" {
   let maybe = false;
   for (const pattern of schemas) {
-    const re = schemaPatternRegex(pattern);
-    if (re === null) maybe = true;
-    else if (re.test("auth")) return "yes";
+    const plain = plainSchemaName(pattern);
+    if (plain === "auth") return "yes";
+    if (plain !== null) continue;
+    if (schemaPatternRegex(pattern)?.test("auth")) return "yes";
+    maybe = true;
   }
   return maybe ? "maybe" : "no";
+}
+
+/** 普通 schema 名字(不带任何模式字符)按 pg_dump 的规则规范化:不加引号折成小写,加了引号原样;是模式就返回 null */
+export function plainSchemaName(pattern: string): string | null {
+  if (/^[A-Za-z_][A-Za-z0-9_$]*$/.test(pattern)) return pattern.toLowerCase();
+  const quoted = /^"((?:[^"]|"")+)"$/.exec(pattern);
+  return quoted ? quoted[1].replace(/""/g, '"') : null;
 }
 
 /** 默认模式用:确定会、或说不准,都算"可能已含 auth"——宁可少做,不碰现有备份 */
@@ -83,9 +94,14 @@ export function schemasMayIncludeAuth(schemas: string[]): boolean {
  */
 async function connectCancellable(databaseUrl: string, signal?: AbortSignal): Promise<pg.Client> {
   if (signal?.aborted) throw new Error("stopped by the caller");
-  const client = new pg.Client(pgConnectOptions(databaseUrl));
+  // 握手最多 20 秒:连接池排队、网络卡住时不能一直挂着,更不能让 CLI 进程在备份做完后迟迟退不出去
+  const client = new pg.Client({ ...pgConnectOptions(databaseUrl), connectionTimeoutMillis: 20_000 });
   attachPgErrorGuard(client);
-  const onAbort = () => void client.end().catch(() => {});
+  const onAbort = () => {
+    // end() 在握手中途是优雅关闭,可能一直等;直接把底层 socket 销毁
+    (client as unknown as { connection?: { stream?: { destroy(): void } } }).connection?.stream?.destroy();
+    void client.end().catch(() => {});
+  };
   signal?.addEventListener("abort", onAbort, { once: true });
   try {
     await client.connect();
@@ -323,7 +339,8 @@ export async function inspectAuth(
  * 用户自己建在 extensions 之类里的函数不在任何一份归档里,新项目里也没有。
  */
 function schemaCovered(schema: string, backedUpSchemas: string[]): boolean {
-  return backedUpSchemas.some((pattern) => schemaPatternRegex(pattern)?.test(schema) ?? false);
+  // 走到这里的 schemas 都是普通名字(带模式写法的根本不做 Auth 备份,见 authInSchemas)
+  return backedUpSchemas.some((name) => plainSchemaName(name) === schema);
 }
 
 /** 触发器依赖的函数所在的全部 schema(触发函数 + WHEN 里调用的);旧记录没有 dependencySchemas 时只看触发函数 */

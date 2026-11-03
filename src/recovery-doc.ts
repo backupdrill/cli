@@ -8,7 +8,7 @@
 //    不把部分恢复表述成完整项目恢复(PRD §2.2 禁用表述)。
 import type { Manifest } from "./manifest.js";
 import { recoveryGrantsSql } from "./grants.js";
-import { manualAuthObjects, restorableAuthObjects } from "./auth-backup.js";
+import { manualAuthObjects, plainSchemaName, restorableAuthObjects } from "./auth-backup.js";
 
 /** 生成手册所需的非秘密快照坐标。刻意不收连接串/密钥类型——签名即防线。 */
 export interface RecoveryDocContext {
@@ -85,7 +85,11 @@ export function renderRecoveryDoc(manifest: Manifest, ctx: RecoveryDocContext): 
 `
       : "";
   // 空目标检查用的 schema 列表(SQL 字符串字面量,单引号按 SQL 规则加倍)
-  const schemaListSql = db.schemas.map((name) => `'${name.replace(/'/g, "''")}'`).join(", ");
+  // 含 Auth 的快照里 schemas 全是普通名字(见 authInSchemas),按 pg_dump 的规则规范化后逐个比较
+  const schemaListSql = db.schemas
+    .map((name) => plainSchemaName(name) ?? name)
+    .map((name) => `'${name.replace(/'/g, "''")}'`)
+    .join(", ");
   // 自动补建的只有 restorableAuthObjects 认可的触发器(名字都是普通标识符,拼进命令也安全);
   // 其余写进下面的手工步骤
   const restorable = auth ? restorableAuthObjects({ triggers: auth.triggers!, policies: auth.policies! }, db.schemas) : null;

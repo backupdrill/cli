@@ -30,7 +30,7 @@ async function available(cmd, args) {
 const canRun = (await available("docker", ["version"])) && (await available(realPgDump, ["--version"]));
 const canRunPsql = canRun && (await available("psql", ["--version"]));
 
-test("schemasMayIncludeAuth: true only when a schema pattern really matches auth (or can't be worked out)", () => {
+test("schemasMayIncludeAuth: false only when every entry is a plain schema name other than auth", () => {
   for (const schemas of [
     ["public", "auth"], ["AUTH"], ['"auth"'], ["*"], ["a*"], ["au?h"], ["public", "[a]uth"], ["(auth|audit)"],
     ["mydb.auth"], // "库.schema" 的写法算不清,按"会"处理
@@ -38,10 +38,12 @@ test("schemasMayIncludeAuth: true only when a schema pattern really matches auth
   ]) {
     assert.equal(schemasMayIncludeAuth(schemas), true, JSON.stringify(schemas));
   }
-  for (const schemas of [
-    ["public"], ["public", "audit"], ["authz"], ['"Auth"'], ["public", "private"], ["pub*"], ["p*"], ["auth?"], ['"a*"'],
-  ]) {
+  for (const schemas of [["public"], ["public", "audit"], ["authz"], ['"Auth"'], ["public", "private"], ['"a*"']]) {
     assert.equal(schemasMayIncludeAuth(schemas), false, JSON.stringify(schemas));
+  }
+  // 模式写法一律不另备 Auth(说不准它最终选中哪些 schema),哪怕看起来匹配不到 auth
+  for (const schemas of [["pub*"], ["p*"], ["auth?"]]) {
+    assert.equal(schemasMayIncludeAuth(schemas), true, JSON.stringify(schemas));
   }
 });
 
@@ -63,8 +65,8 @@ test("restorable Auth objects: only enabled triggers with plain names whose func
     policies: [{ table: "users", name: "p", functionSchemas: [] }],
   };
   assert.deepEqual(restorableAuthObjects(auth, ["public"]).triggers.map((t) => t.name), ["ok"]);
-  // 按模式算覆盖:pub* 覆盖 public
-  assert.deepEqual(restorableAuthObjects(auth, ["pub*"]).triggers.map((t) => t.name), ["ok"]);
+  // 不加引号的名字按 pg_dump 的规则折成小写
+  assert.deepEqual(restorableAuthObjects(auth, ["Public"]).triggers.map((t) => t.name), ["ok"]);
   // private 也备了:触发函数在 private 的、WHEN 里调 private 函数的,都能建了
   assert.deepEqual(restorableAuthObjects(auth, ["public", "private"]).triggers.map((t) => t.name), ["ok", "priv", "when_private"]);
   const notes = manualAuthObjects(auth, ["public"]).join("\n");
@@ -261,7 +263,7 @@ exec "${realPgDump}" "$@"
 }
 
 /** 内存快照存储:记下写了哪些文件;authCapable=false 模拟还没适配 auth.dump 的存储;stallAuth=上传永远完不成 */
-function memoryStore({ authCapable = true, stallAuth = false, lateWrites = false, hangAuthAbort = false } = {}) {
+function memoryStore({ authCapable = true, stallAuth = false, lateWrites = false, hangAuthAbort = false, hangMainAbort = false } = {}) {
   const files = new Map();
   let manifest;
   const stalled = () => ({ done: new Promise(() => {}), abort: async () => {} });
@@ -283,7 +285,9 @@ function memoryStore({ authCapable = true, stallAuth = false, lateWrites = false
         dumpKey: "backupdrill/t/snap/dump.pgcustom",
         storageFiles: null,
         describe: (file) => file,
-        uploadDump: collect("dump.pgcustom"),
+        uploadDump: hangMainAbort
+          ? (body) => ({ ...collect("dump.pgcustom")(body), abort: () => new Promise(() => {}) }) // 中止永远不返回
+          : collect("dump.pgcustom"),
         ...(authCapable
           ? {
               authDumpKey: "backupdrill/t/snap/auth.dump",
@@ -336,9 +340,11 @@ test(
       const { wrapper, log } = writeWrapper(work);
       const LEGACY = " --format=custom --no-owner --no-privileges --schema=public";
 
-      const run = async (name, config, { env = {}, authCapable = true, stallAuth = false, lateWrites = false, hangAuthAbort = false } = {}) => {
+      const run = async (
+        name, config, { env = {}, authCapable = true, stallAuth = false, lateWrites = false, hangAuthAbort = false, hangMainAbort = false } = {}
+      ) => {
         writeFileSync(log, "");
-        const mem = memoryStore({ authCapable, stallAuth, lateWrites, hangAuthAbort });
+        const mem = memoryStore({ authCapable, stallAuth, lateWrites, hangAuthAbort, hangMainAbort });
         const manifest = await withEnv({ BACKUPDRILL_PG_DUMP: wrapper, ...env }, () =>
           runBackup({ projectName: name, schemas: ["public"], ...config }, { store: mem.store })
         );
@@ -570,9 +576,21 @@ test(
         assert.equal(r.files.get("dump.pgcustom").length, r.manifest.dump.bytes);
       });
 
-      await t.test("a schema pattern that can't match auth doesn't stop the Auth backup", async () => {
+      await t.test("a stuck upload abort after the shared-snapshot attempt fails can't keep the fallback from running", async () => {
+        const started = Date.now();
+        const r = await run("hung-main-abort", { databaseUrl: okUrl, auth: "default" }, {
+          env: { BD_TEST_FAIL_MAIN_SNAPSHOT: "1" },
+          hangMainAbort: true,
+        });
+        assert.ok(Date.now() - started < 30_000, `took ${Date.now() - started} ms`);
+        assert.ok(r.manifest.dump.bytes > 0);
+        assert.equal(r.files.get("dump.pgcustom").length, r.manifest.dump.bytes);
+      });
+
+      await t.test("any schema pattern means no separate Auth backup; the main dump is untouched", async () => {
         const r = await run("pattern", { databaseUrl: okUrl, auth: "default", schemas: ["pub*"] });
-        assert.equal(r.manifest.auth.status, "included");
+        assert.deepEqual(r.manifest.auth, { status: "skipped", reason: "schemas_may_include_auth" });
+        assert.deepEqual(r.argv, [" --format=custom --no-owner --no-privileges --schema=pub*"]);
       });
 
       await t.test("someone else holding a lock on auth.users: Auth gives up within seconds, database backup completes", async () => {
