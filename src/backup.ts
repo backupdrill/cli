@@ -157,6 +157,16 @@ export function mainDumpArgs(schemas: string[], snapshotId?: string): string[] {
 
 class AuthDumpTooLarge extends Error {}
 
+/** 等 p 最多 ms 毫秒(到点就不等了,p 仍在后台结束);谁先完成都会清掉计时器,不拖住进程退出 */
+async function waitAtMost(p: Promise<unknown>, ms: number): Promise<void> {
+  let timer: NodeJS.Timeout | undefined;
+  await Promise.race([
+    p.then(() => {}, () => {}),
+    new Promise<void>((resolve) => (timer = setTimeout(resolve, ms))),
+  ]);
+  clearTimeout(timer);
+}
+
 /**
  * 流式跑 pg_dump,边写快照边算 sha256 与字节数。返回校验和与大小。
  * onFirstByte:pg_dump 先导入快照才会吐出第一个字节,调用方据此尽早释放导出快照的连接。
@@ -260,8 +270,10 @@ async function streamPgDump(opts: {
     dumpDone.catch(() => {}); // 没走到 Promise.all 时,被杀的 pg_dump 的退出也得有人接住
     dump.kill("SIGKILL");
     meter.destroy();
-    // 被叫停时中止上传但不等它(可能正卡在那);其余情况照旧等中止完成
+    // 被叫停时中止上传但不等它(可能正卡在那)。可叫停的调用(Auth、共享快照那次)自己失败时,
+    // 等中止最多 5 秒——中止本身也可能卡住,不能让调用方跟着卡。主 dump 的老路径照旧等中止完成
     if (opts.signal?.aborted) void upload?.abort().catch(() => {});
+    else if (opts.signal) await waitAtMost(upload?.abort() ?? Promise.resolve(), 5000);
     else await upload?.abort().catch(() => {});
     // 超限时先失败的往往是上传那一侧(流被 meter 报错中断),原因统一报成超限
     if (opts.maxBytes !== undefined && bytes > opts.maxBytes) {
@@ -448,8 +460,9 @@ async function dumpWithAuth(
     clearTimeout(mainStartWatchdog);
     markMainStarted();
     authAbort.abort();
-    await authRun;
-    await shared.release();
+    // 收尾都有上限:Auth 那边的清理(或者释放快照连接)就算卡住,也不能挡住下面的回退重导
+    await waitAtMost(authRun, 5000);
+    await waitAtMost(shared.release(), 5000);
     // 主 dump 一个字节都没写出就失败了(导入快照失败、连接名额被 Auth 的两条连接占满……原因不限):
     // Auth 的连接上面已经全部放掉,Auth 这次不做,主 dump 按今天的方式重导一次。
     // 重导再失败,就是今天也会失败的情况,照常报错
@@ -476,7 +489,7 @@ async function dumpWithAuth(
     }),
   ]);
   clearTimeout(authTimer);
-  await shared.release();
+  await waitAtMost(shared.release(), 5000);
   if (!authResult.ok) {
     const auth =
       authResult.error instanceof AuthDumpTooLarge

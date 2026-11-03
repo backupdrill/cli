@@ -261,7 +261,7 @@ exec "${realPgDump}" "$@"
 }
 
 /** 内存快照存储:记下写了哪些文件;authCapable=false 模拟还没适配 auth.dump 的存储;stallAuth=上传永远完不成 */
-function memoryStore({ authCapable = true, stallAuth = false, lateWrites = false } = {}) {
+function memoryStore({ authCapable = true, stallAuth = false, lateWrites = false, hangAuthAbort = false } = {}) {
   const files = new Map();
   let manifest;
   const stalled = () => ({ done: new Promise(() => {}), abort: async () => {} });
@@ -285,7 +285,14 @@ function memoryStore({ authCapable = true, stallAuth = false, lateWrites = false
         describe: (file) => file,
         uploadDump: collect("dump.pgcustom"),
         ...(authCapable
-          ? { authDumpKey: "backupdrill/t/snap/auth.dump", uploadAuthDump: stallAuth ? stalled : collect("auth.dump") }
+          ? {
+              authDumpKey: "backupdrill/t/snap/auth.dump",
+              uploadAuthDump: stallAuth
+                ? stalled
+                : hangAuthAbort
+                  ? (body) => ({ ...collect("auth.dump")(body), abort: () => new Promise(() => {}) }) // 中止永远不返回
+                  : collect("auth.dump"),
+            }
           : {}),
         writeRecoveryDoc: async () => {},
         writeManifest: async (written) => {
@@ -329,9 +336,9 @@ test(
       const { wrapper, log } = writeWrapper(work);
       const LEGACY = " --format=custom --no-owner --no-privileges --schema=public";
 
-      const run = async (name, config, { env = {}, authCapable = true, stallAuth = false, lateWrites = false } = {}) => {
+      const run = async (name, config, { env = {}, authCapable = true, stallAuth = false, lateWrites = false, hangAuthAbort = false } = {}) => {
         writeFileSync(log, "");
-        const mem = memoryStore({ authCapable, stallAuth, lateWrites });
+        const mem = memoryStore({ authCapable, stallAuth, lateWrites, hangAuthAbort });
         const manifest = await withEnv({ BACKUPDRILL_PG_DUMP: wrapper, ...env }, () =>
           runBackup({ projectName: name, schemas: ["public"], ...config }, { store: mem.store })
         );
@@ -433,6 +440,16 @@ test(
 
         // 再跑一次:目标里已经有 Auth 用户,脚本在写任何东西之前就拒绝,整个事务回滚,目标原样不动
         await assert.rejects(restoreOnce(), /auth\.users is not empty/);
+        // 没有 Auth 用户、但已有应用表的目标也拒绝,不把快照合并进去
+        await sql(admin, "create database target2");
+        const target2 = `postgresql://postgres:pw@127.0.0.1:${port}/target2`;
+        await sql(target2, AUTH_DDL + "create table public.existing (x int);");
+        await assert.rejects(
+          x("psql", ["-X", "--single-transaction", "-v", "ON_ERROR_STOP=1", "--dbname", target2, "-f", "restore.sql"], { cwd: dir }),
+          /the target already has tables in public/
+        );
+        const t2 = await sql(target2, "select (select count(*)::int from auth.users) as users");
+        assert.equal(t2.rows[0].users, 0);
         const again = await sql(targetUrl, "select (select count(*)::int from auth.users) as users, (select count(*)::int from public.profiles) as profiles");
         assert.deepEqual(again.rows[0], { users: 4, profiles: 4 });
       });
@@ -540,6 +557,17 @@ test(
         } finally {
           AUTH_TIMEOUTS.mainStartGraceMs = previous;
         }
+      });
+
+      await t.test("an Auth cleanup that never returns can't keep the fallback dump from running", async () => {
+        const started = Date.now();
+        const r = await run("hung-abort", { databaseUrl: okUrl, auth: "default" }, {
+          env: { BD_TEST_FAIL_AUTH: "1", BD_TEST_FAIL_MAIN_SNAPSHOT: "1" },
+          hangAuthAbort: true,
+        });
+        assert.ok(Date.now() - started < 30_000, `took ${Date.now() - started} ms`);
+        assert.ok(r.manifest.dump.bytes > 0);
+        assert.equal(r.files.get("dump.pgcustom").length, r.manifest.dump.bytes);
       });
 
       await t.test("a schema pattern that can't match auth doesn't stop the Auth backup", async () => {

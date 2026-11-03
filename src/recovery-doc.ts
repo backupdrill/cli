@@ -84,6 +84,8 @@ export function renderRecoveryDoc(manifest: Manifest, ctx: RecoveryDocContext): 
       ? `- **Supabase Auth users**: not in this snapshot (${AUTH_NOT_INCLUDED_TEXT[manifest.auth.reason ?? ""] ?? manifest.auth.reason ?? "not captured"})
 `
       : "";
+  // 空目标检查用的 schema 列表(SQL 字符串字面量,单引号按 SQL 规则加倍)
+  const schemaListSql = db.schemas.map((name) => `'${name.replace(/'/g, "''")}'`).join(", ");
   // 自动补建的只有 restorableAuthObjects 认可的触发器(名字都是普通标识符,拼进命令也安全);
   // 其余写进下面的手工步骤
   const restorable = auth ? restorableAuthObjects({ triggers: auth.triggers!, policies: auth.policies! }, db.schemas) : null;
@@ -189,6 +191,11 @@ do $$ begin
   if exists (select 1 from auth.users) then
     raise exception 'auth.users is not empty: restore only into a new project';
   end if;
+  if exists (select 1 from pg_class c join pg_namespace n on n.oid = c.relnamespace
+              where n.nspname = any (array[${schemaListSql}]) and c.relkind in ('r', 'p', 'v', 'm', 'f')
+                and not exists (select 1 from pg_depend d where d.objid = c.oid and d.deptype = 'e')) then
+    raise exception 'the target already has tables in ${db.schemas.join(", ").replace(/'/g, "")}: restore only into a new project';
+  end if;
 end $$;
 SQL
     pg_restore --data-only --no-owner --no-privileges -n auth -t users -f - auth.dump
@@ -208,8 +215,11 @@ ${authObjects.length ? `    pg_restore --no-owner --no-privileges -L auth-object
 )
 \`\`\`
 
-   Then run it against the empty target. Enter the password at a hidden prompt so
-   it never touches the URL, argv, or shell history:
+   Then run it against the empty target. pg_restore 17 and newer write
+   \`SET transaction_timeout\`, which PostgreSQL 16 and older reject, so restore into
+   a PostgreSQL 17+ project (new Supabase projects are) or generate the file with a
+   pg_restore matching the target. Enter the password at a hidden prompt so it never
+   touches the URL, argv, or shell history:
 
 \`\`\`bash
 read -rs PGPASSWORD && export PGPASSWORD   # hidden prompt
@@ -218,8 +228,8 @@ psql -X --single-transaction -v ON_ERROR_STOP=1 \\
 unset PGPASSWORD
 \`\`\`
 
-The script stops if the target already has Auth users, so it never merges into
-an existing project. The Auth users go in first, so foreign keys into
+The script stops if the target already has Auth users or tables in the restored
+schemas, so it never merges into an existing project. The Auth users go in first, so foreign keys into
 \`auth.users\` resolve, and their count is checked against this snapshot. Links
 and codes for password resets, email confirmations and email or phone changes
 that were pending at backup time are cleared. ${
