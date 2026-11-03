@@ -57,15 +57,24 @@ function schemaPatternRegex(pattern: string): RegExp | null {
 }
 
 /**
- * schemas 配置会不会已经把 auth 带进主 dump(明写了 auth,或者某个模式匹配得到 auth,例如 "*")。
- * 会的话今天就是这么备的;为了不改变它、也不重复导出,单独的 Auth 备份不做。
- * 算不清的模式按"会"处理:宁可少做,不碰现有备份。
+ * schemas 配置会不会已经把 auth 带进主 dump:
+ *  - "yes":确定会(明写了 auth,或某个模式确定匹配得到 auth,例如 "*")。今天就是这么备的,不另备一份;
+ *  - "maybe":有模式用到了 JavaScript 判断不了的写法,说不准;
+ *  - "no":确定不会。
  */
-export function schemasMayIncludeAuth(schemas: string[]): boolean {
-  return schemas.some((pattern) => {
+export function authInSchemas(schemas: string[]): "yes" | "maybe" | "no" {
+  let maybe = false;
+  for (const pattern of schemas) {
     const re = schemaPatternRegex(pattern);
-    return re === null || re.test("auth");
-  });
+    if (re === null) maybe = true;
+    else if (re.test("auth")) return "yes";
+  }
+  return maybe ? "maybe" : "no";
+}
+
+/** 默认模式用:确定会、或说不准,都算"可能已含 auth"——宁可少做,不碰现有备份 */
+export function schemasMayIncludeAuth(schemas: string[]): boolean {
+  return authInSchemas(schemas) !== "no";
 }
 
 /**

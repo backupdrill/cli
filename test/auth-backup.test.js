@@ -460,6 +460,15 @@ test(
         }
       });
 
+      await t.test("on + a schema pattern that can't be worked out: failed (exit 3), never a silent success", async () => {
+        const r = await run("ambiguous-on", { databaseUrl: okUrl, auth: "on", schemas: ["public", "[p]ublic"] });
+        assert.deepEqual(r.manifest.auth, { status: "failed", reason: "schemas_may_include_auth" });
+        const d = await run("ambiguous-default", { databaseUrl: okUrl, auth: "default", schemas: ["public", "[p]ublic"] });
+        assert.deepEqual(d.manifest.auth, { status: "skipped", reason: "schemas_may_include_auth" });
+        const sure = await run("auth-on", { databaseUrl: okUrl, auth: "on", schemas: ["public", "auth"] });
+        assert.deepEqual(sure.manifest.auth, { status: "skipped", reason: "schemas_may_include_auth" }, "auth is in the main dump");
+      });
+
       await t.test("default + a destination that can't hold auth.dump: skipped, behaves as before", async () => {
         const r = await run("no-dest", { databaseUrl: okUrl, auth: "default" }, { authCapable: false });
         assert.deepEqual(r.manifest.auth, { status: "skipped", reason: "unsupported_destination" });

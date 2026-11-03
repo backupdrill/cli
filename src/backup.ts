@@ -11,7 +11,7 @@ import {
   authDumpArgs,
   exportSharedSnapshot,
   inspectAuth,
-  schemasMayIncludeAuth,
+  authInSchemas,
   manualAuthObjects,
   type AuthMode,
   type SharedSnapshot,
@@ -315,9 +315,15 @@ type AuthPlan =
  */
 async function planAuth(config: BackupConfig, writer: SnapshotWriter, mode: AuthMode): Promise<AuthPlan> {
   if (mode === "off") return { kind: "none" };
-  // schemas 已经(可能)把 auth 带进主 dump:今天怎样以后还怎样,不另备一份,也不算失败
-  if (schemasMayIncludeAuth(config.schemas)) {
+  // schemas 已经(可能)把 auth 带进主 dump:今天怎样以后还怎样,不另备一份。
+  // 确定包含 → skipped(数据就在主 dump 里);说不准 → 默认模式也 skipped,显式要求时记 failed,
+  // 不能在 Auth 用户可能哪份归档都不在的情况下报成功
+  const inSchemas = authInSchemas(config.schemas);
+  if (inSchemas === "yes" || (inSchemas === "maybe" && mode !== "on")) {
     return { kind: "settled", section: { status: "skipped", reason: "schemas_may_include_auth" } };
+  }
+  if (inSchemas === "maybe") {
+    return { kind: "settled", section: { status: "failed", reason: "schemas_may_include_auth" } };
   }
   if (!writer.uploadAuthDump || !writer.authDumpKey) {
     return { kind: "settled", section: authNotDone(mode, "unsupported_destination") };
