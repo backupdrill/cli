@@ -436,12 +436,7 @@ async function dumpWithAuth(
     // 重导再失败,就是今天也会失败的情况,照常报错
     if (!mainStarted) {
       log.warn(`The database dump couldn't start alongside the Auth export (${shortReason(error)}); dumping it the usual way.`);
-      const plain = await streamPgDump({
-        databaseUrl: config.databaseUrl,
-        pgDumpBin,
-        args: mainDumpArgs(config.schemas),
-        upload: (body) => writer.uploadDump(body, relationBytes),
-      });
+      const plain = await plainDumpAfterAuthReleased(config, writer, pgDumpBin, relationBytes);
       return { main: plain, auth: authNotDone(mode, "snapshot_unavailable") };
     }
     throw error;
@@ -484,6 +479,37 @@ async function dumpWithAuth(
       grants: inspection.grants,
     },
   };
+}
+
+/**
+ * 共享快照那次失败后,按今天的方式重导主 dump。刚放掉的 Auth 连接在服务端要过一小会儿才真正退出,
+ * 连接名额紧(角色或连接池上限)时立刻重连可能还会撞上"连接满了":这类错误稍等再试,最多三次。
+ * 每次都只在 pg_dump 成功时才结束上传——失败那次的空上传绝不能晚到、盖掉成功的那次。
+ */
+async function plainDumpAfterAuthReleased(
+  config: BackupConfig,
+  writer: SnapshotWriter,
+  pgDumpBin: string,
+  relationBytes: number | null
+): Promise<{ bytes: number; sha256: string }> {
+  const delays = [1000, 3000];
+  for (let attempt = 0; ; attempt++) {
+    let started = false;
+    try {
+      return await streamPgDump({
+        databaseUrl: config.databaseUrl,
+        pgDumpBin,
+        args: mainDumpArgs(config.schemas),
+        upload: (body) => writer.uploadDump(body, relationBytes),
+        onFirstByte: () => (started = true),
+        endOnlyOnSuccess: true,
+      });
+    } catch (error) {
+      const connectionsFull = /too many connections|remaining connection slots|connection limit/i.test(shortReason(error));
+      if (started || !connectionsFull || attempt >= delays.length) throw error;
+      await new Promise((resolve) => setTimeout(resolve, delays[attempt]));
+    }
+  }
 }
 
 /** 备份结束时把 Auth 段的结果说给人听;warn 的都是不影响数据库备份的事 */

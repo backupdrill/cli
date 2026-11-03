@@ -513,10 +513,11 @@ test(
         const r = await run("limited", { databaseUrl: `postgresql://reader_limited:r@127.0.0.1:${port}/postgres`, auth: "default" }, {
           stallAuth: true,
         });
+        // 谁先拿到名额看时机:主 dump 抢到就照共享快照导完,没抢到就按今天的方式重导。
+        // 两种都必须是一份完整的数据库备份,Auth 都不能报成已备上
         assert.ok(r.manifest.dump.bytes > 0);
         assert.equal(r.files.get("dump.pgcustom").length, r.manifest.dump.bytes);
         assert.notEqual(r.manifest.auth.status, "included");
-        assert.ok(r.argv.includes(LEGACY), r.argv.join("\n"));
       });
 
       await t.test("a schema pattern that can't match auth doesn't stop the Auth backup", async () => {
