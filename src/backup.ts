@@ -186,6 +186,9 @@ async function streamPgDump(opts: {
       cb(null, chunk);
     },
   });
+  // 中止、超限时会带错 destroy 这个流;上传一侧若没在读它,没人接的 error 事件会让整个进程崩掉。
+  // 错误本身由下面 dumpDone / upload.done 的 Promise 报出来,这里只需要接住
+  meter.on("error", () => {});
 
   // pg_dump(libpq):Supabase 主机才改写成 sslmode=verify-full + sslrootcert=<打包CA临时文件>
   // 凭据不进 argv(D6):argv 对同机任何进程的 `ps` 可见。与恢复路径同一个函数——
@@ -203,8 +206,14 @@ async function streamPgDump(opts: {
       }),
     }
   );
-  // 调用方要求停下(例如主 dump 失败了,并行的 auth dump 不必再跑):杀掉 pg_dump,下面的 catch 负责中止上传
-  const onAbort = () => dump.kill("SIGKILL");
+  // 调用方要求停下(例如主 dump 失败了、或 Auth 等太久):杀掉 pg_dump,并直接中止上传和数据流——
+  // pg_dump 可能早已退出、卡住的是上传,只杀进程停不下来
+  let upload: DumpUpload | null = null;
+  const onAbort = () => {
+    dump.kill("SIGKILL");
+    meter.destroy(new Error("stopped by the caller"));
+    void upload?.abort().catch(() => {});
+  };
   opts.signal?.addEventListener("abort", onAbort, { once: true });
 
   let stderr = "";
@@ -235,7 +244,6 @@ async function streamPgDump(opts: {
   // 写入上,调用方(worker 的串行队列)随之永久挂起。Promise.all 会订阅两侧,
   // 先失败的一方抛出后,另一方稍后的 rejection 也已被视为 handled。
   // 开始上传也放进 try:实现可能在建上传时就同步抛错,那时 pg_dump 已经在跑,同样要杀掉。
-  let upload: DumpUpload | null = null;
   try {
     upload = opts.upload(meter);
     await Promise.all([dumpDone, upload.done]);
@@ -258,8 +266,12 @@ async function streamPgDump(opts: {
 
 type ReadableAuth = Extract<Awaited<ReturnType<typeof inspectAuth>>, { readable: true }>;
 
-/** 主 dump 完成后还肯等 Auth 导出多久 */
-const AUTH_WAIT_AFTER_MAIN_MS = 10 * 60 * 1000;
+/**
+ * Auth 一侧的两个时限(导出供测试调短,产品里不改):
+ *  - waitAfterMainMs:主 dump 完成后还肯等 Auth 导出多久
+ *  - prepareDeadlineMs:主 dump 开始前,导出快照 + 统计最多花多久(连接、锁、查询都算在内)
+ */
+export const AUTH_TIMEOUTS = { waitAfterMainMs: 10 * 60 * 1000, prepareDeadlineMs: 2 * 60 * 1000 };
 
 /** 做不了 Auth 备份时记什么:默认开启记 skipped(不算失败);显式要求记 failed */
 function authNotDone(mode: AuthMode, reason: string): AuthSection {
@@ -299,6 +311,22 @@ async function planAuth(config: BackupConfig, writer: SnapshotWriter, mode: Auth
   if (!writer.uploadAuthDump || !writer.authDumpKey) {
     return { kind: "settled", section: authNotDone(mode, "unsupported_destination") };
   }
+  // 导出快照和统计都发生在主 dump 之前,必须有总时限:连接池满时新连接会一直排队,
+  // 不能让数据库备份陪着等。到点就按"快照不可用"放弃,晚到的快照连接回头自己释放
+  const prepared = prepareAuthDump(config, writer, mode);
+  let deadline: NodeJS.Timeout | undefined;
+  const timedOut = new Promise<AuthPlan>((resolve) => {
+    deadline = setTimeout(() => {
+      void prepared.then((late) => (late.kind === "dump" ? late.shared.release() : undefined)).catch(() => {});
+      resolve({ kind: "settled", section: authNotDone(mode, "snapshot_unavailable") });
+    }, AUTH_TIMEOUTS.prepareDeadlineMs);
+  });
+  const plan = await Promise.race([prepared, timedOut]);
+  clearTimeout(deadline);
+  return plan;
+}
+
+async function prepareAuthDump(config: BackupConfig, writer: SnapshotWriter, mode: AuthMode): Promise<AuthPlan> {
   const shared = await exportSharedSnapshot(config.databaseUrl);
   if (!shared) return { kind: "settled", section: authNotDone(mode, "snapshot_unavailable") };
   let inspection: Awaited<ReturnType<typeof inspectAuth>>;
@@ -316,8 +344,8 @@ async function planAuth(config: BackupConfig, writer: SnapshotWriter, mode: Auth
     await shared.release();
     return { kind: "settled", section: authNotDone(mode, inspection.reason) };
   }
-  const uploadAuthDump = writer.uploadAuthDump.bind(writer);
-  return { kind: "dump", shared, inspection, key: writer.authDumpKey, upload: (body) => uploadAuthDump(body) };
+  const uploadAuthDump = writer.uploadAuthDump!.bind(writer);
+  return { kind: "dump", shared, inspection, key: writer.authDumpKey!, upload: (body) => uploadAuthDump(body) };
 }
 
 /**
@@ -389,17 +417,16 @@ async function dumpWithAuth(
   }
 
   // 主 dump 已经完成:Auth 两张表通常几秒就导完。万一那边卡住,最多再等这么久就放弃,
-  // 不能让整份备份(以及 worker 的串行队列)陪着它挂住
+  // 不能让整份备份(以及 worker 的串行队列)陪着它挂住。到点就立刻判失败往下走,
+  // 不再等 authRun 收尾——卡住的可能正是它
   let authTimer: NodeJS.Timeout | undefined;
   const authResult = await Promise.race([
     authRun,
     new Promise<Awaited<typeof authRun>>((resolve) => {
       authTimer = setTimeout(() => {
         authAbort.abort();
-        void authRun.then(() =>
-          resolve({ ok: false, error: new Error(`timed out ${AUTH_WAIT_AFTER_MAIN_MS / 60000} minutes after the main dump`) })
-        );
-      }, AUTH_WAIT_AFTER_MAIN_MS);
+        resolve({ ok: false, error: new Error(`timed out ${Math.round(AUTH_TIMEOUTS.waitAfterMainMs / 1000)}s after the main dump`) });
+      }, AUTH_TIMEOUTS.waitAfterMainMs);
     }),
   ]);
   clearTimeout(authTimer);

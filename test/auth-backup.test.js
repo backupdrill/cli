@@ -11,9 +11,10 @@ import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync, existsSync
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import pg from "pg";
-import { runBackup, mainDumpArgs } from "../dist/backup.js";
+import { runBackup, mainDumpArgs, AUTH_TIMEOUTS } from "../dist/backup.js";
 import { schemasMayIncludeAuth } from "../dist/auth-backup.js";
 import { parseManifest } from "../dist/manifest.js";
+import { renderRecoveryDoc } from "../dist/recovery-doc.js";
 
 const x = promisify(execFile);
 const realPgDump = process.env.BACKUPDRILL_PG_DUMP || "pg_dump";
@@ -27,12 +28,18 @@ async function available(cmd, args) {
   }
 }
 const canRun = (await available("docker", ["version"])) && (await available(realPgDump, ["--version"]));
+const canRunPsql = canRun && (await available("psql", ["--version"]));
 
-test("schemasMayIncludeAuth: explicit auth or any pattern counts; plain other names don't", () => {
-  for (const schemas of [["public", "auth"], ["AUTH"], ['"auth"'], ["*"], ["a*"], ["au?h"], ["public", "[a]uth"]]) {
+test("schemasMayIncludeAuth: true only when a schema pattern really matches auth (or can't be worked out)", () => {
+  for (const schemas of [
+    ["public", "auth"], ["AUTH"], ['"auth"'], ["*"], ["a*"], ["au?h"], ["public", "[a]uth"], ["(auth|audit)"],
+    ["mydb.auth"], // "库.schema" 的写法算不清,按"会"处理
+  ]) {
     assert.equal(schemasMayIncludeAuth(schemas), true, JSON.stringify(schemas));
   }
-  for (const schemas of [["public"], ["public", "audit"], ["authz"], ['"Auth"'], ["public", "private"]]) {
+  for (const schemas of [
+    ["public"], ["public", "audit"], ["authz"], ['"Auth"'], ["public", "private"], ["pub*"], ["p*"], ["auth?"], ['"a*"'],
+  ]) {
     assert.equal(schemasMayIncludeAuth(schemas), false, JSON.stringify(schemas));
   }
 });
@@ -120,14 +127,19 @@ async function sql(url, text) {
   }
 }
 
-// 和 Supabase 同形的最小 auth:两张表开 RLS、identities 外键指向 users;public.profiles 外键指向 auth.users,
-// auth.users 上挂注册时建 profile 的触发器;auth.users 上一条策略引用了不在备份里的 private schema 的函数
-const SETUP = `
+// 新项目里平台建好的 auth 两张表(空的),源库和恢复目标都用它
+const AUTH_DDL = `
   create schema auth;
   create table auth.users (
     instance_id uuid, id uuid primary key, email text, encrypted_password text,
     is_anonymous boolean not null default false, is_sso_user boolean not null default false,
-    raw_user_meta_data jsonb
+    raw_user_meta_data jsonb,
+    confirmation_token varchar(255) default '', recovery_token varchar(255) default '',
+    email_change_token_new varchar(255) default '', email_change_token_current varchar(255) default '',
+    phone_change_token varchar(255) default '', reauthentication_token varchar(255) default '',
+    email_change varchar(255) default '', phone_change text default '', email_change_confirm_status smallint default 0,
+    confirmation_sent_at timestamptz, recovery_sent_at timestamptz, email_change_sent_at timestamptz,
+    phone_change_sent_at timestamptz, reauthentication_sent_at timestamptz
   );
   create table auth.identities (
     id uuid primary key default gen_random_uuid(),
@@ -136,6 +148,12 @@ const SETUP = `
   );
   alter table auth.users enable row level security;
   alter table auth.identities enable row level security;
+`;
+
+// 和 Supabase 同形的最小 auth:两张表开 RLS、identities 外键指向 users;public.profiles 外键指向 auth.users,
+// auth.users 上挂注册时建 profile 的触发器;auth.users 上一条策略引用了不在备份里的 private schema 的函数
+const SETUP = `
+${AUTH_DDL}
   create table public.profiles (id uuid primary key references auth.users (id), name text);
   create function public.handle_new_user() returns trigger language plpgsql security definer set search_path = '' as $$
   begin insert into public.profiles (id, name) values (new.id, new.email); return new; end $$;
@@ -149,6 +167,8 @@ const SETUP = `
     ('33333333-3333-3333-3333-333333333333', 'enc@example.test',
      '{"key_id":"k1","alg":"aes-gcm-hkdf","data":"AAAA","nonce":"AAAAAAAAAAAAAAAA"}', false),
     ('44444444-4444-4444-4444-444444444444', null, '', true);
+  update auth.users set recovery_token = 'pending-reset', recovery_sent_at = now()
+   where id = '11111111-1111-1111-1111-111111111111';
   insert into auth.identities (user_id, provider, provider_id) values
     ('11111111-1111-1111-1111-111111111111', 'email', '11111111-1111-1111-1111-111111111111'),
     ('22222222-2222-2222-2222-222222222222', 'google', '1000001'),
@@ -186,10 +206,11 @@ exec "${realPgDump}" "$@"
   return { wrapper, log };
 }
 
-/** 内存快照存储:记下写了哪些文件;authCapable=false 模拟还没适配 auth.dump 的存储 */
-function memoryStore({ authCapable = true } = {}) {
+/** 内存快照存储:记下写了哪些文件;authCapable=false 模拟还没适配 auth.dump 的存储;stallAuth=上传永远完不成 */
+function memoryStore({ authCapable = true, stallAuth = false } = {}) {
   const files = new Map();
   let manifest;
+  const stalled = () => ({ done: new Promise(() => {}), abort: async () => {} });
   const collect = (name) => (body) => ({
     done: (async () => {
       const chunks = [];
@@ -207,7 +228,9 @@ function memoryStore({ authCapable = true } = {}) {
         storageFiles: null,
         describe: (file) => file,
         uploadDump: collect("dump.pgcustom"),
-        ...(authCapable ? { authDumpKey: "backupdrill/t/snap/auth.dump", uploadAuthDump: collect("auth.dump") } : {}),
+        ...(authCapable
+          ? { authDumpKey: "backupdrill/t/snap/auth.dump", uploadAuthDump: stallAuth ? stalled : collect("auth.dump") }
+          : {}),
         writeRecoveryDoc: async () => {},
         writeManifest: async (written) => {
           manifest = written;
@@ -250,9 +273,9 @@ test(
       const { wrapper, log } = writeWrapper(work);
       const LEGACY = " --format=custom --no-owner --no-privileges --schema=public";
 
-      const run = async (name, config, { env = {}, authCapable = true } = {}) => {
+      const run = async (name, config, { env = {}, authCapable = true, stallAuth = false } = {}) => {
         writeFileSync(log, "");
-        const mem = memoryStore({ authCapable });
+        const mem = memoryStore({ authCapable, stallAuth });
         const manifest = await withEnv({ BACKUPDRILL_PG_DUMP: wrapper, ...env }, () =>
           runBackup({ projectName: name, schemas: ["public"], ...config }, { store: mem.store })
         );
@@ -297,6 +320,50 @@ test(
         // 主 dump 不受影响:就是一份正常的 public 备份
         assert.ok(r.files.get("dump.pgcustom").length > 0);
         assert.equal(r.manifest.dump.bytes, r.files.get("dump.pgcustom").length);
+      });
+
+      await t.test("the RECOVERY.md steps restore Auth users and data in one transaction, as written", { skip: canRunPsql ? false : "requires psql" }, async () => {
+        const r = await run("runbook", { databaseUrl: okUrl, auth: "default" });
+        const doc = renderRecoveryDoc(r.manifest, {
+          snapshot: "snap", bucket: "b", region: "auto", prefix: "backupdrill", projectName: "runbook",
+        });
+        // 第 4 步的两段 bash:先生成 restore.sql,再用一个事务执行
+        const step4 = doc.slice(doc.indexOf("4. Restore the Auth users"));
+        const blocks = [...step4.matchAll(/```bash\n([\s\S]*?)```/g)].map((m) => m[1]);
+        assert.equal(blocks.length >= 2, true, step4);
+        const dir = mkdtempSync(join(work, "runbook-"));
+        writeFileSync(join(dir, "dump.pgcustom"), r.files.get("dump.pgcustom"));
+        writeFileSync(join(dir, "auth.dump"), r.files.get("auth.dump"));
+        const generated = await x("sh", ["-c", blocks[0]], { cwd: dir });
+        assert.match(generated.stdout, /restore\.sql is complete/);
+
+        // 目标 = 一个新项目:平台建好的空 auth 两张表,public 是空的
+        await sql(admin, "create database target");
+        const targetUrl = `postgresql://postgres:pw@127.0.0.1:${port}/target`;
+        await sql(targetUrl, AUTH_DDL);
+        const psqlLine = blocks[1].split("\n").find((l) => l.startsWith("psql "));
+        assert.match(psqlLine, /^psql -X --single-transaction -v ON_ERROR_STOP=1/);
+        const restoreOnce = () =>
+          x("psql", ["-X", "--single-transaction", "-v", "ON_ERROR_STOP=1", "--dbname", targetUrl, "-f", "restore.sql"], { cwd: dir });
+        await restoreOnce();
+
+        const after = await sql(
+          targetUrl,
+          `select (select count(*)::int from auth.users) as users,
+                  (select count(*)::int from auth.identities) as identities,
+                  (select count(*)::int from public.profiles) as profiles,
+                  (select count(*)::int from auth.users where recovery_token <> '' or recovery_sent_at is not null) as pending,
+                  (select count(*)::int from pg_trigger where tgrelid = 'auth.users'::regclass and tgname = 'on_auth_user_created') as trig,
+                  (select count(*)::int from pg_policy where polrelid = 'auth.users'::regclass) as policies,
+                  (select bool_and(convalidated) from pg_constraint where conrelid = 'public.profiles'::regclass and contype = 'f') as fk_valid`
+        );
+        assert.deepEqual(after.rows[0], { users: 4, identities: 4, profiles: 4, pending: 0, trig: 1, policies: 0, fk_valid: true });
+        assert.match(doc, /policy self_read on auth\.users uses functions in private/);
+
+        // 再跑一次会撞上已有的行:整个事务回滚,目标原样不动
+        await assert.rejects(restoreOnce());
+        const again = await sql(targetUrl, "select (select count(*)::int from auth.users) as users, (select count(*)::int from public.profiles) as profiles");
+        assert.deepEqual(again.rows[0], { users: 4, profiles: 4 });
       });
 
       await t.test("default + a role without BYPASSRLS: skipped, nothing extra, main dump exactly as before", async () => {
@@ -347,6 +414,41 @@ test(
         assert.ok(r.argv.includes(LEGACY), r.argv.join("\n"));
         assert.ok(r.files.get("dump.pgcustom").length > 0);
         assert.equal(r.manifest.dump.bytes, r.files.get("dump.pgcustom").length);
+      });
+
+      await t.test("a schema pattern that can't match auth doesn't stop the Auth backup", async () => {
+        const r = await run("pattern", { databaseUrl: okUrl, auth: "default", schemas: ["pub*"] });
+        assert.equal(r.manifest.auth.status, "included");
+      });
+
+      await t.test("someone else holding a lock on auth.users: Auth gives up within seconds, database backup completes", async () => {
+        const locker = new pg.Client({ connectionString: admin });
+        await locker.connect();
+        try {
+          await locker.query("begin; lock table auth.users in access exclusive mode");
+          const started = Date.now();
+          const r = await run("locked", { databaseUrl: okUrl, auth: "default" });
+          assert.ok(Date.now() - started < 30_000, `took ${Date.now() - started} ms`);
+          assert.equal(r.manifest.auth.status, "failed");
+          assert.match(r.manifest.auth.reason, /lock timeout/);
+          assert.ok(r.files.get("dump.pgcustom").length > 0);
+        } finally {
+          await locker.query("rollback").catch(() => {});
+          await locker.end();
+        }
+      });
+
+      await t.test("an Auth upload that never finishes doesn't hold up the backup", async () => {
+        const previous = AUTH_TIMEOUTS.waitAfterMainMs;
+        AUTH_TIMEOUTS.waitAfterMainMs = 1500;
+        try {
+          const r = await run("stall", { databaseUrl: okUrl, auth: "default" }, { stallAuth: true });
+          assert.equal(r.manifest.auth.status, "failed");
+          assert.match(r.manifest.auth.reason, /timed out/);
+          assert.ok(r.files.get("dump.pgcustom").length > 0);
+        } finally {
+          AUTH_TIMEOUTS.waitAfterMainMs = previous;
+        }
       });
 
       await t.test("the snapshot connection is gone once both dumps have started", async () => {

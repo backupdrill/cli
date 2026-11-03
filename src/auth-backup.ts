@@ -23,18 +23,51 @@ export const AUTH_TABLES = ["users", "identities"] as const;
 export const AUTH_DUMP_MAX_BYTES = 2 * 1024 * 1024 * 1024;
 
 /**
- * schemas 配置可能已经把 auth 带进主 dump:明写了 auth,或者带 pg_dump 的模式字符(通配、正则)。
- * 这种配置今天就会把 auth 整个导进主 dump;为了不改变它、也不重复导出,单独的 Auth 备份直接跳过。
- * 判断从宽:拿不准就算"可能包含",宁可少做,不碰现有备份。
+ * 把一个 pg_dump 的 --schema 模式转成正则,规则照 psql 的模式写法(pg_dump 用的是同一套):
+ *  - 双引号外:字母折成小写,* = 任意串,? = 任意一个字符,$ 按字面,其余正则字符保留正则含义;
+ *  - 双引号内:按字面、保留大小写,"" 表示一个双引号;
+ *  - 双引号外的 "." 是"库.schema"的分隔符——这种写法极少见,算不出就返回 null(调用方按"可能包含"处理)。
+ */
+function schemaPatternRegex(pattern: string): RegExp | null {
+  let re = "";
+  let quoted = false;
+  for (let i = 0; i < pattern.length; i++) {
+    const ch = pattern[i];
+    if (ch === '"') {
+      if (quoted && pattern[i + 1] === '"') {
+        re += '"';
+        i++;
+      } else {
+        quoted = !quoted;
+      }
+      continue;
+    }
+    if (quoted) {
+      re += ch.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      continue;
+    }
+    if (ch === ".") return null;
+    if (ch === "*") re += ".*";
+    else if (ch === "?") re += ".";
+    else if (ch === "$") re += "\\$";
+    else re += ch.toLowerCase();
+  }
+  try {
+    return new RegExp(`^(?:${re})$`);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * schemas 配置会不会已经把 auth 带进主 dump(明写了 auth,或者某个模式匹配得到 auth,例如 "*")。
+ * 会的话今天就是这么备的;为了不改变它、也不重复导出,单独的 Auth 备份不做。
+ * 算不清的模式按"会"处理:宁可少做,不碰现有备份。
  */
 export function schemasMayIncludeAuth(schemas: string[]): boolean {
   return schemas.some((pattern) => {
-    // pg_dump 模式:* ? [ ] ( ) | + ^ $ { } 和反斜杠都有特殊含义;"." 是 schema 分隔符
-    if (/[*?[\](){}|+^$\\.]/.test(pattern)) return true;
-    // 不加引号的名字会被折成小写;加了引号就是原样
-    const quoted = /^".*"$/.test(pattern);
-    const name = quoted ? pattern.slice(1, -1).replace(/""/g, '"') : pattern.toLowerCase();
-    return name === "auth";
+    const re = schemaPatternRegex(pattern);
+    return re === null || re.test("auth");
   });
 }
 
@@ -54,8 +87,9 @@ export async function exportSharedSnapshot(databaseUrl: string): Promise<SharedS
   let client: pg.Client | null = null;
   try {
     client = await connectPg(databaseUrl);
-    // 兜底:进程卡住时也不让这个空闲事务一直挂着(正常情况几秒内就释放)
+    // 兜底:进程卡住时也不让这个空闲事务一直挂着(正常情况几秒内就释放);语句本身也不许久等
     await client.query("set idle_in_transaction_session_timeout = '10min'");
+    await client.query("set statement_timeout = '30s'");
     await client.query("begin isolation level repeatable read read only");
     const res = await client.query<{ id: string }>("select pg_export_snapshot() as id");
     const id = res.rows[0]?.id;
@@ -106,6 +140,10 @@ const PLATFORM_SCHEMAS = [
 export async function inspectAuth(databaseUrl: string, snapshotId: string): Promise<AuthInspection> {
   const client = await connectPg(databaseUrl);
   try {
+    // 这些统计跑在主 dump 之前:auth 表上有别人的锁(例如正在跑的 Auth 迁移)时不能陪着等,
+    // 超时就让 Auth 这次不备,主 dump 照常
+    await client.query("set lock_timeout = '5s'");
+    await client.query("set statement_timeout = '60s'");
     await client.query("begin isolation level repeatable read read only");
     // 快照号来自 pg_export_snapshot(),格式固定;仍按字面量转义,不拼裸值
     await client.query(`set transaction snapshot ${client.escapeLiteral(snapshotId)}`);
@@ -256,6 +294,23 @@ export function unbackedAuthDependencies(
   return notes;
 }
 
+/**
+ * 恢复(含 RECOVERY.md 的手工步骤)要补建的 Auth 表对象。只建:
+ *  - 源库里会触发的触发器(O 启用、A 总是);D 停用和 R 只在复制会话触发的在普通会话里本来就不起作用;
+ *  - 依赖都在的对象:函数所在的 schema 在这次备份里(或是平台 schema)。
+ * 依赖不在的建不出来——把它放进单事务恢复,会让整个恢复回滚。跳过它们,另行写进报告和手工步骤。
+ */
+export function restorableAuthObjects(
+  auth: { triggers: AuthTriggerInfo[]; policies: AuthPolicyInfo[] },
+  backedUpSchemas: string[]
+): { triggers: AuthTriggerInfo[]; policies: AuthPolicyInfo[] } {
+  const covered = (schema: string) => backedUpSchemas.includes(schema) || PLATFORM_SCHEMAS.includes(schema);
+  return {
+    triggers: auth.triggers.filter((t) => (t.enabled === "O" || t.enabled === "A") && covered(t.functionSchema)),
+    policies: auth.policies.filter((p) => p.functionSchemas.every(covered)),
+  };
+}
+
 /** pg_dump 参数:只导两张表(结构 + 数据 + 它们上的索引、约束、触发器、策略),同一个共享快照 */
 export function authDumpArgs(snapshotId: string): string[] {
   return [
@@ -263,6 +318,8 @@ export function authDumpArgs(snapshotId: string): string[] {
     "--no-owner",
     "--no-privileges",
     `--snapshot=${snapshotId}`,
+    // 拿不到两张表的共享锁就别一直等(主 dump 的参数不加这个,保持原样)
+    "--lock-wait-timeout=60s",
     ...AUTH_TABLES.map((t) => `--table=auth.${t}`),
   ];
 }

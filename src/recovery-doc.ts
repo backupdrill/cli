@@ -8,6 +8,7 @@
 //    不把部分恢复表述成完整项目恢复(PRD §2.2 禁用表述)。
 import type { Manifest } from "./manifest.js";
 import { recoveryGrantsSql } from "./grants.js";
+import { restorableAuthObjects, unbackedAuthDependencies } from "./auth-backup.js";
 
 /** 生成手册所需的非秘密快照坐标。刻意不收连接串/密钥类型——签名即防线。 */
 export interface RecoveryDocContext {
@@ -22,6 +23,24 @@ export interface RecoveryDocContext {
 function quoteSqlIdent(name: string): string {
   return `"${name.replace(/"/g, '""')}"`;
 }
+
+/** 恢复后作废进行中的认证流程(找回密码、邮箱确认、改邮箱/手机号的链接和验证码),与 GoTrue 的 ClearAllPendingTokens 对齐 */
+export const CLEAR_PENDING_AUTH_SQL =
+  "update auth.users set confirmation_token = '', recovery_token = '', email_change_token_new = '', " +
+  "email_change_token_current = '', phone_change_token = '', reauthentication_token = '', " +
+  "email_change = '', phone_change = '', email_change_confirm_status = 0, confirmation_sent_at = null, " +
+  "recovery_sent_at = null, email_change_sent_at = null, phone_change_sent_at = null, reauthentication_sent_at = null;";
+
+const ereEscape = (s: string) => s.replace(/[.[\]{}()*+?^$|\\]/g, "\\$&");
+
+const AUTH_NOT_INCLUDED_TEXT: Record<string, string> = {
+  no_permission: "the backup role couldn't read every row of the Auth tables",
+  no_auth_schema: "the source database has no Supabase auth schema",
+  unsupported_destination: "this destination couldn't hold the Auth archive",
+  schemas_may_include_auth: "the auth schema is already part of the database dump",
+  too_large: "the Auth archive was larger than 2 GiB",
+  snapshot_unavailable: "a consistent snapshot for the Auth export couldn't be set up",
+};
 
 /** POSIX 安全的 shell 值引用:项目名/前缀里合法的空格与元字符不得拆散或改写命令。 */
 function shellQuote(value: string): string {
@@ -55,6 +74,46 @@ export function renderRecoveryDoc(manifest: Manifest, ctx: RecoveryDocContext): 
         .join("\n")
     : "-- (this snapshot records no extensions)";
 
+  // Auth 用户(2.10.0 起):只有 included 的快照带 auth.dump;没有 auth 字段的快照手册和以前完全一样
+  const auth = manifest.auth?.status === "included" ? manifest.auth : null;
+  const authLine = auth
+    ? `- **Supabase Auth users**: \`${auth.dump!.key}\`
+  (pg_dump custom format, ${mb(auth.dump!.bytes)} MB, sha256 \`${auth.dump!.sha256}\`) — ${auth.rows!.users.toLocaleString("en-US")} users, ${auth.rows!.identities.toLocaleString("en-US")} sign-in identities
+`
+    : manifest.auth
+      ? `- **Supabase Auth users**: not in this snapshot (${AUTH_NOT_INCLUDED_TEXT[manifest.auth.reason ?? ""] ?? manifest.auth.reason ?? "not captured"})
+`
+      : "";
+  // 只补建会触发、依赖也都在备份里的触发器和策略(规则见 restorableAuthObjects);建不出来的写进下面的说明
+  const restorable = auth ? restorableAuthObjects({ triggers: auth.triggers!, policies: auth.policies! }, db.schemas) : null;
+  const authObjects = restorable
+    ? [
+        ...restorable.triggers.map((t) => `TRIGGER auth ${t.table} ${t.name}`),
+        ...restorable.policies.map((p) => `POLICY auth ${p.table} ${p.name}`),
+      ]
+    : [];
+  const authObjectsGrep = authObjects.map((o) => ereEscape(o)).join("|");
+  const authNotes = auth
+    ? [
+        auth.passwordHashes!.encrypted > 0
+          ? `- ${auth.passwordHashes!.encrypted} user(s) have password hashes encrypted with the old project's key; they can't sign in with their old password on a new project and need a password reset.`
+          : "",
+        auth.ssoUsers! > 0
+          ? `- ${auth.ssoUsers} SSO user(s): their accounts are restored, but SSO providers aren't in this snapshot. Recreating a provider gives it a new ID, so these users may not land on their old accounts.`
+          : "",
+        auth.anonymousUsers! > 0
+          ? `- ${auth.anonymousUsers} anonymous user(s): restored, but an anonymous user can only sign in with the session they had, and sessions aren't in this snapshot.`
+          : "",
+        auth.mfaUsers ? `- ${auth.mfaUsers} user(s) had MFA. MFA factors aren't in this snapshot; those users sign in with one factor until they enroll again. Check what your app allows a user at \`aal1\`.` : "",
+        ...auth.triggers!
+          .filter((t) => t.enabled === "D" || t.enabled === "R")
+          .map((t) => `- Trigger \`${t.name}\` on \`auth.${t.table}\` was disabled (or replica-only) at the source and isn't recreated.`),
+        ...unbackedAuthDependencies({ triggers: auth.triggers!, policies: auth.policies! }, db.schemas).map(
+          (note) => `- The ${note}. Create it by hand once that schema exists on the target.`
+        ),
+      ].filter(Boolean)
+    : [];
+
   // 2.0 形态:凭据只经环境变量(argv 对全机器可见);写入需要键入目标 ref 确认。
   // DB-only 快照不出现 Storage 凭据与旗标——不为用不上的能力索要宽权限 key
   const cliRestoreCommand = [
@@ -73,6 +132,98 @@ export function renderRecoveryDoc(manifest: Manifest, ctx: RecoveryDocContext): 
     ...(storage ? [`  --target-supabase-url https://<target-ref>.supabase.co \\`] : []),
     `  --confirm-target <target-ref>`,
   ].join("\n");
+
+  // 没有 Auth 的快照:以下两段与 2.10.0 之前逐字一致
+  const notCovered = auth
+    ? `Supabase **Auth sessions and MFA factors, Auth settings (sign-in providers,
+SMTP, redirect URLs, email templates), secret values, Edge Function code and most
+platform settings are NOT in this snapshot**. After restoring, reconfigure them
+by hand; everyone signs in once more. The Auth users themselves (IDs, emails,
+password hashes, sign-in identities) are in this snapshot and are restored in
+step 4 below, together with the database.
+${authNotes.length ? `\n${authNotes.join("\n")}\n` : ""}`
+    : `Supabase **Auth users/sessions, secret values, Edge Function code and most
+platform settings are NOT in this snapshot**. After restoring, reconfigure them
+by hand. This is a database + Storage snapshot, not a full project image.
+${
+  db.schemas.includes("auth")
+    ? ""
+    : `
+If a table in this snapshot has a foreign key into \`auth.users\` (a \`profiles.id\`
+that references it, for example), copy the Auth users into the new project
+**before** restoring, or that foreign key can't be created and the restore fails.
+\`backupdrill restore --dry-run\` checks those keys against the new project and reports
+the rows that have no user, plus any key it couldn't check.
+Triggers on \`auth.users\` aren't in this snapshot either; recreate them afterwards.
+`
+}`;
+
+  const restoreSteps = auth
+    ? `3. Download \`${manifest.dump.key}\` and \`${auth.dump!.key}\` from this
+   bucket, then verify them:
+
+\`\`\`bash
+shasum -a 256 dump.pgcustom   # must print ${manifest.dump.sha256}
+shasum -a 256 auth.dump       # must print ${auth.dump!.sha256}
+\`\`\`
+
+4. Restore the Auth users and the database **in one transaction**, so any error
+   leaves the target exactly as it was and you can simply run it again. First turn
+   both archives into one SQL file; go on only if the last line prints
+   \`restore.sql is complete\` (a half-written file would otherwise be committed):
+
+\`\`\`bash
+pg_restore -l dump.pgcustom | grep -v ' SCHEMA - public ' > database.list
+${authObjects.length ? `pg_restore -l auth.dump | grep -E ' (${authObjectsGrep}) ' > auth-objects.list\n` : ""}{
+  pg_restore --data-only --no-owner --no-privileges -n auth -t users -f - auth.dump &&
+  pg_restore --data-only --no-owner --no-privileges -n auth -t identities -f - auth.dump &&
+  echo "${CLEAR_PENDING_AUTH_SQL}" &&
+  pg_restore --no-owner --no-privileges -L database.list -f - dump.pgcustom${
+    authObjects.length ? ` &&\n  pg_restore --no-owner --no-privileges -L auth-objects.list -f - auth.dump` : ""
+  }
+} > restore.sql && echo "restore.sql is complete"
+\`\`\`
+
+   Then run it against the empty target. Enter the password at a hidden prompt so
+   it never touches the URL, argv, or shell history:
+
+\`\`\`bash
+read -rs PGPASSWORD && export PGPASSWORD   # hidden prompt
+psql -X --single-transaction -v ON_ERROR_STOP=1 \\
+  --dbname "postgresql://postgres.<target-ref>@<target-pooler-host>:5432/postgres" -f restore.sql
+unset PGPASSWORD
+\`\`\`
+
+The Auth users go in first, so foreign keys into \`auth.users\` resolve. Links
+and codes for password resets, email confirmations and email or phone changes
+that were pending at backup time are cleared. ${
+        authObjects.length
+          ? "The triggers and policies on the Auth tables are recreated at the end."
+          : "There were no triggers or policies of your own on the Auth tables."
+      } Do **not** use \`--clean\` against a Supabase project: it drops and
+recreates \`public\`, and the grants Supabase put on it go with it.
+`
+    : `3. Download \`${manifest.dump.key}\` from this bucket, then verify it:
+
+\`\`\`bash
+shasum -a 256 dump.pgcustom   # must print ${manifest.dump.sha256}
+\`\`\`
+
+4. Restore — **without \`--clean\`**, into the empty target. Enter the password at
+   a hidden prompt so it never touches the URL, argv, or shell history:
+
+\`\`\`bash
+read -rs PGPASSWORD && export PGPASSWORD   # hidden prompt
+pg_restore --no-owner --no-privileges \\
+  --dbname "postgresql://postgres.<target-ref>@<target-pooler-host>:5432/postgres" dump.pgcustom
+unset PGPASSWORD
+\`\`\`
+
+One error is expected and harmless: \`schema "public" already exists\` (the
+target always has it). A foreign key error mentioning \`auth.users\` means the
+Auth users were not copied in first (see "Not covered" above). Do **not** use \`--clean\` against a Supabase project:
+it drops and recreates \`public\`, and the grants Supabase put on it go with it.
+`;
 
   return `# BackupDrill recovery runbook — ${ctx.projectName} @ ${ctx.snapshot}
 
@@ -96,25 +247,11 @@ ${
       ? `${storage.fileCount} files, ${mb(storage.totalBytes)} MB under \`${base}/storage/<bucket>/<key>\` — per-file sha256 in manifest.json`
       : "none (database-only snapshot)"
   }
-- **Machine-readable inventory**: \`${base}/manifest.json\`
+${authLine}- **Machine-readable inventory**: \`${base}/manifest.json\`
 
 ## Not covered — plan for these separately
 
-Supabase **Auth users/sessions, secret values, Edge Function code and most
-platform settings are NOT in this snapshot**. After restoring, reconfigure them
-by hand. This is a database + Storage snapshot, not a full project image.
-${
-  db.schemas.includes("auth")
-    ? ""
-    : `
-If a table in this snapshot has a foreign key into \`auth.users\` (a \`profiles.id\`
-that references it, for example), copy the Auth users into the new project
-**before** restoring, or that foreign key can't be created and the restore fails.
-\`backupdrill restore --dry-run\` checks those keys against the new project and reports
-the rows that have no user, plus any key it couldn't check.
-Triggers on \`auth.users\` aren't in this snapshot either; recreate them afterwards.
-`
-}
+${notCovered}
 ## Restore the database (into an EMPTY project)
 
 1. Create a **fresh** Supabase project (never restore onto the source project),
@@ -125,27 +262,7 @@ Triggers on \`auth.users\` aren't in this snapshot either; recreate them afterwa
 ${extensionSql}
 \`\`\`
 
-3. Download \`${manifest.dump.key}\` from this bucket, then verify it:
-
-\`\`\`bash
-shasum -a 256 dump.pgcustom   # must print ${manifest.dump.sha256}
-\`\`\`
-
-4. Restore — **without \`--clean\`**, into the empty target. Enter the password at
-   a hidden prompt so it never touches the URL, argv, or shell history:
-
-\`\`\`bash
-read -rs PGPASSWORD && export PGPASSWORD   # hidden prompt
-pg_restore --no-owner --no-privileges \\
-  --dbname "postgresql://postgres.<target-ref>@<target-pooler-host>:5432/postgres" dump.pgcustom
-unset PGPASSWORD
-\`\`\`
-
-One error is expected and harmless: \`schema "public" already exists\` (the
-target always has it). A foreign key error mentioning \`auth.users\` means the
-Auth users were not copied in first (see "Not covered" above). Do **not** use \`--clean\` against a Supabase project:
-it drops and recreates \`public\`, and the grants Supabase put on it go with it.
-
+${restoreSteps}
 5. Set the grants for \`anon\`, \`authenticated\` and \`service_role\`. The dump
    carries none. With Supabase's new defaults, supabase-js requests to restored
    tables in \`public\` fail with \`42501 permission denied\` until you grant access. ${
