@@ -8,7 +8,7 @@ import { mkdtempSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileRestoreRecords, restoreRecordKey } from "../dist/restore-record.js";
-import { restoreStatus } from "../dist/restore.js";
+import { finishRestore, restoreStatus } from "../dist/restore.js";
 import { normalizedConstraintDef } from "../dist/orphaned-foreign-keys.js";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
@@ -193,4 +193,32 @@ test("normalizedConstraintDef: whitespace outside quotes and NOT VALID don't mat
     normalizedConstraintDef('FOREIGN KEY (a) REFERENCES public."a""  b"(id)'),
     'FOREIGN KEY (a) REFERENCES public."a""  b"(id)'
   );
+});
+
+test("a record without manifestSha256 (pre-release builds) still shows in --status, and --finish refuses it", async () => {
+  const legacy = {
+    version: 1, snapshot: "s", projectName: "p", dumpSha256: "abc", target: "t",
+    identity: { databaseOid: "1", systemIdentifier: null }, xid: "42", phase: "committed", startedAt: "x", updatedAt: "x",
+  };
+  const dir = mkdtempSync(join(tmpdir(), "bd-legacy-"));
+  try {
+    const records = fileRestoreRecords(dir);
+    await records.save("k", legacy);
+    assert.deepEqual(await records.load("k"), legacy);
+    const store = { load: async () => legacy, save: async () => {} };
+    const status = await restoreStatus({ targetDatabaseUrl: "postgresql://u:p@127.0.0.1:1/x", restoreRecords: store, timeoutMs: 500 });
+    assert.equal(status.recorded, true);
+    await assert.rejects(
+      finishRestore({}, { targetDatabaseUrl: "postgresql://u:p@127.0.0.1:1/x", restoreRecords: store }),
+      /pre-release build[\s\S]*restore --status/
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("CLI: backup --help says Auth users are included by default", async () => {
+  const { stdout } = await run(process.execPath, [cli, "backup", "--help"]);
+  assert.match(stdout.replace(/\s+/g, " "), /included whenever the role can read them/);
+  assert.doesNotMatch(stdout, /the default for now/);
 });

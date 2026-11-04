@@ -1314,6 +1314,12 @@ export async function finishRestore(
   if (record.phase === "done") {
     throw new Error("nothing to finish: that restore committed and every step after it already finished.");
   }
+  if (!record.manifestSha256) {
+    throw new Error(
+      "this restore record was written by a pre-release build and doesn't say which manifest it used, so --finish " +
+        "won't use it. Run restore --status to see whether that restore committed."
+    );
+  }
   const outcome = await transactionOutcome(targetUrl, record.xid, { identity: record.identity, waitMs: 5000 });
   if (outcome !== "committed") {
     throw new Error(

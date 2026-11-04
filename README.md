@@ -226,7 +226,7 @@ Snapshots taken with 2.10.0 or later usually hold the Auth users as well. For th
 
 If the restore is cut off while it commits, `backupdrill restore --status` (same `BACKUPDRILL_TARGET_DATABASE_URL`, same machine) says whether it committed. If it did, `backupdrill restore --finish --confirm-target <ref>` does the grants and foreign keys that come after the commit, and it can be run again safely. `--skip-auth` leaves the Auth users out and restores the database the way 2.9 did; use it if you already copied the users into the target yourself.
 
-Or restore the dump by hand — into an **empty** database, without `--clean`:
+Or restore by hand. For a snapshot with Auth users, follow step 4 of its `RECOVERY.md`, which restores `auth.dump` and `dump.pgcustom` in one transaction. For a snapshot without them, restore the dump into an **empty** database, without `--clean`:
 
 ```bash
 pg_restore --no-owner --no-privileges --dbname "<target-connection-string>" dump.pgcustom
