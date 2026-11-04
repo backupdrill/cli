@@ -11,6 +11,7 @@ import type { Manifest } from "./manifest.js";
 import { s3SnapshotStore, type SnapshotStore } from "./snapshot-store.js";
 import {
   restoreDatabaseArtifact,
+  userObjectCountSql,
   installExtensions,
   projectRefOf,
   refFromStorageEndpoint,
@@ -30,6 +31,16 @@ import { connectPg } from "./supabase-ca.js";
 import { orphanedForeignKeysCheck, type OrphanedForeignKey } from "./orphaned-foreign-keys.js";
 import { grantsCheck } from "./grants.js";
 import { localPgRestoreMajor, restoreToolTargetBlocker } from "./pgbin.js";
+import {
+  authRestoreFailureMessage,
+  authRestoreNotes,
+  authRestorePreflight,
+  largeObjectEntries,
+  psqlProblem,
+  readAuthArchive,
+  restoreWithAuth,
+  type AuthArchive,
+} from "./auth-restore.js";
 import { parsePgDumpMajor } from "./backup.js";
 import { log } from "./log.js";
 
@@ -59,7 +70,32 @@ export interface RestoreResult {
   storageSummary?: StorageRestoreSummary;
   storageFilesWritten: number;
   storageDir?: string;
+  /**
+   * 快照里有 Auth 用户时才有(2.10.0 起):这次恢复有没有把它们写进目标,写了多少,恢复后要注意什么。
+   * 不含 Auth 的快照没有这一项,输出和以前一样
+   */
+  auth?: RestoreAuthResult;
 }
+
+export interface RestoreAuthResult {
+  /** true:Auth 用户、identities 和数据库在同一个事务里写进了目标 */
+  restored: boolean;
+  /** 没写的原因(--skip-auth、读不到 auth.dump) */
+  reason?: string;
+  users?: number;
+  identities?: number;
+  /** 补建了的触发器 */
+  triggers?: string[];
+  /** 恢复后登录会受影响的用户、要手工加回的授权 */
+  notes?: string[];
+  /** 没有自动补建、要手工处理的触发器和策略 */
+  manual?: string[];
+}
+
+/** 恢复后不管快照里有什么都要手工做的事(Auth 配置不在数据库里) */
+const AUTH_AFTER_RESTORE =
+  "Everyone signs in again: sessions aren't in the snapshot. Reconfigure Auth in the Supabase dashboard before " +
+  "switching your app over: sign-in providers (OAuth client IDs and secrets), SMTP, redirect URLs, the site URL and SSO.";
 
 /**
  * restore 无源库配置时的占位连接串(纯 flag 驱动、没有 backupdrill.config.json 的场景)。
@@ -271,23 +307,7 @@ async function userObjectCount(targetUrl: string, schemas: string[]): Promise<nu
   const client = await connectPg(targetUrl);
   try {
     const res = await client.query<{ n: string }>(
-      `select
-         (select count(*) from pg_class c join pg_namespace n on n.oid = c.relnamespace
-           where n.nspname = any($1::text[]) and c.relkind in ('r','p','m','v','S','f','c')
-             and not (exists (select 1 from pg_depend d where d.deptype = 'e'
-                                and ((d.classid = 'pg_class'::regclass and d.objid = c.oid)
-                                  -- 扩展建的复合类型(dblink 的 dblink_pkey_results)登记在类型上,不在关系上
-                                  or (d.classid = 'pg_type'::regclass and d.objid = c.reltype)))
-                      and not exists (select 1 from pg_extension e where c.oid = any(e.extconfig))))
-       + (select count(*) from pg_proc p join pg_namespace n on n.oid = p.pronamespace
-           where n.nspname = any($1::text[])
-             and not exists (select 1 from pg_depend d where d.classid = 'pg_proc'::regclass
-                               and d.objid = p.oid and d.deptype = 'e'))
-       + (select count(*) from pg_type t join pg_namespace n on n.oid = t.typnamespace
-           where n.nspname = any($1::text[]) and t.typtype in ('e','d','r')
-             and not exists (select 1 from pg_depend d where d.classid = 'pg_type'::regclass
-                               and d.objid = t.oid and d.deptype = 'e'))
-         as n`,
+      `select ${userObjectCountSql("$1::text[]")} as n`,
       [schemas]
     );
     return Number(res.rows[0].n);
@@ -374,7 +394,8 @@ async function dryRunPreflight(
   targetUrl: string | undefined,
   storageTarget: StorageRestoreTarget | null,
   alsoRestoringStorage: boolean,
-  reader: SnapshotReader
+  reader: SnapshotReader,
+  skipAuth: boolean
 ): Promise<void> {
   const blockers: string[] = [];
   const db = manifest.database;
@@ -389,9 +410,20 @@ async function dryRunPreflight(
           (manifest.storage.buckets ? `, ${manifest.storage.buckets.length} bucket(s) with attributes` : ", bucket attributes not captured")
       : "storage: none (database-only snapshot)"
   );
-  log.warn(
-    "not covered: Auth users/sessions, secret values, Edge Functions, most platform settings"
-  );
+  if (manifest.auth?.status === "included") {
+    log.ok(
+      `auth: ${manifest.auth.rows!.users.toLocaleString("en-US")} users ` +
+        `(${manifest.auth.rows!.identities.toLocaleString("en-US")} identities)` +
+        (skipAuth ? " — not restored (--skip-auth)" : "")
+    );
+  }
+  if (manifest.auth?.status === "included" && !skipAuth) {
+    log.warn("not covered: Auth sessions and MFA factors, Auth settings, secret values, Edge Functions, most platform settings");
+  } else {
+    log.warn(
+      "not covered: Auth users/sessions, secret values, Edge Functions, most platform settings"
+    );
+  }
 
   // 双目标一致性(dry-run 也要查,不能绿灯放行到正式执行才拒):库与 Storage
   // 两个入口指向不同项目 = 配置错了一个
@@ -476,7 +508,7 @@ async function dryRunPreflight(
       await client.end();
     }
     if (toolReadsArchive) {
-      blockers.push(...(await inspectDumpForTarget(manifest, targetUrl, reader)));
+      blockers.push(...(await inspectDumpForTarget(manifest, targetUrl, reader, skipAuth)));
     } else {
       log.warn("dump not inspected (archive checksum, references outside the backup) — needs a working pg_restore");
     }
@@ -527,7 +559,12 @@ export function restoreFailureAdvice(failure: string): string {
 }
 
 /** dry-run 的读 dump 部分:下载到临时目录,对校验和,查指向备份之外的外键。返回 blocker。 */
-async function inspectDumpForTarget(manifest: Manifest, targetUrl: string, reader: SnapshotReader): Promise<string[]> {
+async function inspectDumpForTarget(
+  manifest: Manifest,
+  targetUrl: string,
+  reader: SnapshotReader,
+  skipAuth: boolean
+): Promise<string[]> {
   // 正式恢复先装扩展再查外键;dry-run 不装,被引用的表可能要等扩展装上才有
   const installed = await installedExtensions(targetUrl);
   const pendingExtensions = (manifest.database.extensions ?? [])
@@ -549,12 +586,22 @@ async function inspectDumpForTarget(manifest: Manifest, targetUrl: string, reade
       return ["archive checksum does not match the manifest"];
     }
     log.ok(`archive integrity: sha256 matches (${sha256.slice(0, 12)}…)`);
+    let withAuth = false;
+    try {
+      const plan = await planAuthRestore(manifest, reader, targetUrl, dumpPath, workdir, skipAuth);
+      withAuth = !!plan.archive;
+      if (withAuth) log.ok("auth: the target can take the Auth users; they'd be restored with the database in one transaction");
+    } catch (error) {
+      log.error(`auth: ${(error as Error).message}`);
+      return [(error as Error).message];
+    }
     try {
       const check = await checkExternalReferences({
         dumpPath,
         dumpedSchemas: manifest.database.schemas,
         targetUrl,
         pendingExtensions,
+        restoredTables: withAuth ? AUTH_TABLES : [],
       });
       return logExternalReferences(check, manifest.database.schemas, true);
     } catch (error) {
@@ -564,6 +611,64 @@ async function inspectDumpForTarget(manifest: Manifest, targetUrl: string, reade
   } finally {
     await rm(workdir, { recursive: true, force: true }).catch(() => {});
   }
+}
+
+/** 和数据库在同一个事务里写进去的两张 Auth 表 */
+const AUTH_TABLES = [
+  { schema: "auth", name: "users" },
+  { schema: "auth", name: "identities" },
+];
+
+/**
+ * 决定这次恢复写不写 Auth 用户,要写就把 auth.dump 下载、校验、读好,并在目标上做完只读预检。
+ * 任何一项过不了就抛错(写入之前);dry-run 和正式执行共用。快照里没有 Auth 用户时什么都不做
+ */
+async function planAuthRestore(
+  manifest: Manifest,
+  reader: SnapshotReader,
+  targetUrl: string,
+  dumpPath: string,
+  workdir: string,
+  skipAuth: boolean
+): Promise<{ archive?: AuthArchive; result?: RestoreAuthResult }> {
+  const auth = manifest.auth;
+  if (auth?.status !== "included") return {};
+  if (skipAuth) {
+    log.warn("The snapshot's Auth users are not restored (--skip-auth); the database is restored the way 2.9 did.");
+    return { result: { restored: false, reason: "--skip-auth" } };
+  }
+  if (!reader.downloadAuthDump) {
+    const reason = "this snapshot location can't read the Auth archive";
+    log.warn(`The snapshot's Auth users are not restored: ${reason}; the database is restored the way 2.9 did.`);
+    return { result: { restored: false, reason } };
+  }
+  const problem = await psqlProblem();
+  if (problem) {
+    throw new Error(`restoring the Auth users needs psql: ${problem}. Or pass --skip-auth to restore the database without them.`);
+  }
+  log.step("Downloading the Auth archive…");
+  const authPath = join(workdir, "auth.dump");
+  const { sha256 } = await reader.downloadAuthDump(manifest, authPath);
+  if (sha256 !== auth.dump!.sha256) {
+    throw new Error(
+      `the Auth archive's sha256 ${sha256.slice(0, 12)}… does not match the manifest's ${auth.dump!.sha256.slice(0, 12)}… — ` +
+        "refusing to restore a corrupted archive"
+    );
+  }
+  const archive = await readAuthArchive(authPath, manifest, workdir);
+  const blockers = await authRestorePreflight(targetUrl, archive);
+  // pg_restore 写 SQL 时在大对象前后自带 BEGIN/COMMIT,会把这个事务提前提交
+  const largeObjects = await largeObjectEntries(dumpPath);
+  if (largeObjects) {
+    blockers.push(
+      "the snapshot has large objects, which can't be restored in the same transaction as the Auth users yet; " +
+        "pass --skip-auth to restore the database alone, then copy the Auth users by hand (see RECOVERY.md)"
+    );
+  }
+  if (blockers.length) {
+    throw new Error(`the Auth users can't be restored into this target:\n  - ${blockers.join("\n  - ")}`);
+  }
+  return { archive };
 }
 
 /** 目标上已经装了哪些扩展。 */
@@ -602,6 +707,11 @@ export async function runRestore(
     storageDir?: string;
     /** 快照从哪读;省略 = config.storage 指的 S3 兼容桶 */
     store?: SnapshotStore;
+    /**
+     * 不写快照里的 Auth 用户,数据库按 2.9 的方式恢复(逃生口:新路径在某个目标上出问题时照样能恢复;
+     * 也用于用户已经自己把 Auth 用户复制到目标上的情况)
+     */
+    skipAuth?: boolean;
   }
 ): Promise<RestoreResult> {
   // 任何 I/O 之前先把源与目标的连接串过一遍覆盖/别名守卫:源串带集群别名或租户覆盖时
@@ -687,7 +797,7 @@ export async function runRestore(
   // dry-run:只读预检后直接返回,零写入(PRD §5.3.2)
   if (opts.dryRun) {
     log.step(`Dry run for snapshot ${snapshot} — nothing will be written`);
-    await dryRunPreflight(config, manifest, opts.targetDatabaseUrl, storageTarget, alsoRestoringStorage, reader);
+    await dryRunPreflight(config, manifest, opts.targetDatabaseUrl, storageTarget, alsoRestoringStorage, reader, !!opts.skipAuth);
     result.dryRun = true;
     return result;
   }
@@ -783,6 +893,12 @@ export async function runRestore(
         );
       }
 
+      // 快照里有 Auth 用户:默认和数据库在同一个事务里写进去(auth-restore.ts)。写任何东西之前把 Auth 的
+      // 只读检查全部做完,过不了就停;读端不支持 auth.dump、或显式 --skip-auth 时按 2.9 的方式只恢复数据库
+      const authPlan = await planAuthRestore(manifest, reader, targetUrl, dumpPath, workdir, !!opts.skipAuth);
+      if (authPlan.result) result.auth = authPlan.result;
+      const authArchive = authPlan.archive;
+
       // 指向备份之外的外键(典型:profiles.id → auth.users),目标上缺被引用的行,恢复必然失败。
       // 和 dry-run 同一份检查,在往目标写任何东西(连扩展都还没装)之前拦下,报错直接说缺什么、去哪补。
       // 被引用的表也可能是待装的扩展建的:这种先记下,装完扩展再查一遍。
@@ -801,6 +917,8 @@ export async function runRestore(
           targetUrl,
           pendingExtensions: pending,
           inTransaction: opts.inTransaction,
+          // 和数据库一起写进去的 Auth 表:指向它们的外键不再算"指向备份之外"
+          restoredTables: authArchive ? AUTH_TABLES : [],
         });
         const referenceProblems = logExternalReferences(references, manifest.database.schemas, false);
         if (referenceProblems.length && opts.final) {
@@ -825,11 +943,27 @@ export async function runRestore(
       // 一起回滚,目标原样不动(否则带配置表的扩展留下来,修好之后的重跑会被空目标门拦下,交叉审查复现)。
       // 正式恢复(pg_restore)失败时装上的扩展留着:下一次运行照样要它们,空目标门也不数扩展自带的对象
       // (配置表除外)。曾经在失败后删掉"本次新装的"扩展,交叉审查复现了它会误删别的连接同时装上的扩展。
-      if (extensions.length) {
+      const unavailableMessage = (unavailable: string[]) =>
+        `target cannot install extension(s): ${unavailable.join(", ")} — enable them in ` +
+        `the Supabase dashboard (Database → Extensions) and retry.`;
+      if (extensions.length && authArchive) {
+        // 带 Auth 的恢复把扩展装在恢复事务里(失败时一起回滚,重跑时目标是干净的)。这里先在一个最后回滚掉的
+        // 事务里试装一遍:装不上的、要等扩展装上才查得了的外键,在写任何东西之前拦下,目标原样不动
+        log.step(`Checking ${extensions.length} extension(s) can be installed on target…`);
+        const client = await connectPg(targetUrl);
+        try {
+          await client.query("begin");
+          const unavailable = await installExtensions(targetUrl, extensions, client);
+          if (unavailable.length) throw new Error(unavailableMessage(unavailable));
+          if (firstCheck.waitingForExtensions || firstCheck.problems.length) {
+            await checkReferences([], { inTransaction: client, final: true });
+          }
+        } finally {
+          await client.query("rollback").catch(() => {});
+          await client.end();
+        }
+      } else if (extensions.length) {
         log.step(`Installing ${extensions.length} extension(s) on target…`);
-        const unavailableMessage = (unavailable: string[]) =>
-          `target cannot install extension(s): ${unavailable.join(", ")} — enable them in ` +
-          `the Supabase dashboard (Database → Extensions) and retry.`;
         if (firstCheck.waitingForExtensions || firstCheck.problems.length) {
           const client = await connectPg(targetUrl);
           try {
@@ -850,13 +984,55 @@ export async function runRestore(
         }
       }
 
-      log.step("Restoring database into target…");
-      const engine = await restoreDatabaseArtifact({
-        dumpPath,
-        connString: targetUrl,
-        target: "supabase",
-        grants: { schemas: manifest.database.schemas, recorded: manifest.database.grants },
-      });
+      const grantsToRestore = { schemas: manifest.database.schemas, recorded: manifest.database.grants };
+      let engine: Awaited<ReturnType<typeof restoreDatabaseArtifact>>;
+      if (authArchive) {
+        log.step("Restoring the Auth users and the database into target in one transaction…");
+        const run = await restoreWithAuth({
+          dumpPath,
+          archive: authArchive,
+          connString: targetUrl,
+          auth: manifest.auth!,
+          schemas: manifest.database.schemas,
+          grants: grantsToRestore,
+          listDir: workdir,
+          extensions,
+        });
+        if (run.transaction !== "committed") {
+          // 结果由事务本身说了算(没写 COMMIT,或 pg_xact_status 的回答),不再数 schema 里的对象去推断
+          throw new Error(authRestoreFailureMessage(run) + restoreFailureAdvice(run.failure ?? ""));
+        }
+        const committed = run.transaction === "committed";
+        const pass = committed ? run.afterCommit!.pass : { expectedSkips: 0, failures: [run.failure!] };
+        engine = {
+          preData: pass,
+          postData: { expectedSkips: 0, failures: [] },
+          ok: committed && pass.failures.length === 0,
+          orphanedForeignKeys: run.afterCommit?.orphaned,
+          grants: run.afterCommit?.grants,
+          // 和老路径一样,committed 只在提交之后的步骤出错时带上
+          ...(pass.failures.length ? { committed: true } : {}),
+        };
+        if (committed) {
+          const { notes, manual } = authRestoreNotes(manifest.auth!, manifest.database.schemas);
+          result.auth = {
+            restored: true,
+            users: manifest.auth!.rows!.users,
+            identities: manifest.auth!.rows!.identities,
+            triggers: run.triggers,
+            notes,
+            manual,
+          };
+        }
+      } else {
+        log.step("Restoring database into target…");
+        engine = await restoreDatabaseArtifact({
+          dumpPath,
+          connString: targetUrl,
+          target: "supabase",
+          grants: grantsToRestore,
+        });
+      }
       if (!engine.ok) {
         const failures = [...engine.preData.failures, ...engine.postData.failures];
         throw new Error(
@@ -894,6 +1070,14 @@ export async function runRestore(
         `Database restored (${verified.tableCount} tables, ` +
           `${verified.rowTotal.toLocaleString()} rows)`
       );
+      if (result.auth?.restored) {
+        const a = result.auth;
+        log.ok(
+          `Auth users restored: ${a.users!.toLocaleString("en-US")} users (${a.identities!.toLocaleString("en-US")} identities)` +
+            (a.triggers!.length ? `; trigger(s) recreated: ${a.triggers!.join(", ")}` : "")
+        );
+        for (const note of [...a.notes!, ...a.manual!.map((m) => `The ${m}.`), AUTH_AFTER_RESTORE]) log.warn(note);
+      }
     } else {
       log.warn("No database target (--database + BACKUPDRILL_TARGET_DATABASE_URL); skipping database restore.");
     }

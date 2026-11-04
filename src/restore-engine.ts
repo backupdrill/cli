@@ -138,6 +138,28 @@ export interface EngineResult {
   committed?: boolean;
 }
 
+/**
+ * 空目标门数的对象(见 restore.ts assertEmptyTarget):这些 schema 里不属于扩展的关系、函数、类型。
+ * schemas 是一个 text[] 表达式(参数 $1::text[] 或字面量数组)。带 Auth 的恢复在事务里锁住之后用同一判据重查
+ */
+export function userObjectCountSql(schemas: string): string {
+  return `(select count(*) from pg_class c join pg_namespace n on n.oid = c.relnamespace
+           where n.nspname = any(${schemas}) and c.relkind in ('r','p','m','v','S','f','c')
+             and not (exists (select 1 from pg_depend d where d.deptype = 'e'
+                                and ((d.classid = 'pg_class'::regclass and d.objid = c.oid)
+                                  -- 扩展建的复合类型(dblink 的 dblink_pkey_results)登记在类型上,不在关系上
+                                  or (d.classid = 'pg_type'::regclass and d.objid = c.reltype)))
+                      and not exists (select 1 from pg_extension e where c.oid = any(e.extconfig))))
+       + (select count(*) from pg_proc p join pg_namespace n on n.oid = p.pronamespace
+           where n.nspname = any(${schemas})
+             and not exists (select 1 from pg_depend d where d.classid = 'pg_proc'::regclass
+                               and d.objid = p.oid and d.deptype = 'e'))
+       + (select count(*) from pg_type t join pg_namespace n on n.oid = t.typnamespace
+           where n.nspname = any(${schemas}) and t.typtype in ('e','d','r')
+             and not exists (select 1 from pg_depend d where d.classid = 'pg_type'::regclass
+                               and d.objid = t.oid and d.deptype = 'e'))`;
+}
+
 /** 恢复完要重建授权的范围与依据:manifest.database.schemas 和 manifest.database.grants。 */
 export interface GrantsToRestore {
   schemas: string[];
@@ -182,7 +204,8 @@ async function deferredForeignKeys(
   bin: string,
   dumpPath: string,
   entries: string[],
-  listDir: string
+  listDir: string,
+  alsoFullyDumped: string[] = []
 ): Promise<{ lines: Set<string>; fks: ForeignKeyDef[]; commentSql?: string }> {
   const none = { lines: new Set<string>(), fks: [] };
   const fkEntries = entries.filter((line) => /^\d+; \d+ \d+ FK CONSTRAINT /.test(line));
@@ -196,7 +219,7 @@ async function deferredForeignKeys(
   await writeFile(tableList, tableEntries.join("\n") + "\n");
   const tableDdl = await pgRestoreOutput(bin, ["-f", "-", `--use-list=${tableList}`, dumpPath]);
   if (tableDdl.code !== 0) return none;
-  const fullyDumped = new Set(parseCreatedTables(tableDdl.stdout).map(tableKey));
+  const fullyDumped = new Set([...parseCreatedTables(tableDdl.stdout).map(tableKey), ...alsoFullyDumped]);
   const listFile = join(listDir, "foreign-keys.list");
   await writeFile(listFile, fkEntries.join("\n") + "\n");
   const ddl = await pgRestoreOutput(bin, ["-f", "-", `--use-list=${listFile}`, dumpPath]);
@@ -893,85 +916,119 @@ async function restoreInOneTransaction(
   grantsToRestore: GrantsToRestore
 ): Promise<{ pass: ClassifiedPass; orphaned?: OrphanedForeignKey[]; committed?: boolean; grants?: GrantRestore }> {
   const fail = (failure: string) => ({ pass: { expectedSkips: 0, failures: [failure] } });
-  const listing = await pgRestoreOutput(bin, ["--list", dumpPath]);
-  if (listing.code !== 0) {
-    return fail(`pg_restore --list exited with code ${listing.code}: ${listing.stderr.trim().replace(/\s+/g, " ").slice(0, 200)}`);
-  }
-  const entries = listing.stdout.split("\n").filter((line) => /^\d+;/.test(line));
   const listDir = await mkdtemp(join(tmpdir(), "backupdrill-restore-"));
   try {
-    // 目录行里的名字和属主之间只隔一个空格,名字本身又可以带空格,拆不准。让 pg_restore 把这几条
-    // 写成 SQL,按顺序读 CREATE SCHEMA 后面的标识符,第 i 条语句就是第 i 行
-    const schemaEntries = entries.filter((line) => /^\d+; \d+ \d+ SCHEMA - /.test(line));
-    const skip = new Set<string>();
-    if (schemaEntries.length) {
-      const schemaList = join(listDir, "schemas.list");
-      await writeFile(schemaList, schemaEntries.join("\n") + "\n");
-      const ddl = await pgRestoreOutput(bin, ["-f", "-", `--use-list=${schemaList}`, dumpPath]);
-      const names = parseCreateSchemas(ddl.stdout);
-      if (ddl.code !== 0 || names.length !== schemaEntries.length) {
-        return fail(`could not read the schema entries in the archive (pg_restore exited with code ${ddl.code})`);
-      }
-      const client = await connectPg(connString);
-      try {
-        const existing = await client.query<{ nspname: string }>(
-          "select nspname from pg_namespace where nspname = any($1::text[])",
-          [names]
-        );
-        const present = new Set(existing.rows.map((row) => row.nspname));
-        schemaEntries.forEach((line, i) => {
-          if (present.has(names[i])) skip.add(line);
-        });
-      } finally {
-        await client.end();
-      }
-    }
-    const deferred = await deferredForeignKeys(bin, dumpPath, entries, listDir);
-    const listFile = join(listDir, "restore.list");
-    await writeFile(
-      listFile,
-      entries.filter((line) => !skip.has(line) && !deferred.lines.has(line)).join("\n") + "\n"
-    );
-    const run = await spawnPgRestore(bin, ["--single-transaction", `--use-list=${listFile}`, ...common], env, childOpts);
+    const prepared = await prepareMainRestore(bin, dumpPath, connString, listDir);
+    if (!prepared.ok) return fail(prepared.failure);
+    const run = await spawnPgRestore(bin, ["--single-transaction", `--use-list=${prepared.listFile}`, ...common], env, childOpts);
     if (run.code === null) return fail(`pg_restore was killed by a signal: ${firstRestoreError(run.stderr)}`);
     if (run.code !== 0) return fail(firstRestoreError(run.stderr));
-    // 授权紧跟着主事务、放在外键前面:提交到这里之间,恢复出来的对象用的是目标的默认授权(pg_restore
-    // 在子进程里,插不进它的事务)。外键那一步更可能失败,不能让它拖住授权
-    let grants: GrantRestore;
-    try {
-      grants = await applyGrants(connString, grantsToRestore);
-    } catch (error) {
-      const fallback = await lockDownAfterGrantFailure(connString, grantsToRestore.schemas);
-      return {
-        pass: {
-          expectedSkips: 0,
-          failures: [`setting grants for the Data API roles failed: ${(error as Error).message}; ${fallback}`],
-        },
-        committed: true,
-      };
-    }
-    if (!deferred.fks.length) return { pass: { expectedSkips: 0, failures: [] }, grants };
-    try {
-      const client = await connectPg(connString);
-      try {
-        const added = await addForeignKeys(client, deferred.fks, {
-          allow: NEVER_MATCH,
-          stopOnError: true,
-          commentSql: deferred.commentSql,
-        });
-        return { pass: { expectedSkips: 0, failures: [] }, orphaned: added.orphaned, grants };
-      } finally {
-        await client.end();
-      }
-    } catch (error) {
-      return {
-        pass: { expectedSkips: 0, failures: [`adding foreign keys failed: ${(error as Error).message}`] },
-        committed: true,
-        grants,
-      };
-    }
+    return await afterCommit(connString, grantsToRestore, prepared.deferred);
   } finally {
     await rm(listDir, { recursive: true, force: true });
+  }
+}
+
+/** 主 dump 要恢复的条目清单(写在 listDir 里),和留到提交之后再加的外键 */
+export type MainRestorePlan =
+  | { ok: true; listFile: string; deferred: Awaited<ReturnType<typeof deferredForeignKeys>> }
+  | { ok: false; failure: string };
+
+/**
+ * 单事务恢复要交给 pg_restore 的清单:目标上已经有的 schema 条目拿掉(见 restoreInOneTransaction),
+ * 两端都在备份里的外键拿掉、留到提交之后加。alsoFullyDumped(tableKey)是同一次恢复里另外整表写进去的表
+ * ——带 Auth 的恢复里的 auth.users、auth.identities:指向它们的外键也留到提交之后,源库的孤儿行建成 NOT VALID
+ */
+export async function prepareMainRestore(
+  bin: string,
+  dumpPath: string,
+  connString: string,
+  listDir: string,
+  opts: { alsoFullyDumped?: string[]; schemasCreatedFirst?: string[] } = {}
+): Promise<MainRestorePlan> {
+  const listing = await pgRestoreOutput(bin, ["--list", dumpPath]);
+  if (listing.code !== 0) {
+    return {
+      ok: false,
+      failure: `pg_restore --list exited with code ${listing.code}: ${listing.stderr.trim().replace(/\s+/g, " ").slice(0, 200)}`,
+    };
+  }
+  const entries = listing.stdout.split("\n").filter((line) => /^\d+;/.test(line));
+  // 目录行里的名字和属主之间只隔一个空格,名字本身又可以带空格,拆不准。让 pg_restore 把这几条
+  // 写成 SQL,按顺序读 CREATE SCHEMA 后面的标识符,第 i 条语句就是第 i 行
+  const schemaEntries = entries.filter((line) => /^\d+; \d+ \d+ SCHEMA - /.test(line));
+  const skip = new Set<string>();
+  if (schemaEntries.length) {
+    const schemaList = join(listDir, "schemas.list");
+    await writeFile(schemaList, schemaEntries.join("\n") + "\n");
+    const ddl = await pgRestoreOutput(bin, ["-f", "-", `--use-list=${schemaList}`, dumpPath]);
+    const names = parseCreateSchemas(ddl.stdout);
+    if (ddl.code !== 0 || names.length !== schemaEntries.length) {
+      return { ok: false, failure: `could not read the schema entries in the archive (pg_restore exited with code ${ddl.code})` };
+    }
+    const client = await connectPg(connString);
+    try {
+      const existing = await client.query<{ nspname: string }>(
+        "select nspname from pg_namespace where nspname = any($1::text[])",
+        [names]
+      );
+      // 同一个事务里先建好的 schema(带 Auth 的恢复在事务开头装扩展,会建扩展所在的 schema)也算已存在
+      const present = new Set([...existing.rows.map((row) => row.nspname), ...(opts.schemasCreatedFirst ?? [])]);
+      schemaEntries.forEach((line, i) => {
+        if (present.has(names[i])) skip.add(line);
+      });
+    } finally {
+      await client.end();
+    }
+  }
+  const deferred = await deferredForeignKeys(bin, dumpPath, entries, listDir, opts.alsoFullyDumped);
+  const listFile = join(listDir, "restore.list");
+  await writeFile(listFile, entries.filter((line) => !skip.has(line) && !deferred.lines.has(line)).join("\n") + "\n");
+  return { ok: true, listFile, deferred };
+}
+
+/**
+ * 主事务提交之后:先补授权,再加留下来的外键。授权紧跟着主事务、放在外键前面:提交到这里之间,恢复出来的
+ * 对象用的是目标的默认授权(主事务插不进别的语句)。外键那一步更可能失败,不能让它拖住授权
+ */
+export async function afterCommit(
+  connString: string,
+  grantsToRestore: GrantsToRestore,
+  deferred: { fks: ForeignKeyDef[]; commentSql?: string }
+): Promise<{ pass: ClassifiedPass; orphaned?: OrphanedForeignKey[]; committed?: true; grants?: GrantRestore }> {
+  // committed 只在提交之后的步骤出错时带上(和拆分之前一样):调用方据此说明"数据已经在目标上了"
+  let grants: GrantRestore;
+  try {
+    grants = await applyGrants(connString, grantsToRestore);
+  } catch (error) {
+    const fallback = await lockDownAfterGrantFailure(connString, grantsToRestore.schemas);
+    return {
+      pass: {
+        expectedSkips: 0,
+        failures: [`setting grants for the Data API roles failed: ${(error as Error).message}; ${fallback}`],
+      },
+      committed: true,
+    };
+  }
+  if (!deferred.fks.length) return { pass: { expectedSkips: 0, failures: [] }, grants };
+  try {
+    const client = await connectPg(connString);
+    try {
+      const added = await addForeignKeys(client, deferred.fks, {
+        allow: NEVER_MATCH,
+        stopOnError: true,
+        commentSql: deferred.commentSql,
+      });
+      return { pass: { expectedSkips: 0, failures: [] }, orphaned: added.orphaned, grants };
+    } finally {
+      await client.end();
+    }
+  } catch (error) {
+    return {
+      pass: { expectedSkips: 0, failures: [`adding foreign keys failed: ${(error as Error).message}`] },
+      committed: true,
+      grants,
+    };
   }
 }
 

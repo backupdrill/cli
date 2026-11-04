@@ -20,6 +20,29 @@ export function resolvePgRestoreBin(): string {
 }
 
 /**
+ * psql 二进制(带 Auth 的恢复由它执行单事务):显式 BACKUPDRILL_PSQL 最高优先;否则和 pg_restore 同目录
+ * (resolvePgRestoreBin 以 pg_restore 结尾时换成 psql),它们是同一个客户端包;推不出来就用 PATH 上的 psql
+ */
+export function resolvePsqlBin(): string {
+  if (process.env.BACKUPDRILL_PSQL) return process.env.BACKUPDRILL_PSQL;
+  const pgRestore = resolvePgRestoreBin();
+  if (/(^|\/)pg_restore$/.test(pgRestore)) return pgRestore.replace(/pg_restore$/, "psql");
+  return "psql";
+}
+
+/** `<工具> --version` 里的完整版本号(17.6 → [17, 6]);拿不到 → null */
+export async function localToolVersion(bin: string): Promise<[number, number] | null> {
+  try {
+    // 有上限:包装脚本之类的东西卡住时,不能把恢复挂在这里
+    const { stdout } = await execFileAsync(bin, ["--version"], { timeout: 10_000 });
+    const match = stdout.match(/\(PostgreSQL\)\s+(\d+)(?:\.(\d+))?/);
+    return match ? [Number(match[1]), Number(match[2] ?? 0)] : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Parse the major version out of `pg_dump --version` output.
  *
  * MUST tolerate a trailing vendor suffix: Homebrew/macOS prints `pg_dump (PostgreSQL) 17.2`, but

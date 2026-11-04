@@ -8,7 +8,8 @@
 //    不把部分恢复表述成完整项目恢复(PRD §2.2 禁用表述)。
 import type { Manifest } from "./manifest.js";
 import { recoveryGrantsSql } from "./grants.js";
-import { manualAuthObjects, plainSchemaName, restorableAuthObjects } from "./auth-backup.js";
+import { plainSchemaName, restorableAuthObjects } from "./auth-backup.js";
+import { authRestoreNotes, CLEAR_PENDING_AUTH_SQL } from "./auth-restore.js";
 
 /** 生成手册所需的非秘密快照坐标。刻意不收连接串/密钥类型——签名即防线。 */
 export interface RecoveryDocContext {
@@ -23,13 +24,6 @@ export interface RecoveryDocContext {
 function quoteSqlIdent(name: string): string {
   return `"${name.replace(/"/g, '""')}"`;
 }
-
-/** 恢复后作废进行中的认证流程(找回密码、邮箱确认、改邮箱/手机号的链接和验证码),与 GoTrue 的 ClearAllPendingTokens 对齐 */
-export const CLEAR_PENDING_AUTH_SQL =
-  "update auth.users set confirmation_token = '', recovery_token = '', email_change_token_new = '', " +
-  "email_change_token_current = '', phone_change_token = '', reauthentication_token = '', " +
-  "email_change = '', phone_change = '', email_change_confirm_status = 0, confirmation_sent_at = null, " +
-  "recovery_sent_at = null, email_change_sent_at = null, phone_change_sent_at = null, reauthentication_sent_at = null;";
 
 const ereEscape = (s: string) => s.replace(/[.[\]{}()*+?^$|\\]/g, "\\$&");
 
@@ -100,33 +94,15 @@ export function renderRecoveryDoc(manifest: Manifest, ctx: RecoveryDocContext): 
   const authObjects = restorable ? restorable.triggers.map((t) => `TRIGGER auth ${t.table} ${t.name}`) : [];
   const authObjectsGrep = authObjects.map((o) => ereEscape(o)).join("|");
   const authNotes = auth
-    ? [
-        auth.passwordHashes!.encrypted > 0
-          ? `- ${auth.passwordHashes!.encrypted} user(s) have password hashes encrypted with the old project's key; they can't sign in with their old password on a new project and need a password reset.`
-          : "",
-        auth.passwordHashes!.unrecognized > 0
-          ? `- ${auth.passwordHashes!.unrecognized} user(s) have password hashes in a format BackupDrill doesn't recognize; whether they can sign in with their old password on a new project is unknown. Be ready to send them a password reset.`
-          : "",
-        auth.ssoUsers! > 0
-          ? `- ${auth.ssoUsers} SSO user(s): their accounts are restored, but SSO providers aren't in this snapshot. Recreating a provider gives it a new ID, so these users may not land on their old accounts.`
-          : "",
-        auth.anonymousUsers! > 0
-          ? `- ${auth.anonymousUsers} anonymous user(s): restored, but an anonymous user can only sign in with the session they had, and sessions aren't in this snapshot.`
-          : "",
-        auth.mfaUsers ? `- ${auth.mfaUsers} user(s) had MFA. MFA factors aren't in this snapshot; those users sign in with one factor until they enroll again. Check what your app allows a user at \`aal1\`.` : "",
-        (auth.grants ?? []).some((g) => ["anon", "authenticated", "service_role", "PUBLIC"].includes(g.grantee))
-          ? `- At backup time the Auth tables had grants to API roles (${[
-              ...new Set(
-                (auth.grants ?? [])
-                  .filter((g) => ["anon", "authenticated", "service_role", "PUBLIC"].includes(g.grantee))
-                  .map((g) => `${g.privilege} on auth.${g.table} to ${g.grantee}`)
-              ),
-            ].join(", ")}). A new project sets its own grants on these tables; add back any you had added yourself.`
-          : "",
-        ...manualAuthObjects({ triggers: auth.triggers!, policies: auth.policies! }, db.schemas).map(
-          (note) => `- The ${note}. Its definition is in \`auth.dump\` (\`pg_restore --section=post-data -f - auth.dump\`).`
-        ),
-      ].filter(Boolean)
+    ? (() => {
+        const { notes, manual } = authRestoreNotes(auth, db.schemas);
+        return [
+          ...notes.map((note) => `- ${note}`),
+          ...manual.map(
+            (note) => `- The ${note}. Its definition is in \`auth.dump\` (\`pg_restore --section=post-data -f - auth.dump\`).`
+          ),
+        ];
+      })()
     : [];
 
   // 2.0 形态:凭据只经环境变量(argv 对全机器可见);写入需要键入目标 ref 确认。
