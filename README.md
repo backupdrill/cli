@@ -336,6 +336,32 @@ Prefer a plain workflow file? [`examples/scheduled-backup.yml`](examples/schedul
 
 Before switching to a **daily** schedule, read the egress-cost section above — every run is egress on your Supabase bill.
 
+## Docker / scheduled backups on your own server
+
+If you'd rather run backups on a machine you already have (a home server, a NAS, Unraid, any Docker host), use the image at `ghcr.io/backupdrill/backupdrill`. It has the CLI and `pg_dump` 17, and nothing else: no credentials are in the image, every setting comes from the same `BACKUPDRILL_*` environment variables listed above.
+
+Set `BACKUPDRILL_CRON` and the container stays up and runs `backupdrill backup` on that schedule. The time zone comes from `TZ` (UTC if unset). A run that's still going when the next one is due makes the next one wait its turn rather than overlap.
+
+```bash
+docker run -d --name backupdrill --restart unless-stopped \
+  -e BACKUPDRILL_CRON="0 3 * * 0" \
+  -e TZ="Europe/Berlin" \
+  -e BACKUPDRILL_DATABASE_URL="postgresql://postgres.<ref>:<pw>@<pooler-host>:5432/postgres" \
+  -e BACKUPDRILL_PROJECT_NAME="my-app" \
+  -e BACKUPDRILL_S3_ENDPOINT="https://<account>.r2.cloudflarestorage.com" \
+  -e BACKUPDRILL_S3_BUCKET="my-backups" \
+  -e BACKUPDRILL_S3_ACCESS_KEY_ID="…" \
+  -e BACKUPDRILL_S3_SECRET_ACCESS_KEY="…" \
+  -e BACKUPDRILL_PING_URL="https://hc-ping.com/<uuid>" \
+  ghcr.io/backupdrill/backupdrill:latest
+```
+
+- Without `BACKUPDRILL_CRON` the container runs one backup and exits with the CLI's exit code, which suits a host cron job or a scheduler you already use.
+- Arguments go straight to the CLI: `docker run --rm -e … ghcr.io/backupdrill/backupdrill estimate` or `… --help`. To start a backup now in a running scheduled container: `docker exec backupdrill backupdrill backup`.
+- An invalid `BACKUPDRILL_CRON` stops the container at start (exit code 64) instead of leaving it idle.
+- `drill` needs Docker to start its throwaway Postgres, and the image doesn't get access to your Docker daemon, so run drills where Docker is available (your machine, or the GitHub Action with `drill: "true"`).
+- Tags: `latest`, the CLI version (e.g. `2.10.0`), and `sha-<commit>`. Images are built for amd64 and arm64.
+
 ## Alerts with Healthchecks.io
 
 A scheduled backup can fail quietly, or not run at all: a cron entry that never fires, a runner that dies, a workflow GitHub disabled. `backup` and `drill` can report every run to a [Healthchecks.io](https://healthchecks.io) check (a self-hosted Healthchecks works the same), and Healthchecks alerts you when a run fails or a success ping doesn't arrive on time.

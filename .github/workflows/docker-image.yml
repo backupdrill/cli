@@ -1,0 +1,102 @@
+# Builds the container image on every PR that touches it, smoke-tests it, and on
+# main publishes it to ghcr.io/backupdrill/backupdrill (latest + the package.json
+# version + the commit SHA). Credentials never enter the image; the only secret
+# used here is the workflow's own GITHUB_TOKEN, to push to GHCR.
+name: docker-image
+
+on:
+  pull_request:
+    paths:
+      - Dockerfile
+      - .dockerignore
+      - docker/**
+      - src/**
+      - package.json
+      - pnpm-lock.yaml
+      - tsconfig.json
+      - .github/workflows/docker-image.yml
+  push:
+    branches: [main]
+    paths:
+      - Dockerfile
+      - .dockerignore
+      - docker/**
+      - src/**
+      - package.json
+      - pnpm-lock.yaml
+      - tsconfig.json
+      - .github/workflows/docker-image.yml
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: docker-image-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  IMAGE: ghcr.io/backupdrill/backupdrill
+
+jobs:
+  image:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build for the smoke test (amd64, local only)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          tags: backupdrill:smoke
+
+      - name: Smoke test
+        run: |
+          set -eu
+          expected="$(node -p 'require("./package.json").version')"
+          actual="$(docker run --rm backupdrill:smoke --version)"
+          test "$actual" = "$expected" || { echo "image says $actual, package.json says $expected"; exit 1; }
+          docker run --rm --entrypoint pg_dump backupdrill:smoke --version | grep -q 'PostgreSQL) 17\.'
+          # an invalid schedule must stop the container instead of idling
+          status=0; docker run --rm -e BACKUPDRILL_CRON="not a cron" backupdrill:smoke || status=$?
+          test "$status" = 64
+          # with no config it must fail fast with the missing-config message
+          status=0; docker run --rm backupdrill:smoke 2>err.txt || status=$?
+          test "$status" != 0 && grep -q BACKUPDRILL_DATABASE_URL err.txt
+
+      - name: Image tags
+        if: github.event_name != 'pull_request'
+        id: tags
+        run: |
+          version="$(node -p 'require("./package.json").version')"
+          {
+            echo "list<<EOF"
+            echo "$IMAGE:latest"
+            echo "$IMAGE:$version"
+            echo "$IMAGE:sha-${GITHUB_SHA::7}"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Log in to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push (amd64 + arm64)
+        if: github.event_name != 'pull_request'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.tags.outputs.list }}
