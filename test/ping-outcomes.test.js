@@ -205,7 +205,7 @@ async function withPostgres(fn) {
     ]);
     await fn(`postgresql://postgres:outcomes@127.0.0.1:${port}/postgres`);
   } finally {
-    await x("docker", ["rm", "-f", id]).catch(() => {});
+    await x("docker", ["rm", "-f", "-v", id]).catch(() => {});
   }
 }
 

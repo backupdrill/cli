@@ -5,12 +5,11 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Client } from "pg";
 import type { Manifest } from "./manifest.js";
-import { manualAuthObjects, restorableAuthObjects } from "./auth-backup.js";
+import { connectCancellable, manualAuthObjects, restorableAuthObjects } from "./auth-backup.js";
 import { parseForeignKeys } from "./dump-sql.js";
 import { addForeignKeys, type OrphanedForeignKey } from "./orphaned-foreign-keys.js";
 import { resolvePgRestoreBin } from "./pgbin.js";
 import { credentialSafeDbArgs, pgRestoreOutput, spawnPgRestore } from "./restore-engine.js";
-import { connectPg } from "./supabase-ca.js";
 import { interrupted } from "./interrupt.js";
 
 /**
@@ -96,6 +95,8 @@ const tocType = (line: string): string | null => /^\d+; \d+ \d+ (.+)$/.exec(line
 
 const SIGNUP_USER_ID = "00000000-0000-4000-8000-00000000d211";
 const SIGNUP_EMAIL = "drill-signup@backupdrill.invalid";
+/** 测试注册不带用户元数据:应用注册时会传、触发器又要用的字段,这次没测到,报告里说清楚 */
+const SIGNUP_TESTED_AS = " (tested as an email sign-up with no user metadata)";
 
 /** 给 NOT NULL 又没有默认值的列造一个合法的值;造不出来返回 null(就不模拟了) */
 function syntheticValue(type: string, column: string): string | null {
@@ -104,6 +105,12 @@ function syntheticValue(type: string, column: string): string | null {
   if (column === "provider") return "'email'";
   if (column === "provider_id") return `'${SIGNUP_USER_ID}'`;
   if (column === "identity_data") return `jsonb_build_object('sub', '${SIGNUP_USER_ID}', 'email', '${SIGNUP_EMAIL}')`;
+  // 和 GoTrue 邮箱注册那条 INSERT 一样(internal/api/signup.go):AFTER INSERT 触发器看到的就是这些。
+  // app 元数据在插入前就写好了 provider;用户元数据只有客户端随注册传的 data,不传就是 {}——
+  // sub、email、email_verified 是同一事务里稍后 UPDATE 进去的,插入那一刻还没有
+  if (column === "raw_app_meta_data") return `jsonb_build_object('provider', 'email', 'providers', jsonb_build_array('email'))`;
+  if (column === "raw_user_meta_data") return "'{}'::jsonb";
+  if (column === "created_at" || column === "updated_at") return "now()";
   if (/^uuid$/.test(type)) return "'00000000-0000-4000-8000-000000000001'::uuid";
   if (/^(text|character varying|character)\b/.test(type)) return "'drill'";
   if (/^jsonb?$/.test(type)) return "'{}'";
@@ -125,8 +132,8 @@ async function insertStatement(client: Client, table: "users" | "identities"): P
   // 一次正常注册会写的几列总带上;再补齐所有必填列
   const wanted = new Set(
     table === "users"
-      ? ["id", "email", "raw_user_meta_data", "raw_app_meta_data", "aud", "role"]
-      : ["user_id", "provider", "provider_id", "identity_data"]
+      ? ["id", "email", "raw_user_meta_data", "raw_app_meta_data", "aud", "role", "created_at", "updated_at"]
+      : ["user_id", "provider", "provider_id", "identity_data", "created_at", "updated_at"]
   );
   const names: string[] = [];
   const values: string[] = [];
@@ -148,9 +155,17 @@ export async function runAuthDrill(
   sandboxConnString: string,
   manifest: Manifest,
   mainDumpPath: string,
-  authDump: AuthDumpForDrill
+  authDump: AuthDumpForDrill,
+  signal?: AbortSignal
 ): Promise<AuthDrillReport> {
   const auth = manifest.auth!;
+  // 这一节的所有会话都带上 application_name,超时时 authDrillSection 只终止它们
+  sandboxConnString = taggedUrl(sandboxConnString);
+  // 叫停(超时)之后:不再开始任何新的一步;已经开着的连接被 connectCancellable 直接断开,
+  // 正在跑的 pg_restore 被 spawnPgRestore 停掉。服务端还没收手的会话由 authDrillSection 事后终止
+  const stopIfCancelled = () => {
+    if (signal?.aborted) throw new Error("the Auth check was stopped");
+  };
   if (authDump.error || !authDump.path) {
     return { status: "not_checked", summary: authDump.error ?? "the Auth archive couldn't be downloaded" };
   }
@@ -165,11 +180,14 @@ export async function runAuthDrill(
   const bin = resolvePgRestoreBin();
   const { url, env } = credentialSafeDbArgs(sandboxConnString);
   const work = await mkdtemp(join(tmpdir(), "backupdrill-auth-drill-"));
-  // connectPg 挂好了错误监听:沙箱连接被掐断时不会把整个进程(托管 worker)带走
-  const client = await connectPg(sandboxConnString);
-  // 每条语句都有上限(整段另有总时限,见 authDrillSection)
-  await client.query("set statement_timeout = '5min'; set lock_timeout = '1min'");
+  let client: Client | undefined;
   try {
+    // connectCancellable 挂好了错误监听(沙箱连接被掐断时不会把托管 worker 带走),叫停时直接断开
+    stopIfCancelled();
+    client = await connectCancellable(sandboxConnString, signal);
+    stopIfCancelled();
+    // 每条语句都有上限(整段另有总时限,见 authDrillSection)
+    await client.query("set statement_timeout = '5min'; set lock_timeout = '1min'");
     // ── 1. 两张表:结构、数据、约束、索引;触发器和策略留到外键之后 ──
     // 新项目里这两张表的属主是平台的 supabase_auth_admin,GoTrue 也用它注册用户:沙箱里照建
     await client.query(`do $$ begin
@@ -178,7 +196,8 @@ export async function runAuthDrill(
       end if; end $$;
       create schema if not exists auth;
       grant usage on schema auth to supabase_auth_admin`);
-    const listing = await pgRestoreOutput(bin, ["--list", authDump.path]);
+    stopIfCancelled();
+    const listing = await pgRestoreOutput(bin, ["--list", authDump.path], { signal });
     if (listing.code !== 0) {
       return { status: "problems", summary: `Auth archive couldn't be listed: ${safeRestoreError(listing.code, listing.stderr)}` };
     }
@@ -189,10 +208,12 @@ export async function runAuthDrill(
       // 触发器、策略和它们的注释都留到后面(注释先于对象执行会让整个恢复中止);注释不影响功能,干脆不建
       entries.filter((l) => !/^(TRIGGER|POLICY) |^COMMENT \S+ (TRIGGER|POLICY) /.test(tocType(l) ?? "")).join("\n") + "\n"
     );
+    stopIfCancelled();
     const restored = await spawnPgRestore(
       bin,
       ["--no-owner", "--no-privileges", "--exit-on-error", "--single-transaction", `--use-list=${tablesList}`, "--dbname", url, authDump.path],
-      env
+      env,
+      { supabaseHost: false, signal }
     );
     if (restored.code !== 0) {
       return { status: "problems", summary: `the Auth tables couldn't be restored: ${safeRestoreError(restored.code, restored.stderr)}` };
@@ -210,7 +231,8 @@ export async function runAuthDrill(
     }
 
     // ── 2. 之前因为沙箱没有 auth 表而跳过的外键:现在补上 ──
-    const mainListing = await pgRestoreOutput(bin, ["--list", mainDumpPath]);
+    stopIfCancelled();
+    const mainListing = await pgRestoreOutput(bin, ["--list", mainDumpPath], { signal });
     let foreignKeys: AuthDrillReport["foreignKeys"] = { created: 0, orphaned: [], failed: [] };
     if (mainListing.code !== 0) problems.push("the database archive couldn't be listed, so its foreign keys into the Auth tables weren't checked");
     if (mainListing.code === 0) {
@@ -218,7 +240,8 @@ export async function runAuthDrill(
       if (fkEntries.length) {
         const fkList = join(work, "fks.list");
         await writeFile(fkList, fkEntries.join("\n") + "\n");
-        const ddl = await pgRestoreOutput(bin, ["-f", "-", `--use-list=${fkList}`, mainDumpPath]);
+        stopIfCancelled();
+        const ddl = await pgRestoreOutput(bin, ["-f", "-", `--use-list=${fkList}`, mainDumpPath], { signal });
         const parsed = ddl.code === 0 ? parseForeignKeys(ddl.stdout) : [];
         // 读不全外键定义(命令失败,或有定义没解析出来)时不能说"全部对上":把没能检查的条数记下来
         if (parsed.length !== fkEntries.length) {
@@ -243,7 +266,8 @@ export async function runAuthDrill(
         const missing = intoAuth.filter((fk) => !existing.has(`${fk.table.schema}.${fk.table.name}.${fk.constraint}`));
         if (missing.length) {
           // addForeignKeys 会改这条连接的会话设置(search_path 等),给它单独一条
-          const fkClient = await connectPg(sandboxConnString);
+          stopIfCancelled();
+          const fkClient = await connectCancellable(sandboxConnString, signal);
           try {
             const added = await addForeignKeys(fkClient, missing, { allow: /(?!)/, stopOnError: false });
             foreignKeys = {
@@ -273,7 +297,11 @@ export async function runAuthDrill(
       }
       const list = join(work, `trigger-${t.name}.list`);
       await writeFile(list, entry + "\n");
-      const made = await spawnPgRestore(bin, ["--no-owner", "--no-privileges", "--exit-on-error", `--use-list=${list}`, "--dbname", url, authDump.path], env);
+      stopIfCancelled();
+      const made = await spawnPgRestore(bin, ["--no-owner", "--no-privileges", "--exit-on-error", `--use-list=${list}`, "--dbname", url, authDump.path], env, {
+        supabaseHost: false,
+        signal,
+      });
       if (made.code === 0) triggers.created.push(t.name);
       else triggers.failed.push(`${t.name}: ${safeRestoreError(made.code, made.stderr)}`);
     }
@@ -297,6 +325,7 @@ export async function runAuthDrill(
       }
     }
 
+    stopIfCancelled();
     // ── 4. 以 GoTrue 的身份(supabase_auth_admin,非超级用户)模拟一次邮箱注册,事后回滚 ──
     let signup: NonNullable<AuthDrillReport["signup"]> = { ran: false, detail: "no triggers of your own on the Auth tables" };
     if (triggers.created.length) {
@@ -321,7 +350,7 @@ export async function runAuthDrill(
             /PL\/pgSQL function|SQL function|trigger/i.test(e.where ?? "") ||
             ["23503", "23505", "42501", "42883", "42P01", "42703", "3F000", "P0001"].includes(e.code ?? "");
           signup = triggerPath
-            ? { ran: true, ok: false, detail: `a new sign-up would fail: ${safeError(e)}` }
+            ? { ran: true, ok: false, detail: `a new sign-up would fail: ${safeError(e)}${SIGNUP_TESTED_AS}` }
             : { ran: false, detail: `couldn't simulate a sign-up: ${safeError(e)}` };
         } finally {
           await client.query("rollback").catch(() => {});
@@ -352,9 +381,44 @@ export async function runAuthDrill(
       signup,
     };
   } finally {
-    await client.end().catch(() => {});
+    await client?.end().catch(() => {});
     await rm(work, { recursive: true, force: true }).catch(() => {});
   }
+}
+
+/** Auth 这一节在沙箱里开的每个会话(查询连接、pg_restore)都带这个名字,超时时只终止它们 */
+const AUTH_DRILL_APP_NAME = "backupdrill-auth-drill";
+
+function taggedUrl(connString: string): string {
+  const url = new URL(connString);
+  url.searchParams.set("application_name", AUTH_DRILL_APP_NAME);
+  return url.toString();
+}
+
+/**
+ * 终止 Auth 这一节在沙箱里开的会话(按 application_name 认),别人的会话不动。
+ * 整个过程(连接、查询、断开)有硬时限:到点直接销毁 socket,沙箱没回应也挂不住进程
+ */
+export async function stopAuthSessions(sandboxConnString: string, deadlineMs = 10_000): Promise<void> {
+  try {
+    const client = await connectCancellable(sandboxConnString, AbortSignal.timeout(deadlineMs));
+    try {
+      await client.query(
+        "select pg_terminate_backend(pid) from pg_stat_activity where application_name = $1 and pid <> pg_backend_pid()",
+        [AUTH_DRILL_APP_NAME]
+      );
+    } finally {
+      await client.end().catch(() => {});
+    }
+  } catch {
+    // 沙箱可能已经不在了,或者到点了:没什么能再做的
+  }
+}
+
+async function waitAtMost(p: Promise<unknown>, ms: number): Promise<void> {
+  let t: NodeJS.Timeout | undefined;
+  await Promise.race([p.then(() => {}, () => {}), new Promise<void>((resolve) => (t = setTimeout(resolve, ms)))]);
+  clearTimeout(t);
 }
 
 /** Auth 这一节最多花多久(下载等待 + 恢复两张表 + 外键 + 触发器 + 模拟注册);到点记 not_checked */
@@ -374,17 +438,30 @@ export async function authDrillSection(
 ): Promise<AuthDrillReport | undefined> {
   if (manifest.auth?.status !== "included" || !authDump) return undefined;
   if (interrupted()) return undefined;
-  const work = (async () => runAuthDrill(sandboxConnString, manifest, mainDumpPath, await authDump))();
+  const cancel = new AbortController();
+  const work = (async () => runAuthDrill(sandboxConnString, manifest, mainDumpPath, await authDump, cancel.signal))();
   work.catch(() => {});
+  const timedOut: AuthDrillReport = {
+    status: "not_checked",
+    summary: `the Auth check didn't finish within ${AUTH_DRILL_LIMITS.totalMs / 60000} minutes`,
+  };
   let timer: NodeJS.Timeout | undefined;
   try {
     return await Promise.race([
       work,
       new Promise<AuthDrillReport>((resolve) => {
         timer = setTimeout(() => {
-          // 下载停掉;数据库那边的活随沙箱销毁一起断开
+          // 超时结果立刻返回,收尾放到后台、每一步都有时限,绝不让演练等它:
+          //  - 叫停:不再开始任何新的一步,自己的连接当场断开,自己的 pg_restore 当场停掉;下载停掉;
+          //  - 等这一节真正退出(那之后它不会再开任何连接),再把服务端还没收手的会话终止掉
+          //    (比如还在等锁的语句)——--keep 留下的沙箱事后不会再被改动
+          cancel.abort();
           stopDownload?.();
-          resolve({ status: "not_checked", summary: `the Auth check didn't finish within ${AUTH_DRILL_LIMITS.totalMs / 60000} minutes` });
+          void (async () => {
+            await waitAtMost(work, 10_000);
+            await stopAuthSessions(sandboxConnString);
+          })();
+          resolve(timedOut);
         }, AUTH_DRILL_LIMITS.totalMs);
       }),
     ]);

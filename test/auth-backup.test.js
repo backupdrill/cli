@@ -619,7 +619,7 @@ test(
         assert.equal(idle.rows[0].n, 0);
       });
     } finally {
-      for (const id of ids) await x("docker", ["rm", "-f", id]).catch(() => {});
+      for (const id of ids) await x("docker", ["rm", "-f", "-v", id]).catch(() => {});
       if (existsSync(work)) rmSync(work, { recursive: true, force: true });
     }
   }

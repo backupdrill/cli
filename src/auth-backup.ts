@@ -94,19 +94,28 @@ export function schemasMayIncludeAuth(schemas: string[]): boolean {
  * 连库,但能被 signal 随时打断:到点时直接断开连接,不管它还在连接池里排队、还是正在跑查询。
  * Auth 这两条连接都在主 dump 之前用,绝不能让它们占着连接、把数据库备份堵在后面。
  */
-async function connectCancellable(databaseUrl: string, signal?: AbortSignal): Promise<pg.Client> {
+export async function connectCancellable(databaseUrl: string, signal?: AbortSignal): Promise<pg.Client> {
   if (signal?.aborted) throw new Error("stopped by the caller");
   // 握手最多 20 秒:连接池排队、网络卡住时不能一直挂着,更不能让 CLI 进程在备份做完后迟迟退不出去
   const client = new pg.Client({ ...pgConnectOptions(databaseUrl), connectionTimeoutMillis: 20_000 });
   attachPgErrorGuard(client);
+  let connected = false;
   const onAbort = () => {
-    // end() 在握手中途是优雅关闭,可能一直等;直接把底层 socket 销毁
-    (client as unknown as { connection?: { stream?: { destroy(): void } } }).connection?.stream?.destroy();
+    const stream = (client as unknown as { connection?: { stream?: { destroy(error?: Error): void } } }).connection?.stream;
+    if (!connected) {
+      // 握手中途:带着错误销毁 socket,connect() 随之 reject。不能先调 end():它把 client 标成
+      // "主动结束",node-pg 之后就不再回调 connect(),connect() 永远等不到结果
+      stream?.destroy(new Error("stopped by the caller"));
+      return;
+    }
+    // 连上之后:直接销毁 socket,进行中的查询随之 reject(end() 在握手后是优雅关闭,对方不回应就一直等)
+    stream?.destroy();
     void client.end().catch(() => {});
   };
   signal?.addEventListener("abort", onAbort, { once: true });
   try {
     await client.connect();
+    connected = true;
   } catch (error) {
     signal?.removeEventListener("abort", onAbort);
     throw error;

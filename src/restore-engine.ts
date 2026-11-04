@@ -331,10 +331,12 @@ export function spawnPgRestore(
   bin: string,
   args: string[],
   extraEnv: NodeJS.ProcessEnv = {},
-  opts: { supabaseHost: boolean; urlSslMode?: string | null } = { supabaseHost: false }
+  opts: { supabaseHost: boolean; urlSslMode?: string | null; signal?: AbortSignal } = { supabaseHost: false }
 ): Promise<{ code: number | null; stderr: string }> {
   // 收到信号之后不再起新的一遍(两遍恢复、并行建索引后的重跑都是一个接一个起的)
   if (interrupted()) return Promise.reject(new Error("interrupted; not starting pg_restore"));
+  // 调用方叫停(演练的 Auth 检查超时):已叫停就不起,起了就停掉。不传 signal 的调用方行为不变
+  if (opts.signal?.aborted) return Promise.reject(new Error("stopped by the caller; not starting pg_restore"));
   return new Promise((resolve, reject) => {
     const proc = spawn(bin, args, {
       stdio: ["ignore", "ignore", "pipe"],
@@ -342,6 +344,9 @@ export function spawnPgRestore(
     });
     // `kill <pid>` 只发给 node 时 pg_restore 收不到;中断时由我们停掉它
     stopOnInterrupt(proc);
+    const stopOnAbort = () => proc.kill("SIGTERM");
+    opts.signal?.addEventListener("abort", stopOnAbort, { once: true });
+    proc.once("close", () => opts.signal?.removeEventListener("abort", stopOnAbort));
     let stderr = "";
     proc.stderr.setEncoding("utf8");
     proc.stderr.on("data", (d: string) => (stderr += d));
@@ -810,9 +815,15 @@ export function splitPostDataList(listing: string): { indexBuilds: string[]; res
 }
 
 /** 不连库的 pg_restore(--list、-f - 出 SQL),整段收集 stdout。只用于目录和 DDL 这类小输出。 */
-export function pgRestoreOutput(bin: string, args: string[]): Promise<{ code: number | null; stdout: string; stderr: string }> {
+export function pgRestoreOutput(
+  bin: string,
+  args: string[],
+  opts: { signal?: AbortSignal } = {}
+): Promise<{ code: number | null; stdout: string; stderr: string }> {
   // 和 spawnPgRestore 一样:收到信号之后不再起,起了的中断时停掉(并行演练里读目录的那一步也是它)
   if (interrupted()) return Promise.reject(new Error("interrupted; not starting pg_restore"));
+  // 调用方叫停同理;不传 signal 的调用方行为不变
+  if (opts.signal?.aborted) return Promise.reject(new Error("stopped by the caller; not starting pg_restore"));
   return new Promise((resolve, reject) => {
     // 只读归档、不连库,但同样钉 C locale,和恢复子进程一致
     const proc = spawn(bin, args, {
@@ -820,6 +831,9 @@ export function pgRestoreOutput(bin: string, args: string[]): Promise<{ code: nu
       env: libpqChildEnv(),
     });
     stopOnInterrupt(proc);
+    const stopOnAbort = () => proc.kill("SIGTERM");
+    opts.signal?.addEventListener("abort", stopOnAbort, { once: true });
+    proc.once("close", () => opts.signal?.removeEventListener("abort", stopOnAbort));
     let stdout = "";
     let stderr = "";
     // 按流解码:一个多字节字符可能被拆在两块里,逐块 toString 会把它解坏(schema 名里的中文就会对不上)
