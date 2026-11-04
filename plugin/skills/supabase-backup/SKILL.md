@@ -7,7 +7,9 @@ description: Use when the user wants to back up a Supabase project to their own 
 
 backupdrill is an open-source (MIT) command-line tool. `backup` dumps the project's Postgres database with `pg_dump`, copies Storage files too once their S3 keys are set, and writes everything to a bucket the user owns, with a checksummed `manifest.json` and a `RECOVERY.md` in every snapshot. `drill` restores a snapshot into a throwaway Postgres in Docker and checks that it came back. The CLI runs on the user's machine. It talks to their Supabase project, their bucket and the local Docker daemon, and sends nothing to BackupDrill.
 
-Always run it as `npx -y backupdrill@2.10.0 <command>`, so every run uses the same version.
+Always run it as `npx -y backupdrill@2.10.0 <command>`, so every run uses the same version. Every command and option is documented at [backupdrill.com/docs/cli](https://backupdrill.com/docs/cli); check there before using an option this skill doesn't mention.
+
+If the user asks what Supabase already backs up on their plan, wants a plain `pg_dump` backup without the CLI, or wants to test a restore by hand, read [references/postgres-backup-basics.md](references/postgres-backup-basics.md).
 
 You need a shell on the user's machine for this. If you don't have one, walk the user through the same commands instead of running them.
 
