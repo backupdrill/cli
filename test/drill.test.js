@@ -92,7 +92,7 @@ test(
       bytes = buf.length;
       sha = createHash("sha256").update(buf).digest("hex");
     } finally {
-      await x("docker", ["rm", "-f", id]).catch(() => {});
+      await x("docker", ["rm", "-f", "-v", id]).catch(() => {});
     }
 
     // 注意:故意不带 extensions 字段 = 0.1.1 及更早的旧 manifest,行为必须不变
@@ -232,7 +232,7 @@ test(
       assert.equal(running.trim(), "true", "kept sandbox container must still be running");
     } finally {
       // 断言失败也不能把容器留在机器上(xreview:测试自身不许泄漏沙箱)
-      await x("docker", ["rm", "-f", kept.keptSandbox.containerId]).catch(() => {});
+      await x("docker", ["rm", "-f", "-v", kept.keptSandbox.containerId]).catch(() => {});
     }
 
     // 8. 异常路径 + --keep:恢复抛出时报告不存在,沙箱坐标必须并入错误信息
@@ -248,7 +248,7 @@ test(
     assert.match(thrown.message, /sandbox kept: postgresql:/);
     const keptId = thrown.message.match(/docker rm -f ([0-9a-f]+)/)?.[1];
     assert.ok(keptId, "error message must carry the container id");
-    await x("docker", ["rm", "-f", keptId]).catch(() => {});
+    await x("docker", ["rm", "-f", "-v", keptId]).catch(() => {});
   }
 );
 
@@ -297,7 +297,7 @@ test(
       bytes = buf.length;
       sha = createHash("sha256").update(buf).digest("hex");
     } finally {
-      await x("docker", ["rm", "-f", id]).catch(() => {});
+      await x("docker", ["rm", "-f", "-v", id]).catch(() => {});
     }
 
     const manifest = {

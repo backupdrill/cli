@@ -275,7 +275,7 @@ test(
       assert.equal(drill.grants.mode, "recorded");
       assert.deepEqual(await grantsOf(target(sandboxPort)), source);
     } finally {
-      await Promise.all(ids.map((id) => x("docker", ["rm", "-f", id]).catch(() => {})));
+      await Promise.all(ids.map((id) => x("docker", ["rm", "-f", "-v", id]).catch(() => {})));
       rmSync(work, { recursive: true, force: true });
     }
   }
@@ -446,7 +446,7 @@ test(
         anon_reads_notes: true,
       });
     } finally {
-      await Promise.all(ids.map((id) => x("docker", ["rm", "-f", id]).catch(() => {})));
+      await Promise.all(ids.map((id) => x("docker", ["rm", "-f", "-v", id]).catch(() => {})));
       rmSync(work, { recursive: true, force: true });
     }
   }
@@ -590,7 +590,7 @@ test(
       assert.ok(extensionAclBefore, "the target's defaults gave the extension function an ACL");
       assert.equal(await similarityAcl(), extensionAclBefore);
     } finally {
-      await Promise.all(ids.map((id) => x("docker", ["rm", "-f", id]).catch(() => {})));
+      await Promise.all(ids.map((id) => x("docker", ["rm", "-f", "-v", id]).catch(() => {})));
       rmSync(work, { recursive: true, force: true });
     }
   }
@@ -638,7 +638,7 @@ test(
       const after = await withClient(admin, (client) => captureGrants(client, ["public"]));
       assert.deepEqual(find(after, "table", "t").privileges, {});
     } finally {
-      await Promise.all(ids.map((id) => x("docker", ["rm", "-f", id]).catch(() => {})));
+      await Promise.all(ids.map((id) => x("docker", ["rm", "-f", "-v", id]).catch(() => {})));
     }
   }
 );

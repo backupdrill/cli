@@ -365,7 +365,7 @@ id" uuid references auth.users (id) on delete set null)`);
         assert.match(report.auth.summary, /backup counted 5 \/ 4/);
       });
     } finally {
-      for (const id of ids) await x("docker", ["rm", "-f", id]).catch(() => {});
+      for (const id of ids) await x("docker", ["rm", "-f", "-v", id]).catch(() => {});
     }
   }
 );

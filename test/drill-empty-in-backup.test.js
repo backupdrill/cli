@@ -143,8 +143,8 @@ test(
         "restored empty despite manifest rows: public.drained, public.kept, public.kept_mv, public.cr\rname, public.tricky"
       );
     } finally {
-      await x("docker", ["rm", "-f", source.id]).catch(() => {});
-      if (target) await x("docker", ["rm", "-f", target.id]).catch(() => {});
+      await x("docker", ["rm", "-f", "-v", source.id]).catch(() => {});
+      if (target) await x("docker", ["rm", "-f", "-v", target.id]).catch(() => {});
       rmSync(tmp, { recursive: true, force: true });
     }
   }
