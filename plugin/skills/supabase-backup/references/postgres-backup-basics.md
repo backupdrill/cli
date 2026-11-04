@@ -8,7 +8,7 @@ Read this when the user asks what Supabase already backs up for them, wants a pl
 - **Pro and Team:** daily backups, kept 7 days on Pro and 14 on Team, restorable from the dashboard. On the physical backup process that current projects use they can't be downloaded. Point-in-time recovery is a paid add-on: about $100/month per project for 7 days of history, and it needs a Small compute add-on or larger.
 - **Storage files are not in any database backup.** A database restore brings back the `storage.objects` rows, which only point at files. The files themselves need a separate copy (the CLI copies them once the Storage S3 keys are set).
 
-Every backup taken from outside the project counts as egress on the user's Supabase bill. Free includes 5 GB a month, shared with whatever the app already serves. Each run transfers roughly the size of the data it dumps. At the Free plan's 500 MB database limit, that is about 2 GB a month for weekly backups and about 15 GB for daily ones, three times the allowance.
+Every backup taken from outside the project counts as egress on the user's Supabase bill. Free includes 5 GB a month, shared with whatever the app already serves. Run `backupdrill estimate --plan free` for the real figure. As a rough guide, if each run transfers 500 MB (the Free database limit), weekly backups use about 2 GB a month and daily ones about 15 GB, three times the allowance.
 
 ## Use the Session pooler connection string
 
@@ -28,13 +28,15 @@ aws-0-<region>.pooler.supabase.com:5432:postgres:postgres.<project-ref>:<passwor
 ```
 
 ```sh
-export DB_URL="postgresql://postgres.<project-ref>@aws-0-<region>.pooler.supabase.com:5432/postgres"
+export DB_URL="postgresql://postgres.<project-ref>@aws-0-<region>.pooler.supabase.com:5432/postgres?sslmode=require"
 export BACKUP_FILE="backup-$(date +%Y%m%dT%H%M%S).dump"
 
-pg_dump "$DB_URL" --format=custom --schema=public --file="$BACKUP_FILE" \
+# umask 077 in a subshell: the dump is production data, so only the user can read it
+( umask 077 && pg_dump "$DB_URL" --format=custom --schema=public --file="$BACKUP_FILE" ) \
 && pg_restore --list "$BACKUP_FILE" > /dev/null && echo "archive is readable"
 ```
 
+- `sslmode=require` encrypts the connection. To also check the server's certificate, download the CA certificate from the project's database settings (SSL Configuration) and use `sslmode=verify-full&sslrootcert=<path to the certificate>`.
 - `--format=custom` writes an archive that only `pg_restore` reads; it allows selective and parallel restores. A plain-text dump goes through `psql` instead.
 - `--schema=public` leaves out Supabase-managed schemas, including `auth`, so Auth users aren't in this file. Add `--schema=<name>` for each of the app's own schemas.
 - Never ask for the password in the chat. With the CLI, it lives in `.env.backupdrill` as `SKILL.md` describes.
@@ -75,9 +77,9 @@ psql "$TEST_DB" -c "select count(*) from public.<a table that must never be empt
 
 When you're done, remove only the container you started: `docker rm -f "$cid"`.
 
-- `pg_restore` keeps going after an error and prints how many it ignored at the end. Treat any ignored error as a failed test and read the first one.
+- `pg_restore` keeps going after an error and prints how many it ignored at the end. Read every error. The one expected failure is a foreign key to `auth.users` (a `profiles` table usually has one): this dump has no Auth users, so the constraint can't be created here. Anything else is a failed test.
 - Compare the table count and a few row counts with the same queries on production. For a table that only grows, `max(created_at)` shows how recent the backup is.
-- If the schema uses extensions, the restore fails on the first object that needs one the container doesn't have. Install it in the container first, or run the CLI's drill, which installs the extensions recorded in the snapshot's manifest before restoring.
+- If the schema uses extensions, the restore fails on the first object that needs one the container doesn't have. Install the missing extension in the container first. The CLI's drill tries to install the extensions listed in the snapshot's manifest and reports any its container can't install; a restore can still fail on those.
 
 ## What the CLI adds
 
