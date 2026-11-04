@@ -65,7 +65,7 @@ jobs:
           test "$actual" = "$expected" || { echo "image says $actual, package.json says $expected"; exit 1; }
           docker run --rm --entrypoint pg_dump backupdrill:smoke --version | grep -q 'PostgreSQL) 17\.'
           # an invalid schedule (including a comment or VAR=value line) must stop the container instead of idling
-          for schedule in "not a cron" "# off" "FOO=bar" "0 3 * *" "@daily extra" "0 3 * * 0 #off"; do
+          for schedule in "not a cron" "# off" "FOO=bar" "0 3 * *" "@daily extra" "0 3 * * 0 #off" "0 3 * * * foo"; do
             status=0; docker run --rm -e BACKUPDRILL_CRON="$schedule" backupdrill:smoke || status=$?
             test "$status" = 64 || { echo "schedule '$schedule' exited $status, expected 64"; exit 1; }
           done

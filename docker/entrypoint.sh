@@ -22,9 +22,10 @@ case "$BACKUPDRILL_CRON" in
     ;;
 esac
 
-# supercronic -test alone would accept a comment ("# off") or a VAR=value line and
-# then sit there with no job, so backups would silently never run. Only allow cron
-# syntax: a descriptor like @daily, or 5 to 7 fields made of cron characters.
+# supercronic -test alone would accept a comment ("# off"), a VAR=value line, or
+# "0 3 * * * foo" (it reads the 6th word as the start of the command), and the
+# container would then run something other than the backup, or nothing. So only
+# standard cron is allowed: a descriptor like @daily, or exactly 5 fields.
 invalid_schedule() {
   echo "BACKUPDRILL_CRON is not a valid cron expression: \"$BACKUPDRILL_CRON\"" >&2
   exit 64
@@ -49,7 +50,7 @@ for field in "$@"; do
 done
 case "$1" in
   @*) [ "$#" -eq 1 ] || invalid_schedule ;;
-  *) { [ "$#" -ge 5 ] && [ "$#" -le 7 ]; } || invalid_schedule ;;
+  *) [ "$#" -eq 5 ] || invalid_schedule ;;
 esac
 
 crontab_file="$(mktemp)"
