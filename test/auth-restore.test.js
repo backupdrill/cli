@@ -64,6 +64,19 @@ test(
       const port = await startPostgres(ids);
       const admin = `postgresql://postgres:pw@127.0.0.1:${port}/postgres`;
       await sql(admin, SETUP);
+      // 一个装在 public 里、自带配置表的扩展(pg_extension_config_dump):恢复把它装在事务里,
+      // 锁内重查不能把它的配置表当成"目标不空";失败时它随事务回滚,下面每个"目标原样不动"的检查都数 public 里的表
+      const extDir = mkdtempSync(join(work, "ext-"));
+      writeFileSync(join(extDir, "bd_cfg.control"), "default_version = '1.0'\nrelocatable = false\nschema = public\nsuperuser = true\n");
+      writeFileSync(
+        join(extDir, "bd_cfg--1.0.sql"),
+        "create table bd_cfg_settings (k text primary key, v text);\nselect pg_catalog.pg_extension_config_dump('bd_cfg_settings', '');\n"
+      );
+      const shareDir = (await x("docker", ["exec", ids[0], "pg_config", "--sharedir"])).stdout.trim();
+      for (const file of ["bd_cfg.control", "bd_cfg--1.0.sql"]) {
+        await x("docker", ["cp", join(extDir, file), `${ids[0]}:${shareDir}/extension/${file}`]);
+      }
+      await sql(admin, "create extension bd_cfg; insert into public.bd_cfg_settings values ('mode', 'kept');");
       // 一张表的外键指向 auth.users,源库里却有一行找不到用户(绕过外键写进去的,外键本身是有效的):
       // 恢复后这条外键建成 NOT VALID,数据一行不少,报告里列出来
       await sql(admin, `
@@ -143,6 +156,8 @@ test(
           links_fk: 1, // 指向 auth.identities 的外键也建了
         });
         assert.deepEqual(result.orphanedForeignKeys.map((o) => o.constraint), ["notes_owner_fkey"]);
+        const ext = await sql(target, "select extname from pg_extension where extname = 'bd_cfg'");
+        assert.equal(ext.rows.length, 1, "the extension is installed in the restore transaction");
         // 补建的触发器在:新注册的用户有 profile
         await sql(target, "insert into auth.users (id, email) values ('55555555-5555-5555-5555-555555555555', 'new@example.test')");
         const profile = await sql(target, "select name from public.profiles where id = '55555555-5555-5555-5555-555555555555'");
@@ -204,7 +219,13 @@ test(
         const blocker = (tag) => `
           create schema test_blockers;
           create function test_blockers.block() returns event_trigger language plpgsql as $$
-          begin raise exception 'blocked for the test'; end $$;
+          begin
+            -- 只挡应用的表和触发器;扩展自己的配置表照常建
+            if exists (select 1 from pg_event_trigger_ddl_commands()
+                        where object_identity = 'public.profiles' or command_tag = 'CREATE TRIGGER') then
+              raise exception 'blocked for the test';
+            end if;
+          end $$;
           create event trigger block_it on ddl_command_end when tag in ('${tag}') execute function test_blockers.block();`;
         for (const [tag, stage] of [["CREATE TABLE", "restoring the database"], ["CREATE TRIGGER", "recreating your triggers on the Auth tables"]]) {
           const target = await freshTarget(blocker(tag));
@@ -230,6 +251,31 @@ test(
         );
         assert.deepEqual(await targetState(target), EMPTY);
         assert.equal((await restore(target)).auth.restored, true);
+      });
+
+      await t.test("pg_restore output without \\restrict is never handed to psql", async () => {
+        const target = await freshTarget();
+        // 生成应用数据那一段时把 \restrict 那一行去掉:没有受限模式,归档里混进来的 psql 元命令就会被执行
+        const fake = wrapper(
+          "pg_restore",
+          `case "$*" in *restore.list*) "${realPgRestore}" "$@" | grep -v '^\\\\restrict '; exit 0;; esac\nexec "${realPgRestore}" "$@"`
+        );
+        await withEnv({ BACKUPDRILL_PG_RESTORE: fake, BACKUPDRILL_PSQL: realPsql }, () =>
+          assert.rejects(restore(target), /output for the database didn't start with \\restrict, so it wasn't passed to psql[\s\S]*rolled back/)
+        );
+        assert.deepEqual(await targetState(target), EMPTY);
+      });
+
+      await t.test("a pg_restore too old to write \\restrict is refused before anything is written", async () => {
+        const target = await freshTarget();
+        const dir = mkdtempSync(join(work, "bin-"));
+        const old = join(dir, "pg_restore");
+        writeFileSync(old, `#!/bin/sh\nif [ "$1" = "--version" ]; then echo "pg_restore (PostgreSQL) 17.5"; exit 0; fi\nexec "${realPgRestore}" "$@"\n`);
+        chmodSync(old, 0o755);
+        await withEnv({ BACKUPDRILL_PG_RESTORE: old, BACKUPDRILL_PSQL: realPsql }, () =>
+          assert.rejects(restore(target), /pg_restore 17\.5 is too old to protect psql[\s\S]*--skip-auth/)
+        );
+        assert.deepEqual(await targetState(target), EMPTY);
       });
 
       await t.test("COMMIT that never reaches the target: the transaction id says it rolled back", async () => {

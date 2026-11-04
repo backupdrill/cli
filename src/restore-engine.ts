@@ -944,7 +944,7 @@ export async function prepareMainRestore(
   dumpPath: string,
   connString: string,
   listDir: string,
-  opts: { alsoFullyDumped?: string[] } = {}
+  opts: { alsoFullyDumped?: string[]; schemasCreatedFirst?: string[] } = {}
 ): Promise<MainRestorePlan> {
   const listing = await pgRestoreOutput(bin, ["--list", dumpPath]);
   if (listing.code !== 0) {
@@ -972,7 +972,8 @@ export async function prepareMainRestore(
         "select nspname from pg_namespace where nspname = any($1::text[])",
         [names]
       );
-      const present = new Set(existing.rows.map((row) => row.nspname));
+      // 同一个事务里先建好的 schema(带 Auth 的恢复在事务开头装扩展,会建扩展所在的 schema)也算已存在
+      const present = new Set([...existing.rows.map((row) => row.nspname), ...(opts.schemasCreatedFirst ?? [])]);
       schemaEntries.forEach((line, i) => {
         if (present.has(names[i])) skip.add(line);
       });

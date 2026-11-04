@@ -32,6 +32,7 @@ import { orphanedForeignKeysCheck, type OrphanedForeignKey } from "./orphaned-fo
 import { grantsCheck } from "./grants.js";
 import { localPgRestoreMajor, restoreToolTargetBlocker } from "./pgbin.js";
 import {
+  authRestoreFailureMessage,
   authRestoreNotes,
   authRestorePreflight,
   largeObjectEntries,
@@ -942,11 +943,27 @@ export async function runRestore(
       // 一起回滚,目标原样不动(否则带配置表的扩展留下来,修好之后的重跑会被空目标门拦下,交叉审查复现)。
       // 正式恢复(pg_restore)失败时装上的扩展留着:下一次运行照样要它们,空目标门也不数扩展自带的对象
       // (配置表除外)。曾经在失败后删掉"本次新装的"扩展,交叉审查复现了它会误删别的连接同时装上的扩展。
-      if (extensions.length) {
+      const unavailableMessage = (unavailable: string[]) =>
+        `target cannot install extension(s): ${unavailable.join(", ")} — enable them in ` +
+        `the Supabase dashboard (Database → Extensions) and retry.`;
+      if (extensions.length && authArchive) {
+        // 带 Auth 的恢复把扩展装在恢复事务里(失败时一起回滚,重跑时目标是干净的)。这里先在一个最后回滚掉的
+        // 事务里试装一遍:装不上的、要等扩展装上才查得了的外键,在写任何东西之前拦下,目标原样不动
+        log.step(`Checking ${extensions.length} extension(s) can be installed on target…`);
+        const client = await connectPg(targetUrl);
+        try {
+          await client.query("begin");
+          const unavailable = await installExtensions(targetUrl, extensions, client);
+          if (unavailable.length) throw new Error(unavailableMessage(unavailable));
+          if (firstCheck.waitingForExtensions || firstCheck.problems.length) {
+            await checkReferences([], { inTransaction: client, final: true });
+          }
+        } finally {
+          await client.query("rollback").catch(() => {});
+          await client.end();
+        }
+      } else if (extensions.length) {
         log.step(`Installing ${extensions.length} extension(s) on target…`);
-        const unavailableMessage = (unavailable: string[]) =>
-          `target cannot install extension(s): ${unavailable.join(", ")} — enable them in ` +
-          `the Supabase dashboard (Database → Extensions) and retry.`;
         if (firstCheck.waitingForExtensions || firstCheck.problems.length) {
           const client = await connectPg(targetUrl);
           try {
@@ -979,7 +996,12 @@ export async function runRestore(
           schemas: manifest.database.schemas,
           grants: grantsToRestore,
           listDir: workdir,
+          extensions,
         });
+        if (run.transaction !== "committed") {
+          // 结果由事务本身说了算(没写 COMMIT,或 pg_xact_status 的回答),不再数 schema 里的对象去推断
+          throw new Error(authRestoreFailureMessage(run) + restoreFailureAdvice(run.failure ?? ""));
+        }
         const committed = run.transaction === "committed";
         const pass = committed ? run.afterCommit!.pass : { expectedSkips: 0, failures: [run.failure!] };
         engine = {

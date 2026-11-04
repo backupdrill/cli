@@ -16,8 +16,8 @@ import { spawn } from "node:child_process";
 import { once } from "node:events";
 import { writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import type { AuthSection, Manifest } from "./manifest.js";
-import { manualAuthObjects, plainSchemaName, restorableAuthObjects } from "./auth-backup.js";
+import type { AuthSection, ExtensionInfo, Manifest } from "./manifest.js";
+import { connectCancellable, manualAuthObjects, plainSchemaName, restorableAuthObjects } from "./auth-backup.js";
 import { describeSqlstate } from "./auth-drill.js";
 import { parseGeneratedColumns, parseTableColumns } from "./dump-sql.js";
 import { localToolVersion, resolvePgRestoreBin, resolvePsqlBin } from "./pgbin.js";
@@ -28,6 +28,7 @@ import {
   libpqChildEnv,
   pgRestoreOutput,
   prepareMainRestore,
+  quoteIdent,
   urlSslModeOf,
   userObjectCountSql,
   type GrantsToRestore,
@@ -184,8 +185,19 @@ export async function largeObjectEntries(dumpPath: string): Promise<number> {
 }
 
 /**
- * psql 要能执行 pg_restore 写出来的 SQL:同一个客户端包,版本不比 pg_restore 旧。pg_restore 新版会写
- * \restrict 这类元命令,旧 psql 不认识。返回拦下的原因,null = 可以
+ * pg_restore 从这些小版本起在 SQL 输出开头写 `\restrict <随机密钥>`:psql 读到它就进入受限模式,在对应的
+ * \unrestrict 之前不执行任何元命令。归档内容(对象名、注释……)里混进来的 `\!` 之类因此不会在本机执行
+ * (CVE-2025-8714,2025-08 的修复版本)。18 起全部带
+ */
+const RESTRICT_SINCE: Record<number, number> = { 13: 22, 14: 19, 15: 14, 16: 10, 17: 6 };
+
+export function emitsRestrict([major, minor]: [number, number]): boolean {
+  return major >= 18 || (RESTRICT_SINCE[major] !== undefined && minor >= RESTRICT_SINCE[major]);
+}
+
+/**
+ * psql 要能安全地执行 pg_restore 写出来的 SQL:pg_restore 得是带 \restrict 的版本,psql 和它同一个客户端包、
+ * 不比它旧(旧 psql 不认识 \restrict)。返回拦下的原因,null = 可以
  */
 export async function psqlProblem(): Promise<string | null> {
   const psql = await localToolVersion(resolvePsqlBin());
@@ -193,17 +205,39 @@ export async function psqlProblem(): Promise<string | null> {
     return "psql wasn't found; it comes with pg_restore in the PostgreSQL client package (or set BACKUPDRILL_PSQL)";
   }
   const pgRestore = await localToolVersion(resolvePgRestoreBin());
-  if (pgRestore && (psql[0] < pgRestore[0] || (psql[0] === pgRestore[0] && psql[1] < pgRestore[1]))) {
+  if (!pgRestore) return "the pg_restore version couldn't be read";
+  if (!emitsRestrict(pgRestore)) {
+    return (
+      `pg_restore ${pgRestore.join(".")} is too old to protect psql from commands carried in an archive ` +
+      "(needs 17.6, 16.10, 15.14, 14.19, 13.22 or newer); update the PostgreSQL client"
+    );
+  }
+  if (psql[0] < pgRestore[0] || (psql[0] === pgRestore[0] && psql[1] < pgRestore[1])) {
     return `psql ${psql.join(".")} is older than pg_restore ${pgRestore.join(".")}; install a psql from the same client package`;
   }
   return null;
 }
 
-type Stage = "lock" | "recheck" | "auth-data" | "auth-check" | "database" | "triggers" | "commit" | "committed";
+/**
+ * pg_restore -f - 的输出开头:第一条不是注释、不是空行的行必须是 `\restrict <密钥>`。还没读到完整的那一行时
+ * 返回 "more"。不是它就不交给 psql:没有受限模式,归档内容里的元命令会被执行
+ */
+export function restrictHeader(text: string): "ok" | "missing" | "more" {
+  const lines = text.split("\n");
+  lines.pop(); // 最后一段可能还没读完
+  for (const line of lines) {
+    if (line === "" || line.startsWith("--")) continue;
+    return /^\\restrict [A-Za-z0-9]+$/.test(line) ? "ok" : "missing";
+  }
+  return "more";
+}
+
+type Stage = "lock" | "recheck" | "extensions" | "auth-data" | "auth-check" | "database" | "triggers" | "commit" | "committed";
 
 const STAGE_TEXT: Record<Stage, string> = {
   lock: "locking the target's Auth tables",
   recheck: "checking the target is still empty",
+  extensions: "installing extensions",
   "auth-data": "writing the Auth users",
   "auth-check": "checking the Auth users",
   database: "restoring the database",
@@ -235,19 +269,22 @@ export function firstPsqlError(stderr: string): string {
 export async function transactionOutcome(
   connString: string,
   xid: string,
-  opts: { waitMs: number; pollMs: number } = { waitMs: 30_000, pollMs: 1000 }
+  opts: { waitMs?: number; pollMs?: number; graceMs?: number } = {}
 ): Promise<"committed" | "rolled_back" | "unknown"> {
-  const deadline = Date.now() + opts.waitMs;
+  const { waitMs = 30_000, pollMs = 1000, graceMs = 15_000 } = opts;
+  const deadline = Date.now() + waitMs;
+  // 连接和每次查询都算在一个硬时限里:提交之后网络出问题时,这里不能一直挂着。到点直接断开连接
+  const giveUp = AbortSignal.timeout(waitMs + graceMs);
   try {
-    const client = await connectPg(connString);
+    const client = await connectCancellable(connString, giveUp);
     try {
       for (;;) {
         const res = await client.query<{ status: string | null }>("select pg_xact_status($1::xid8) as status", [xid]);
         const status = res.rows[0].status;
         if (status === "committed") return "committed";
         if (status === "aborted") return "rolled_back";
-        if (status !== "in progress" || Date.now() >= deadline) return "unknown";
-        await new Promise((resolve) => setTimeout(resolve, opts.pollMs));
+        if (status !== "in progress" || Date.now() >= deadline || giveUp.aborted) return "unknown";
+        await new Promise((resolve) => setTimeout(resolve, pollMs));
       }
     } finally {
       await client.end().catch(() => {});
@@ -279,12 +316,19 @@ export async function restoreWithAuth(opts: {
   schemas: string[];
   grants: GrantsToRestore;
   listDir: string;
+  /**
+   * manifest 记着的扩展:装在这个事务里(锁内重查之后),恢复失败时随事务一起回滚,重跑时目标是干净的。
+   * 调用方事先在一个回滚掉的事务里确认过它们装得上
+   */
+  extensions?: ExtensionInfo[];
   /** 拿到事务号之后、写 COMMIT 之前调用:调用方据此记下"这次恢复对应哪个事务" */
   onTransactionId?: (xid: string) => Promise<void> | void;
 }): Promise<AuthRestoreRun> {
   const pgRestore = resolvePgRestoreBin();
+  const extensions = opts.extensions ?? [];
   const prepared = await prepareMainRestore(pgRestore, opts.dumpPath, opts.connString, opts.listDir, {
     alsoFullyDumped: AUTH_TABLE_KEYS,
+    schemasCreatedFirst: extensions.map((ext) => ext.schema),
   });
   if (!prepared.ok) return { transaction: "rolled_back", failure: prepared.failure, triggers: [] };
   const listFile = async (name: string, lines: string[]) => {
@@ -371,9 +415,24 @@ export async function restoreWithAuth(opts: {
       gen.on("close", (code) => resolve(code));
     });
     void exited.then(() => gen.kill("SIGTERM"));
+    // 开头确认是 \restrict 之前一个字节都不交给 psql
+    let head: Buffer | null = Buffer.alloc(0);
+    let unrestricted = false;
     try {
       for await (const chunk of gen.stdout) {
-        if (!(await send(chunk))) break;
+        let data = chunk as Buffer;
+        if (head) {
+          head = Buffer.concat([head, data]);
+          const verdict = restrictHeader(head.toString("utf8"));
+          if (verdict === "more" && head.length < 64 * 1024) continue;
+          if (verdict !== "ok") {
+            unrestricted = true;
+            break;
+          }
+          data = head;
+          head = null;
+        }
+        if (!(await send(data))) break;
       }
     } catch {
       // 读生成端的输出出错:按它的退出码判
@@ -381,6 +440,9 @@ export async function restoreWithAuth(opts: {
     gen.kill("SIGTERM");
     const code = await closed;
     forget();
+    if (unrestricted || (head && head.length > 0)) {
+      return `pg_restore's output for ${what} didn't start with \\restrict, so it wasn't passed to psql (without it, psql would run commands carried in the archive)`;
+    }
     if (psqlGone) return null;
     if (code === 0) return null;
     return `pg_restore stopped while writing out ${what} (${code === null ? "killed by a signal" : `exit code ${code}`}): ${firstRestoreError(genStderr)}`;
@@ -422,6 +484,16 @@ export async function restoreWithAuth(opts: {
     const id = await xidSeen;
     if (!id) return;
     await opts.onTransactionId?.(id);
+
+    // 扩展装在事务里、重查之后:重查看不到这次要装的东西(带配置表的扩展不会把自己拦下),失败时一起回滚
+    if (extensions.length) {
+      const install = extensions.flatMap((ext) => [
+        `create schema if not exists ${quoteIdent(ext.schema)};`,
+        // CASCADE 自动带上依赖扩展,免受 manifest 里的安装顺序摆布
+        `create extension if not exists ${quoteIdent(ext.name)} schema ${quoteIdent(ext.schema)} cascade;`,
+      ]);
+      if (!(await send(["", `\\echo ${STAGE_MARK}extensions`, ...install, ""].join("\n")))) return;
+    }
 
     // 2. Auth 用户和 identities(先 users,identities 的外键指向它),清掉待处理的认证状态。
     //    这一段的报错只留 SQLSTATE:PostgreSQL 的报错会带出错行的值(邮箱、metadata)
@@ -472,10 +544,14 @@ export async function restoreWithAuth(opts: {
   const code = await exited;
   forgetPsql();
 
-  // 没写 COMMIT:一定没提交(这条 SQL 流里没有别的 COMMIT,见 largeObjectEntries)。写了:不管 psql 报没报
-  // "已提交",都拿事务号向目标确认一次,不单凭 psql 的输出下结论
-  const transaction: AuthRestoreRun["transaction"] =
-    commitSent && xid ? await transactionOutcome(opts.connString, xid) : "rolled_back";
+  // 没写 COMMIT:一定没提交(这条 SQL 流里没有别的 COMMIT,见 largeObjectEntries)。
+  // psql 执行完 COMMIT 才会打印 committed 标记,标记在、psql 0 退出就是提交了;写了 COMMIT 却没等到确认
+  // (进程被杀、连接断了),才拿事务号问目标
+  const transaction: AuthRestoreRun["transaction"] = !commitSent || !xid
+    ? "rolled_back"
+    : (stage as Stage | null) === "committed" && code === 0
+      ? "committed"
+      : await transactionOutcome(opts.connString, xid);
 
   if (transaction !== "committed") {
     const psqlSays =
@@ -495,6 +571,25 @@ export async function restoreWithAuth(opts: {
   }
   const after = await afterCommit(opts.connString, opts.grants, prepared.deferred);
   return { transaction, xid, afterCommit: after, triggers: opts.archive.triggers.map((t) => t.name) };
+}
+
+/**
+ * 没提交(或查不清)时给用户的那句话。结果只由事务本身说了算(没写 COMMIT,或 pg_xact_status 的回答),
+ * 不去数目标里有什么来推断:查不清就如实说查不清,并给出能查清的那条语句
+ */
+export function authRestoreFailureMessage(run: AuthRestoreRun): string {
+  if (run.transaction === "rolled_back") {
+    return (
+      `database restore failed: ${run.failure}. It ran in one transaction and was rolled back, so nothing from the ` +
+      "snapshot (Auth users included) is on the target and you can run restore again on the same project once the cause is fixed."
+    );
+  }
+  return (
+    `database restore failed: ${run.failure}. The restore sent COMMIT but couldn't confirm whether the target committed it, ` +
+    "so the Auth users and the database are either all there or not there at all. Check before doing anything else" +
+    (run.xid ? `: \`select pg_xact_status('${run.xid}'::xid8);\` on the target says committed or aborted.` : ".") +
+    " If it committed, the grants and the foreign keys added after the commit are still missing."
+  );
 }
 
 /**
