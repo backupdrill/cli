@@ -5,14 +5,14 @@ Read this when the user asks what Supabase already backs up for them, wants a pl
 ## What Supabase keeps for you
 
 - **Free plan:** no access to automatic backups. Supabase's docs tell Free projects to export their data themselves (`supabase db dump`) and keep off-site copies. Free projects are paused after a week of inactivity; the pause snapshot lets the user restore the paused project from the dashboard for up to a year.
-- **Pro and Team:** daily backups, kept 7 days on Pro and 14 on Team, restorable from the dashboard. On the physical backup process that current projects use they can't be downloaded. Point-in-time recovery is an add-on at $100/month per project.
+- **Pro and Team:** daily backups, kept 7 days on Pro and 14 on Team, restorable from the dashboard. On the physical backup process that current projects use they can't be downloaded. Point-in-time recovery is a paid add-on: about $100/month per project for 7 days of history, and it needs a Small compute add-on or larger.
 - **Storage files are not in any database backup.** A database restore brings back the `storage.objects` rows, which only point at files. The files themselves need a separate copy (the CLI copies them once the Storage S3 keys are set).
 
-Every backup taken from outside the project counts as egress on the user's Supabase bill. Free includes 5 GB a month, shared with whatever the app already serves. At the Free plan's 500 MB database limit, a weekly dump is about 2 GB a month, and a daily one would go over.
+Every backup taken from outside the project counts as egress on the user's Supabase bill. Free includes 5 GB a month, shared with whatever the app already serves. Each run transfers roughly the size of the data it dumps. At the Free plan's 500 MB database limit, that is about 2 GB a month for weekly backups and about 15 GB for daily ones, three times the allowance.
 
 ## Use the Session pooler connection string
 
-In the dashboard, **Connect** → **Session pooler**: port 5432, user `postgres.<project-ref>`. The direct connection is IPv6-only unless the project has the IPv4 add-on, so it fails on most home and CI networks. Don't use port 6543, the transaction pooler: `pg_dump` needs a session.
+In the dashboard, **Connect** → **Session pooler**: port 5432, user `postgres.<project-ref>`. Without the IPv4 add-on, the direct connection needs IPv6, so on an IPv4-only home or CI network it won't connect. Don't use port 6543, the transaction pooler: `pg_dump` needs a session.
 
 ## Match client and server versions
 
