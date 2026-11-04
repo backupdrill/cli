@@ -30,6 +30,7 @@ import {
   type StorageRestoreTarget,
 } from "./storage-restore.js";
 import { connectPg } from "./supabase-ca.js";
+import { connectCancellable } from "./auth-backup.js";
 import { orphanedForeignKeysCheck, type OrphanedForeignKey } from "./orphaned-foreign-keys.js";
 import { grantsCheck } from "./grants.js";
 import { localPgRestoreMajor, restoreToolTargetBlocker } from "./pgbin.js";
@@ -1027,6 +1028,7 @@ export async function runRestore(
               version: 1,
               snapshot,
               projectName: manifest.projectName,
+              dumpSha256: manifest.dump.sha256,
               target: describeTarget(targetUrl),
               identity,
               xid,
@@ -1236,7 +1238,12 @@ export interface RestoreStatus {
 /**
  * restore --status:只读。读这台机器上对这个目标的恢复记录,核对目标还是那个库,再用事务号问它提交了没有
  */
-export async function restoreStatus(opts: { targetDatabaseUrl: string; restoreRecords: RestoreRecordStore }): Promise<RestoreStatus> {
+export async function restoreStatus(opts: {
+  targetDatabaseUrl: string;
+  restoreRecords: RestoreRecordStore;
+  /** 连接加查询的总时限:目标不回应时到点断开,答"查不清",不一直挂着 */
+  timeoutMs?: number;
+}): Promise<RestoreStatus> {
   assertNoHostOverride(opts.targetDatabaseUrl);
   const target = describeTarget(opts.targetDatabaseUrl);
   const record = await opts.restoreRecords.load(restoreRecordKey(opts.targetDatabaseUrl));
@@ -1247,7 +1254,7 @@ export async function restoreStatus(opts: { targetDatabaseUrl: string; restoreRe
   let transaction: NonNullable<RestoreStatus["transaction"]> = "unknown";
   let sameTarget = true;
   try {
-    const client = await connectPg(opts.targetDatabaseUrl);
+    const client = await connectCancellable(opts.targetDatabaseUrl, AbortSignal.timeout(opts.timeoutMs ?? 20_000));
     try {
       const now = await targetIdentity(client);
       sameTarget =
@@ -1317,6 +1324,13 @@ export async function finishRestore(
   const store = opts.store ?? s3SnapshotStore(config);
   const reader = await store.openSnapshot(record.snapshot);
   const manifest = parseManifest(await reader.readManifest());
+  // 快照名只是时间戳:核对这就是当初恢复的那一份(同一个项目、同一个 dump),不然授权和外键会照别的快照改
+  if (manifest.projectName !== record.projectName || manifest.dump.sha256 !== record.dumpSha256) {
+    throw new Error(
+      `snapshot ${record.snapshot} here isn't the one that was restored (project ${record.projectName}, dump ` +
+        `${record.dumpSha256.slice(0, 12)}…): point restore --finish at the same bucket and project as the restore.`
+    );
+  }
   const workdir = await mkdtemp(join(tmpdir(), "backupdrill-finish-"));
   const save = async (phase: RestorePhase) => {
     record = { ...record!, phase, updatedAt: new Date().toISOString() };

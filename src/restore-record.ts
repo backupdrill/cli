@@ -29,6 +29,11 @@ export interface RestoreRecord {
   version: 1;
   snapshot: string;
   projectName: string;
+  /**
+   * 那份快照的 dump 的 sha256:--finish 只接着做同一份快照。快照名只是时间戳,
+   * 别的项目、别的桶里可能有同名的快照,拿它补授权会改错目标上的权限
+   */
+  dumpSha256: string;
   /** 给人看的目标说明(ref 或 主机/库名),不含密码 */
   target: string;
   identity: TargetIdentity;
@@ -71,7 +76,7 @@ export function fileRestoreRecords(dir = process.env.BACKUPDRILL_STATE_DIR || jo
     async load(key) {
       try {
         const parsed = JSON.parse(await readFile(join(dir, `${key}.json`), "utf8")) as RestoreRecord;
-        return parsed?.version === 1 && typeof parsed.xid === "string" ? parsed : null;
+        return parsed?.version === 1 && typeof parsed.xid === "string" && typeof parsed.dumpSha256 === "string" ? parsed : null;
       } catch (error) {
         if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
         throw new Error(`the restore record couldn't be read (${(error as Error).message})`);

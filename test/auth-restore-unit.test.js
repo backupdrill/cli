@@ -8,6 +8,10 @@ import { mkdtempSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileRestoreRecords, restoreRecordKey } from "../dist/restore-record.js";
+import { restoreStatus } from "../dist/restore.js";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
+import { fileURLToPath } from "node:url";
 import {
   drainOrExit,
   authRestoreFailureMessage,
@@ -119,12 +123,56 @@ test("fileRestoreRecords: saves and loads a record, readable only by the user", 
     const records = fileRestoreRecords(dir);
     assert.equal(await records.load("k"), null);
     const record = {
-      version: 1, snapshot: "s", projectName: "p", target: "t", identity: { databaseOid: "1", systemIdentifier: null },
+      version: 1, snapshot: "s", projectName: "p", dumpSha256: "abc", target: "t", identity: { databaseOid: "1", systemIdentifier: null },
       xid: "42", phase: "transaction", startedAt: "x", updatedAt: "x",
     };
     await records.save("k", record);
     assert.deepEqual(await records.load("k"), record);
     assert.equal(statSync(join(dir, "k.json")).mode & 0o777, 0o600);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("restoreStatus: a target that never answers gives 'unknown' on time", async () => {
+  const sockets = [];
+  const server = createServer((socket) => {
+    sockets.push(socket);
+    socket.on("error", () => {});
+    socket.resume();
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  try {
+    const record = {
+      version: 1, snapshot: "s", projectName: "p", dumpSha256: "abc", target: "t",
+      identity: { databaseOid: "1", systemIdentifier: null }, xid: "42", phase: "transaction", startedAt: "x", updatedAt: "x",
+    };
+    const started = Date.now();
+    const status = await restoreStatus({
+      targetDatabaseUrl: `postgresql://u:p@127.0.0.1:${server.address().port}/db`,
+      restoreRecords: { load: async () => record, save: async () => {} },
+      timeoutMs: 500,
+    });
+    assert.equal(status.transaction, "unknown");
+    assert.ok(Date.now() - started < 5000, `took ${Date.now() - started} ms`);
+  } finally {
+    for (const s of sockets) s.destroy();
+    await new Promise((resolve) => server.close(resolve));
+  }
+});
+
+const cli = fileURLToPath(new URL("../dist/index.js", import.meta.url));
+const run = promisify(execFile);
+
+test("CLI: restore --status needs only the target (no config, no bucket); --finish --dry-run is refused", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "bd-cli-status-"));
+  try {
+    const env = { ...process.env, BACKUPDRILL_TARGET_DATABASE_URL: "postgresql://u:p@127.0.0.1:1/x", BACKUPDRILL_STATE_DIR: dir };
+    const { stdout } = await run(process.execPath, [cli, "restore", "--status"], { cwd: dir, env });
+    assert.deepEqual(JSON.parse(stdout).recorded, false);
+    const refused = await run(process.execPath, [cli, "restore", "--finish", "--dry-run"], { cwd: dir, env }).catch((e) => e);
+    assert.equal(refused.code, 1);
+    assert.match(refused.stderr, /--finish writes to the target/);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

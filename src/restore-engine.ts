@@ -205,27 +205,36 @@ async function deferredForeignKeys(
   dumpPath: string,
   entries: string[],
   listDir: string,
-  alsoFullyDumped: string[] = []
+  alsoFullyDumped: string[] = [],
+  /**
+   * restore --finish 用:读不出来就报错,不退回"一条也不挪"。正常恢复里退回是安全的(外键全留给 pg_restore,
+   * 在主事务里建),接着做的时候退回就是漏加外键
+   */
+  strict = false
 ): Promise<{ lines: Set<string>; fks: ForeignKeyDef[]; commentSql?: string }> {
   const none = { lines: new Set<string>(), fks: [] };
+  const giveUp = (why: string): typeof none => {
+    if (strict) throw new Error(`the foreign keys to add couldn't be read from the dump (${why})`);
+    return none;
+  };
   const fkEntries = entries.filter((line) => /^\d+; \d+ \d+ FK CONSTRAINT /.test(line));
   if (!fkEntries.length) return none;
   // 沙箱那边传进来的只有 post-data 条目,数据条目要看完整目录
   const fullListing = await pgRestoreOutput(bin, ["--list", dumpPath]);
-  if (fullListing.code !== 0) return none;
+  if (fullListing.code !== 0) return giveUp(`pg_restore --list exited with code ${fullListing.code}`);
   const tableEntries = fullyDumpedTableEntries(fullListing.stdout);
   if (!tableEntries.length) return none;
   const tableList = join(listDir, "tables.list");
   await writeFile(tableList, tableEntries.join("\n") + "\n");
   const tableDdl = await pgRestoreOutput(bin, ["-f", "-", `--use-list=${tableList}`, dumpPath]);
-  if (tableDdl.code !== 0) return none;
+  if (tableDdl.code !== 0) return giveUp(`pg_restore exited with code ${tableDdl.code} writing the table definitions`);
   const fullyDumped = new Set([...parseCreatedTables(tableDdl.stdout).map(tableKey), ...alsoFullyDumped]);
   const listFile = join(listDir, "foreign-keys.list");
   await writeFile(listFile, fkEntries.join("\n") + "\n");
   const ddl = await pgRestoreOutput(bin, ["-f", "-", `--use-list=${listFile}`, dumpPath]);
   const parsed = parseForeignKeys(ddl.stdout);
-  if (ddl.code !== 0 || parsed.length !== fkEntries.length) return none;
-  if (parsed.some((fk, i) => !fkEntries[i].includes(fk.constraint))) return none;
+  if (ddl.code !== 0 || parsed.length !== fkEntries.length) return giveUp("the foreign key definitions didn't match the listing");
+  if (parsed.some((fk, i) => !fkEntries[i].includes(fk.constraint))) return giveUp("the foreign key definitions didn't match the listing");
   const lines = new Set<string>();
   const fks: ForeignKeyDef[] = [];
   parsed.forEach((fk, i) => {
@@ -250,7 +259,7 @@ async function deferredForeignKeys(
   const commentList = join(listDir, "foreign-key-comments.list");
   await writeFile(commentList, commentLines.join("\n") + "\n");
   const comments = await pgRestoreOutput(bin, ["-f", "-", `--use-list=${commentList}`, dumpPath]);
-  if (comments.code !== 0) return none;
+  if (comments.code !== 0) return giveUp(`pg_restore exited with code ${comments.code} writing the foreign key comments`);
   for (const line of commentLines) lines.add(line);
   return { lines, fks, commentSql: withoutRestrictWrapper(comments.stdout) };
 }
@@ -1024,33 +1033,11 @@ export async function afterCommit(
   try {
     const client = await connectPg(connString);
     try {
-      let fks = deferred.fks;
-      if (opts.resume) {
-        const pending: ForeignKeyDef[] = [];
-        for (const fk of fks) {
-          const existing = await client.query<{ def: string }>(
-            `select pg_get_constraintdef(c.oid) as def from pg_constraint c
-              where c.conrelid = to_regclass($1) and c.conname = $2 and c.contype = 'f'`,
-            [`${quoteIdent(fk.table.schema)}.${quoteIdent(fk.table.name)}`, fk.constraint]
-          );
-          if (!existing.rows.length) {
-            pending.push(fk);
-            continue;
-          }
-          const there = normalizedConstraintDef(existing.rows[0].def);
-          if (there !== normalizedConstraintDef(foreignKeyDefinition(fk))) {
-            throw new Error(
-              `${fk.table.schema}.${fk.table.name} already has a foreign key ${fk.constraint} with a different definition ` +
-                `(${existing.rows[0].def}); it was left as it is`
-            );
-          }
-        }
-        fks = pending;
-      }
-      const added = await addForeignKeys(client, fks, {
+      const added = await addForeignKeys(client, deferred.fks, {
         allow: NEVER_MATCH,
         stopOnError: true,
         commentSql: deferred.commentSql,
+        resume: opts.resume,
       });
       return { pass: { expectedSkips: 0, failures: [] }, orphaned: added.orphaned, grants };
     } finally {
@@ -1077,19 +1064,8 @@ export async function deferredForeignKeysOf(
   const listing = await pgRestoreOutput(bin, ["--list", dumpPath]);
   if (listing.code !== 0) throw new Error(`pg_restore --list exited with code ${listing.code}`);
   const entries = listing.stdout.split("\n").filter((line) => /^\d+;/.test(line));
-  const deferred = await deferredForeignKeys(bin, dumpPath, entries, listDir, alsoFullyDumped);
+  const deferred = await deferredForeignKeys(bin, dumpPath, entries, listDir, alsoFullyDumped, true);
   return { fks: deferred.fks, commentSql: deferred.commentSql };
-}
-
-/** pg_dump 的外键语句里 ADD CONSTRAINT <名> 之后、分号之前那一段,就是源库上 pg_get_constraintdef 的输出 */
-export function foreignKeyDefinition(fk: ForeignKeyDef): string {
-  const match = /ADD CONSTRAINT (?:"(?:[^"]|"")+"|[a-z_][a-z0-9_]*) ([\s\S]*?);\s*$/.exec(fk.statement);
-  return match ? match[1] : fk.statement;
-}
-
-/** 比较外键定义:空白归一,NOT VALID 不算差别(源库的孤儿行会让恢复把它建成 NOT VALID) */
-export function normalizedConstraintDef(def: string): string {
-  return def.replace(/\s+/g, " ").trim().replace(/ NOT VALID$/, "");
 }
 
 /**

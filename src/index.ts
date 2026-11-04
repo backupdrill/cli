@@ -294,6 +294,31 @@ program
   .option("--project-name <name>", "project name used in the object key")
   .action(async (opts) => {
     try {
+      // restore --status / --finish:只针对带 Auth 的恢复,按这台机器上的恢复记录查结果、接着做。
+      // --status 只读、只要目标连接串,放在读配置之前:不需要桶的凭据
+      if (opts.status || opts.finish) {
+        if (opts.status && opts.finish) throw new Error("use --status or --finish, not both");
+        if (opts.finish && opts.dryRun) {
+          throw new Error("--finish writes to the target; for a read-only look use --status instead of --dry-run");
+        }
+      }
+      let statusTarget: string | undefined;
+      if (opts.status || opts.finish) {
+        statusTarget =
+          process.env.BACKUPDRILL_TARGET_DATABASE_URL?.trim() ||
+          (await promptSecret("Target database connection string (BACKUPDRILL_TARGET_DATABASE_URL)"));
+      }
+      if (opts.status) {
+        const status = await restoreStatus({ targetDatabaseUrl: statusTarget!, restoreRecords: fileRestoreRecords() });
+        console.log(JSON.stringify(status));
+        const finished = status.transaction === "committed" && status.phase === "done";
+        (finished ? log.ok : log.warn)(
+          status.recorded
+            ? `${status.target}: snapshot ${status.snapshot}, transaction ${status.xid} ${status.transaction} — ${status.next}`
+            : `${status.target}: ${status.next}`
+        );
+        return;
+      }
       // 源库连接串不再无条件屏蔽:配置/环境里有真实源时,runRestore 的同源阻断门
       // 要拿它比对;纯 flag 驱动(无任何源配置)才退回占位符
       const overrides = {
@@ -315,25 +340,9 @@ program
           overrides: { ...overrides, databaseUrl: NO_SOURCE_DATABASE },
         });
       }
-      // restore --status / --finish:只针对带 Auth 的恢复,按这台机器上的恢复记录查结果、接着做
-      if (opts.status || opts.finish) {
-        if (opts.status && opts.finish) throw new Error("use --status or --finish, not both");
-        const targetUrl =
-          process.env.BACKUPDRILL_TARGET_DATABASE_URL?.trim() ||
-          (await promptSecret("Target database connection string (BACKUPDRILL_TARGET_DATABASE_URL)"));
-        if (opts.status) {
-          const status = await restoreStatus({ targetDatabaseUrl: targetUrl, restoreRecords: fileRestoreRecords() });
-          console.log(JSON.stringify(status));
-          const finished = status.transaction === "committed" && status.phase === "done";
-          (finished ? log.ok : log.warn)(
-            status.recorded
-              ? `${status.target}: snapshot ${status.snapshot}, transaction ${status.xid} ${status.transaction} — ${status.next}`
-              : `${status.target}: ${status.next}`
-          );
-          return;
-        }
+      if (opts.finish) {
         const finished = await finishRestore(config, {
-          targetDatabaseUrl: targetUrl,
+          targetDatabaseUrl: statusTarget!,
           confirmTarget: opts.confirmTarget,
           restoreRecords: fileRestoreRecords(),
           snapshot: opts.snapshot,

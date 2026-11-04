@@ -87,7 +87,9 @@ test(
         insert into public.notes values (2, '99999999-0000-0000-0000-000000000000');
         reset session_replication_role;
         create table public.links (identity_id uuid references auth.identities (id));
-        insert into public.links select id from auth.identities limit 1;`);
+        insert into public.links select id from auth.identities limit 1;
+        create table public.comments (note_id int references public.notes (id));
+        insert into public.comments values (1);`);
       const okUrl = `postgresql://reader_ok:r@127.0.0.1:${port}/postgres`;
       const config = { databaseUrl: okUrl, projectName: "restore", schemas: ["public"], storage: { bucket: "unused" } };
       const mem = readableMemoryStore();
@@ -362,6 +364,7 @@ test(
           alter table public.profiles drop constraint profiles_id_fkey;
           alter table public.notes drop constraint notes_owner_fkey;
           alter table public.links drop constraint links_identity_id_fkey;
+          alter table public.comments drop constraint comments_note_id_fkey;
           revoke all on all tables in schema public from anon, authenticated, service_role;`);
         status = await restoreStatus({ targetDatabaseUrl: target, restoreRecords: records });
         assert.equal(status.transaction, "committed");
@@ -375,20 +378,45 @@ test(
         assert.equal(finished.databaseVerified, true, JSON.stringify(finished.databaseChecks));
         assert.deepEqual(finished.orphanedForeignKeys.map((o) => o.constraint), ["notes_owner_fkey"]);
         const fks = await sql(target, `select conname, convalidated from pg_constraint
-          where conname in ('profiles_id_fkey', 'notes_owner_fkey', 'links_identity_id_fkey') order by conname`);
+          where conname in ('profiles_id_fkey', 'notes_owner_fkey', 'links_identity_id_fkey', 'comments_note_id_fkey') order by conname`);
         assert.deepEqual(fks.rows, [
+          { conname: "comments_note_id_fkey", convalidated: true },
           { conname: "links_identity_id_fkey", convalidated: true },
           { conname: "notes_owner_fkey", convalidated: false },
           { conname: "profiles_id_fkey", convalidated: true },
         ]);
         assert.equal((await records.load(key)).phase, "done");
 
-        // 中途断过一次(授权补了、外键加了一部分)再跑:已有的定义一样就跳过,结果和一次成功的恢复一样
+        // 中途断过一次(授权补了、外键加了一部分)再跑:已有的定义一样就跳过(public → public 的也认得出),
+        // 已经是 NOT VALID 的照样数孤儿行、写进报告,结果和一次成功的恢复一样
         await records.save(key, { ...(await records.load(key)), phase: "grants" });
         await sql(target, "alter table public.profiles drop constraint profiles_id_fkey");
-        await finishRestore(config, { targetDatabaseUrl: target, confirmTarget: "127.0.0.1", restoreRecords: records, store: mem.store });
-        const again = await sql(target, "select count(*)::int as n from pg_constraint where conname in ('profiles_id_fkey', 'notes_owner_fkey', 'links_identity_id_fkey')");
-        assert.equal(again.rows[0].n, 3);
+        const rerun = await finishRestore(config, { targetDatabaseUrl: target, confirmTarget: "127.0.0.1", restoreRecords: records, store: mem.store });
+        assert.deepEqual(rerun.orphanedForeignKeys.map((o) => [o.constraint, o.orphanRows]), [["notes_owner_fkey", 1]]);
+        const again = await sql(target, "select count(*)::int as n from pg_constraint where conname in ('profiles_id_fkey', 'notes_owner_fkey', 'links_identity_id_fkey', 'comments_note_id_fkey')");
+        assert.equal(again.rows[0].n, 4);
+
+        // 别的项目里同名的快照:不拿它补授权、加外键
+        const otherMem = readableMemoryStore();
+        await runBackup({ ...config, projectName: "other", auth: "default" }, { store: otherMem.store });
+        await records.save(key, { ...(await records.load(key)), phase: "grants" });
+        await assert.rejects(
+          finishRestore(config, { targetDatabaseUrl: target, confirmTarget: "127.0.0.1", restoreRecords: records, store: otherMem.store }),
+          /snapshot snap here isn't the one that was restored/
+        );
+
+        // 读不出要加的外键:报错,不当成"没有外键"把记录标成做完
+        const failing = wrapper(
+          "pg_restore",
+          `case "$*" in *foreign-keys.list*) exit 1;; esac\nexec "${realPgRestore}" "$@"`
+        );
+        await withEnv({ BACKUPDRILL_PG_RESTORE: failing, BACKUPDRILL_PSQL: realPsql }, () =>
+          assert.rejects(
+            finishRestore(config, { targetDatabaseUrl: target, confirmTarget: "127.0.0.1", restoreRecords: records, store: mem.store }),
+            /the foreign keys to add couldn't be read from the dump/
+          )
+        );
+        assert.equal((await records.load(key)).phase, "grants");
 
         // 同名、定义不同的外键:停下报告,不覆盖
         await records.save(key, { ...(await records.load(key)), phase: "grants" });

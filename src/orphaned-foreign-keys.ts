@@ -165,6 +165,17 @@ export interface AddForeignKeysResult {
  * 其余错误:stopOnError(真实目标)= 回滚整个事务并抛出;否则(沙箱)按 allow 分类后继续。
  * 调用方负责连接和最终的 commit/rollback 之外的一切——这里自己 begin/commit。
  */
+/** pg_dump 的外键语句里 ADD CONSTRAINT <名> 之后、分号之前那一段,就是源库上 pg_get_constraintdef 的输出 */
+export function foreignKeyDefinition(fk: ForeignKeyDef): string {
+  const match = /ADD CONSTRAINT (?:"(?:[^"]|"")+"|[a-z_][a-z0-9_]*) ([\s\S]*?);\s*$/.exec(fk.statement);
+  return match ? match[1] : fk.statement;
+}
+
+/** 比较外键定义:空白归一,NOT VALID 不算差别(源库的孤儿行会让恢复把它建成 NOT VALID) */
+export function normalizedConstraintDef(def: string): string {
+  return def.replace(/\s+/g, " ").trim().replace(/ NOT VALID$/, "");
+}
+
 export async function addForeignKeys(
   client: Client,
   fks: ForeignKeyDef[],
@@ -173,6 +184,12 @@ export async function addForeignKeys(
     stopOnError: boolean;
     /** 这些外键上的 COMMENT(pg_restore 写出的 SQL):外键加完再执行,不然注释对象还不存在 */
     commentSql?: string;
+    /**
+     * 接着做(restore --finish):表上已经有同名外键时,定义一样(NOT VALID 与否不论)就不再加——是 NOT VALID 的
+     * 照样数孤儿行、写进报告,和一次成功的恢复一样;定义不一样就报错,不覆盖。比较在下面的 search_path 下做,
+     * pg_get_constraintdef 和 pg_dump 一样写全限定名
+     */
+    resume?: boolean;
   }
 ): Promise<AddForeignKeysResult> {
   const result: AddForeignKeysResult = { orphaned: [], expectedSkips: 0, failures: [] };
@@ -202,7 +219,61 @@ export async function addForeignKeys(
       [[...new Set(fks.flatMap((fk) => [fk.table, fk.references]).map((t) => `${quoteIdent(t.schema)}.${quoteIdent(t.name)}`))]]
     );
     for (const { name } of forced.rows) await client.query(`alter table only ${name} no force row level security`);
+    /** 数违反这条外键的行;数不出来(类型没有可用的运算符等)时为 null,只影响报告 */
+    const countOrphans = async (fk: ForeignKeyDef): Promise<number | null> => {
+      await client.query("savepoint count_orphans");
+      try {
+        const plan = await client.query<{
+          schema: string;
+          name: string;
+          left: string;
+          right: string;
+          referenced_partitioned: boolean;
+        }>(COMPARISON_PLAN_SQL, [fk.constraint, `${quoteIdent(fk.table.schema)}.${quoteIdent(fk.table.name)}`]);
+        if (plan.rows.length !== fk.columns.length) throw new Error("comparison operators not found");
+        const counted = await client.query<{ n: string }>(
+          orphanCountSql(fk, {
+            operators: plan.rows,
+            referencedPartitioned: plan.rows[0].referenced_partitioned,
+          })
+        );
+        await client.query("release savepoint count_orphans");
+        return Number(counted.rows[0].n);
+      } catch {
+        await client.query("rollback to savepoint count_orphans");
+        return null;
+      }
+    };
+    const orphanedEntry = (fk: ForeignKeyDef, orphanRows: number | null): OrphanedForeignKey => ({
+      constraint: fk.constraint,
+      table: formatQualified(fk.table),
+      referencedTable: formatQualified(fk.references),
+      columns: fk.columns,
+      referencedColumns: fk.referencedColumns,
+      matchFull: fk.matchFull,
+      orphanRows,
+    });
     for (const fk of fks) {
+      if (opts.resume) {
+        const existing = await client.query<{ def: string; valid: boolean }>(
+          `select pg_get_constraintdef(c.oid) as def, c.convalidated as valid from pg_constraint c
+            where c.conrelid = to_regclass($1) and c.conname = $2 and c.contype = 'f'`,
+          [`${quoteIdent(fk.table.schema)}.${quoteIdent(fk.table.name)}`, fk.constraint]
+        );
+        if (existing.rows.length) {
+          if (normalizedConstraintDef(existing.rows[0].def) !== normalizedConstraintDef(foreignKeyDefinition(fk))) {
+            throw new Error(
+              `${formatQualified(fk.table)} already has a foreign key ${fk.constraint} with a different definition ` +
+                `(${existing.rows[0].def}); it was left as it is`
+            );
+          }
+          if (!existing.rows[0].valid) {
+            const orphanRows = await countOrphans(fk);
+            if (orphanRows !== 0) result.orphaned.push(orphanedEntry(fk, orphanRows));
+          }
+          continue;
+        }
+      }
       await client.query("savepoint add_fk");
       try {
         await client.query(fk.statement);
@@ -230,38 +301,9 @@ export async function addForeignKeys(
         continue;
       }
       // 计数只为报告:失败(类型没有 = 运算符等)不影响已经加上的外键
-      await client.query("savepoint count_orphans");
-      let orphanRows: number | null = null;
-      try {
-        const plan = await client.query<{
-          schema: string;
-          name: string;
-          left: string;
-          right: string;
-          referenced_partitioned: boolean;
-        }>(COMPARISON_PLAN_SQL, [fk.constraint, `${quoteIdent(fk.table.schema)}.${quoteIdent(fk.table.name)}`]);
-        if (plan.rows.length !== fk.columns.length) throw new Error("comparison operators not found");
-        const counted = await client.query<{ n: string }>(
-          orphanCountSql(fk, {
-            operators: plan.rows,
-            referencedPartitioned: plan.rows[0].referenced_partitioned,
-          })
-        );
-        orphanRows = Number(counted.rows[0].n);
-        await client.query("release savepoint count_orphans");
-      } catch {
-        await client.query("rollback to savepoint count_orphans");
-      }
+      const orphanRows = await countOrphans(fk);
       await client.query("release savepoint add_fk");
-      result.orphaned.push({
-        constraint: fk.constraint,
-        table: formatQualified(fk.table),
-        referencedTable: formatQualified(fk.references),
-        columns: fk.columns,
-        referencedColumns: fk.referencedColumns,
-        matchFull: fk.matchFull,
-        orphanRows,
-      });
+      result.orphaned.push(orphanedEntry(fk, orphanRows));
     }
     if (opts.commentSql) {
       await client.query("savepoint add_comments");
