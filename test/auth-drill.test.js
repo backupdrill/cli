@@ -100,7 +100,7 @@ test(
           assert.deepEqual(verdict(report), verdict(baseline));
           assert.equal(report.auth.status, "problems");
           assert.equal(report.auth.signup.ok, false);
-          assert.match(report.auth.signup.detail, /a new sign-up would fail: permission denied for table profiles/);
+          assert.equal(report.auth.signup.detail, "a new sign-up would fail: permission denied (SQLSTATE 42501)");
         } finally {
           await sql(admin, "alter function public.handle_new_user() security definer");
         }
@@ -117,10 +117,60 @@ test(
           const report = await runDrill(config, { store: mem.store });
           assert.deepEqual(verdict(report), verdict(baseline));
           assert.equal(report.auth.status, "problems");
-          assert.equal(report.auth.signup.detail, "a new sign-up would fail: SQLSTATE P0001");
+          assert.equal(report.auth.signup.detail, "a new sign-up would fail: an exception was raised (SQLSTATE P0001)");
           assert.equal(JSON.stringify(report).includes("$2a$"), false);
         } finally {
           await sql(admin, "drop trigger leak on auth.users; drop function public.leak()");
+        }
+      });
+
+      await t.test("a trigger message under an ordinary error code still never reaches the report", async () => {
+        // 23514(CHECK)是会给对象名的那类错误码,但消息是触发器自己写的:报告里只能有固定说法
+        await sql(admin, `
+          create function public.leak2() returns trigger language plpgsql security definer set search_path = '' as $$
+          begin raise exception using errcode = '23514',
+            message = (select encrypted_password from auth.users where encrypted_password like '$2a%' limit 1); end $$;
+          create trigger leak2 after insert on auth.users for each row execute function public.leak2();`);
+        try {
+          const mem = await backup("default");
+          const report = await runDrill(config, { store: mem.store });
+          assert.equal(report.auth.signup.detail, "a new sign-up would fail: a check constraint was violated (SQLSTATE 23514)");
+          assert.equal(JSON.stringify(report).includes("$2a$"), false);
+        } finally {
+          await sql(admin, "drop trigger leak2 on auth.users; drop function public.leak2()");
+        }
+      });
+
+      await t.test("a download error (thrown or rejected) never reaches the report and never fails the drill", async () => {
+        const mem = await backup("default");
+        const reader = await mem.store.openSnapshot();
+        for (const downloadAuthDump of [
+          () => Promise.reject(new Error("GET https://bucket/x?X-Amz-Credential=AKIASECRET token=abc bob@example.com")),
+          () => {
+            throw new Error("sync failure with secret bob@example.com");
+          },
+        ]) {
+          const store = { ...mem.store, openSnapshot: async () => ({ ...reader, downloadAuthDump }) };
+          const report = await runDrill(config, { store });
+          assert.deepEqual(verdict(report), verdict(baseline));
+          assert.equal(report.auth.status, "not_checked");
+          assert.equal(report.auth.summary, "the Auth archive couldn't be downloaded");
+        }
+      });
+
+      await t.test("a foreign key whose definition can't be read is reported as unchecked, never as verified", async () => {
+        // 列名里带换行:合法,但逐行读 pg_dump 输出的解析器读不全它
+        await sql(admin, `create table public.weird ("user
+id" uuid references auth.users (id) on delete set null)`);
+        try {
+          const mem = await backup("default");
+          const report = await runDrill(config, { store: mem.store });
+          assert.deepEqual(verdict(report).pass, baseline.pass);
+          if (report.auth.foreignKeys.created === 2) return; // 解析器读得了这种写法:那就是两条都建上了,同样没问题
+          assert.equal(report.auth.status, "problems", report.auth.summary);
+          assert.match(report.auth.summary, /couldn't be read, so they weren't checked/);
+        } finally {
+          await sql(admin, "drop table public.weird");
         }
       });
 

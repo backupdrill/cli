@@ -938,12 +938,14 @@ export async function runDrill(
     if (manifest.auth?.status === "included" && (opts.authCheck ?? !opts.supervision)) {
       const authPath = join(workdir, "auth.dump");
       const download = reader.downloadAuthDump;
+      // 下载出错的原文不进报告(里面可能有凭据、对象键之类),只给固定的说法;
+      // 同步抛出的错误也在这个 Promise 里接住,绝不冒到演练本身
       authDump = download
-        ? download
-            .call(reader, manifest, authPath)
+        ? Promise.resolve()
+            .then(() => download.call(reader, manifest, authPath))
             .then(
-              () => ({ path: authPath }),
-              (error: unknown) => ({ error: String((error as Error)?.message ?? error).split("\n")[0].slice(0, 300) })
+              (): AuthDumpForDrill => ({ path: authPath }),
+              (): AuthDumpForDrill => ({ error: "the Auth archive couldn't be downloaded" })
             )
         : Promise.resolve({ error: "this snapshot location can't read the Auth archive" });
     }

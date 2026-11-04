@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Client } from "pg";
 import type { Manifest } from "./manifest.js";
-import { manualAuthObjects, redactValues, restorableAuthObjects } from "./auth-backup.js";
+import { manualAuthObjects, restorableAuthObjects } from "./auth-backup.js";
 import { parseForeignKeys } from "./dump-sql.js";
 import { addForeignKeys, type OrphanedForeignKey } from "./orphaned-foreign-keys.js";
 import { resolvePgRestoreBin } from "./pgbin.js";
@@ -43,26 +43,37 @@ export interface AuthDumpForDrill {
   error?: string;
 }
 
-// 报告会发给用户、进运营者告警,报错文字一律不带可能是数据的东西。
-// PostgreSQL 的报错按 SQLSTATE 分:下面这些类别的主消息里只有对象名(表、列、约束、函数、角色),
-// 留着方便排查;其余(触发器里 RAISE 的、数据格式错误之类,消息里可能带着行里的值)只给 SQLSTATE。
-const SAFE_SQLSTATES = new Set([
-  "42501", // 权限不足
-  "42P01", "42883", "42703", "42704", "3F000", // 表、函数、列、对象、schema 不存在
-  "42P07", "42710", // 已存在
-  "23503", "23505", "23502", "23514", // 外键、唯一、非空、CHECK 约束
-  "42804", "42846", // 类型不匹配
-  "55P03", "57014", "40P01", // 锁超时、语句超时/取消、死锁
-]);
+// 报告会发给用户、进运营者告警,**一律不放报错原文**:触发器能在任何错误码下抛出自定义消息,
+// 消息里可以是任意数据,靠脱敏堵不干净。只给 SQLSTATE 映射出的固定说法、SQLSTATE 本身,
+// 以及 PostgreSQL 结构化给出的对象名(schema / 表 / 列 / 约束,都是标识符,不是行里的值)
+const SQLSTATE_TEXT: Record<string, string> = {
+  "42501": "permission denied",
+  "42P01": "a table doesn't exist",
+  "42883": "a function doesn't exist",
+  "42703": "a column doesn't exist",
+  "3F000": "a schema doesn't exist",
+  "42P07": "a table already exists",
+  "42710": "an object already exists",
+  "23503": "a foreign key was violated",
+  "23505": "a unique constraint was violated",
+  "23502": "a not-null constraint was violated",
+  "23514": "a check constraint was violated",
+  "42804": "a data type didn't match",
+  "55P03": "a lock wait timed out",
+  "57014": "a statement timed out or was cancelled",
+  "40P01": "a deadlock",
+  P0001: "an exception was raised",
+};
 
 function safeError(error: unknown): string {
-  const e = error as { code?: string; message?: string };
-  // 先对整行脱敏再截短:反过来会把一个被截成半截的引号值漏过去
-  const firstLine = redactValues(String(e?.message ?? error).split("\n")[0]).slice(0, 300);
-  if (typeof e?.code === "string" && /^[0-9A-Z]{5}$/.test(e.code)) {
-    return SAFE_SQLSTATES.has(e.code) ? `${firstLine} (SQLSTATE ${e.code})` : `SQLSTATE ${e.code}`;
-  }
-  return firstLine;
+  const e = error as { code?: string; schema?: string; table?: string; column?: string; constraint?: string };
+  if (typeof e?.code !== "string" || !/^[0-9A-Z]{5}$/.test(e.code)) return "an unexpected error";
+  const objects = [
+    e.constraint && `constraint ${e.constraint}`,
+    e.table && `table ${e.schema ? `${e.schema}.` : ""}${e.table}`,
+    e.column && `column ${e.column}`,
+  ].filter(Boolean);
+  return `${SQLSTATE_TEXT[e.code] ?? "an error"}${objects.length ? ` (${objects.join(", ")})` : ""} (SQLSTATE ${e.code})`;
 }
 
 /** pg_restore 的 stderr 是一段文字,拿不到 SQLSTATE:只归成几类,不带原文 */
@@ -144,7 +155,7 @@ export async function runAuthDrill(
 ): Promise<AuthDrillReport> {
   const auth = manifest.auth!;
   if (authDump.error || !authDump.path) {
-    return { status: "not_checked", summary: `Auth archive couldn't be read: ${authDump.error ?? "not downloaded"}` };
+    return { status: "not_checked", summary: authDump.error ?? "the Auth archive couldn't be downloaded" };
   }
   const sha = await sha256Of(authDump.path);
   if (sha !== auth.dump!.sha256) {
@@ -210,7 +221,12 @@ export async function runAuthDrill(
         const fkList = join(work, "fks.list");
         await writeFile(fkList, fkEntries.join("\n") + "\n");
         const ddl = await pgRestoreOutput(bin, ["-f", "-", `--use-list=${fkList}`, mainDumpPath]);
-        const intoAuth = parseForeignKeys(ddl.stdout).filter(
+        const parsed = ddl.code === 0 ? parseForeignKeys(ddl.stdout) : [];
+        // 读不全外键定义(命令失败,或有定义没解析出来)时不能说"全部对上":把没能检查的条数记下来
+        if (parsed.length !== fkEntries.length) {
+          problems.push(`${fkEntries.length - parsed.length} foreign key definition(s) couldn't be read, so they weren't checked`);
+        }
+        const intoAuth = parsed.filter(
           (fk) => fk.references.schema === "auth" && (fk.references.name === "users" || fk.references.name === "identities")
         );
         // 已经建上的(例如转储自己带了 auth)不再重复
