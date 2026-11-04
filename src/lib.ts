@@ -8,8 +8,10 @@ export { runDrill, drillDump } from "./drill.js";
 export { runRestore, restoreStatus, finishRestore } from "./restore.js";
 export { fileRestoreRecords, restoreRecordKey } from "./restore-record.js";
 export type { RestoreRecord, RestoreRecordStore, RestorePhase } from "./restore-record.js";
-// RECOVERY.md 的授权那一步:worker 的 Drive 版手册和这里的 S3 版用同一份 SQL
+// RECOVERY.md 的授权那一步和 Auth 用户那几段:worker 的 Drive 版手册和这里的 S3 版用同一份
 export { recoveryGrantsSql } from "./grants.js";
+export { authRecoveryText } from "./recovery-doc.js";
+export type { AuthRecoveryText, RecoveryDocPlace } from "./recovery-doc.js";
 // 身份判定三件套对外导出:托管 worker 用它们与 app 侧 shared 的副本做同规则回归(交叉审查)
 export { projectRefOf, assertNoHostOverride, libpqChildEnv } from "./restore-engine.js";
 export { sameDatabaseTarget } from "./restore.js";
