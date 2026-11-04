@@ -331,10 +331,12 @@ export function spawnPgRestore(
   bin: string,
   args: string[],
   extraEnv: NodeJS.ProcessEnv = {},
-  opts: { supabaseHost: boolean; urlSslMode?: string | null } = { supabaseHost: false }
+  opts: { supabaseHost: boolean; urlSslMode?: string | null; signal?: AbortSignal } = { supabaseHost: false }
 ): Promise<{ code: number | null; stderr: string }> {
   // 收到信号之后不再起新的一遍(两遍恢复、并行建索引后的重跑都是一个接一个起的)
   if (interrupted()) return Promise.reject(new Error("interrupted; not starting pg_restore"));
+  // 调用方叫停(演练的 Auth 检查超时):已叫停就不起,起了就停掉。不传 signal 的调用方行为不变
+  if (opts.signal?.aborted) return Promise.reject(new Error("stopped by the caller; not starting pg_restore"));
   return new Promise((resolve, reject) => {
     const proc = spawn(bin, args, {
       stdio: ["ignore", "ignore", "pipe"],
@@ -342,6 +344,9 @@ export function spawnPgRestore(
     });
     // `kill <pid>` 只发给 node 时 pg_restore 收不到;中断时由我们停掉它
     stopOnInterrupt(proc);
+    const stopOnAbort = () => proc.kill("SIGTERM");
+    opts.signal?.addEventListener("abort", stopOnAbort, { once: true });
+    proc.once("close", () => opts.signal?.removeEventListener("abort", stopOnAbort));
     let stderr = "";
     proc.stderr.setEncoding("utf8");
     proc.stderr.on("data", (d: string) => (stderr += d));

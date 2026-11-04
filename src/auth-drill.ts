@@ -5,13 +5,11 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Client } from "pg";
 import type { Manifest } from "./manifest.js";
-import { manualAuthObjects, restorableAuthObjects } from "./auth-backup.js";
+import { connectCancellable, manualAuthObjects, restorableAuthObjects } from "./auth-backup.js";
 import { parseForeignKeys } from "./dump-sql.js";
 import { addForeignKeys, type OrphanedForeignKey } from "./orphaned-foreign-keys.js";
 import { resolvePgRestoreBin } from "./pgbin.js";
 import { credentialSafeDbArgs, pgRestoreOutput, spawnPgRestore } from "./restore-engine.js";
-import pg from "pg";
-import { attachPgErrorGuard, connectPg, pgConnectOptions } from "./supabase-ca.js";
 import { interrupted } from "./interrupt.js";
 
 /**
@@ -161,7 +159,8 @@ export async function runAuthDrill(
   const auth = manifest.auth!;
   // 这一节的所有会话都带上 application_name,超时时 authDrillSection 只终止它们
   sandboxConnString = taggedUrl(sandboxConnString);
-  // 超时后不再开始任何新的一步(新连接、pg_restore、下一阶段):已经在跑的由 authDrillSection 终止
+  // 叫停(超时)之后:不再开始任何新的一步;已经开着的连接被 connectCancellable 直接断开,
+  // 正在跑的 pg_restore 被 spawnPgRestore 停掉。服务端还没收手的会话由 authDrillSection 事后终止
   const stopIfCancelled = () => {
     if (signal?.aborted) throw new Error("the Auth check was stopped");
   };
@@ -178,13 +177,14 @@ export async function runAuthDrill(
 
   const bin = resolvePgRestoreBin();
   const { url, env } = credentialSafeDbArgs(sandboxConnString);
-  const work = await mkdtemp(join(tmpdir(), "backupdrill-auth-drill-"));
-  // connectPg 挂好了错误监听:沙箱连接被掐断时不会把整个进程(托管 worker)带走
+  // connectCancellable 挂好了错误监听(沙箱连接被掐断时不会把托管 worker 带走),叫停时直接断开
   stopIfCancelled();
-  const client = await connectPg(sandboxConnString);
-  // 每条语句都有上限(整段另有总时限,见 authDrillSection)
-  await client.query("set statement_timeout = '5min'; set lock_timeout = '1min'");
+  const client = await connectCancellable(sandboxConnString, signal);
+  const work = await mkdtemp(join(tmpdir(), "backupdrill-auth-drill-"));
   try {
+    stopIfCancelled();
+    // 每条语句都有上限(整段另有总时限,见 authDrillSection)
+    await client.query("set statement_timeout = '5min'; set lock_timeout = '1min'");
     // ── 1. 两张表:结构、数据、约束、索引;触发器和策略留到外键之后 ──
     // 新项目里这两张表的属主是平台的 supabase_auth_admin,GoTrue 也用它注册用户:沙箱里照建
     await client.query(`do $$ begin
@@ -209,7 +209,8 @@ export async function runAuthDrill(
     const restored = await spawnPgRestore(
       bin,
       ["--no-owner", "--no-privileges", "--exit-on-error", "--single-transaction", `--use-list=${tablesList}`, "--dbname", url, authDump.path],
-      env
+      env,
+      { supabaseHost: false, signal }
     );
     if (restored.code !== 0) {
       return { status: "problems", summary: `the Auth tables couldn't be restored: ${safeRestoreError(restored.code, restored.stderr)}` };
@@ -263,7 +264,7 @@ export async function runAuthDrill(
         if (missing.length) {
           // addForeignKeys 会改这条连接的会话设置(search_path 等),给它单独一条
           stopIfCancelled();
-          const fkClient = await connectPg(sandboxConnString);
+          const fkClient = await connectCancellable(sandboxConnString, signal);
           try {
             const added = await addForeignKeys(fkClient, missing, { allow: /(?!)/, stopOnError: false });
             foreignKeys = {
@@ -294,7 +295,10 @@ export async function runAuthDrill(
       const list = join(work, `trigger-${t.name}.list`);
       await writeFile(list, entry + "\n");
       stopIfCancelled();
-      const made = await spawnPgRestore(bin, ["--no-owner", "--no-privileges", "--exit-on-error", `--use-list=${list}`, "--dbname", url, authDump.path], env);
+      const made = await spawnPgRestore(bin, ["--no-owner", "--no-privileges", "--exit-on-error", `--use-list=${list}`, "--dbname", url, authDump.path], env, {
+        supabaseHost: false,
+        signal,
+      });
       if (made.code === 0) triggers.created.push(t.name);
       else triggers.failed.push(`${t.name}: ${safeRestoreError(made.code, made.stderr)}`);
     }
@@ -388,13 +392,13 @@ function taggedUrl(connString: string): string {
   return url.toString();
 }
 
-/** 终止 Auth 这一节在沙箱里开的会话(按 application_name 认):它的 pg_restore 和查询随之结束,别人的会话不动 */
-async function stopAuthSessions(sandboxConnString: string): Promise<void> {
+/**
+ * 终止 Auth 这一节在沙箱里开的会话(按 application_name 认),别人的会话不动。
+ * 整个过程(连接、查询、断开)有硬时限:到点直接销毁 socket,沙箱没回应也挂不住进程
+ */
+export async function stopAuthSessions(sandboxConnString: string, deadlineMs = 10_000): Promise<void> {
   try {
-    // 自带连接超时:沙箱没有回应时,这条清理连接也不能挂住进程
-    const client = new pg.Client({ ...pgConnectOptions(sandboxConnString), connectionTimeoutMillis: 10_000 });
-    attachPgErrorGuard(client);
-    await client.connect();
+    const client = await connectCancellable(sandboxConnString, AbortSignal.timeout(deadlineMs));
     try {
       await client.query(
         "select pg_terminate_backend(pid) from pg_stat_activity where application_name = $1 and pid <> pg_backend_pid()",
@@ -404,7 +408,7 @@ async function stopAuthSessions(sandboxConnString: string): Promise<void> {
       await client.end().catch(() => {});
     }
   } catch {
-    // 沙箱可能已经不在了:那就没什么要停的
+    // 沙箱可能已经不在了,或者到点了:没什么能再做的
   }
 }
 
@@ -444,13 +448,16 @@ export async function authDrillSection(
       work,
       new Promise<AuthDrillReport>((resolve) => {
         timer = setTimeout(() => {
-          // 超时结果立刻返回,收尾放到后台、自带时限,绝不让演练等它:
-          //  - 不再开始任何新的一步(cancel);
-          //  - 下载停掉;
-          //  - 这一节在沙箱里开的会话全部终止,正在跑的 pg_restore 随之退出——--keep 留下的沙箱不会再被改动
+          // 超时结果立刻返回,收尾放到后台、每一步都有时限,绝不让演练等它:
+          //  - 叫停:不再开始任何新的一步,自己的连接当场断开,自己的 pg_restore 当场停掉;下载停掉;
+          //  - 等这一节真正退出(那之后它不会再开任何连接),再把服务端还没收手的会话终止掉
+          //    (比如还在等锁的语句)——--keep 留下的沙箱事后不会再被改动
           cancel.abort();
           stopDownload?.();
-          void waitAtMost(stopAuthSessions(sandboxConnString), 10_000);
+          void (async () => {
+            await waitAtMost(work, 10_000);
+            await stopAuthSessions(sandboxConnString);
+          })();
           resolve(timedOut);
         }, AUTH_DRILL_LIMITS.totalMs);
       }),
