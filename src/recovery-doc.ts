@@ -37,7 +37,9 @@ const AUTH_NOT_INCLUDED_TEXT: Record<string, string> = {
   no_permission: "the backup role couldn't read every row of the Auth tables",
   no_auth_schema: "the source database has no Supabase auth schema",
   unsupported_destination: "this destination couldn't hold the Auth archive",
-  schemas_may_include_auth: "the auth schema is already part of the database dump",
+  schemas_include_auth: "the auth schema is part of the database dump",
+  schemas_not_plain:
+    "the schema list used a pattern or a quoted name; the Auth users are in the database dump only if one of those patterns matched auth",
   too_large: "the Auth archive was larger than 2 GiB",
   snapshot_unavailable: "a consistent snapshot for the Auth export couldn't be set up",
 };
@@ -101,6 +103,9 @@ export function renderRecoveryDoc(manifest: Manifest, ctx: RecoveryDocContext): 
     ? [
         auth.passwordHashes!.encrypted > 0
           ? `- ${auth.passwordHashes!.encrypted} user(s) have password hashes encrypted with the old project's key; they can't sign in with their old password on a new project and need a password reset.`
+          : "",
+        auth.passwordHashes!.unrecognized > 0
+          ? `- ${auth.passwordHashes!.unrecognized} user(s) have password hashes in a format BackupDrill doesn't recognize; whether they can sign in with their old password on a new project is unknown. Be ready to send them a password reset.`
           : "",
         auth.ssoUsers! > 0
           ? `- ${auth.ssoUsers} SSO user(s): their accounts are restored, but SSO providers aren't in this snapshot. Recreating a provider gives it a new ID, so these users may not land on their old accounts.`
