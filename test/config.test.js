@@ -28,6 +28,7 @@ const ENV_KEYS = [
   "BACKUPDRILL_SUPABASE_STORAGE_ACCESS_KEY_ID",
   "BACKUPDRILL_SUPABASE_STORAGE_SECRET_ACCESS_KEY",
   "BACKUPDRILL_SUPABASE_STORAGE_BUCKETS",
+  "BACKUPDRILL_AUTH",
 ];
 
 // 模拟 index.ts 里 backup 命令的 overrides 形状:未传 flag = 显式 undefined
@@ -36,6 +37,7 @@ function cliOverrides(extra = {}) {
     databaseUrl: undefined,
     projectName: undefined,
     schemas: undefined,
+    auth: undefined,
     storage: {
       bucket: undefined,
       endpoint: undefined,
@@ -261,4 +263,39 @@ test("empty optional variables from an unset secret leave every default in place
   assert.equal(config.storage.prefix, "backupdrill");
   assert.equal(config.storage.forcePathStyle, false);
   assert.equal(config.supabaseStorage, undefined);
+});
+
+// 2.10.0 Auth 用户备份:CLI 不说就关着(读端就绪前);flag > 环境变量 > 配置文件
+const REQUIRED_ENV = {
+  BACKUPDRILL_DATABASE_URL: "postgresql://u:p@h/db",
+  BACKUPDRILL_S3_BUCKET: "b",
+  BACKUPDRILL_S3_ACCESS_KEY_ID: "k",
+  BACKUPDRILL_S3_SECRET_ACCESS_KEY: "s",
+};
+
+test("auth: off unless asked; --auth / --no-auth / BACKUPDRILL_AUTH / config file override it in that order", async () => {
+  Object.assign(process.env, REQUIRED_ENV);
+  const configPath = join(dir, "c.json");
+  const load = (extra = {}) => loadConfig({ configPath, overrides: cliOverrides(extra) });
+
+  assert.equal((await load()).auth, "off");
+  writeFileSync(configPath, JSON.stringify({ auth: true }));
+  assert.equal((await load()).auth, "on");
+  writeFileSync(configPath, JSON.stringify({ auth: false }));
+  assert.equal((await load()).auth, "off");
+  process.env.BACKUPDRILL_AUTH = "on";
+  assert.equal((await load()).auth, "on", "env beats the config file");
+  process.env.BACKUPDRILL_AUTH = "";
+  assert.equal((await load()).auth, "off", "an empty env var (unset GitHub secret) counts as not set");
+  process.env.BACKUPDRILL_AUTH = "on";
+  assert.equal((await load({ auth: false })).auth, "off", "--no-auth beats env");
+  assert.equal((await load({ auth: true })).auth, "on");
+});
+
+test("auth: an unrecognized BACKUPDRILL_AUTH is an error, not silently ignored", async () => {
+  Object.assign(process.env, REQUIRED_ENV, { BACKUPDRILL_AUTH: "maybe" });
+  await assert.rejects(
+    loadConfig({ configPath: join(dir, "none.json"), overrides: cliOverrides() }),
+    /BACKUPDRILL_AUTH must be "on" or "off"/
+  );
 });

@@ -75,6 +75,13 @@ program
   .option("--endpoint <url>", "S3-compatible endpoint (required for R2/B2; omit for AWS S3)")
   .option("--region <region>", "bucket region (default: auto)")
   .option("--prefix <prefix>", "key prefix inside the bucket (default: backupdrill)")
+  // 先定义 --auth 再定义 --no-auth:两个都不传时值是 undefined(= 默认行为),而不是 true
+  .option(
+    "--auth",
+    "also back up Supabase Auth users (auth.users + auth.identities), or BACKUPDRILL_AUTH=on; " +
+      "if it can't be done the database backup still completes and the command exits with code 3"
+  )
+  .option("--no-auth", "don't back up Supabase Auth users (the default for now)")
   .option(PING_FLAG, PING_HELP)
   .action(async (opts) => {
     const ping = createPinger(await resolvePingUrl({ flag: opts.pingUrl, configPath: opts.config }));
@@ -87,6 +94,7 @@ program
           databaseUrl: opts.databaseUrl,
           projectName: opts.projectName,
           schemas: opts.schema,
+          auth: opts.auth,
           storage: {
             bucket: opts.bucket,
             endpoint: opts.endpoint,
@@ -103,9 +111,29 @@ program
         `Backup complete — ${manifest.database.tableCount} tables` +
           `${storageNote}.`
       );
+      // 只有显式要求 Auth(--auth / BACKUPDRILL_AUTH=on)而它没备上,才让这次运行报失败:
+      // 数据库备份照样完成;退出码 3 与"整个备份失败"的 1 区分开。默认情况下做不了只打警告,
+      // 升级到这个版本的定时任务不会因此变红
+      // (显式要求时 planAuth 把所有"做不了"都记成 failed;只有 schemas 已含 auth 记 skipped——那时数据就在主 dump 里)
+      const authRequiredButMissing = config.auth === "on" && manifest.auth?.status === "failed";
       // stdout 输出机器可读结果,便于在 CI / GitHub Action 里消费
-      process.stdout.write(JSON.stringify({ ok: true, manifest }) + "\n");
-      await ping.success(backupSummary(manifest));
+      process.stdout.write(
+        JSON.stringify(
+          authRequiredButMissing
+            ? { ok: false, database: { ok: true }, auth: manifest.auth, manifest }
+            : { ok: true, manifest }
+        ) + "\n"
+      );
+      if (authRequiredButMissing) {
+        process.exitCode = 3;
+        await ping.fail(
+          `${backupSummary(manifest)}. Auth users were required but not backed up: ` +
+            `${manifest.auth?.reason ?? "unknown reason"}`,
+          sensitiveValuesOf(config, opts.databaseUrl)
+        );
+      } else {
+        await ping.success(backupSummary(manifest));
+      }
     } catch (error) {
       const message = (error as Error).message;
       log.error(message);

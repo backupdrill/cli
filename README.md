@@ -77,6 +77,7 @@ All recognized variables:
 | `BACKUPDRILL_DATABASE_URL` | Source connection string (falls back to `DATABASE_URL`) | — (required) |
 | `BACKUPDRILL_PROJECT_NAME` | Readable name used in object keys and the manifest | `supabase` |
 | `BACKUPDRILL_SCHEMAS` | Comma-separated schemas to dump | `public` |
+| `BACKUPDRILL_AUTH` | `on` also backs up Supabase Auth users (`auth.users` + `auth.identities`); if that can't be done the database backup still completes and `backup` exits with code 3 | `off` |
 | `BACKUPDRILL_S3_ENDPOINT` | S3-compatible endpoint (R2/B2/self-hosted; omit for AWS S3) | — |
 | `BACKUPDRILL_S3_REGION` | Destination bucket region | `auto` |
 | `BACKUPDRILL_S3_BUCKET` | Destination bucket | — (required) |
