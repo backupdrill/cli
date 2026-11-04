@@ -124,12 +124,13 @@ test(
         }
       });
 
-      await t.test("a trigger message under an ordinary error code still never reaches the report", async () => {
+      await t.test("a trigger message or RAISE USING fields under an ordinary error code never reach the report", async () => {
         // 23514(CHECK)是会给对象名的那类错误码,但消息是触发器自己写的:报告里只能有固定说法
         await sql(admin, `
           create function public.leak2() returns trigger language plpgsql security definer set search_path = '' as $$
-          begin raise exception using errcode = '23514',
-            message = (select encrypted_password from auth.users where encrypted_password like '$2a%' limit 1); end $$;
+          declare secret text := (select encrypted_password from auth.users where encrypted_password like '$2a%' limit 1);
+          begin raise exception using errcode = '23514', message = secret,
+            table = secret, column = secret, constraint = secret, schema = secret; end $$;
           create trigger leak2 after insert on auth.users for each row execute function public.leak2();`);
         try {
           const mem = await backup("default");
@@ -174,6 +175,21 @@ id" uuid references auth.users (id) on delete set null)`);
         }
       });
 
+      await t.test("a trigger that also fires on UPDATE is noted as not exercised by the test sign-up", async () => {
+        await sql(admin, `
+          create function public.touch_users() returns trigger language plpgsql security definer set search_path = '' as $$
+          begin return new; end $$;
+          create trigger touch_users before insert or update on auth.users for each row execute function public.touch_users();`);
+        try {
+          const mem = await backup("default");
+          const report = await runDrill(config, { store: mem.store });
+          assert.equal(report.auth.status, "verified", report.auth.summary);
+          assert.ok(report.auth.notes.some((n) => /touch_users .* also fires on UPDATE/.test(n)), JSON.stringify(report.auth.notes));
+        } finally {
+          await sql(admin, "drop trigger touch_users on auth.users; drop function public.touch_users()");
+        }
+      });
+
       await t.test("a deferred trigger that fails at commit is caught by the test sign-up", async () => {
         await sql(admin, `
           create function public.fail_late() returns trigger language plpgsql security definer set search_path = '' as $$
@@ -212,9 +228,20 @@ id" uuid references auth.users (id) on delete set null)`);
       await t.test("an Auth download that never finishes: not checked within the limit, the verdict doesn't move", async () => {
         const mem = await backup("default");
         const reader = await mem.store.openSnapshot();
+        let stopped = false;
+        // 一个只在被叫停时才结束的下载:超时后必须收到叫停,不然连接会把 CLI 进程拖住
         const stuck = {
           ...mem.store,
-          openSnapshot: async () => ({ ...reader, downloadAuthDump: () => new Promise(() => {}) }),
+          openSnapshot: async () => ({
+            ...reader,
+            downloadAuthDump: (_m, _dest, opts) =>
+              new Promise((_, reject) =>
+                opts?.signal?.addEventListener("abort", () => {
+                  stopped = true;
+                  reject(new Error("aborted"));
+                })
+              ),
+          }),
         };
         const previous = AUTH_DRILL_LIMITS.totalMs;
         AUTH_DRILL_LIMITS.totalMs = 1000;
@@ -224,6 +251,7 @@ id" uuid references auth.users (id) on delete set null)`);
           assert.deepEqual(verdict(report), verdict(baseline));
           assert.equal(report.auth.status, "not_checked");
           assert.match(report.auth.summary, /didn't finish/);
+          assert.equal(stopped, true, "the stuck download was stopped");
           assert.ok(Date.now() - started < 60_000, `took ${Date.now() - started} ms`);
         } finally {
           AUTH_DRILL_LIMITS.totalMs = previous;

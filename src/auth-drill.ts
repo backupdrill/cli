@@ -33,6 +33,8 @@ export interface AuthDrillReport {
   triggers?: { created: string[]; failed: string[] };
   /** 不会自动恢复、要人手处理的对象 */
   manual?: string[];
+  /** 没验证到的部分,例如触发器还响应模拟注册之外的事件 */
+  notes?: string[];
   /** 模拟注册:ran=false 时说明为什么没跑 */
   signup?: { ran: boolean; ok?: boolean; detail?: string };
 }
@@ -43,9 +45,8 @@ export interface AuthDumpForDrill {
   error?: string;
 }
 
-// 报告会发给用户、进运营者告警,**一律不放报错原文**:触发器能在任何错误码下抛出自定义消息,
-// 消息里可以是任意数据,靠脱敏堵不干净。只给 SQLSTATE 映射出的固定说法、SQLSTATE 本身,
-// 以及 PostgreSQL 结构化给出的对象名(schema / 表 / 列 / 约束,都是标识符,不是行里的值)
+// 报告会发给用户、进运营者告警,**一律不放报错原文**:触发器能在任何错误码下抛出自定义消息、
+// 伪造对象名字段,里面可以是任意数据,靠脱敏堵不干净。只给 SQLSTATE 映射出的固定说法和 SQLSTATE 本身
 const SQLSTATE_TEXT: Record<string, string> = {
   "42501": "permission denied",
   "42P01": "a table doesn't exist",
@@ -66,14 +67,10 @@ const SQLSTATE_TEXT: Record<string, string> = {
 };
 
 function safeError(error: unknown): string {
-  const e = error as { code?: string; schema?: string; table?: string; column?: string; constraint?: string };
-  if (typeof e?.code !== "string" || !/^[0-9A-Z]{5}$/.test(e.code)) return "an unexpected error";
-  const objects = [
-    e.constraint && `constraint ${e.constraint}`,
-    e.table && `table ${e.schema ? `${e.schema}.` : ""}${e.table}`,
-    e.column && `column ${e.column}`,
-  ].filter(Boolean);
-  return `${SQLSTATE_TEXT[e.code] ?? "an error"}${objects.length ? ` (${objects.join(", ")})` : ""} (SQLSTATE ${e.code})`;
+  // 只用 SQLSTATE:触发器能用 RAISE ... USING 伪造 TABLE / COLUMN / CONSTRAINT 这些字段,它们同样不可信
+  const code = (error as { code?: string })?.code;
+  if (typeof code !== "string" || !/^[0-9A-Z]{5}$/.test(code)) return "an unexpected error";
+  return `${SQLSTATE_TEXT[code] ?? "an error"} (SQLSTATE ${code})`;
 }
 
 /** pg_restore 的 stderr 是一段文字,拿不到 SQLSTATE:只归成几类,不带原文 */
@@ -215,6 +212,7 @@ export async function runAuthDrill(
     // ── 2. 之前因为沙箱没有 auth 表而跳过的外键:现在补上 ──
     const mainListing = await pgRestoreOutput(bin, ["--list", mainDumpPath]);
     let foreignKeys: AuthDrillReport["foreignKeys"] = { created: 0, orphaned: [], failed: [] };
+    if (mainListing.code !== 0) problems.push("the database archive couldn't be listed, so its foreign keys into the Auth tables weren't checked");
     if (mainListing.code === 0) {
       const fkEntries = mainListing.stdout.split("\n").filter((l) => /^FK CONSTRAINT /.test(tocType(l) ?? ""));
       if (fkEntries.length) {
@@ -280,6 +278,24 @@ export async function runAuthDrill(
       else triggers.failed.push(`${t.name}: ${safeRestoreError(made.code, made.stderr)}`);
     }
     if (triggers.failed.length) problems.push(`${triggers.failed.length} trigger(s) on the Auth tables couldn't be recreated`);
+    // 模拟注册只是 INSERT:同样响应 UPDATE / DELETE / TRUNCATE 的触发器,那些事件没验证到,明说
+    const notes: string[] = [];
+    if (triggers.created.length) {
+      const events = await client.query<{ name: string; table: string; tgtype: number }>(
+        `select t.tgname as name, c.relname as table, t.tgtype::int as tgtype
+           from pg_trigger t join pg_class c on c.oid = t.tgrelid
+          where c.oid in ('auth.users'::regclass, 'auth.identities'::regclass) and t.tgname = any($1::text[])`,
+        [triggers.created]
+      );
+      for (const e of events.rows) {
+        const other = [
+          e.tgtype & 8 ? "DELETE" : "",
+          e.tgtype & 16 ? "UPDATE" : "",
+          e.tgtype & 32 ? "TRUNCATE" : "",
+        ].filter(Boolean);
+        if (other.length) notes.push(`trigger ${e.name} on auth.${e.table} also fires on ${other.join(", ")}, which the test sign-up doesn't exercise`);
+      }
+    }
 
     // ── 4. 以 GoTrue 的身份(supabase_auth_admin,非超级用户)模拟一次邮箱注册,事后回滚 ──
     let signup: NonNullable<AuthDrillReport["signup"]> = { ran: false, detail: "no triggers of your own on the Auth tables" };
@@ -301,7 +317,10 @@ export async function runAuthDrill(
         } catch (error) {
           const e = error as Error & { where?: string; code?: string };
           // 只有错在触发器里才算触发器的问题;造的测试行本身不合表结构,算没模拟成
-          signup = /PL\/pgSQL function|SQL function|trigger/i.test(e.where ?? "") || e.code === "23503" || e.code === "23505"
+          const triggerPath =
+            /PL\/pgSQL function|SQL function|trigger/i.test(e.where ?? "") ||
+            ["23503", "23505", "42501", "42883", "42P01", "42703", "3F000", "P0001"].includes(e.code ?? "");
+          signup = triggerPath
             ? { ran: true, ok: false, detail: `a new sign-up would fail: ${safeError(e)}` }
             : { ran: false, detail: `couldn't simulate a sign-up: ${safeError(e)}` };
         } finally {
@@ -309,6 +328,8 @@ export async function runAuthDrill(
         }
       }
       if (signup.ran && !signup.ok) problems.push(signup.detail!);
+      // 有要验证的触发器,却没能模拟成注册:不能报"全部对上"
+      if (!signup.ran) problems.push(`the test sign-up couldn't run (${signup.detail})`);
     }
 
     const parts = [
@@ -327,6 +348,7 @@ export async function runAuthDrill(
       foreignKeys,
       triggers,
       ...(manual.length ? { manual } : {}),
+      ...(notes.length ? { notes } : {}),
       signup,
     };
   } finally {
@@ -347,7 +369,8 @@ export async function authDrillSection(
   sandboxConnString: string,
   manifest: Manifest,
   mainDumpPath: string,
-  authDump: Promise<AuthDumpForDrill> | undefined
+  authDump: Promise<AuthDumpForDrill> | undefined,
+  stopDownload?: () => void
 ): Promise<AuthDrillReport | undefined> {
   if (manifest.auth?.status !== "included" || !authDump) return undefined;
   if (interrupted()) return undefined;
@@ -358,10 +381,11 @@ export async function authDrillSection(
     return await Promise.race([
       work,
       new Promise<AuthDrillReport>((resolve) => {
-        timer = setTimeout(
-          () => resolve({ status: "not_checked", summary: `the Auth check didn't finish within ${AUTH_DRILL_LIMITS.totalMs / 60000} minutes` }),
-          AUTH_DRILL_LIMITS.totalMs
-        );
+        timer = setTimeout(() => {
+          // 下载停掉;数据库那边的活随沙箱销毁一起断开
+          stopDownload?.();
+          resolve({ status: "not_checked", summary: `the Auth check didn't finish within ${AUTH_DRILL_LIMITS.totalMs / 60000} minutes` });
+        }, AUTH_DRILL_LIMITS.totalMs);
       }),
     ]);
   } catch (error) {

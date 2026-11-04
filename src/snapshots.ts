@@ -159,7 +159,12 @@ export async function downloadToFile(
   bucket: string,
   key: string,
   dest: string,
-  opts: { maxAttempts?: number; openFile?: (path: string) => Promise<WritableHandle> } = {}
+  opts: {
+    maxAttempts?: number;
+    openFile?: (path: string) => Promise<WritableHandle>;
+    /** 可选:调用方叫停时中止请求和写盘、不再重试(Auth 附加校验用;不传时行为与之前一致) */
+    signal?: AbortSignal;
+  } = {}
 ): Promise<{ bytes: number; sha256: string }> {
   const maxAttempts = opts.maxAttempts ?? DOWNLOAD_MAX_ATTEMPTS;
   const hash = createHash("sha256");
@@ -178,13 +183,13 @@ export async function downloadToFile(
       await inFlight.catch(() => {});
       const from = written; // 本次请求的起点在发请求前冻结,后面的判断都用它
       try {
-        const res = await s3.send(
-          new GetObjectCommand({
-            Bucket: bucket,
-            Key: key,
-            ...(from > 0 ? { Range: `bytes=${from}-` } : {}),
-          })
-        );
+        if (opts.signal?.aborted) throw new NonRetryableDownloadError("download stopped by the caller");
+        const command = new GetObjectCommand({
+          Bucket: bucket,
+          Key: key,
+          ...(from > 0 ? { Range: `bytes=${from}-` } : {}),
+        });
+        const res = opts.signal ? await s3.send(command, { abortSignal: opts.signal }) : await s3.send(command);
         const body = res.Body as Readable;
         const status = res.$metadata.httpStatusCode;
         if (from > 0 && status !== 206) {
@@ -225,7 +230,8 @@ export async function downloadToFile(
             );
           },
         });
-        await pipeline(body, sink);
+        if (opts.signal) await pipeline(body, sink, { signal: opts.signal });
+        else await pipeline(body, sink);
         await inFlight.catch(() => {});
         if (total !== null && written !== total) {
           // 流"正常"结束但字节不够:对端掐断时 Node 有时不报错只是提前 end
@@ -235,6 +241,7 @@ export async function downloadToFile(
       } catch (error) {
         if (
           error instanceof NonRetryableDownloadError ||
+          opts.signal?.aborted ||
           !isRetryableDownloadError(error) ||
           attempt >= maxAttempts
         ) {
