@@ -8,7 +8,7 @@ Read this when the user asks what Supabase already backs up for them, wants a pl
 - **Pro and Team:** daily backups, kept 7 days on Pro and 14 on Team, restorable from the dashboard. On the physical backup process that current projects use they can't be downloaded. Point-in-time recovery is a paid add-on: about $100/month per project for 7 days of history, and it needs a Small compute add-on or larger.
 - **Storage files are not in any database backup.** A database restore brings back the `storage.objects` rows, which only point at files. The files themselves need a separate copy (the CLI copies them once the Storage S3 keys are set).
 
-Every backup taken from outside the project counts as egress on the user's Supabase bill. Free includes 5 GB a month, shared with whatever the app already serves. Run `backupdrill estimate --plan free` for the real figure. As a rough guide, if each run transfers 500 MB (the Free database limit), weekly backups use about 2 GB a month and daily ones about 15 GB, three times the allowance.
+Every backup taken from outside the project counts as egress on the user's Supabase bill. Free includes 5 GB a month, shared with whatever the app already serves. Run `backupdrill estimate --plan free` for an upper-bound estimate of the project's backup egress. As a rough guide, if each run transfers 500 MB (the Free database limit), weekly backups use about 2 GB a month and daily ones about 15 GB, three times the allowance.
 
 ## Use the Session pooler connection string
 
@@ -26,6 +26,8 @@ Keep the password off the command line, where other users on the machine can see
 ```
 <pooler-host>:5432:postgres:postgres.<project-ref>:<password>
 ```
+
+In that file a `:` or `\` inside the password has to be written as `\:` or `\\`.
 
 ```sh
 export DB_URL="postgresql://postgres.<project-ref>@<pooler-host>:5432/postgres?sslmode=require"
