@@ -43,37 +43,35 @@ function shellQuote(value: string): string {
   return /^[A-Za-z0-9._/:@=-]+$/.test(value) ? value : `'${value.replace(/'/g, `'\\''`)}'`;
 }
 
-export function renderRecoveryDoc(manifest: Manifest, ctx: RecoveryDocContext): string {
-  const base = manifest.dump.key.replace(/\/dump\.pgcustom$/, "");
+/**
+ * 手册里的归档在哪。bucket = S3 兼容桶,写完整对象键;folder = 托管 worker 的 Google Drive 目标,
+ * 手册就放在归档旁边,写文件名,name 是下载那一步说的"从哪里下"(如 "Google Drive folder")
+ */
+export type RecoveryDocPlace = { kind: "bucket" } | { kind: "folder"; name: string };
+
+export interface AuthRecoveryText {
+  /** "What this snapshot contains" 里 Auth 那一行(带换行);manifest 没有 auth 段时为空串 */
+  contentsLine: string;
+  /** 只有 Auth 为 included 的快照才有:替换"Not covered"整段和恢复的第 3、4 步 */
+  included: { notCovered: string; restoreSteps: string } | null;
+}
+
+/**
+ * RECOVERY.md 里和 Auth 用户有关的段落(2.10.0 起)。S3 版(renderRecoveryDoc)和托管 worker 的
+ * Google Drive 版共用这一份:单事务恢复脚本里的空目标检查、清理待处理链接、行数核对,两边不能各写各的。
+ * 没有 auth 字段的快照:contentsLine 为空、included 为 null,手册和 2.10.0 之前一样
+ */
+export function authRecoveryText(manifest: Manifest, place: RecoveryDocPlace): AuthRecoveryText {
   const db = manifest.database;
-  const extensions = db.extensions ?? [];
-  const storage = manifest.storage;
   const mb = (bytes: number) => (bytes / 1024 / 1024).toFixed(1);
-  // 归档格式跟随 dump 工具版本(允许比服务端新):pg_restore 必须 ≥ 两者较大值,
-  // 只按服务端版本指引会让 PG17 的 pg_restore 读不了 PG18 pg_dump 写的归档。
-  // 解析口径与 backup.ts parsePgDumpMajor 一致(不 import:backup → recovery-doc 会成环)
-  const dumpToolMajor =
-    db.pgDumpVersion.match(/\(PostgreSQL\)\s+(\d+)/)?.[1] ??
-    db.pgDumpVersion.match(/(\d+)(?:\.\d+)+/)?.[1];
-  const requiredRestoreMajor = Math.max(
-    Number(dumpToolMajor ?? 0),
-    parseInt(db.serverVersion, 10) || 0
-  );
-
-  const extensionSql = extensions.length
-    ? extensions
-        .map(
-          (e) =>
-            `create schema if not exists ${quoteSqlIdent(e.schema)};\n` +
-            `create extension if not exists ${quoteSqlIdent(e.name)} schema ${quoteSqlIdent(e.schema)} cascade;`
-        )
-        .join("\n")
-    : "-- (this snapshot records no extensions)";
-
-  // Auth 用户(2.10.0 起):只有 included 的快照带 auth.dump;没有 auth 字段的快照手册和以前完全一样
+  // 只有 included 的快照带 auth.dump
   const auth = manifest.auth?.status === "included" ? manifest.auth : null;
+  const dumpFile = place.kind === "bucket" ? manifest.dump.key : "dump.pgcustom";
+  const authFile = place.kind === "bucket" ? (auth?.dump?.key ?? "auth.dump") : "auth.dump";
+  const authListing = place.kind === "bucket" ? `\`${authFile}\`` : "`auth.dump` in this folder";
+  const container = place.kind === "bucket" ? "bucket" : place.name;
   const authLine = auth
-    ? `- **Supabase Auth users**: \`${auth.dump!.key}\`
+    ? `- **Supabase Auth users**: ${authListing}
   (pg_dump custom format, ${mb(auth.dump!.bytes)} MB, sha256 \`${auth.dump!.sha256}\`) — ${auth.rows!.users.toLocaleString("en-US")} users, ${auth.rows!.identities.toLocaleString("en-US")} sign-in identities
 `
     : manifest.auth
@@ -105,53 +103,16 @@ export function renderRecoveryDoc(manifest: Manifest, ctx: RecoveryDocContext): 
       })()
     : [];
 
-  // 2.0 形态:凭据只经环境变量(argv 对全机器可见);写入需要键入目标 ref 确认。
-  // DB-only 快照不出现 Storage 凭据与旗标——不为用不上的能力索要宽权限 key
-  const cliRestoreCommand = [
-    `read -rs BACKUPDRILL_TARGET_DATABASE_URL && export BACKUPDRILL_TARGET_DATABASE_URL   # hidden prompt`,
-    ...(storage
-      ? [`read -rs BACKUPDRILL_TARGET_SERVICE_ROLE_KEY && export BACKUPDRILL_TARGET_SERVICE_ROLE_KEY`]
-      : []),
-    `backupdrill restore \\`,
-    `  --snapshot ${shellQuote(ctx.snapshot)} \\`,
-    `  --bucket ${shellQuote(ctx.bucket)} \\`,
-    ...(ctx.endpoint ? [`  --endpoint ${shellQuote(ctx.endpoint)} \\`] : []),
-    ...(ctx.region ? [`  --region ${shellQuote(ctx.region)} \\`] : []),
-    `  --prefix ${shellQuote(ctx.prefix)} \\`,
-    `  --project-name ${shellQuote(ctx.projectName)} \\`,
-    `  --database \\`,
-    ...(storage ? [`  --target-supabase-url https://<target-ref>.supabase.co \\`] : []),
-    `  --confirm-target <target-ref>`,
-  ].join("\n");
-
-  // 没有 Auth 的快照:以下两段与 2.10.0 之前逐字一致
-  const notCovered = auth
-    ? `Supabase **Auth sessions and MFA factors, Auth settings (sign-in providers,
+  if (!auth) return { contentsLine: authLine, included: null };
+  const notCovered = `Supabase **Auth sessions and MFA factors, Auth settings (sign-in providers,
 SMTP, redirect URLs, email templates), secret values, Edge Function code and most
 platform settings are NOT in this snapshot**. After restoring, reconfigure them
 by hand; everyone signs in once more. The Auth users themselves (IDs, emails,
 password hashes, sign-in identities) are in this snapshot and are restored in
 step 4 below, together with the database.
-${authNotes.length ? `\n${authNotes.join("\n")}\n` : ""}`
-    : `Supabase **Auth users/sessions, secret values, Edge Function code and most
-platform settings are NOT in this snapshot**. After restoring, reconfigure them
-by hand. This is a database + Storage snapshot, not a full project image.
-${
-  db.schemas.includes("auth")
-    ? ""
-    : `
-If a table in this snapshot has a foreign key into \`auth.users\` (a \`profiles.id\`
-that references it, for example), copy the Auth users into the new project
-**before** restoring, or that foreign key can't be created and the restore fails.
-\`backupdrill restore --dry-run\` checks those keys against the new project and reports
-the rows that have no user, plus any key it couldn't check.
-Triggers on \`auth.users\` aren't in this snapshot either; recreate them afterwards.
-`
-}`;
-
-  const restoreSteps = auth
-    ? `3. Download \`${manifest.dump.key}\` and \`${auth.dump!.key}\` from this
-   bucket, then verify them:
+${authNotes.length ? `\n${authNotes.join("\n")}\n` : ""}`;
+  const restoreSteps = `3. Download \`${dumpFile}\` and \`${authFile}\` from this
+   ${container}, then verify them:
 
 \`\`\`bash
 shasum -a 256 dump.pgcustom   # must print ${manifest.dump.sha256}
@@ -231,7 +192,81 @@ that were pending at backup time are cleared. ${
           : "There are no triggers of your own on the Auth tables to recreate."
       } Do **not** use \`--clean\` against a Supabase project: it drops and
 recreates \`public\`, and the grants Supabase put on it go with it.
+`;
+  return { contentsLine: authLine, included: { notCovered, restoreSteps } };
+}
+
+export function renderRecoveryDoc(manifest: Manifest, ctx: RecoveryDocContext): string {
+  const base = manifest.dump.key.replace(/\/dump\.pgcustom$/, "");
+  const db = manifest.database;
+  const extensions = db.extensions ?? [];
+  const storage = manifest.storage;
+  const mb = (bytes: number) => (bytes / 1024 / 1024).toFixed(1);
+  // 归档格式跟随 dump 工具版本(允许比服务端新):pg_restore 必须 ≥ 两者较大值,
+  // 只按服务端版本指引会让 PG17 的 pg_restore 读不了 PG18 pg_dump 写的归档。
+  // 解析口径与 backup.ts parsePgDumpMajor 一致(不 import:backup → recovery-doc 会成环)
+  const dumpToolMajor =
+    db.pgDumpVersion.match(/\(PostgreSQL\)\s+(\d+)/)?.[1] ??
+    db.pgDumpVersion.match(/(\d+)(?:\.\d+)+/)?.[1];
+  const requiredRestoreMajor = Math.max(
+    Number(dumpToolMajor ?? 0),
+    parseInt(db.serverVersion, 10) || 0
+  );
+
+  const extensionSql = extensions.length
+    ? extensions
+        .map(
+          (e) =>
+            `create schema if not exists ${quoteSqlIdent(e.schema)};\n` +
+            `create extension if not exists ${quoteSqlIdent(e.name)} schema ${quoteSqlIdent(e.schema)} cascade;`
+        )
+        .join("\n")
+    : "-- (this snapshot records no extensions)";
+
+  // Auth 用户(2.10.0 起):没有 auth 字段的快照,下面用到的三段都和以前一样
+  const authText = authRecoveryText(manifest, { kind: "bucket" });
+  const auth = authText.included;
+
+  // 2.0 形态:凭据只经环境变量(argv 对全机器可见);写入需要键入目标 ref 确认。
+  // DB-only 快照不出现 Storage 凭据与旗标——不为用不上的能力索要宽权限 key
+  const cliRestoreCommand = [
+    `read -rs BACKUPDRILL_TARGET_DATABASE_URL && export BACKUPDRILL_TARGET_DATABASE_URL   # hidden prompt`,
+    ...(storage
+      ? [`read -rs BACKUPDRILL_TARGET_SERVICE_ROLE_KEY && export BACKUPDRILL_TARGET_SERVICE_ROLE_KEY`]
+      : []),
+    `backupdrill restore \\`,
+    `  --snapshot ${shellQuote(ctx.snapshot)} \\`,
+    `  --bucket ${shellQuote(ctx.bucket)} \\`,
+    ...(ctx.endpoint ? [`  --endpoint ${shellQuote(ctx.endpoint)} \\`] : []),
+    ...(ctx.region ? [`  --region ${shellQuote(ctx.region)} \\`] : []),
+    `  --prefix ${shellQuote(ctx.prefix)} \\`,
+    `  --project-name ${shellQuote(ctx.projectName)} \\`,
+    `  --database \\`,
+    ...(storage ? [`  --target-supabase-url https://<target-ref>.supabase.co \\`] : []),
+    `  --confirm-target <target-ref>`,
+  ].join("\n");
+
+  // 没有 Auth 的快照:以下两段与 2.10.0 之前逐字一致
+  const notCovered = auth
+    ? auth.notCovered
+    : `Supabase **Auth users/sessions, secret values, Edge Function code and most
+platform settings are NOT in this snapshot**. After restoring, reconfigure them
+by hand. This is a database + Storage snapshot, not a full project image.
+${
+  db.schemas.includes("auth")
+    ? ""
+    : `
+If a table in this snapshot has a foreign key into \`auth.users\` (a \`profiles.id\`
+that references it, for example), copy the Auth users into the new project
+**before** restoring, or that foreign key can't be created and the restore fails.
+\`backupdrill restore --dry-run\` checks those keys against the new project and reports
+the rows that have no user, plus any key it couldn't check.
+Triggers on \`auth.users\` aren't in this snapshot either; recreate them afterwards.
 `
+}`;
+
+  const restoreSteps = auth
+    ? auth.restoreSteps
     : `3. Download \`${manifest.dump.key}\` from this bucket, then verify it:
 
 \`\`\`bash
@@ -316,7 +351,7 @@ ${
       ? `${storage.fileCount} files, ${mb(storage.totalBytes)} MB under \`${base}/storage/<bucket>/<key>\` — per-file sha256 in manifest.json`
       : "none (database-only snapshot)"
   }
-${authLine}- **Machine-readable inventory**: \`${base}/manifest.json\`
+${authText.contentsLine}- **Machine-readable inventory**: \`${base}/manifest.json\`
 
 ## Not covered — plan for these separately
 

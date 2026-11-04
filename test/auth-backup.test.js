@@ -14,7 +14,7 @@ import pg from "pg";
 import { runBackup, mainDumpArgs, AUTH_TIMEOUTS } from "../dist/backup.js";
 import { schemasMayIncludeAuth, restorableAuthObjects, manualAuthObjects, redactValues } from "../dist/auth-backup.js";
 import { parseManifest } from "../dist/manifest.js";
-import { renderRecoveryDoc } from "../dist/recovery-doc.js";
+import { authRecoveryText, renderRecoveryDoc } from "../dist/recovery-doc.js";
 import { AUTH_DDL, SETUP, sql, startPostgres } from "./auth-fixtures.js";
 
 const x = promisify(execFile);
@@ -627,3 +627,25 @@ test(
     }
   }
 );
+
+test("authRecoveryText: the Drive runbook gets the same Auth steps, naming files in its folder instead of bucket keys", () => {
+  const manifest = { ...baseManifest(), auth: includedAuth() };
+  const folder = authRecoveryText(manifest, { kind: "folder", name: "Google Drive folder" });
+  const bucket = authRecoveryText(manifest, { kind: "bucket" });
+  assert.match(folder.contentsLine, /^- \*\*Supabase Auth users\*\*: `auth\.dump` in this folder\n/);
+  assert.match(folder.included.restoreSteps, /^3\. Download `dump\.pgcustom` and `auth\.dump` from this\n   Google Drive folder, then verify them:/);
+  assert.match(bucket.included.restoreSteps, /^3\. Download `backupdrill\/p\/s\/dump\.pgcustom` and `backupdrill\/p\/s\/auth\.dump` from this\n   bucket,/);
+  // 下载那一句之后逐字相同:单事务脚本、空目标检查、清理待处理链接只有一份
+  const afterDownload = (text) => text.slice(text.indexOf("\n\n"));
+  assert.equal(afterDownload(folder.included.restoreSteps), afterDownload(bucket.included.restoreSteps));
+  assert.equal(folder.included.notCovered, bucket.included.notCovered);
+  // S3 版手册里用的就是 bucket 这一份
+  const doc = renderRecoveryDoc(manifest, { snapshot: "s", bucket: "b", prefix: "p", projectName: "p" });
+  assert.ok(doc.includes(bucket.contentsLine) && doc.includes(bucket.included.restoreSteps) && doc.includes(bucket.included.notCovered));
+
+  // 没备上的快照只有一行说明;没有 auth 字段的快照什么都不加
+  const skipped = authRecoveryText({ ...baseManifest(), auth: { status: "skipped", reason: "no_permission" } }, { kind: "folder", name: "x" });
+  assert.equal(skipped.included, null);
+  assert.match(skipped.contentsLine, /not in this snapshot \(the backup role couldn't read every row of the Auth tables\)/);
+  assert.deepEqual(authRecoveryText(baseManifest(), { kind: "folder", name: "x" }), { contentsLine: "", included: null });
+});
