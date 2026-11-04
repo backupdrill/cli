@@ -271,6 +271,11 @@ program
     "proceed although the source identity cannot be verified (legacy snapshot without config) — " +
       "same-source protection is inert; double-check the target first"
   )
+  .option(
+    "--skip-auth",
+    "don't restore the snapshot's Auth users; restore the database the way 2.9 did (for example when you " +
+      "copied the users into the target yourself)"
+  )
   .option("--storage-dir <path>", "local directory to write Storage files to (when not uploading)")
   .option("--snapshot <timestamp>", "which snapshot to restore (default: latest)")
   .option("--bucket <name>", "bucket the backups live in")
@@ -327,6 +332,7 @@ program
         acknowledgeUnverifiedSource: opts.acknowledgeUnverifiedSource,
         storageDir: opts.storageDir,
         snapshot: opts.snapshot,
+        skipAuth: opts.skipAuth,
       });
       // stdout = 机器可读通道(人读日志全在 stderr):完整结构化结果供脚本/报告消费
       console.log(JSON.stringify(result));

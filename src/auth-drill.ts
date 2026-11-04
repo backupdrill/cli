@@ -67,7 +67,11 @@ const SQLSTATE_TEXT: Record<string, string> = {
 
 function safeError(error: unknown): string {
   // 只用 SQLSTATE:触发器能用 RAISE ... USING 伪造 TABLE / COLUMN / CONSTRAINT 这些字段,它们同样不可信
-  const code = (error as { code?: string })?.code;
+  return describeSqlstate((error as { code?: string })?.code);
+}
+
+/** SQLSTATE → 固定说法 + 代码本身;不是合法的 SQLSTATE 就说"意外错误"。恢复端写 Auth 数据出错时也用它 */
+export function describeSqlstate(code: unknown): string {
   if (typeof code !== "string" || !/^[0-9A-Z]{5}$/.test(code)) return "an unexpected error";
   return `${SQLSTATE_TEXT[code] ?? "an error"} (SQLSTATE ${code})`;
 }

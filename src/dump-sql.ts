@@ -127,6 +127,36 @@ export function parseTableColumns(sql: string): Map<string, Map<string, string>>
   return tables;
 }
 
+/**
+ * 建表语句里的生成列(`GENERATED ALWAYS AS (…)`,STORED 和 PG 18 的 VIRTUAL 都算),按表 → 列名集合。
+ * pg_dump 不导出生成列的数据,恢复时由目标自己算:数据段的列 = 建表语句的列减去这些。
+ * 和 parseTableColumns 同样按位置读列,只是每列再看一眼这一行剩下的部分
+ */
+export function parseGeneratedColumns(sql: string): Map<string, Set<string>> {
+  const tables = new Map<string, Set<string>>();
+  const header = new RegExp(String.raw`^CREATE (?:UNLOGGED )?TABLE ${QUALIFIED} \(\n`, "gm");
+  for (const match of sql.matchAll(header)) {
+    const generated = new Set<string>();
+    tables.set(`${unquoteIdent(match[1])}\u0000${unquoteIdent(match[2])}`, generated);
+    let at = match.index! + match[0].length;
+    const column = new RegExp(String.raw` {4}(${IDENT}) (.+?)(?= COLLATE | DEFAULT | NOT NULL| GENERATED |,?\n)`, "y");
+    while (at < sql.length && !sql.startsWith(")", at)) {
+      if (sql.startsWith("    CONSTRAINT ", at)) {
+        at = sql.indexOf("\n", at) + 1 || sql.length;
+        continue;
+      }
+      column.lastIndex = at;
+      const found = column.exec(sql);
+      if (!found) break;
+      const lineEnd = sql.indexOf("\n", column.lastIndex);
+      const rest = sql.slice(column.lastIndex, lineEnd < 0 ? sql.length : lineEnd);
+      if (/ GENERATED ALWAYS AS \(/.test(rest)) generated.add(unquoteIdent(found[1]));
+      at = lineEnd + 1 || sql.length;
+    }
+  }
+  return tables;
+}
+
 /** 一个 COPY 头最长读这么多字符;超过就当作读不了,免得坏归档把内存吃满。 */
 export const MAX_COPY_HEADER = 100_000;
 

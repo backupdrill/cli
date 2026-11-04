@@ -71,6 +71,11 @@ export async function checkExternalReferences(opts: {
    * 每条查询包在一个保存点里、查完就回滚到保存点,检查本身留不下任何东西。
    */
   inTransaction?: pg.Client;
+  /**
+   * 同一次恢复里会整表写进去的备份之外的表(带 Auth 的恢复:auth.users、auth.identities)。指向它们的外键
+   * 不算"指向备份之外":数据和引用方一起写进去,提交后按备份内的外键加,源库的孤儿行建成 NOT VALID
+   */
+  restoredTables?: QualifiedName[];
 }): Promise<ExternalReferenceCheck> {
   const bin = resolvePgRestoreBin();
   const result: ExternalReferenceCheck = { checked: [], problems: [], unchecked: [], waitingForExtensions: false };
@@ -103,7 +108,10 @@ export async function checkExternalReferences(opts: {
     );
   }
   const dumped = new Set(opts.dumpedSchemas);
-  const external = foreignKeys.filter((fk) => !dumped.has(fk.references.schema) && fk.validatesRows);
+  const restoredAlongside = new Set((opts.restoredTables ?? []).map(keyOf));
+  const external = foreignKeys.filter(
+    (fk) => !dumped.has(fk.references.schema) && fk.validatesRows && !restoredAlongside.has(keyOf(fk.references))
+  );
   if (!external.length) return result;
 
   // 分区父表上的外键,数据在各级叶子分区里(dump 只给叶子写 COPY)

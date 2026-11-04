@@ -11,11 +11,12 @@ import { fileURLToPath } from "node:url";
 const ROOT = fileURLToPath(new URL("..", import.meta.url));
 const WORKFLOW = join(ROOT, "plugin/skills/supabase-backup/assets/scheduled-backup.yml");
 
-// 不属于 `backup` 的设置:恢复目标、演练沙箱、Storage 回传阈值;pg_dump 路径由前一步写进 $GITHUB_ENV
+// 不属于 `backup` 的设置:恢复目标和恢复用的 pg_restore / psql、演练沙箱、Storage 回传阈值;pg_dump 路径由前一步写进 $GITHUB_ENV
 const NOT_BACKUP_SETTINGS = new Set([
   "BACKUPDRILL_TARGET_DATABASE_URL",
   "BACKUPDRILL_TARGET_SERVICE_ROLE_KEY",
   "BACKUPDRILL_PG_RESTORE",
+  "BACKUPDRILL_PSQL",
   "BACKUPDRILL_SANDBOX_URL",
   "BACKUPDRILL_TUS_THRESHOLD",
   "BACKUPDRILL_PG_DUMP",

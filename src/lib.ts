@@ -52,5 +52,5 @@ export type { GrantedObject, GrantRestore } from "./grants.js";
 export type { DrillReport, DrillCheck, DrillSupervision, DrillPhase } from "./drill.js";
 export type { AuthDrillReport } from "./auth-drill.js";
 export type { OrphanedForeignKey } from "./orphaned-foreign-keys.js";
-export type { RestoreResult } from "./restore.js";
+export type { RestoreResult, RestoreAuthResult } from "./restore.js";
 export type { EgressPricing, EgressProjection } from "./estimate.js";
