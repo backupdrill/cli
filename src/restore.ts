@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { mkdtemp, mkdir, rm, readdir, lstat } from "node:fs/promises";
 import { createWriteStream } from "node:fs";
 import { tmpdir } from "node:os";
@@ -737,7 +738,8 @@ export async function runRestore(
   const store = opts.store ?? s3SnapshotStore(config);
   const reader = await store.openSnapshot(opts.snapshot);
   const snapshot = reader.name;
-  const manifest = parseManifest(await reader.readManifest());
+  const rawManifest = await reader.readManifest();
+  const manifest = parseManifest(rawManifest);
 
   // Storage 目标构造即校验(https + 恰为 <ref>.supabase.co):service key 只发往
   // 已验证的 Supabase 项目源;目标库连接串拒绝 host 覆盖(身份判定=实际写入目标)
@@ -1029,6 +1031,7 @@ export async function runRestore(
               snapshot,
               projectName: manifest.projectName,
               dumpSha256: manifest.dump.sha256,
+              manifestSha256: createHash("sha256").update(rawManifest).digest("hex"),
               target: describeTarget(targetUrl),
               identity,
               xid,
@@ -1323,9 +1326,15 @@ export async function finishRestore(
 
   const store = opts.store ?? s3SnapshotStore(config);
   const reader = await store.openSnapshot(record.snapshot);
-  const manifest = parseManifest(await reader.readManifest());
-  // 快照名只是时间戳:核对这就是当初恢复的那一份(同一个项目、同一个 dump),不然授权和外键会照别的快照改
-  if (manifest.projectName !== record.projectName || manifest.dump.sha256 !== record.dumpSha256) {
+  const rawManifest = await reader.readManifest();
+  const manifest = parseManifest(rawManifest);
+  // 快照名只是时间戳:核对这就是当初恢复的那一份(同一个项目、同一个 dump、一字不差的 manifest),
+  // 不然授权和外键会照别的快照、或被改过的 manifest 改
+  if (
+    manifest.projectName !== record.projectName ||
+    manifest.dump.sha256 !== record.dumpSha256 ||
+    createHash("sha256").update(rawManifest).digest("hex") !== record.manifestSha256
+  ) {
     throw new Error(
       `snapshot ${record.snapshot} here isn't the one that was restored (project ${record.projectName}, dump ` +
         `${record.dumpSha256.slice(0, 12)}…): point restore --finish at the same bucket and project as the restore.`

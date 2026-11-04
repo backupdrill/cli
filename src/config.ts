@@ -227,10 +227,10 @@ export async function loadConfig(opts: {
     };
   }
 
-  // 显式 flag > 环境变量 > 配置文件。都没说 = 先关着:恢复和演练还不读 auth.dump 之前,
-  // 不该默认产出它们用不上的归档。读端就绪、发 2.10.0 时改成 "default"(做得了就备,做不了只警告)
+  // 显式 flag > 环境变量 > 配置文件。都没说 = "default"(2.10.0 起,PRD 决策 D4):做得了就备,
+  // 做不了(角色读不到 auth、目标存不下……)只警告、退出码照旧是 0,定时备份不会因此变红
   const authChoice = [o.auth, env.auth, file.auth].find((v) => typeof v === "boolean");
-  const auth: AuthMode = authChoice === undefined ? "off" : authChoice ? "on" : "off";
+  const auth: AuthMode = authChoice === undefined ? "default" : authChoice ? "on" : "off";
 
   return {
     databaseUrl: databaseUrl!,

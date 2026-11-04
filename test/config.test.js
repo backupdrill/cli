@@ -273,12 +273,12 @@ const REQUIRED_ENV = {
   BACKUPDRILL_S3_SECRET_ACCESS_KEY: "s",
 };
 
-test("auth: off unless asked; --auth / --no-auth / BACKUPDRILL_AUTH / config file override it in that order", async () => {
+test("auth: on when possible unless told otherwise; --auth / --no-auth / BACKUPDRILL_AUTH / config file override it in that order", async () => {
   Object.assign(process.env, REQUIRED_ENV);
   const configPath = join(dir, "c.json");
   const load = (extra = {}) => loadConfig({ configPath, overrides: cliOverrides(extra) });
 
-  assert.equal((await load()).auth, "off");
+  assert.equal((await load()).auth, "default");
   writeFileSync(configPath, JSON.stringify({ auth: true }));
   assert.equal((await load()).auth, "on");
   writeFileSync(configPath, JSON.stringify({ auth: false }));
@@ -286,7 +286,7 @@ test("auth: off unless asked; --auth / --no-auth / BACKUPDRILL_AUTH / config fil
   process.env.BACKUPDRILL_AUTH = "on";
   assert.equal((await load()).auth, "on", "env beats the config file");
   process.env.BACKUPDRILL_AUTH = "";
-  assert.equal((await load()).auth, "off", "an empty env var (unset GitHub secret) counts as not set");
+  assert.equal((await load()).auth, "off", "an empty env var (unset GitHub secret) counts as not set, so the file's false holds");
   process.env.BACKUPDRILL_AUTH = "on";
   assert.equal((await load({ auth: false })).auth, "off", "--no-auth beats env");
   assert.equal((await load({ auth: true })).auth, "on");

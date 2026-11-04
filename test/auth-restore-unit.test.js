@@ -9,6 +9,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileRestoreRecords, restoreRecordKey } from "../dist/restore-record.js";
 import { restoreStatus } from "../dist/restore.js";
+import { normalizedConstraintDef } from "../dist/orphaned-foreign-keys.js";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { fileURLToPath } from "node:url";
@@ -123,7 +124,7 @@ test("fileRestoreRecords: saves and loads a record, readable only by the user", 
     const records = fileRestoreRecords(dir);
     assert.equal(await records.load("k"), null);
     const record = {
-      version: 1, snapshot: "s", projectName: "p", dumpSha256: "abc", target: "t", identity: { databaseOid: "1", systemIdentifier: null },
+      version: 1, snapshot: "s", projectName: "p", dumpSha256: "abc", manifestSha256: "def", target: "t", identity: { databaseOid: "1", systemIdentifier: null },
       xid: "42", phase: "transaction", startedAt: "x", updatedAt: "x",
     };
     await records.save("k", record);
@@ -176,4 +177,20 @@ test("CLI: restore --status needs only the target (no config, no bucket); --fini
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test("normalizedConstraintDef: whitespace outside quotes and NOT VALID don't matter, whitespace inside quoted names does", () => {
+  assert.equal(
+    normalizedConstraintDef("FOREIGN KEY (a)  REFERENCES public.t(id)\n  NOT VALID"),
+    normalizedConstraintDef("FOREIGN KEY (a) REFERENCES public.t(id)")
+  );
+  assert.notEqual(
+    normalizedConstraintDef('FOREIGN KEY (a) REFERENCES public."parent  table"(id)'),
+    normalizedConstraintDef('FOREIGN KEY (a) REFERENCES public."parent table"(id)')
+  );
+  // "" 是引号里的一个双引号,不结束引号
+  assert.equal(
+    normalizedConstraintDef('FOREIGN KEY (a) REFERENCES public."a""  b"(id)'),
+    'FOREIGN KEY (a) REFERENCES public."a""  b"(id)'
+  );
 });
