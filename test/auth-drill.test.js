@@ -7,6 +7,11 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { runBackup } from "../dist/backup.js";
 import { runDrill } from "../dist/drill.js";
+import { AUTH_DRILL_LIMITS } from "../dist/auth-drill.js";
+import { mkdtempSync, rmSync } from "node:fs";
+import { randomUUID } from "node:crypto";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { SETUP, readableMemoryStore, sql, startPostgres } from "./auth-fixtures.js";
 
 const x = promisify(execFile);
@@ -98,6 +103,95 @@ test(
           assert.match(report.auth.signup.detail, /a new sign-up would fail: permission denied for table profiles/);
         } finally {
           await sql(admin, "alter function public.handle_new_user() security definer");
+        }
+      });
+
+      await t.test("an error raised inside a trigger never carries data into the report", async () => {
+        // 触发器把一个已存的密码哈希塞进异常消息:报告里只能有 SQLSTATE
+        await sql(admin, `
+          create function public.leak() returns trigger language plpgsql security definer set search_path = '' as $$
+          begin raise exception 'leak %', (select encrypted_password from auth.users where encrypted_password like '$2a%' limit 1); end $$;
+          create trigger leak after insert on auth.users for each row execute function public.leak();`);
+        try {
+          const mem = await backup("default");
+          const report = await runDrill(config, { store: mem.store });
+          assert.deepEqual(verdict(report), verdict(baseline));
+          assert.equal(report.auth.status, "problems");
+          assert.equal(report.auth.signup.detail, "a new sign-up would fail: SQLSTATE P0001");
+          assert.equal(JSON.stringify(report).includes("$2a$"), false);
+        } finally {
+          await sql(admin, "drop trigger leak on auth.users; drop function public.leak()");
+        }
+      });
+
+      await t.test("a deferred trigger that fails at commit is caught by the test sign-up", async () => {
+        await sql(admin, `
+          create function public.fail_late() returns trigger language plpgsql security definer set search_path = '' as $$
+          begin raise exception 'late'; end $$;
+          create constraint trigger fail_late after insert on auth.users deferrable initially deferred
+            for each row execute function public.fail_late();`);
+        try {
+          const mem = await backup("default");
+          const report = await runDrill(config, { store: mem.store });
+          assert.deepEqual(verdict(report), verdict(baseline));
+          assert.equal(report.auth.signup.ok, false, JSON.stringify(report.auth));
+        } finally {
+          await sql(admin, "drop trigger fail_late on auth.users; drop function public.fail_late()");
+        }
+      });
+
+      await t.test("a commented trigger and a foreign key sharing a name with an Auth one are both handled", async () => {
+        await sql(admin, `
+          comment on trigger on_auth_user_created on auth.users is 'creates the profile';
+          create table public.links (
+            user_id uuid,
+            constraint identities_user_id_fkey foreign key (user_id) references auth.users (id)
+          );`);
+        try {
+          const mem = await backup("default");
+          const report = await runDrill(config, { store: mem.store });
+          assert.deepEqual(verdict(report).pass, baseline.pass);
+          assert.equal(report.auth.status, "verified", report.auth.summary);
+          assert.equal(report.auth.foreignKeys.created, 2, "profiles' and links' foreign keys into auth.users");
+          assert.deepEqual(report.auth.triggers.created, ["on_auth_user_created"]);
+        } finally {
+          await sql(admin, "drop table public.links; comment on trigger on_auth_user_created on auth.users is null");
+        }
+      });
+
+      await t.test("an Auth download that never finishes: not checked within the limit, the verdict doesn't move", async () => {
+        const mem = await backup("default");
+        const reader = await mem.store.openSnapshot();
+        const stuck = {
+          ...mem.store,
+          openSnapshot: async () => ({ ...reader, downloadAuthDump: () => new Promise(() => {}) }),
+        };
+        const previous = AUTH_DRILL_LIMITS.totalMs;
+        AUTH_DRILL_LIMITS.totalMs = 1000;
+        try {
+          const started = Date.now();
+          const report = await runDrill(config, { store: stuck });
+          assert.deepEqual(verdict(report), verdict(baseline));
+          assert.equal(report.auth.status, "not_checked");
+          assert.match(report.auth.summary, /didn't finish/);
+          assert.ok(Date.now() - started < 60_000, `took ${Date.now() - started} ms`);
+        } finally {
+          AUTH_DRILL_LIMITS.totalMs = previous;
+        }
+      });
+
+      await t.test("a supervised (hosted) drill leaves the Auth check off unless asked", async () => {
+        const mem = await backup("default");
+        const workdir = mkdtempSync(join(tmpdir(), "bd-auth-sup-"));
+        // 托管 worker 的资源名形如 bd-drill-<uuid>(drill.ts 会校验)
+        const supervision = { workdir, resourceName: `bd-drill-${randomUUID()}`, observe: async () => {} };
+        try {
+          const off = await runDrill(config, { store: mem.store, supervision });
+          assert.equal(off.auth, undefined);
+          const on = await runDrill(config, { store: mem.store, supervision, authCheck: true });
+          assert.equal(on.auth.status, "verified", on.auth.summary);
+        } finally {
+          rmSync(workdir, { recursive: true, force: true });
         }
       });
 

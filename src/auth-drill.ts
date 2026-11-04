@@ -43,19 +43,40 @@ export interface AuthDumpForDrill {
   error?: string;
 }
 
-// 只取 pg_restore / PostgreSQL 报错的第一行(后面的 DETAIL / CONTEXT 常带着行里的值),
-// 再去掉可能是数据的部分(见 redactValues):报告会发给用户、进运营者告警
-function firstLine(text: string): string {
-  return redactValues(
-    (
-      text
-        .split("\n")
-        .map((l) => l.trim())
-        .find((l) => /error/i.test(l)) ?? text.split("\n")[0]
-    ).slice(0, 300)
-  );
+// 报告会发给用户、进运营者告警,报错文字一律不带可能是数据的东西。
+// PostgreSQL 的报错按 SQLSTATE 分:下面这些类别的主消息里只有对象名(表、列、约束、函数、角色),
+// 留着方便排查;其余(触发器里 RAISE 的、数据格式错误之类,消息里可能带着行里的值)只给 SQLSTATE。
+const SAFE_SQLSTATES = new Set([
+  "42501", // 权限不足
+  "42P01", "42883", "42703", "42704", "3F000", // 表、函数、列、对象、schema 不存在
+  "42P07", "42710", // 已存在
+  "23503", "23505", "23502", "23514", // 外键、唯一、非空、CHECK 约束
+  "42804", "42846", // 类型不匹配
+  "55P03", "57014", "40P01", // 锁超时、语句超时/取消、死锁
+]);
+
+function safeError(error: unknown): string {
+  const e = error as { code?: string; message?: string };
+  // 先对整行脱敏再截短:反过来会把一个被截成半截的引号值漏过去
+  const firstLine = redactValues(String(e?.message ?? error).split("\n")[0]).slice(0, 300);
+  if (typeof e?.code === "string" && /^[0-9A-Z]{5}$/.test(e.code)) {
+    return SAFE_SQLSTATES.has(e.code) ? `${firstLine} (SQLSTATE ${e.code})` : `SQLSTATE ${e.code}`;
+  }
+  return firstLine;
 }
 
+/** pg_restore 的 stderr 是一段文字,拿不到 SQLSTATE:只归成几类,不带原文 */
+function safeRestoreError(code: number | null, stderr: string): string {
+  const categories: Array<[RegExp, string]> = [
+    [/already exists/i, "an object it creates already exists"],
+    [/does not exist/i, "something it refers to doesn't exist"],
+    [/permission denied|must be owner/i, "permission denied"],
+    [/violates/i, "a constraint was violated"],
+    [/no space left|out of memory|could not extend file/i, "the sandbox ran out of resources"],
+  ];
+  const category = categories.find(([re]) => re.test(stderr))?.[1];
+  return `${category ? `${category} ` : ""}(pg_restore exited with code ${code})`;
+}
 async function sha256Of(path: string): Promise<string> {
   const hash = createHash("sha256");
   for await (const chunk of createReadStream(path)) hash.update(chunk);
@@ -138,6 +159,8 @@ export async function runAuthDrill(
   const work = await mkdtemp(join(tmpdir(), "backupdrill-auth-drill-"));
   // connectPg 挂好了错误监听:沙箱连接被掐断时不会把整个进程(托管 worker)带走
   const client = await connectPg(sandboxConnString);
+  // 每条语句都有上限(整段另有总时限,见 authDrillSection)
+  await client.query("set statement_timeout = '5min'; set lock_timeout = '1min'");
   try {
     // ── 1. 两张表:结构、数据、约束、索引;触发器和策略留到外键之后 ──
     // 新项目里这两张表的属主是平台的 supabase_auth_admin,GoTrue 也用它注册用户:沙箱里照建
@@ -149,13 +172,14 @@ export async function runAuthDrill(
       grant usage on schema auth to supabase_auth_admin`);
     const listing = await pgRestoreOutput(bin, ["--list", authDump.path]);
     if (listing.code !== 0) {
-      return { status: "problems", summary: `Auth archive couldn't be listed: ${firstLine(listing.stderr)}` };
+      return { status: "problems", summary: `Auth archive couldn't be listed: ${safeRestoreError(listing.code, listing.stderr)}` };
     }
     const entries = listing.stdout.split("\n").filter((l) => /^\d+;/.test(l));
     const tablesList = join(work, "auth-tables.list");
     await writeFile(
       tablesList,
-      entries.filter((l) => !/^(TRIGGER|POLICY) /.test(tocType(l) ?? "")).join("\n") + "\n"
+      // 触发器、策略和它们的注释都留到后面(注释先于对象执行会让整个恢复中止);注释不影响功能,干脆不建
+      entries.filter((l) => !/^(TRIGGER|POLICY) |^COMMENT \S+ (TRIGGER|POLICY) /.test(tocType(l) ?? "")).join("\n") + "\n"
     );
     const restored = await spawnPgRestore(
       bin,
@@ -163,7 +187,7 @@ export async function runAuthDrill(
       env
     );
     if (restored.code !== 0) {
-      return { status: "problems", summary: `the Auth tables couldn't be restored: ${firstLine(restored.stderr)}` };
+      return { status: "problems", summary: `the Auth tables couldn't be restored: ${safeRestoreError(restored.code, restored.stderr)}` };
     }
     const counts = await client.query<{ users: string; identities: string }>(
       "select (select count(*) from auth.users) as users, (select count(*) from auth.identities) as identities"
@@ -190,14 +214,19 @@ export async function runAuthDrill(
           (fk) => fk.references.schema === "auth" && (fk.references.name === "users" || fk.references.name === "identities")
         );
         // 已经建上的(例如转储自己带了 auth)不再重复
+        // 约束名只在同一张表内唯一:按"schema.表.约束名"判断是否已经建上
         const existing = new Set(
           (
-            await client.query<{ name: string }>(
-              "select conname as name from pg_constraint where contype = 'f' and confrelid in ('auth.users'::regclass, 'auth.identities'::regclass)"
+            await client.query<{ key: string }>(
+              `select n.nspname || '.' || c.relname || '.' || con.conname as key
+                 from pg_constraint con
+                 join pg_class c on c.oid = con.conrelid
+                 join pg_namespace n on n.oid = c.relnamespace
+                where con.contype = 'f' and con.confrelid in ('auth.users'::regclass, 'auth.identities'::regclass)`
             )
-          ).rows.map((r) => r.name)
+          ).rows.map((r) => r.key)
         );
-        const missing = intoAuth.filter((fk) => !existing.has(fk.constraint));
+        const missing = intoAuth.filter((fk) => !existing.has(`${fk.table.schema}.${fk.table.name}.${fk.constraint}`));
         if (missing.length) {
           // addForeignKeys 会改这条连接的会话设置(search_path 等),给它单独一条
           const fkClient = await connectPg(sandboxConnString);
@@ -206,7 +235,8 @@ export async function runAuthDrill(
             foreignKeys = {
               created: missing.length - added.failures.length,
               orphaned: added.orphaned,
-              failed: added.failures.map(firstLine),
+              // 只留"哪条外键、在哪张表上",消息本身不进报告
+              failed: added.failures.map((f) => f.split(": ")[0]),
             };
           } finally {
             await fkClient.end().catch(() => {});
@@ -231,7 +261,7 @@ export async function runAuthDrill(
       await writeFile(list, entry + "\n");
       const made = await spawnPgRestore(bin, ["--no-owner", "--no-privileges", "--exit-on-error", `--use-list=${list}`, "--dbname", url, authDump.path], env);
       if (made.code === 0) triggers.created.push(t.name);
-      else triggers.failed.push(`${t.name}: ${firstLine(made.stderr)}`);
+      else triggers.failed.push(`${t.name}: ${safeRestoreError(made.code, made.stderr)}`);
     }
     if (triggers.failed.length) problems.push(`${triggers.failed.length} trigger(s) on the Auth tables couldn't be recreated`);
 
@@ -249,13 +279,15 @@ export async function runAuthDrill(
           await client.query("set local role supabase_auth_admin");
           await client.query(userInsert);
           await client.query(identityInsert);
+          // 延迟检查的约束和约束触发器平时在提交时才跑:这里立刻跑完,才算这次注册真的能成
+          await client.query("set constraints all immediate");
           signup = { ran: true, ok: true };
         } catch (error) {
-          const e = error as Error & { where?: string };
+          const e = error as Error & { where?: string; code?: string };
           // 只有错在触发器里才算触发器的问题;造的测试行本身不合表结构,算没模拟成
-          signup = /PL\/pgSQL function|SQL function|trigger/i.test(e.where ?? "")
-            ? { ran: true, ok: false, detail: `a new sign-up would fail: ${firstLine(e.message)}` }
-            : { ran: false, detail: `couldn't simulate a sign-up: ${firstLine(e.message)}` };
+          signup = /PL\/pgSQL function|SQL function|trigger/i.test(e.where ?? "") || e.code === "23503" || e.code === "23505"
+            ? { ran: true, ok: false, detail: `a new sign-up would fail: ${safeError(e)}` }
+            : { ran: false, detail: `couldn't simulate a sign-up: ${safeError(e)}` };
         } finally {
           await client.query("rollback").catch(() => {});
         }
@@ -287,18 +319,38 @@ export async function runAuthDrill(
   }
 }
 
-/** 演练里调用:任何异常都收进报告,绝不让演练因为 Auth 这一节抛错 */
+/** Auth 这一节最多花多久(下载等待 + 恢复两张表 + 外键 + 触发器 + 模拟注册);到点记 not_checked */
+export const AUTH_DRILL_LIMITS = { totalMs: 15 * 60 * 1000 };
+
+/**
+ * 演练里调用:任何异常、超时都收进报告,绝不让演练因为 Auth 这一节抛错或拖住。
+ * authDump 是个 Promise:下载和正式演练同时进行,这里才等它。到点就不等了,沙箱随后照常销毁,
+ * 还在跑的 pg_restore 跟着断开
+ */
 export async function authDrillSection(
   sandboxConnString: string,
   manifest: Manifest,
   mainDumpPath: string,
-  authDump: AuthDumpForDrill | undefined
+  authDump: Promise<AuthDumpForDrill> | undefined
 ): Promise<AuthDrillReport | undefined> {
-  if (manifest.auth?.status !== "included") return undefined;
+  if (manifest.auth?.status !== "included" || !authDump) return undefined;
   if (interrupted()) return undefined;
+  const work = (async () => runAuthDrill(sandboxConnString, manifest, mainDumpPath, await authDump))();
+  work.catch(() => {});
+  let timer: NodeJS.Timeout | undefined;
   try {
-    return await runAuthDrill(sandboxConnString, manifest, mainDumpPath, authDump ?? { error: "not downloaded" });
+    return await Promise.race([
+      work,
+      new Promise<AuthDrillReport>((resolve) => {
+        timer = setTimeout(
+          () => resolve({ status: "not_checked", summary: `the Auth check didn't finish within ${AUTH_DRILL_LIMITS.totalMs / 60000} minutes` }),
+          AUTH_DRILL_LIMITS.totalMs
+        );
+      }),
+    ]);
   } catch (error) {
-    return { status: "not_checked", summary: `the Auth check couldn't run: ${firstLine((error as Error).message)}` };
+    return { status: "not_checked", summary: `the Auth check couldn't run: ${safeError(error)}` };
+  } finally {
+    clearTimeout(timer);
   }
 }

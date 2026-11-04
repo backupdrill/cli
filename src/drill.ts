@@ -686,8 +686,8 @@ export async function drillDump(
     appCheckCommand?: string;
     keepSandboxOnFailure?: boolean;
     supervision?: DrillSupervision;
-    /** 快照带 Auth 用户时由 runDrill 下载好的 auth.dump(或下载失败的原因) */
-    authDump?: AuthDumpForDrill;
+    /** 快照带 Auth 用户时 runDrill 在后台下载的 auth.dump(和正式演练同时进行) */
+    authDump?: Promise<AuthDumpForDrill>;
   } = {}
 ): Promise<DrillReport> {
   // 空/纯空白命令 = 危险的假配置(CI 里变量没展开的典型形态):跑了会以 exit 0
@@ -868,6 +868,12 @@ export async function runDrill(
     supervision?: DrillSupervision;
     /** 快照从哪读;省略 = config.storage 指的 S3 兼容桶 */
     store?: SnapshotStore;
+    /**
+     * 快照带 Auth 用户时做不做附加的 Auth 校验(不影响结论,见 auth-drill.ts)。默认:没有 supervision 时做
+     * (CLI);有 supervision(托管 worker)时不做——auth.dump 不在它按 dumpBytes 算的磁盘预算里,
+     * 等 worker 把两份都算进预算再显式打开
+     */
+    authCheck?: boolean;
   } = {}
 ): Promise<DrillReport> {
   validateSupervision(opts.supervision, opts.appCheckCommand, opts.keepSandboxOnFailure);
@@ -926,20 +932,20 @@ export async function runDrill(
       );
     }
 
-    // 快照带 Auth 用户:把 auth.dump 也取下来给附加校验用。取不到只记进报告的 Auth 一节,不影响演练
-    let authDump: AuthDumpForDrill | undefined;
-    if (manifest.auth?.status === "included") {
-      if (!reader.downloadAuthDump) {
-        authDump = { error: "this snapshot location can't read the Auth archive" };
-      } else {
-        const authPath = join(workdir, "auth.dump");
-        try {
-          await reader.downloadAuthDump(manifest, authPath);
-          authDump = { path: authPath };
-        } catch (error) {
-          authDump = { error: String((error as Error).message ?? error).split("\n")[0].slice(0, 300) };
-        }
-      }
+    // 快照带 Auth 用户:在后台把 auth.dump 取下来给附加校验用,和正式演练同时进行、不让它等。
+    // 取不到只记进报告的 Auth 一节
+    let authDump: Promise<AuthDumpForDrill> | undefined;
+    if (manifest.auth?.status === "included" && (opts.authCheck ?? !opts.supervision)) {
+      const authPath = join(workdir, "auth.dump");
+      const download = reader.downloadAuthDump;
+      authDump = download
+        ? download
+            .call(reader, manifest, authPath)
+            .then(
+              () => ({ path: authPath }),
+              (error: unknown) => ({ error: String((error as Error)?.message ?? error).split("\n")[0].slice(0, 300) })
+            )
+        : Promise.resolve({ error: "this snapshot location can't read the Auth archive" });
     }
 
     return await drillDump(dumpPath, manifest, snapshot, preChecks, {

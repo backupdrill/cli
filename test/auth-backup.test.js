@@ -104,6 +104,8 @@ test("redactValues: values that may be user data go, identifiers stay", () => {
     'ERROR:  duplicate key value violates unique constraint "users_pkey"'
   );
   assert.equal(redactValues("value 'secret-token' for user 0b1c2d3e-0000-4000-8000-123456789abc at a@b.io"), "value '…' for user … at …");
+  // 没闭合的引号:后面整段都当成值
+  assert.equal(redactValues('ERROR:  invalid input syntax for type uuid: "$2a$10$abcdefghij'), 'ERROR:  invalid input syntax for type uuid: "…"');
 });
 
 const baseManifest = () => ({
