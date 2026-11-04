@@ -269,7 +269,7 @@ export function firstPsqlError(stderr: string): string {
 export async function transactionOutcome(
   connString: string,
   xid: string,
-  opts: { waitMs?: number; pollMs?: number; graceMs?: number } = {}
+  opts: { waitMs?: number; pollMs?: number; graceMs?: number; identity?: TargetIdentity } = {}
 ): Promise<"committed" | "rolled_back" | "unknown"> {
   const { waitMs = 30_000, pollMs = 1000, graceMs = 15_000 } = opts;
   const deadline = Date.now() + waitMs;
@@ -278,6 +278,17 @@ export async function transactionOutcome(
   try {
     const client = await connectCancellable(connString, giveUp);
     try {
+      if (opts.identity) {
+        const now = await targetIdentity(client);
+        if (
+          now.databaseOid !== opts.identity.databaseOid ||
+          (now.systemIdentifier !== null &&
+            opts.identity.systemIdentifier !== null &&
+            now.systemIdentifier !== opts.identity.systemIdentifier)
+        ) {
+          return "unknown";
+        }
+      }
       for (;;) {
         const res = await client.query<{ status: string | null }>("select pg_xact_status($1::xid8) as status", [xid]);
         const status = res.rows[0].status;
@@ -303,6 +314,41 @@ export interface AuthRestoreRun {
   afterCommit?: Awaited<ReturnType<typeof afterCommit>>;
   /** 补建了的触发器 */
   triggers: string[];
+}
+
+/**
+ * 两张 Auth 表上可以延后检查的约束,现在就检查:不然它们要到 COMMIT 才报错,那时已经不在只报 SQLSTATE 的阶段,
+ * 报错的 DETAIL 会带出行值(邮箱之类)。之后这次恢复不再写这两张表,改成立即检查不影响别的
+ */
+const AUTH_CONSTRAINTS_NOW_SQL = [
+  "do $bd$ declare c record; begin",
+  "  for c in select n.nspname, con.conname from pg_constraint con join pg_namespace n on n.oid = con.connamespace",
+  "            where con.conrelid in ('auth.users'::regclass, 'auth.identities'::regclass) and con.condeferrable loop",
+  "    execute format('set constraints %I.%I immediate', c.nspname, c.conname);",
+  "  end loop;",
+  "end $bd$;",
+].join("\n");
+
+/**
+ * 目标是哪个库:库的 OID,读得到时再加集群的 system identifier。事务号只在同一个集群里有意义,
+ * 拿事务号问结果之前先核对:目标被换掉、连接改指了别处,就不能拿那边同号的事务当答案
+ */
+export interface TargetIdentity {
+  databaseOid: string;
+  systemIdentifier: string | null;
+}
+
+export async function targetIdentity(client: { query: (text: string) => Promise<{ rows: Array<Record<string, unknown>> }> }): Promise<TargetIdentity> {
+  const db = await client.query("select oid::text as oid from pg_database where datname = current_database()");
+  let systemIdentifier: string | null = null;
+  try {
+    // 托管上普通角色可能没有执行权限:读不到就只比库的 OID
+    const sys = await client.query("select system_identifier::text as id from pg_control_system()");
+    systemIdentifier = (sys.rows[0]?.id as string | undefined) ?? null;
+  } catch {
+    systemIdentifier = null;
+  }
+  return { databaseOid: db.rows[0].oid as string, systemIdentifier };
 }
 
 /** 两个 Auth 表名在 tableKey 里的写法:指向它们的外键和备份里的外键一样,提交后再加 */
@@ -346,6 +392,14 @@ export async function restoreWithAuth(opts: {
   const { url, env } = credentialSafeDbArgs(dumpUrlFor(opts.connString));
   const childEnv = libpqChildEnv(env, process.env, { supabaseHost: isSupabaseHost(opts.connString), urlSslMode: urlSslModeOf(url) });
   if (interrupted()) return { transaction: "rolled_back", failure: "interrupted before anything was written", triggers: [] };
+  // 开事务之前记下目标是哪个库:事后拿事务号问结果时先核对
+  const identityClient = await connectPg(opts.connString);
+  let identity: TargetIdentity;
+  try {
+    identity = await targetIdentity(identityClient);
+  } finally {
+    await identityClient.end().catch(() => {});
+  }
   // -X 不读用户的 psqlrc(它能改掉错误处理、把数据回显到终端);-A -t 只输出值,标记行原样可读
   const psql = spawn(resolvePsqlBin(), ["-X", "-q", "-A", "-t", "-v", "ON_ERROR_STOP=1", "--dbname", url], {
     stdio: ["pipe", "pipe", "pipe"],
@@ -500,7 +554,7 @@ export async function restoreWithAuth(opts: {
     if (!(await send(`\n\\echo ${STAGE_MARK}auth-data\n\\set VERBOSITY sqlstate\n`))) return;
     if ((failure = await generate(usersList, opts.archive.path, "the Auth users"))) return;
     if ((failure = await generate(identitiesList, opts.archive.path, "the Auth identities"))) return;
-    if (!(await send(`\n${CLEAR_PENDING_AUTH_SQL}\n`))) return;
+    if (!(await send(`\n${CLEAR_PENDING_AUTH_SQL}\n${AUTH_CONSTRAINTS_NOW_SQL}\n`))) return;
     // 3. 行数和快照一致,每条 identity 都有它的用户
     const check = [
       "",
@@ -551,7 +605,7 @@ export async function restoreWithAuth(opts: {
     ? "rolled_back"
     : (stage as Stage | null) === "committed" && code === 0
       ? "committed"
-      : await transactionOutcome(opts.connString, xid);
+      : await transactionOutcome(opts.connString, xid, { identity });
 
   if (transaction !== "committed") {
     const psqlSays =

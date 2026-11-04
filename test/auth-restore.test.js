@@ -11,7 +11,7 @@ import { join } from "node:path";
 import pg from "pg";
 import { runBackup } from "../dist/backup.js";
 import { runRestore } from "../dist/restore.js";
-import { transactionOutcome } from "../dist/auth-restore.js";
+import { targetIdentity, transactionOutcome } from "../dist/auth-restore.js";
 import { AUTH_DDL, SETUP, readableMemoryStore, sql, startPostgres } from "./auth-fixtures.js";
 
 const x = promisify(execFile);
@@ -201,6 +201,31 @@ test(
         assert.equal(again.auth.restored, true);
       });
 
+      await t.test("a deferred Auth constraint fails while errors are still redacted, not at COMMIT", async () => {
+        // 另一个源库:两个用户同一个邮箱(源库上没有唯一约束);目标上的唯一约束是延后检查的。
+        // 不提前检查的话它在 COMMIT 才报错,DETAIL 里就是那个邮箱
+        await sql(admin, "create database dupsource");
+        const dupAdmin = `postgresql://postgres:pw@127.0.0.1:${port}/dupsource`;
+        await sql(dupAdmin, `${AUTH_DDL}
+          insert into auth.users (id, email) values
+            ('aaaaaaaa-0000-0000-0000-000000000001', 'twice@example.test'),
+            ('aaaaaaaa-0000-0000-0000-000000000002', 'twice@example.test');`);
+        const dupConfig = { ...config, databaseUrl: `postgresql://reader_ok:r@127.0.0.1:${port}/dupsource`, projectName: "dup" };
+        const dupMem = readableMemoryStore();
+        await runBackup({ ...dupConfig, auth: "default" }, { store: dupMem.store });
+        assert.equal(dupMem.manifest().auth.status, "included");
+        const target = await freshTarget("alter table auth.users add constraint email_once unique (email) deferrable initially deferred;");
+        await assert.rejects(
+          runRestore(dupConfig, { store: dupMem.store, targetDatabaseUrl: target, confirmTarget: "127.0.0.1" }),
+          (error) => {
+            assert.match(error.message, /writing the Auth users failed: a unique constraint was violated \(SQLSTATE 23505\)/);
+            assert.doesNotMatch(error.message, /twice@example\.test/);
+            return true;
+          }
+        );
+        assert.deepEqual(await targetState(target), EMPTY);
+      });
+
       await t.test("an Auth row count that doesn't match the snapshot stops the restore", async () => {
         const target = await freshTarget();
         const original = mem.manifest();
@@ -338,6 +363,11 @@ test(
           await client.query("rollback");
           assert.equal(await transactionOutcome(admin, String(BigInt(open) + 1_000_000n)), "unknown");
           assert.equal(await transactionOutcome("postgresql://postgres:pw@127.0.0.1:1/none", committed), "unknown");
+          // 事务号只在原来那个库里有意义:目标换了(这里是另一个库),同号的事务不能当答案
+          const here = await targetIdentity(client);
+          assert.equal(await transactionOutcome(admin, committed, { identity: here }), "committed");
+          const elsewhere = await freshTarget();
+          assert.equal(await transactionOutcome(elsewhere, committed, { identity: here }), "unknown");
         } finally {
           await client.end();
         }

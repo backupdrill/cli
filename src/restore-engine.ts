@@ -995,7 +995,8 @@ export async function afterCommit(
   connString: string,
   grantsToRestore: GrantsToRestore,
   deferred: { fks: ForeignKeyDef[]; commentSql?: string }
-): Promise<{ pass: ClassifiedPass; orphaned?: OrphanedForeignKey[]; committed: true; grants?: GrantRestore }> {
+): Promise<{ pass: ClassifiedPass; orphaned?: OrphanedForeignKey[]; committed?: true; grants?: GrantRestore }> {
+  // committed 只在提交之后的步骤出错时带上(和拆分之前一样):调用方据此说明"数据已经在目标上了"
   let grants: GrantRestore;
   try {
     grants = await applyGrants(connString, grantsToRestore);
@@ -1009,7 +1010,7 @@ export async function afterCommit(
       committed: true,
     };
   }
-  if (!deferred.fks.length) return { pass: { expectedSkips: 0, failures: [] }, grants, committed: true };
+  if (!deferred.fks.length) return { pass: { expectedSkips: 0, failures: [] }, grants };
   try {
     const client = await connectPg(connString);
     try {
@@ -1018,7 +1019,7 @@ export async function afterCommit(
         stopOnError: true,
         commentSql: deferred.commentSql,
       });
-      return { pass: { expectedSkips: 0, failures: [] }, orphaned: added.orphaned, grants, committed: true };
+      return { pass: { expectedSkips: 0, failures: [] }, orphaned: added.orphaned, grants };
     } finally {
       await client.end();
     }

@@ -1010,7 +1010,8 @@ export async function runRestore(
           ok: committed && pass.failures.length === 0,
           orphanedForeignKeys: run.afterCommit?.orphaned,
           grants: run.afterCommit?.grants,
-          ...(committed ? { committed: true } : {}),
+          // 和老路径一样,committed 只在提交之后的步骤出错时带上
+          ...(pass.failures.length ? { committed: true } : {}),
         };
         if (committed) {
           const { notes, manual } = authRestoreNotes(manifest.auth!, manifest.database.schemas);
