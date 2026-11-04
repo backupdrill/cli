@@ -207,3 +207,39 @@ test("authDrillSection:运行中被 supervisor 叫停,立刻记 not_checked 并�
   assert.equal(skipped.status, "not_checked");
   assert.equal(downloadStopped, 1);
 });
+
+test("authDrillSection:supervisor 迟迟不回 begin 时照样能叫停:立刻返回、停掉下载、不再开始检查", async () => {
+  let downloadStopped = 0;
+  const stop = new AbortController();
+  const pending = authDrillSection(REFUSED, includedManifest, "/nonexistent", new Promise(() => {}), () => downloadStopped++, {
+    begin: () => new Promise(() => {}),
+    stop: stop.signal,
+  });
+  await new Promise((r) => setTimeout(r, 20));
+  stop.abort("low disk space on the drill host");
+  const started = Date.now();
+  const report = await pending;
+  assert.equal(report.summary, "the drill runner stopped the Auth check (low disk space on the drill host)");
+  assert.ok(Date.now() - started < 500);
+  assert.equal(downloadStopped, 1);
+});
+
+test("authDrillSection:提前退出后下载那边才失败,不留下没人接的 rejection", async () => {
+  const unhandled = [];
+  const onUnhandled = (reason) => unhandled.push(reason);
+  process.on("unhandledRejection", onUnhandled);
+  try {
+    let failDownload;
+    const authDump = new Promise((_resolve, reject) => (failDownload = reject));
+    const report = await authDrillSection(REFUSED, includedManifest, "/nonexistent", authDump, () => failDownload(new Error("download stopped")), {
+      begin: async () => {
+        throw new Error("not now");
+      },
+    });
+    assert.equal(report.status, "not_checked");
+    await new Promise((r) => setTimeout(r, 20));
+    assert.deepEqual(unhandled, []);
+  } finally {
+    process.off("unhandledRejection", onUnhandled);
+  }
+});
