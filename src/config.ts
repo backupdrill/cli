@@ -40,7 +40,7 @@ export interface BackupConfig {
   /**
    * 2.10.0 起:是否另外备份 Supabase Auth 用户(auth.users + auth.identities,见 auth-backup.ts)。
    * 库调用方不传 = "off",备份与之前逐字节一致;托管 worker 显式传值才打开。
-   * CLI 的 loadConfig 目前默认 "off",显式打开给 "on"(读端就绪后默认改为 "default")。
+   * CLI 的 loadConfig 默认 "default"(做得了就备,做不了只警告);--auth / BACKUPDRILL_AUTH=on 给 "on",关掉给 "off"。
    */
   auth?: AuthMode;
 }

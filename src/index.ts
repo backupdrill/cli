@@ -81,7 +81,7 @@ program
     "--auth",
     "require the Supabase Auth users (auth.users + auth.identities) in the backup, or BACKUPDRILL_AUTH=on; " +
       "if they can't be included the database backup still completes and the command exits with code 3. " +
-      "Without --auth/--no-auth they're included whenever the role can read them"
+      "By default they're included when possible; BACKUPDRILL_AUTH or the config file can change that"
   )
   .option("--no-auth", "don't back up the Supabase Auth users (emails, password hashes, sign-in methods), or BACKUPDRILL_AUTH=off")
   .option(PING_FLAG, PING_HELP)

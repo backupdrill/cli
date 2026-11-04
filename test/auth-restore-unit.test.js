@@ -219,6 +219,6 @@ test("a record without manifestSha256 (pre-release builds) still shows in --stat
 
 test("CLI: backup --help says Auth users are included by default", async () => {
   const { stdout } = await run(process.execPath, [cli, "backup", "--help"]);
-  assert.match(stdout.replace(/\s+/g, " "), /included whenever the role can read them/);
+  assert.match(stdout.replace(/\s+/g, " "), /By default they're included when possible/);
   assert.doesNotMatch(stdout, /the default for now/);
 });
