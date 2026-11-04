@@ -13,6 +13,7 @@ import {
   inspectAuth,
   authInSchemas,
   manualAuthObjects,
+  redactValues,
   type AuthMode,
   type SharedSnapshot,
 } from "./auth-backup.js";
@@ -327,7 +328,7 @@ const AUTH_SKIP_TEXT: Record<string, string> = {
 
 /** 报错只留第一行、截短:pg_dump / 上传的错误不该把大段原文(更不能是行值)带进 manifest 和告警 */
 function shortReason(error: unknown): string {
-  return String((error as Error)?.message ?? error).split("\n")[0].slice(0, 300);
+  return redactValues(String((error as Error)?.message ?? error).split("\n")[0].slice(0, 300));
 }
 
 type AuthPlan =

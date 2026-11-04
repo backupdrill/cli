@@ -12,7 +12,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import pg from "pg";
 import { runBackup, mainDumpArgs, AUTH_TIMEOUTS } from "../dist/backup.js";
-import { schemasMayIncludeAuth, restorableAuthObjects, manualAuthObjects } from "../dist/auth-backup.js";
+import { schemasMayIncludeAuth, restorableAuthObjects, manualAuthObjects, redactValues } from "../dist/auth-backup.js";
 import { parseManifest } from "../dist/manifest.js";
 import { renderRecoveryDoc } from "../dist/recovery-doc.js";
 import { AUTH_DDL, SETUP, sql, startPostgres } from "./auth-fixtures.js";
@@ -92,6 +92,18 @@ test("RECOVERY.md never puts an object name into a shell command unless it is a 
   assert.equal(bash.includes("pwned"), false);
   assert.ok(doc.includes(JSON.stringify(evil)), "the odd name is listed as a manual step instead");
   assert.equal(doc.includes("backupdrill restore \\"), false, "no CLI restore recipe until the CLI restores Auth users");
+});
+
+test("redactValues: values that may be user data go, identifiers stay", () => {
+  assert.equal(
+    redactValues('ERROR:  invalid input syntax for type uuid: "bob@example.com"'),
+    'ERROR:  invalid input syntax for type uuid: "…"'
+  );
+  assert.equal(
+    redactValues('ERROR:  duplicate key value violates unique constraint "users_pkey"'),
+    'ERROR:  duplicate key value violates unique constraint "users_pkey"'
+  );
+  assert.equal(redactValues("value 'secret-token' for user 0b1c2d3e-0000-4000-8000-123456789abc at a@b.io"), "value '…' for user … at …");
 });
 
 const baseManifest = () => ({

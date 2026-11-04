@@ -3,13 +3,14 @@ import { createReadStream } from "node:fs";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { Client } from "pg";
+import type { Client } from "pg";
 import type { Manifest } from "./manifest.js";
-import { manualAuthObjects, restorableAuthObjects } from "./auth-backup.js";
+import { manualAuthObjects, redactValues, restorableAuthObjects } from "./auth-backup.js";
 import { parseForeignKeys } from "./dump-sql.js";
 import { addForeignKeys, type OrphanedForeignKey } from "./orphaned-foreign-keys.js";
 import { resolvePgRestoreBin } from "./pgbin.js";
 import { credentialSafeDbArgs, pgRestoreOutput, spawnPgRestore } from "./restore-engine.js";
+import { connectPg } from "./supabase-ca.js";
 import { interrupted } from "./interrupt.js";
 
 /**
@@ -42,15 +43,17 @@ export interface AuthDumpForDrill {
   error?: string;
 }
 
-// 只取 pg_restore / PostgreSQL 报错的第一行:后面的 DETAIL / CONTEXT 可能带着行里的值(邮箱、ID),
-// 不能进报告和告警
+// 只取 pg_restore / PostgreSQL 报错的第一行(后面的 DETAIL / CONTEXT 常带着行里的值),
+// 再去掉可能是数据的部分(见 redactValues):报告会发给用户、进运营者告警
 function firstLine(text: string): string {
-  return (
-    text
-      .split("\n")
-      .map((l) => l.trim())
-      .find((l) => /error/i.test(l)) ?? text.split("\n")[0]
-  ).slice(0, 300);
+  return redactValues(
+    (
+      text
+        .split("\n")
+        .map((l) => l.trim())
+        .find((l) => /error/i.test(l)) ?? text.split("\n")[0]
+    ).slice(0, 300)
+  );
 }
 
 async function sha256Of(path: string): Promise<string> {
@@ -133,8 +136,8 @@ export async function runAuthDrill(
   const bin = resolvePgRestoreBin();
   const { url, env } = credentialSafeDbArgs(sandboxConnString);
   const work = await mkdtemp(join(tmpdir(), "backupdrill-auth-drill-"));
-  const client = new Client({ connectionString: sandboxConnString });
-  await client.connect();
+  // connectPg 挂好了错误监听:沙箱连接被掐断时不会把整个进程(托管 worker)带走
+  const client = await connectPg(sandboxConnString);
   try {
     // ── 1. 两张表:结构、数据、约束、索引;触发器和策略留到外键之后 ──
     // 新项目里这两张表的属主是平台的 supabase_auth_admin,GoTrue 也用它注册用户:沙箱里照建
@@ -197,8 +200,7 @@ export async function runAuthDrill(
         const missing = intoAuth.filter((fk) => !existing.has(fk.constraint));
         if (missing.length) {
           // addForeignKeys 会改这条连接的会话设置(search_path 等),给它单独一条
-          const fkClient = new Client({ connectionString: sandboxConnString });
-          await fkClient.connect();
+          const fkClient = await connectPg(sandboxConnString);
           try {
             const added = await addForeignKeys(fkClient, missing, { allow: /(?!)/, stopOnError: false });
             foreignKeys = {
