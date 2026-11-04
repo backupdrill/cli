@@ -7,11 +7,12 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { runBackup } from "../dist/backup.js";
 import { runDrill } from "../dist/drill.js";
-import { AUTH_DRILL_LIMITS } from "../dist/auth-drill.js";
-import { mkdtempSync, rmSync } from "node:fs";
+import { AUTH_DRILL_LIMITS, authDrillSection } from "../dist/auth-drill.js";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import pg from "pg";
 import { SETUP, readableMemoryStore, sql, startPostgres } from "./auth-fixtures.js";
 
 const x = promisify(execFile);
@@ -196,9 +197,11 @@ id" uuid references auth.users (id) on delete set null)`);
           create table public.signups (user_id uuid primary key, signed_up_at timestamptz not null, provider text not null);
           create function public.track_signup() returns trigger language plpgsql security definer set search_path = '' as $$
           begin
-            if new.raw_app_meta_data ->> 'provider' = 'email' then
-              insert into public.signups values (new.id, new.created_at, new.raw_app_meta_data ->> 'provider');
+            -- 不像一次真实的邮箱注册就直接报错:测试的注册少了这些,这条测试就会失败
+            if new.raw_app_meta_data ->> 'provider' is distinct from 'email' or new.created_at is null then
+              raise exception 'not a real-looking email sign-up';
             end if;
+            insert into public.signups values (new.id, new.created_at, new.raw_app_meta_data ->> 'provider');
             return new;
           end $$;
           create trigger track_signup after insert on auth.users for each row execute function public.track_signup();`);
@@ -211,17 +214,62 @@ id" uuid references auth.users (id) on delete set null)`);
         }
       });
 
-      await t.test("a timeout also stops the Auth work in the sandbox", async () => {
+      await t.test("a timeout stops the Auth work in a sandbox that stays around (as with --keep)", async () => {
+        // 自己起一个沙箱并留着:先把主 dump 的表和数据恢复进去,再从另一个会话锁住 public.profiles,
+        // Auth 这一节补外键时就会卡在那里。超时后:马上返回、沙箱里不留它的会话、之后也不再改动沙箱
         const mem = await backup("default");
+        const dir = mkdtempSync(join(tmpdir(), "bd-auth-timeout-"));
+        const sandboxPort = await startPostgres(ids);
+        const sandbox = `postgresql://postgres:pw@127.0.0.1:${sandboxPort}/postgres`;
+        const dumpPath = join(dir, "dump.pgcustom");
+        const authPath = join(dir, "auth.dump");
+        writeFileSync(dumpPath, mem.files.get("dump.pgcustom"));
+        writeFileSync(authPath, mem.files.get("auth.dump"));
+        // 唯一预期的报错是 schema "public" already exists(新库里本来就有),其余都算失败
+        await x(process.env.BACKUPDRILL_PG_RESTORE || "pg_restore", [
+          "--no-owner", "--no-privileges", "--section=pre-data", "--section=data", "--dbname", sandbox, dumpPath,
+        ]).catch((error) => {
+          const errors = (error.stderr ?? "").split("\n").filter((l) => /ERROR:/.test(l));
+          if (errors.length !== 1 || !/schema "public" already exists/.test(errors[0])) throw error;
+        });
+        const locker = new pg.Client({ connectionString: sandbox });
+        await locker.connect();
         const previous = AUTH_DRILL_LIMITS.totalMs;
-        AUTH_DRILL_LIMITS.totalMs = 1; // 立刻超时:这一节刚开始就被叫停
+        AUTH_DRILL_LIMITS.totalMs = 4000;
         try {
-          const report = await runDrill(config, { store: mem.store });
-          assert.deepEqual(verdict(report), verdict(baseline));
-          assert.equal(report.auth.status, "not_checked");
+          await locker.query("begin; lock table public.profiles in access exclusive mode");
+          const started = Date.now();
+          const result = await authDrillSection(sandbox, mem.manifest(), dumpPath, Promise.resolve({ path: authPath }), () => {});
+          assert.equal(result.status, "not_checked");
+          assert.ok(Date.now() - started < 8000, `took ${Date.now() - started} ms`);
+          // 后台的收尾很快就把这一节的会话都终止了
+          const others = async () =>
+            (
+              await sql(
+                sandbox,
+                `select count(*)::int as n from pg_stat_activity
+                  where backend_type = 'client backend' and pid <> pg_backend_pid() and pid <> ${locker.processID}`
+              )
+            ).rows[0].n;
+          let n = 1;
+          for (let i = 0; i < 50 && n > 0; i++) {
+            n = await others();
+            if (n > 0) await new Promise((r) => setTimeout(r, 100));
+          }
+          assert.equal(n, 0, "no Auth session left in the sandbox");
         } finally {
           AUTH_DRILL_LIMITS.totalMs = previous;
+          await locker.query("rollback").catch(() => {});
+          await locker.end();
         }
+        // 锁放开以后也不能再有人往沙箱里加外键:被叫停的活没有接着做
+        await new Promise((r) => setTimeout(r, 1500));
+        const fk = await sql(
+          sandbox,
+          "select count(*)::int as n from pg_constraint where conrelid = 'public.profiles'::regclass and contype = 'f'"
+        );
+        assert.equal(fk.rows[0].n, 0);
+        rmSync(dir, { recursive: true, force: true });
       });
 
       await t.test("a deferred trigger that fails at commit is caught by the test sign-up", async () => {
