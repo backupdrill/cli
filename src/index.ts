@@ -7,7 +7,8 @@ import { runEstimate, type EgressPricing } from "./estimate.js";
 import { runDrill } from "./drill.js";
 import { createInterface } from "node:readline/promises";
 import { Writable } from "node:stream";
-import { runRestore, NO_SOURCE_DATABASE } from "./restore.js";
+import { runRestore, NO_SOURCE_DATABASE, restoreStatus, finishRestore } from "./restore.js";
+import { fileRestoreRecords } from "./restore-record.js";
 import { recordDrillOutcome } from "./drill-record.js";
 import { DEFAULT_EXPORTER_PORT, startExporter } from "./exporter.js";
 import { exitCleanlyOnSignals, interrupted } from "./interrupt.js";
@@ -272,6 +273,14 @@ program
       "same-source protection is inert; double-check the target first"
   )
   .option(
+    "--status",
+    "read-only: for a restore with Auth users into this target, say whether it committed and what's left to do"
+  )
+  .option(
+    "--finish",
+    "for a restore with Auth users that committed, do the steps after the commit that didn't finish (grants, foreign keys); safe to run again"
+  )
+  .option(
     "--skip-auth",
     "don't restore the snapshot's Auth users; restore the database the way 2.9 did (for example when you " +
       "copied the users into the target yourself)"
@@ -285,6 +294,31 @@ program
   .option("--project-name <name>", "project name used in the object key")
   .action(async (opts) => {
     try {
+      // restore --status / --finish:只针对带 Auth 的恢复,按这台机器上的恢复记录查结果、接着做。
+      // --status 只读、只要目标连接串,放在读配置之前:不需要桶的凭据
+      if (opts.status || opts.finish) {
+        if (opts.status && opts.finish) throw new Error("use --status or --finish, not both");
+        if (opts.finish && opts.dryRun) {
+          throw new Error("--finish writes to the target; for a read-only look use --status instead of --dry-run");
+        }
+      }
+      let statusTarget: string | undefined;
+      if (opts.status || opts.finish) {
+        statusTarget =
+          process.env.BACKUPDRILL_TARGET_DATABASE_URL?.trim() ||
+          (await promptSecret("Target database connection string (BACKUPDRILL_TARGET_DATABASE_URL)"));
+      }
+      if (opts.status) {
+        const status = await restoreStatus({ targetDatabaseUrl: statusTarget!, restoreRecords: fileRestoreRecords() });
+        console.log(JSON.stringify(status));
+        const finished = status.transaction === "committed" && status.phase === "done";
+        (finished ? log.ok : log.warn)(
+          status.recorded
+            ? `${status.target}: snapshot ${status.snapshot}, transaction ${status.xid} ${status.transaction} — ${status.next}`
+            : `${status.target}: ${status.next}`
+        );
+        return;
+      }
       // 源库连接串不再无条件屏蔽:配置/环境里有真实源时,runRestore 的同源阻断门
       // 要拿它比对;纯 flag 驱动(无任何源配置)才退回占位符
       const overrides = {
@@ -305,6 +339,17 @@ program
           configPath: opts.config,
           overrides: { ...overrides, databaseUrl: NO_SOURCE_DATABASE },
         });
+      }
+      if (opts.finish) {
+        const finished = await finishRestore(config, {
+          targetDatabaseUrl: statusTarget!,
+          confirmTarget: opts.confirmTarget,
+          restoreRecords: fileRestoreRecords(),
+          snapshot: opts.snapshot,
+        });
+        console.log(JSON.stringify(finished));
+        if ((finished.databaseChecks ?? []).some((c) => !c.pass)) process.exitCode = 1;
+        return;
       }
       // 凭据形态(决策 D6,2.0 起):env 或隐藏式交互输入,绝不经 argv。
       // --database 只表达意图,秘密自身不上命令行
@@ -333,6 +378,8 @@ program
         storageDir: opts.storageDir,
         snapshot: opts.snapshot,
         skipAuth: opts.skipAuth,
+        // 带 Auth 的恢复把事务号和进度记在本机,供 --status / --finish 用
+        restoreRecords: fileRestoreRecords(),
       });
       // stdout = 机器可读通道(人读日志全在 stderr):完整结构化结果供脚本/报告消费
       console.log(JSON.stringify(result));

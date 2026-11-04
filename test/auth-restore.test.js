@@ -10,7 +10,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import pg from "pg";
 import { runBackup } from "../dist/backup.js";
-import { runRestore } from "../dist/restore.js";
+import { finishRestore, restoreStatus, runRestore } from "../dist/restore.js";
+import { fileRestoreRecords } from "../dist/restore-record.js";
 import { targetIdentity, transactionOutcome } from "../dist/auth-restore.js";
 import { AUTH_DDL, SETUP, readableMemoryStore, sql, startPostgres } from "./auth-fixtures.js";
 
@@ -86,7 +87,9 @@ test(
         insert into public.notes values (2, '99999999-0000-0000-0000-000000000000');
         reset session_replication_role;
         create table public.links (identity_id uuid references auth.identities (id));
-        insert into public.links select id from auth.identities limit 1;`);
+        insert into public.links select id from auth.identities limit 1;
+        create table public.comments (note_id int references public.notes (id));
+        insert into public.comments values (1);`);
       const okUrl = `postgresql://reader_ok:r@127.0.0.1:${port}/postgres`;
       const config = { databaseUrl: okUrl, projectName: "restore", schemas: ["public"], storage: { bucket: "unused" } };
       const mem = readableMemoryStore();
@@ -336,6 +339,140 @@ test(
           assert.match(error.message, /auth\.identities\.provider is text in the backup but character varying\(20\) on the target/);
           return true;
         });
+        assert.deepEqual(await targetState(target), EMPTY);
+      });
+
+      await t.test("restore record: --status reads the outcome, --finish does the steps after the commit, safely twice", async () => {
+        const records = fileRestoreRecords(mkdtempSync(join(work, "records-")));
+        const target = await freshTarget();
+        const done = await restore(target, { restoreRecords: records });
+        assert.equal(done.auth.restored, true);
+        let status = await restoreStatus({ targetDatabaseUrl: target, restoreRecords: records });
+        assert.equal(status.transaction, "committed");
+        assert.equal(status.phase, "done");
+        assert.match(status.next, /Nothing to do/);
+        await assert.rejects(
+          finishRestore(config, { targetDatabaseUrl: target, confirmTarget: "127.0.0.1", restoreRecords: records, store: mem.store }),
+          /nothing to finish/
+        );
+
+        // 模拟提交之后进程就没了:外键和授权都没补,记录停在 committed
+        const key = (await import("../dist/restore-record.js")).restoreRecordKey(target);
+        const committedOnly = { ...(await records.load(key)), phase: "committed" };
+        await records.save(key, committedOnly);
+        await sql(target, `
+          alter table public.profiles drop constraint profiles_id_fkey;
+          alter table public.notes drop constraint notes_owner_fkey;
+          alter table public.links drop constraint links_identity_id_fkey;
+          alter table public.comments drop constraint comments_note_id_fkey;
+          revoke all on all tables in schema public from anon, authenticated, service_role;`);
+        status = await restoreStatus({ targetDatabaseUrl: target, restoreRecords: records });
+        assert.equal(status.transaction, "committed");
+        assert.match(status.next, /restore --finish/);
+        // 不键入目标确认就不写
+        await assert.rejects(
+          finishRestore(config, { targetDatabaseUrl: target, restoreRecords: records, store: mem.store }),
+          /confirm/
+        );
+        const finished = await finishRestore(config, { targetDatabaseUrl: target, confirmTarget: "127.0.0.1", restoreRecords: records, store: mem.store });
+        assert.equal(finished.databaseVerified, true, JSON.stringify(finished.databaseChecks));
+        assert.deepEqual(finished.orphanedForeignKeys.map((o) => o.constraint), ["notes_owner_fkey"]);
+        const fks = await sql(target, `select conname, convalidated from pg_constraint
+          where conname in ('profiles_id_fkey', 'notes_owner_fkey', 'links_identity_id_fkey', 'comments_note_id_fkey') order by conname`);
+        assert.deepEqual(fks.rows, [
+          { conname: "comments_note_id_fkey", convalidated: true },
+          { conname: "links_identity_id_fkey", convalidated: true },
+          { conname: "notes_owner_fkey", convalidated: false },
+          { conname: "profiles_id_fkey", convalidated: true },
+        ]);
+        assert.equal((await records.load(key)).phase, "done");
+
+        // 中途断过一次(授权补了、外键加了一部分)再跑:已有的定义一样就跳过(public → public 的也认得出),
+        // 已经是 NOT VALID 的照样数孤儿行、写进报告,结果和一次成功的恢复一样
+        await records.save(key, { ...(await records.load(key)), phase: "grants" });
+        await sql(target, "alter table public.profiles drop constraint profiles_id_fkey");
+        const rerun = await finishRestore(config, { targetDatabaseUrl: target, confirmTarget: "127.0.0.1", restoreRecords: records, store: mem.store });
+        assert.deepEqual(rerun.orphanedForeignKeys.map((o) => [o.constraint, o.orphanRows]), [["notes_owner_fkey", 1]]);
+        const again = await sql(target, "select count(*)::int as n from pg_constraint where conname in ('profiles_id_fkey', 'notes_owner_fkey', 'links_identity_id_fkey', 'comments_note_id_fkey')");
+        assert.equal(again.rows[0].n, 4);
+
+        // 别的项目里同名的快照:不拿它补授权、加外键
+        const otherMem = readableMemoryStore();
+        await runBackup({ ...config, projectName: "other", auth: "default" }, { store: otherMem.store });
+        await records.save(key, { ...(await records.load(key)), phase: "grants" });
+        await assert.rejects(
+          finishRestore(config, { targetDatabaseUrl: target, confirmTarget: "127.0.0.1", restoreRecords: records, store: otherMem.store }),
+          /snapshot snap here isn't the one that was restored/
+        );
+
+        // 读不出要加的外键:报错,不当成"没有外键"把记录标成做完
+        const failing = wrapper(
+          "pg_restore",
+          `case "$*" in *foreign-keys.list*) exit 1;; esac\nexec "${realPgRestore}" "$@"`
+        );
+        await withEnv({ BACKUPDRILL_PG_RESTORE: failing, BACKUPDRILL_PSQL: realPsql }, () =>
+          assert.rejects(
+            finishRestore(config, { targetDatabaseUrl: target, confirmTarget: "127.0.0.1", restoreRecords: records, store: mem.store }),
+            /the foreign keys to add couldn't be read from the dump/
+          )
+        );
+        assert.equal((await records.load(key)).phase, "grants");
+
+        // 同名、定义不同的外键:停下报告,不覆盖
+        await records.save(key, { ...(await records.load(key)), phase: "grants" });
+        await sql(target, `alter table public.profiles drop constraint profiles_id_fkey;
+          alter table public.profiles add constraint profiles_id_fkey foreign key (id) references auth.users (id) on delete cascade;`);
+        await assert.rejects(
+          finishRestore(config, { targetDatabaseUrl: target, confirmTarget: "127.0.0.1", restoreRecords: records, store: mem.store }),
+          /already has a foreign key profiles_id_fkey with a different definition/
+        );
+      });
+
+      await t.test("restore record: a rolled-back restore says so, and a recreated target isn't mistaken for the old one", async () => {
+        const records = fileRestoreRecords(mkdtempSync(join(work, "records-")));
+        const target = await freshTarget();
+        const fake = wrapper("psql", `awk '/^commit;$/ { exit } { print; fflush() }' | "${realPsql}" "$@"`);
+        await withEnv({ BACKUPDRILL_PSQL: fake }, () => assert.rejects(restore(target, { restoreRecords: records }), /rolled back/));
+        const status = await restoreStatus({ targetDatabaseUrl: target, restoreRecords: records });
+        assert.equal(status.phase, "rolled_back");
+        assert.equal(status.transaction, "aborted");
+        assert.match(status.next, /rolled back[\s\S]*Run restore again/);
+        await assert.rejects(
+          finishRestore(config, { targetDatabaseUrl: target, confirmTarget: "127.0.0.1", restoreRecords: records, store: mem.store }),
+          /rolled back, so there's nothing to finish/
+        );
+        // 同名重建的库:OID 变了,同号事务不能当答案
+        const name = new URL(target).pathname.slice(1);
+        await sql(admin, `drop database ${name}`);
+        await sql(admin, `create database ${name}`);
+        const recreated = await restoreStatus({ targetDatabaseUrl: target, restoreRecords: records });
+        assert.equal(recreated.transaction, "unknown");
+        assert.match(recreated.next, /isn't the database the record was written for/);
+      });
+
+      await t.test("restore record: if it can't be saved before COMMIT, nothing is committed", async () => {
+        const target = await freshTarget();
+        const broken = { load: async () => null, save: async () => { throw new Error("disk full"); } };
+        await assert.rejects(restore(target, { restoreRecords: broken }), /the restore record couldn't be saved, so nothing was committed \(disk full\)[\s\S]*rolled back/);
+        assert.deepEqual(await targetState(target), EMPTY);
+      });
+
+      await t.test("a foreign key into an Auth table still gets its structure checked before anything is written", async () => {
+        // 源库:auth.users.email 上有唯一约束,一张表的外键指向它;新项目的 auth.users 没有这个约束,提交后这条外键加不上
+        await sql(admin, "create database emailsource");
+        const src = `postgresql://postgres:pw@127.0.0.1:${port}/emailsource`;
+        await sql(src, `${AUTH_DDL}
+          alter table auth.users add constraint users_email_key unique (email);
+          insert into auth.users (id, email) values ('bbbbbbbb-0000-0000-0000-000000000001', 'one@example.test');
+          create table public.contacts (email text references auth.users (email));
+          insert into public.contacts values ('one@example.test');`);
+        const srcConfig = { ...config, databaseUrl: `postgresql://reader_ok:r@127.0.0.1:${port}/emailsource`, projectName: "emailfk" };
+        const srcMem = readableMemoryStore();
+        await runBackup({ ...srcConfig, auth: "default" }, { store: srcMem.store });
+        const target = await freshTarget();
+        const run = (extra) => runRestore(srcConfig, { store: srcMem.store, targetDatabaseUrl: target, confirmTarget: "127.0.0.1", ...extra });
+        await assert.rejects(run({ dryRun: true }), /auth\.users on the target has no unique index on \(email\)/);
+        await assert.rejects(run(), /auth\.users on the target has no unique index on \(email\)/);
         assert.deepEqual(await targetState(target), EMPTY);
       });
 

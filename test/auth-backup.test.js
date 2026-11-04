@@ -91,7 +91,10 @@ test("RECOVERY.md never puts an object name into a shell command unless it is a 
   assert.ok(bash.includes("TRIGGER auth users on_signup"));
   assert.equal(bash.includes("pwned"), false);
   assert.ok(doc.includes(JSON.stringify(evil)), "the odd name is listed as a manual step instead");
-  assert.equal(doc.includes("backupdrill restore \\"), false, "no CLI restore recipe until the CLI restores Auth users");
+  // 2.10.0 起 CLI 也恢复 Auth 用户:配方回来了,也有 --status / --finish 的说明
+  assert.ok(doc.includes("backupdrill restore \\"), "the CLI restore recipe is there");
+  assert.match(doc, /backupdrill restore --status/);
+  assert.match(doc, /backupdrill restore --finish --confirm-target <target-ref>/);
 });
 
 test("redactValues: values that may be user data go, identifiers stay", () => {

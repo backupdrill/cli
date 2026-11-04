@@ -205,27 +205,36 @@ async function deferredForeignKeys(
   dumpPath: string,
   entries: string[],
   listDir: string,
-  alsoFullyDumped: string[] = []
+  alsoFullyDumped: string[] = [],
+  /**
+   * restore --finish 用:读不出来就报错,不退回"一条也不挪"。正常恢复里退回是安全的(外键全留给 pg_restore,
+   * 在主事务里建),接着做的时候退回就是漏加外键
+   */
+  strict = false
 ): Promise<{ lines: Set<string>; fks: ForeignKeyDef[]; commentSql?: string }> {
   const none = { lines: new Set<string>(), fks: [] };
+  const giveUp = (why: string): typeof none => {
+    if (strict) throw new Error(`the foreign keys to add couldn't be read from the dump (${why})`);
+    return none;
+  };
   const fkEntries = entries.filter((line) => /^\d+; \d+ \d+ FK CONSTRAINT /.test(line));
   if (!fkEntries.length) return none;
   // 沙箱那边传进来的只有 post-data 条目,数据条目要看完整目录
   const fullListing = await pgRestoreOutput(bin, ["--list", dumpPath]);
-  if (fullListing.code !== 0) return none;
+  if (fullListing.code !== 0) return giveUp(`pg_restore --list exited with code ${fullListing.code}`);
   const tableEntries = fullyDumpedTableEntries(fullListing.stdout);
   if (!tableEntries.length) return none;
   const tableList = join(listDir, "tables.list");
   await writeFile(tableList, tableEntries.join("\n") + "\n");
   const tableDdl = await pgRestoreOutput(bin, ["-f", "-", `--use-list=${tableList}`, dumpPath]);
-  if (tableDdl.code !== 0) return none;
+  if (tableDdl.code !== 0) return giveUp(`pg_restore exited with code ${tableDdl.code} writing the table definitions`);
   const fullyDumped = new Set([...parseCreatedTables(tableDdl.stdout).map(tableKey), ...alsoFullyDumped]);
   const listFile = join(listDir, "foreign-keys.list");
   await writeFile(listFile, fkEntries.join("\n") + "\n");
   const ddl = await pgRestoreOutput(bin, ["-f", "-", `--use-list=${listFile}`, dumpPath]);
   const parsed = parseForeignKeys(ddl.stdout);
-  if (ddl.code !== 0 || parsed.length !== fkEntries.length) return none;
-  if (parsed.some((fk, i) => !fkEntries[i].includes(fk.constraint))) return none;
+  if (ddl.code !== 0 || parsed.length !== fkEntries.length) return giveUp("the foreign key definitions didn't match the listing");
+  if (parsed.some((fk, i) => !fkEntries[i].includes(fk.constraint))) return giveUp("the foreign key definitions didn't match the listing");
   const lines = new Set<string>();
   const fks: ForeignKeyDef[] = [];
   parsed.forEach((fk, i) => {
@@ -250,7 +259,7 @@ async function deferredForeignKeys(
   const commentList = join(listDir, "foreign-key-comments.list");
   await writeFile(commentList, commentLines.join("\n") + "\n");
   const comments = await pgRestoreOutput(bin, ["-f", "-", `--use-list=${commentList}`, dumpPath]);
-  if (comments.code !== 0) return none;
+  if (comments.code !== 0) return giveUp(`pg_restore exited with code ${comments.code} writing the foreign key comments`);
   for (const line of commentLines) lines.add(line);
   return { lines, fks, commentSql: withoutRestrictWrapper(comments.stdout) };
 }
@@ -994,7 +1003,16 @@ export async function prepareMainRestore(
 export async function afterCommit(
   connString: string,
   grantsToRestore: GrantsToRestore,
-  deferred: { fks: ForeignKeyDef[]; commentSql?: string }
+  deferred: { fks: ForeignKeyDef[]; commentSql?: string },
+  opts: {
+    /** 授权补完之后调用(带 Auth 的恢复据此更新恢复记录);它抛错按授权失败处理之外的失败,原样抛出 */
+    onGrantsApplied?: () => Promise<void> | void;
+    /**
+     * 接着做(restore --finish):目标上已经有同名外键的,定义一样(NOT VALID 与否不论,孤儿行会让它 NOT VALID)
+     * 就跳过,不一样就停下报告,不覆盖。授权本来就可以重复执行
+     */
+    resume?: boolean;
+  } = {}
 ): Promise<{ pass: ClassifiedPass; orphaned?: OrphanedForeignKey[]; committed?: true; grants?: GrantRestore }> {
   // committed 只在提交之后的步骤出错时带上(和拆分之前一样):调用方据此说明"数据已经在目标上了"
   let grants: GrantRestore;
@@ -1010,6 +1028,7 @@ export async function afterCommit(
       committed: true,
     };
   }
+  await opts.onGrantsApplied?.();
   if (!deferred.fks.length) return { pass: { expectedSkips: 0, failures: [] }, grants };
   try {
     const client = await connectPg(connString);
@@ -1018,6 +1037,7 @@ export async function afterCommit(
         allow: NEVER_MATCH,
         stopOnError: true,
         commentSql: deferred.commentSql,
+        resume: opts.resume,
       });
       return { pass: { expectedSkips: 0, failures: [] }, orphaned: added.orphaned, grants };
     } finally {
@@ -1030,6 +1050,22 @@ export async function afterCommit(
       grants,
     };
   }
+}
+
+/**
+ * restore --finish 用:提交之后要加的外键,和那次恢复算出来的一模一样(同一份 dump、同一套 deferredForeignKeys 规则)
+ */
+export async function deferredForeignKeysOf(
+  dumpPath: string,
+  listDir: string,
+  alsoFullyDumped: string[]
+): Promise<{ fks: ForeignKeyDef[]; commentSql?: string }> {
+  const bin = resolvePgRestoreBin();
+  const listing = await pgRestoreOutput(bin, ["--list", dumpPath]);
+  if (listing.code !== 0) throw new Error(`pg_restore --list exited with code ${listing.code}`);
+  const entries = listing.stdout.split("\n").filter((line) => /^\d+;/.test(line));
+  const deferred = await deferredForeignKeys(bin, dumpPath, entries, listDir, alsoFullyDumped, true);
+  return { fks: deferred.fks, commentSql: deferred.commentSql };
 }
 
 /**
