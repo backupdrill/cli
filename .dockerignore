@@ -1,0 +1,17 @@
+# Only package.json, pnpm-lock.yaml, tsconfig.json, src/ and docker/ are copied,
+# but keep local credentials and build output out of the build context anyway.
+.git
+.github
+.review
+node_modules
+dist
+.env
+.env.*
+backupdrill.config.json
+supabase
+examples
+plugin
+.claude-plugin
+.cursor-plugin
+*.log
+.DS_Store
