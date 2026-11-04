@@ -115,6 +115,18 @@ const includedAuth = () => ({
   policies: [],
 });
 
+test("RECOVERY.md: a pattern-skipped Auth backup doesn't claim the users are in the dump; unrecognized hashes are called out", () => {
+  const ctx = { snapshot: "s", bucket: "b", prefix: "p", projectName: "p" };
+  const notPlain = renderRecoveryDoc({ ...baseManifest(), auth: { status: "skipped", reason: "schemas_not_plain" } }, ctx);
+  assert.match(notPlain, /only if one of those patterns matched auth/);
+  assert.doesNotMatch(notPlain, /the auth schema is part of the database dump/);
+  const included = renderRecoveryDoc(
+    { ...baseManifest(), auth: { ...includedAuth(), passwordHashes: { none: 1, portable: 1, encrypted: 0, unrecognized: 2 } } },
+    ctx
+  );
+  assert.match(included, /2 user\(s\) have password hashes in a format BackupDrill doesn't recognize/);
+});
+
 test("manifest: a valid included auth section parses; a broken one is rejected before anything is written", () => {
   const ok = parseManifest(JSON.stringify({ ...baseManifest(), auth: includedAuth() }));
   assert.equal(ok.auth.status, "included");
@@ -501,7 +513,7 @@ test(
       await t.test("default + schemas that may already include auth: skipped, main dump untouched", async () => {
         for (const schemas of [["public", "auth"], ["*"]]) {
           const r = await run("in-schemas", { databaseUrl: okUrl, auth: "default", schemas });
-          assert.deepEqual(r.manifest.auth, { status: "skipped", reason: "schemas_may_include_auth" });
+          assert.deepEqual(r.manifest.auth, { status: "skipped", reason: "schemas_include_auth" });
           assert.deepEqual(r.argv, [" --format=custom --no-owner --no-privileges" + schemas.map((s) => ` --schema=${s}`).join("")]);
           assert.deepEqual([...r.files.keys()], ["dump.pgcustom"]);
         }
@@ -509,11 +521,11 @@ test(
 
       await t.test("on + a schema pattern that can't be worked out: failed (exit 3), never a silent success", async () => {
         const r = await run("ambiguous-on", { databaseUrl: okUrl, auth: "on", schemas: ["public", "[p]ublic"] });
-        assert.deepEqual(r.manifest.auth, { status: "failed", reason: "schemas_may_include_auth" });
+        assert.deepEqual(r.manifest.auth, { status: "failed", reason: "schemas_not_plain" });
         const d = await run("ambiguous-default", { databaseUrl: okUrl, auth: "default", schemas: ["public", "[p]ublic"] });
-        assert.deepEqual(d.manifest.auth, { status: "skipped", reason: "schemas_may_include_auth" });
+        assert.deepEqual(d.manifest.auth, { status: "skipped", reason: "schemas_not_plain" });
         const sure = await run("auth-on", { databaseUrl: okUrl, auth: "on", schemas: ["public", "auth"] });
-        assert.deepEqual(sure.manifest.auth, { status: "skipped", reason: "schemas_may_include_auth" }, "auth is in the main dump");
+        assert.deepEqual(sure.manifest.auth, { status: "skipped", reason: "schemas_include_auth" }, "auth is in the main dump");
       });
 
       await t.test("default + a destination that can't hold auth.dump: skipped, behaves as before", async () => {
@@ -602,7 +614,7 @@ test(
 
       await t.test("any schema pattern means no separate Auth backup; the main dump is untouched", async () => {
         const r = await run("pattern", { databaseUrl: okUrl, auth: "default", schemas: ["pub*"] });
-        assert.deepEqual(r.manifest.auth, { status: "skipped", reason: "schemas_may_include_auth" });
+        assert.deepEqual(r.manifest.auth, { status: "skipped", reason: "schemas_not_plain" });
         assert.deepEqual(r.argv, [" --format=custom --no-owner --no-privileges --schema=pub*"]);
       });
 

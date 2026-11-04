@@ -317,7 +317,10 @@ const AUTH_SKIP_TEXT: Record<string, string> = {
     "the backup role can't read every row of auth.users and auth.identities (it needs BYPASSRLS or superuser, plus read access)",
   no_auth_schema: "this database has no Supabase auth schema",
   unsupported_destination: "this backup destination can't hold the Auth archive yet",
-  schemas_may_include_auth: "your schema list already includes auth (or a pattern), so it is in the main dump",
+  schemas_include_auth: "your schema list includes auth, so the Auth users are in the database dump",
+  schemas_not_plain:
+    "your schema list uses a pattern or a quoted name, so the Auth users aren't backed up separately " +
+    "(they are in the database dump only if one of those patterns matches auth)",
   too_large: "the Auth archive is larger than 2 GiB",
   snapshot_unavailable: "a consistent snapshot for the Auth export couldn't be set up",
 };
@@ -342,11 +345,11 @@ async function planAuth(config: BackupConfig, writer: SnapshotWriter, mode: Auth
   // 确定包含 → skipped(数据就在主 dump 里);说不准 → 默认模式也 skipped,显式要求时记 failed,
   // 不能在 Auth 用户可能哪份归档都不在的情况下报成功
   const inSchemas = authInSchemas(config.schemas);
-  if (inSchemas === "yes" || (inSchemas === "maybe" && mode !== "on")) {
-    return { kind: "settled", section: { status: "skipped", reason: "schemas_may_include_auth" } };
+  if (inSchemas === "yes") {
+    return { kind: "settled", section: { status: "skipped", reason: "schemas_include_auth" } };
   }
   if (inSchemas === "maybe") {
-    return { kind: "settled", section: { status: "failed", reason: "schemas_may_include_auth" } };
+    return { kind: "settled", section: authNotDone(mode, "schemas_not_plain") };
   }
   if (!writer.uploadAuthDump || !writer.authDumpKey) {
     return { kind: "settled", section: authNotDone(mode, "unsupported_destination") };
@@ -557,6 +560,12 @@ function logAuthOutcome(auth: AuthSection, schemas: string[]): void {
         `${auth.rows!.identities.toLocaleString("en-US")} sign-in identities, ` +
         `${(auth.dump!.bytes / 1024 / 1024).toFixed(1)} MB)`
     );
+    if (auth.passwordHashes!.unrecognized > 0) {
+      log.warn(
+        `${auth.passwordHashes!.unrecognized} password hash(es) are in a format BackupDrill doesn't recognize; ` +
+          `whether those users can sign in with their old password after a restore is unknown.`
+      );
+    }
     if (auth.passwordHashes!.encrypted > 0) {
       log.warn(
         `${auth.passwordHashes!.encrypted} password hash(es) are encrypted with this project's key; ` +

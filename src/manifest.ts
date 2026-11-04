@@ -121,7 +121,8 @@ export const AUTH_SKIP_REASONS = [
   "no_permission",
   "no_auth_schema",
   "unsupported_destination",
-  "schemas_may_include_auth",
+  "schemas_include_auth",
+  "schemas_not_plain",
   "too_large",
   "snapshot_unavailable",
 ] as const;
