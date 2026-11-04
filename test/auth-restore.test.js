@@ -376,6 +376,11 @@ test(
         );
         const finished = await finishRestore(config, { targetDatabaseUrl: target, confirmTarget: "127.0.0.1", restoreRecords: records, store: mem.store });
         assert.equal(finished.databaseVerified, true, JSON.stringify(finished.databaseChecks));
+        // Auth 用户随那次提交已经写进去了:接着做的结果照实说,不能让报告以为没恢复
+        assert.equal(finished.auth?.restored, true);
+        assert.equal(finished.auth.users, mem.manifest().auth.rows.users);
+        assert.equal(finished.auth.identities, mem.manifest().auth.rows.identities);
+        assert.ok(Array.isArray(finished.auth.notes) && Array.isArray(finished.auth.manual));
         assert.deepEqual(finished.orphanedForeignKeys.map((o) => o.constraint), ["notes_owner_fkey"]);
         const fks = await sql(target, `select conname, convalidated from pg_constraint
           where conname in ('profiles_id_fkey', 'notes_owner_fkey', 'links_identity_id_fkey', 'comments_note_id_fkey') order by conname`);

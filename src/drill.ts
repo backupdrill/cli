@@ -50,15 +50,20 @@ export function sampleStorageFiles<T>(files: T[], n: number): T[] {
 }
 
 /** @internal 托管 worker 专用钩子;事件不携带客户数据或凭据,不属于稳定 CLI 契约。 */
-export type DrillPhase = "download" | "storage" | "sandbox" | "restore" | "verify" | "cleanup";
+export type DrillPhase = "download" | "storage" | "sandbox" | "restore" | "verify" | "auth" | "cleanup";
 export interface DrillSupervision {
   /** 仅 runDrill 使用:supervisor 独占的空临时目录,由 supervisor 清理。 */
   workdir: string;
   /** 每次尝试唯一;即使 docker run 被中断,supervisor 也能按名字清理。 */
   resourceName: string;
-  /** 非 cleanup 阶段抛错 = 主动中止并清理;上报失败应由调用方自行吞掉,回调须自带超时(托管 worker 另有进程级执行上限)。
-   * cleanup 阶段同步/异步错误均忽略,最多等待 5 秒,绝不阻止 teardown。 */
+  /** 非 cleanup、非 auth 阶段抛错 = 主动中止并清理;上报失败应由调用方自行吞掉,回调须自带超时(托管 worker 另有进程级执行上限)。
+   * cleanup 阶段同步/异步错误均忽略,最多等待 5 秒,绝不阻止 teardown。auth 阶段抛错只跳过 Auth 附加检查。 */
   observe: (event: { phase: DrillPhase; dumpBytes?: number }) => Promise<void>;
+  /**
+   * 2.10.0 起:supervisor 叫停 Auth 附加检查(比如磁盘吃紧)。这一节记 not_checked,演练结论不变——
+   * 结论在 Auth 这一节之前就定了。"auth" 阶段的 observe 被拒绝同样只跳过这一节,不中止演练
+   */
+  authStop?: AbortSignal;
 }
 
 export interface DrillCheck {
@@ -821,7 +826,11 @@ export async function drillDump(
     if (orphaned.length) report.orphanedForeignKeys = orphaned;
     // Auth 附加校验:结论(pass)上面已经定了,这里只往报告里加一节。它在同一个沙箱里补外键、
     // 建触发器、模拟注册——放在所有正式检查之后,不影响它们;自己出错也只记在这一节里
-    const authSection = await authDrillSection(pg.connString, manifest, dumpPath, opts.authDump, opts.stopAuthDownload);
+    const authSection = await authDrillSection(pg.connString, manifest, dumpPath, opts.authDump, opts.stopAuthDownload, {
+      // 托管 worker 在这一步前后换磁盘守卫的规则:Auth 阶段吃紧只叫停这一节,不判演练失败
+      begin: opts.supervision ? () => opts.supervision!.observe({ phase: "auth" }) : undefined,
+      stop: opts.supervision?.authStop,
+    });
     if (authSection) {
       report.auth = authSection;
       const line = `Auth users: ${authSection.summary}`;
