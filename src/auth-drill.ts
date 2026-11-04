@@ -95,6 +95,8 @@ const tocType = (line: string): string | null => /^\d+; \d+ \d+ (.+)$/.exec(line
 
 const SIGNUP_USER_ID = "00000000-0000-4000-8000-00000000d211";
 const SIGNUP_EMAIL = "drill-signup@backupdrill.invalid";
+/** 测试注册不带用户元数据:应用注册时会传、触发器又要用的字段,这次没测到,报告里说清楚 */
+const SIGNUP_TESTED_AS = " (tested as an email sign-up with no user metadata)";
 
 /** 给 NOT NULL 又没有默认值的列造一个合法的值;造不出来返回 null(就不模拟了) */
 function syntheticValue(type: string, column: string): string | null {
@@ -103,11 +105,11 @@ function syntheticValue(type: string, column: string): string | null {
   if (column === "provider") return "'email'";
   if (column === "provider_id") return `'${SIGNUP_USER_ID}'`;
   if (column === "identity_data") return `jsonb_build_object('sub', '${SIGNUP_USER_ID}', 'email', '${SIGNUP_EMAIL}')`;
-  // 和 GoTrue 一次邮箱注册写进去的一样:触发器常按 provider 分支,或者读这些元数据
+  // 和 GoTrue 邮箱注册那条 INSERT 一样(internal/api/signup.go):AFTER INSERT 触发器看到的就是这些。
+  // app 元数据在插入前就写好了 provider;用户元数据只有客户端随注册传的 data,不传就是 {}——
+  // sub、email、email_verified 是同一事务里稍后 UPDATE 进去的,插入那一刻还没有
   if (column === "raw_app_meta_data") return `jsonb_build_object('provider', 'email', 'providers', jsonb_build_array('email'))`;
-  if (column === "raw_user_meta_data") {
-    return `jsonb_build_object('sub', '${SIGNUP_USER_ID}', 'email', '${SIGNUP_EMAIL}', 'email_verified', false, 'phone_verified', false)`;
-  }
+  if (column === "raw_user_meta_data") return "'{}'::jsonb";
   if (column === "created_at" || column === "updated_at") return "now()";
   if (/^uuid$/.test(type)) return "'00000000-0000-4000-8000-000000000001'::uuid";
   if (/^(text|character varying|character)\b/.test(type)) return "'drill'";
@@ -177,11 +179,12 @@ export async function runAuthDrill(
 
   const bin = resolvePgRestoreBin();
   const { url, env } = credentialSafeDbArgs(sandboxConnString);
-  // connectCancellable 挂好了错误监听(沙箱连接被掐断时不会把托管 worker 带走),叫停时直接断开
-  stopIfCancelled();
-  const client = await connectCancellable(sandboxConnString, signal);
   const work = await mkdtemp(join(tmpdir(), "backupdrill-auth-drill-"));
+  let client: Client | undefined;
   try {
+    // connectCancellable 挂好了错误监听(沙箱连接被掐断时不会把托管 worker 带走),叫停时直接断开
+    stopIfCancelled();
+    client = await connectCancellable(sandboxConnString, signal);
     stopIfCancelled();
     // 每条语句都有上限(整段另有总时限,见 authDrillSection)
     await client.query("set statement_timeout = '5min'; set lock_timeout = '1min'");
@@ -194,7 +197,7 @@ export async function runAuthDrill(
       create schema if not exists auth;
       grant usage on schema auth to supabase_auth_admin`);
     stopIfCancelled();
-    const listing = await pgRestoreOutput(bin, ["--list", authDump.path]);
+    const listing = await pgRestoreOutput(bin, ["--list", authDump.path], { signal });
     if (listing.code !== 0) {
       return { status: "problems", summary: `Auth archive couldn't be listed: ${safeRestoreError(listing.code, listing.stderr)}` };
     }
@@ -229,7 +232,7 @@ export async function runAuthDrill(
 
     // ── 2. 之前因为沙箱没有 auth 表而跳过的外键:现在补上 ──
     stopIfCancelled();
-    const mainListing = await pgRestoreOutput(bin, ["--list", mainDumpPath]);
+    const mainListing = await pgRestoreOutput(bin, ["--list", mainDumpPath], { signal });
     let foreignKeys: AuthDrillReport["foreignKeys"] = { created: 0, orphaned: [], failed: [] };
     if (mainListing.code !== 0) problems.push("the database archive couldn't be listed, so its foreign keys into the Auth tables weren't checked");
     if (mainListing.code === 0) {
@@ -238,7 +241,7 @@ export async function runAuthDrill(
         const fkList = join(work, "fks.list");
         await writeFile(fkList, fkEntries.join("\n") + "\n");
         stopIfCancelled();
-        const ddl = await pgRestoreOutput(bin, ["-f", "-", `--use-list=${fkList}`, mainDumpPath]);
+        const ddl = await pgRestoreOutput(bin, ["-f", "-", `--use-list=${fkList}`, mainDumpPath], { signal });
         const parsed = ddl.code === 0 ? parseForeignKeys(ddl.stdout) : [];
         // 读不全外键定义(命令失败,或有定义没解析出来)时不能说"全部对上":把没能检查的条数记下来
         if (parsed.length !== fkEntries.length) {
@@ -347,7 +350,7 @@ export async function runAuthDrill(
             /PL\/pgSQL function|SQL function|trigger/i.test(e.where ?? "") ||
             ["23503", "23505", "42501", "42883", "42P01", "42703", "3F000", "P0001"].includes(e.code ?? "");
           signup = triggerPath
-            ? { ran: true, ok: false, detail: `a new sign-up would fail: ${safeError(e)}` }
+            ? { ran: true, ok: false, detail: `a new sign-up would fail: ${safeError(e)}${SIGNUP_TESTED_AS}` }
             : { ran: false, detail: `couldn't simulate a sign-up: ${safeError(e)}` };
         } finally {
           await client.query("rollback").catch(() => {});
@@ -378,7 +381,7 @@ export async function runAuthDrill(
       signup,
     };
   } finally {
-    await client.end().catch(() => {});
+    await client?.end().catch(() => {});
     await rm(work, { recursive: true, force: true }).catch(() => {});
   }
 }

@@ -3,12 +3,13 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createServer } from "node:net";
-import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { spawnPgRestore } from "../dist/restore-engine.js";
+import { pgRestoreOutput, spawnPgRestore } from "../dist/restore-engine.js";
 import { connectCancellable } from "../dist/auth-backup.js";
-import { stopAuthSessions } from "../dist/auth-drill.js";
+import { runAuthDrill, stopAuthSessions } from "../dist/auth-drill.js";
 
 /**
  * 假 Postgres。answerStartup 为 true 时对启动包回 AuthenticationOk + ReadyForQuery(客户端认为连上了),
@@ -66,6 +67,45 @@ test("spawnPgRestore:运行中叫停,进程当场停掉", async () => {
   const result = await run;
   assert.notEqual(result.code, 0);
   assert.ok(Date.now() - started < 5000, "叫停后进程要立刻退出");
+});
+
+test("pgRestoreOutput:已经叫停就不起进程,运行中叫停就停掉", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "bd-cancel-"));
+  try {
+    const marker = join(dir, "started");
+    await assert.rejects(pgRestoreOutput("touch", [marker], { signal: AbortSignal.abort() }), /stopped by the caller/);
+    assert.equal(existsSync(marker), false);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+  const stop = new AbortController();
+  const started = Date.now();
+  const run = pgRestoreOutput("sleep", ["30"], { signal: stop.signal });
+  setTimeout(() => stop.abort(), 200);
+  const result = await run;
+  assert.notEqual(result.code, 0);
+  assert.ok(Date.now() - started < 5000, "叫停后进程要立刻退出");
+});
+
+test("runAuthDrill:建临时目录失败时还没连沙箱,不会留下连接", async () => {
+  const pgServer = await stalledPostgres({ answerStartup: true });
+  const dir = mkdtempSync(join(tmpdir(), "bd-cancel-"));
+  const previousTmp = process.env.TMPDIR;
+  try {
+    const authPath = join(dir, "auth.dump");
+    writeFileSync(authPath, "not a real archive");
+    const sha256 = createHash("sha256").update("not a real archive").digest("hex");
+    const manifest = { auth: { status: "included", dump: { sha256 } }, database: { schemas: ["public"] } };
+    process.env.TMPDIR = join(dir, "missing", "deeper");
+    await assert.rejects(runAuthDrill(pgServer.url, manifest, join(dir, "dump.pgcustom"), { path: authPath }), /ENOENT/);
+    await new Promise((r) => setTimeout(r, 100));
+    assert.equal(pgServer.connections(), 0, "临时目录建不出来时不该已经连上沙箱");
+  } finally {
+    if (previousTmp === undefined) delete process.env.TMPDIR;
+    else process.env.TMPDIR = previousTmp;
+    rmSync(dir, { recursive: true, force: true });
+    await pgServer.stop();
+  }
 });
 
 test("connectCancellable:已经叫停就不连", async () => {

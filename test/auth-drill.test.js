@@ -101,7 +101,7 @@ test(
           assert.deepEqual(verdict(report), verdict(baseline));
           assert.equal(report.auth.status, "problems");
           assert.equal(report.auth.signup.ok, false);
-          assert.equal(report.auth.signup.detail, "a new sign-up would fail: permission denied (SQLSTATE 42501)");
+          assert.equal(report.auth.signup.detail, "a new sign-up would fail: permission denied (SQLSTATE 42501) (tested as an email sign-up with no user metadata)");
         } finally {
           await sql(admin, "alter function public.handle_new_user() security definer");
         }
@@ -118,7 +118,7 @@ test(
           const report = await runDrill(config, { store: mem.store });
           assert.deepEqual(verdict(report), verdict(baseline));
           assert.equal(report.auth.status, "problems");
-          assert.equal(report.auth.signup.detail, "a new sign-up would fail: an exception was raised (SQLSTATE P0001)");
+          assert.equal(report.auth.signup.detail, "a new sign-up would fail: an exception was raised (SQLSTATE P0001) (tested as an email sign-up with no user metadata)");
           assert.equal(JSON.stringify(report).includes("$2a$"), false);
         } finally {
           await sql(admin, "drop trigger leak on auth.users; drop function public.leak()");
@@ -136,7 +136,7 @@ test(
         try {
           const mem = await backup("default");
           const report = await runDrill(config, { store: mem.store });
-          assert.equal(report.auth.signup.detail, "a new sign-up would fail: a check constraint was violated (SQLSTATE 23514)");
+          assert.equal(report.auth.signup.detail, "a new sign-up would fail: a check constraint was violated (SQLSTATE 23514) (tested as an email sign-up with no user metadata)");
           assert.equal(JSON.stringify(report).includes("$2a$"), false);
         } finally {
           await sql(admin, "drop trigger leak2 on auth.users; drop function public.leak2()");
@@ -188,6 +188,28 @@ id" uuid references auth.users (id) on delete set null)`);
           assert.ok(report.auth.notes.some((n) => /touch_users .* also fires on UPDATE/.test(n)), JSON.stringify(report.auth.notes));
         } finally {
           await sql(admin, "drop trigger touch_users on auth.users; drop function public.touch_users()");
+        }
+      });
+
+      await t.test("the test sign-up sends no user metadata, as GoTrue's insert does when the client sends none", async () => {
+        // 插入那一刻 raw_user_meta_data 只有客户端传的 data:要求里面有 email 的触发器,真实注册会失败,测试注册也得失败
+        await sql(admin, `
+          create function public.needs_meta_email() returns trigger language plpgsql security definer set search_path = '' as $$
+          begin
+            if new.raw_user_meta_data ->> 'email' is null then raise exception 'no email in metadata'; end if;
+            return new;
+          end $$;
+          create trigger needs_meta_email after insert on auth.users for each row execute function public.needs_meta_email();`);
+        try {
+          const mem = await backup("default");
+          const report = await runDrill(config, { store: mem.store });
+          assert.equal(report.auth.signup.ok, false, JSON.stringify(report.auth));
+          assert.equal(
+            report.auth.signup.detail,
+            "a new sign-up would fail: an exception was raised (SQLSTATE P0001) (tested as an email sign-up with no user metadata)"
+          );
+        } finally {
+          await sql(admin, "drop trigger needs_meta_email on auth.users; drop function public.needs_meta_email()");
         }
       });
 
