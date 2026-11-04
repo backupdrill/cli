@@ -130,8 +130,15 @@ test(
     const good = await drillDump(dumpPath, manifest, "good");
     assert.equal(good.pass, true, "good backup should pass");
     // 匿名卷泄漏回归(2026-09-12 生产实测一次演练遗留 37.6 GB):销毁后不能多出任何卷
-    const volumesAfter = await anonVolumes();
-    assert.deepEqual(volumesAfter.filter((v) => !volumesBefore.includes(v)), [], "no docker volume may be left behind");
+    let leaked = (await anonVolumes()).filter((v) => !volumesBefore.includes(v));
+    // 并行跑的别的测试文件正在 docker rm -f -v 一个容器时,它的匿名卷会有一瞬间没人挂着(容器先删、卷后删),
+    // 恰好落在这个窗口里就会被数进来。真泄漏的卷会一直在:等几秒再看一遍,只算还在的
+    for (let i = 0; i < 10 && leaked.length; i++) {
+      await new Promise((r) => setTimeout(r, 500));
+      const still = new Set(await anonVolumes());
+      leaked = leaked.filter((v) => still.has(v));
+    }
+    assert.deepEqual(leaked, [], "no docker volume may be left behind");
     assert.equal(good.restoredRowTotal, 232);
     assert.equal(good.restoredTableCount, 7);
     // pre-data 全严格:is_admin(default auth.uid()) 与它的 comment 建不出来会让上面直接失败;

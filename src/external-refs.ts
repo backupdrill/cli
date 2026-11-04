@@ -108,10 +108,10 @@ export async function checkExternalReferences(opts: {
     );
   }
   const dumped = new Set(opts.dumpedSchemas);
+  // 指向同一次恢复里一起写进去的表(restoredTables)的外键:结构照查(被引用列在不在、类型对不对、有没有唯一键,
+  // 目标上缺了这些,提交之后加外键必然失败),只是不查行——那些行和引用方一起写进去
   const restoredAlongside = new Set((opts.restoredTables ?? []).map(keyOf));
-  const external = foreignKeys.filter(
-    (fk) => !dumped.has(fk.references.schema) && fk.validatesRows && !restoredAlongside.has(keyOf(fk.references))
-  );
+  const external = foreignKeys.filter((fk) => !dumped.has(fk.references.schema) && fk.validatesRows);
   if (!external.length) return result;
 
   // 分区父表上的外键,数据在各级叶子分区里(dump 只给叶子写 COPY)
@@ -158,6 +158,7 @@ export async function checkExternalReferences(opts: {
         }
         continue;
       }
+      if (restoredAlongside.has(keyOf(fk.references))) continue;
       const checked: CheckedForeignKey = { fk, rows: 0, missingRows: 0 };
       result.checked.push(checked);
       scans.push({ checked, comparisons: lookup.comparisons, only: lookup.only, leaves: new Set(leavesOf(fk.table).map(keyOf)), seen: new Set(), batch: new Map() });

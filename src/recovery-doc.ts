@@ -257,8 +257,22 @@ it drops and recreates \`public\`, and the grants Supabase put on it go with it.
   const cliSection = auth
     ? `## The BackupDrill CLI
 
-This snapshot holds Auth users, and this version of \`backupdrill restore\` doesn't
-restore them yet: use the steps above.
+\`backupdrill restore\` 2.10.0 and newer does step 4 for you: the Auth users and the
+database go in one transaction, and it checks the target before writing anything.
+It needs \`psql\` from the same PostgreSQL client package as \`pg_restore\`.
+
+\`\`\`bash
+npm install -g backupdrill
+${cliRestoreCommand}
+\`\`\`
+
+Add \`--dry-run\` first to preview every check without writing anything. (Skip the
+\`read\` lines to have the CLI prompt you itself; \`unset\` the variables afterwards.)
+If it's interrupted while committing, run \`backupdrill restore --status\` with the same
+\`BACKUPDRILL_TARGET_DATABASE_URL\` on the same machine: it says whether the restore
+committed. If it did and the grants or foreign keys after the commit didn't finish,
+\`backupdrill restore --finish --confirm-target <target-ref>\` with the same settings
+does them. \`--skip-auth\` restores the database without the Auth users.
 
 `
     : `## Easiest path — the BackupDrill CLI

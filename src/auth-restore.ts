@@ -13,7 +13,6 @@
  * 引擎在任何情况下都不自动删目标里的数据。
  */
 import { spawn } from "node:child_process";
-import { once } from "node:events";
 import { writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { AuthSection, ExtensionInfo, Manifest } from "./manifest.js";
@@ -249,6 +248,26 @@ const STAGE_TEXT: Record<Stage, string> = {
 const STAGE_MARK = "backupdrill-stage:";
 const XID_MARK = "backupdrill-xid:";
 
+/**
+ * 等 stdin 能再写(drain)或者 psql 已经退出。监听用完就摘掉:大库恢复要等几十万次,
+ * 挂在一个直到最后才结束的 Promise 上的回调会一直攒着
+ */
+export function drainOrExit(stdin: NodeJS.WritableStream, child: NodeJS.EventEmitter): Promise<void> {
+  return new Promise<void>((resolve) => {
+    const done = () => {
+      stdin.removeListener("drain", done);
+      stdin.removeListener("error", done);
+      child.removeListener("close", done);
+      child.removeListener("error", done);
+      resolve();
+    };
+    stdin.once("drain", done);
+    stdin.once("error", done);
+    child.once("close", done);
+    child.once("error", done);
+  });
+}
+
 /** psql 默认格式的第一条错误:主消息 + DETAIL/HINT。不带 CONTEXT(COPY 出错时那里是整行数据) */
 export function firstPsqlError(stderr: string): string {
   const lines = stderr.split("\n");
@@ -352,7 +371,7 @@ export async function targetIdentity(client: { query: (text: string) => Promise<
 }
 
 /** 两个 Auth 表名在 tableKey 里的写法:指向它们的外键和备份里的外键一样,提交后再加 */
-const AUTH_TABLE_KEYS = ["auth\u0000users", "auth\u0000identities"];
+export const AUTH_TABLE_KEYS = ["auth\u0000users", "auth\u0000identities"];
 
 export async function restoreWithAuth(opts: {
   dumpPath: string;
@@ -368,7 +387,11 @@ export async function restoreWithAuth(opts: {
    */
   extensions?: ExtensionInfo[];
   /** 拿到事务号之后、写 COMMIT 之前调用:调用方据此记下"这次恢复对应哪个事务" */
-  onTransactionId?: (xid: string) => Promise<void> | void;
+  onTransactionId?: (xid: string, identity: TargetIdentity) => Promise<void> | void;
+  /** 事务结果确定之后、提交后的步骤之前调用 */
+  onOutcome?: (transaction: AuthRestoreRun["transaction"]) => Promise<void> | void;
+  /** 提交后补完授权时调用 */
+  onGrantsApplied?: () => Promise<void> | void;
 }): Promise<AuthRestoreRun> {
   const pgRestore = resolvePgRestoreBin();
   const extensions = opts.extensions ?? [];
@@ -448,7 +471,7 @@ export async function restoreWithAuth(opts: {
 
   const send = async (data: string | Buffer): Promise<boolean> => {
     if (psqlGone || psql.stdin.destroyed) return false;
-    if (!psql.stdin.write(data)) await Promise.race([once(psql.stdin, "drain").catch(() => {}), exited]);
+    if (!psql.stdin.write(data)) await drainOrExit(psql.stdin, psql);
     return !psqlGone;
   };
   /** 把一个 pg_restore -f - 的输出整段喂给 psql。返回生成端的失败原因;psql 先退出了返回 null(由 psql 的报错说明) */
@@ -537,7 +560,12 @@ export async function restoreWithAuth(opts: {
     if (!(await send(prelude))) return;
     const id = await xidSeen;
     if (!id) return;
-    await opts.onTransactionId?.(id);
+    // 先把事务号存下来再往下写:存不下就不提交(之后要靠它查结果、接着做)
+    try {
+      await opts.onTransactionId?.(id, identity);
+    } catch (error) {
+      throw new Error(`the restore record couldn't be saved, so nothing was committed (${(error as Error).message})`);
+    }
 
     // 扩展装在事务里、重查之后:重查看不到这次要装的东西(带配置表的扩展不会把自己拦下),失败时一起回滚
     if (extensions.length) {
@@ -607,6 +635,8 @@ export async function restoreWithAuth(opts: {
       ? "committed"
       : await transactionOutcome(opts.connString, xid, { identity });
 
+  // 回滚、提交、查不清,都先告诉调用方(记进恢复记录),再往下走
+  await opts.onOutcome?.(transaction);
   if (transaction !== "committed") {
     const psqlSays =
       stage === "auth-data"
@@ -623,7 +653,7 @@ export async function restoreWithAuth(opts: {
       (interrupted() ? "interrupted" : `${stage ? STAGE_TEXT[stage] : "connecting to the target"} failed: ${psqlSays}`);
     return { transaction, failure: why, xid, triggers: [] };
   }
-  const after = await afterCommit(opts.connString, opts.grants, prepared.deferred);
+  const after = await afterCommit(opts.connString, opts.grants, prepared.deferred, { onGrantsApplied: opts.onGrantsApplied });
   return { transaction, xid, afterCommit: after, triggers: opts.archive.triggers.map((t) => t.name) };
 }
 

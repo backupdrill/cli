@@ -994,7 +994,16 @@ export async function prepareMainRestore(
 export async function afterCommit(
   connString: string,
   grantsToRestore: GrantsToRestore,
-  deferred: { fks: ForeignKeyDef[]; commentSql?: string }
+  deferred: { fks: ForeignKeyDef[]; commentSql?: string },
+  opts: {
+    /** 授权补完之后调用(带 Auth 的恢复据此更新恢复记录);它抛错按授权失败处理之外的失败,原样抛出 */
+    onGrantsApplied?: () => Promise<void> | void;
+    /**
+     * 接着做(restore --finish):目标上已经有同名外键的,定义一样(NOT VALID 与否不论,孤儿行会让它 NOT VALID)
+     * 就跳过,不一样就停下报告,不覆盖。授权本来就可以重复执行
+     */
+    resume?: boolean;
+  } = {}
 ): Promise<{ pass: ClassifiedPass; orphaned?: OrphanedForeignKey[]; committed?: true; grants?: GrantRestore }> {
   // committed 只在提交之后的步骤出错时带上(和拆分之前一样):调用方据此说明"数据已经在目标上了"
   let grants: GrantRestore;
@@ -1010,11 +1019,35 @@ export async function afterCommit(
       committed: true,
     };
   }
+  await opts.onGrantsApplied?.();
   if (!deferred.fks.length) return { pass: { expectedSkips: 0, failures: [] }, grants };
   try {
     const client = await connectPg(connString);
     try {
-      const added = await addForeignKeys(client, deferred.fks, {
+      let fks = deferred.fks;
+      if (opts.resume) {
+        const pending: ForeignKeyDef[] = [];
+        for (const fk of fks) {
+          const existing = await client.query<{ def: string }>(
+            `select pg_get_constraintdef(c.oid) as def from pg_constraint c
+              where c.conrelid = to_regclass($1) and c.conname = $2 and c.contype = 'f'`,
+            [`${quoteIdent(fk.table.schema)}.${quoteIdent(fk.table.name)}`, fk.constraint]
+          );
+          if (!existing.rows.length) {
+            pending.push(fk);
+            continue;
+          }
+          const there = normalizedConstraintDef(existing.rows[0].def);
+          if (there !== normalizedConstraintDef(foreignKeyDefinition(fk))) {
+            throw new Error(
+              `${fk.table.schema}.${fk.table.name} already has a foreign key ${fk.constraint} with a different definition ` +
+                `(${existing.rows[0].def}); it was left as it is`
+            );
+          }
+        }
+        fks = pending;
+      }
+      const added = await addForeignKeys(client, fks, {
         allow: NEVER_MATCH,
         stopOnError: true,
         commentSql: deferred.commentSql,
@@ -1030,6 +1063,33 @@ export async function afterCommit(
       grants,
     };
   }
+}
+
+/**
+ * restore --finish 用:提交之后要加的外键,和那次恢复算出来的一模一样(同一份 dump、同一套 deferredForeignKeys 规则)
+ */
+export async function deferredForeignKeysOf(
+  dumpPath: string,
+  listDir: string,
+  alsoFullyDumped: string[]
+): Promise<{ fks: ForeignKeyDef[]; commentSql?: string }> {
+  const bin = resolvePgRestoreBin();
+  const listing = await pgRestoreOutput(bin, ["--list", dumpPath]);
+  if (listing.code !== 0) throw new Error(`pg_restore --list exited with code ${listing.code}`);
+  const entries = listing.stdout.split("\n").filter((line) => /^\d+;/.test(line));
+  const deferred = await deferredForeignKeys(bin, dumpPath, entries, listDir, alsoFullyDumped);
+  return { fks: deferred.fks, commentSql: deferred.commentSql };
+}
+
+/** pg_dump 的外键语句里 ADD CONSTRAINT <名> 之后、分号之前那一段,就是源库上 pg_get_constraintdef 的输出 */
+export function foreignKeyDefinition(fk: ForeignKeyDef): string {
+  const match = /ADD CONSTRAINT (?:"(?:[^"]|"")+"|[a-z_][a-z0-9_]*) ([\s\S]*?);\s*$/.exec(fk.statement);
+  return match ? match[1] : fk.statement;
+}
+
+/** 比较外键定义:空白归一,NOT VALID 不算差别(源库的孤儿行会让恢复把它建成 NOT VALID) */
+export function normalizedConstraintDef(def: string): string {
+  return def.replace(/\s+/g, " ").trim().replace(/ NOT VALID$/, "");
 }
 
 /**

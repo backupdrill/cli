@@ -7,7 +7,8 @@ import { runEstimate, type EgressPricing } from "./estimate.js";
 import { runDrill } from "./drill.js";
 import { createInterface } from "node:readline/promises";
 import { Writable } from "node:stream";
-import { runRestore, NO_SOURCE_DATABASE } from "./restore.js";
+import { runRestore, NO_SOURCE_DATABASE, restoreStatus, finishRestore } from "./restore.js";
+import { fileRestoreRecords } from "./restore-record.js";
 import { recordDrillOutcome } from "./drill-record.js";
 import { DEFAULT_EXPORTER_PORT, startExporter } from "./exporter.js";
 import { exitCleanlyOnSignals, interrupted } from "./interrupt.js";
@@ -272,6 +273,14 @@ program
       "same-source protection is inert; double-check the target first"
   )
   .option(
+    "--status",
+    "read-only: for a restore with Auth users into this target, say whether it committed and what's left to do"
+  )
+  .option(
+    "--finish",
+    "for a restore with Auth users that committed, do the steps after the commit that didn't finish (grants, foreign keys); safe to run again"
+  )
+  .option(
     "--skip-auth",
     "don't restore the snapshot's Auth users; restore the database the way 2.9 did (for example when you " +
       "copied the users into the target yourself)"
@@ -306,6 +315,33 @@ program
           overrides: { ...overrides, databaseUrl: NO_SOURCE_DATABASE },
         });
       }
+      // restore --status / --finish:只针对带 Auth 的恢复,按这台机器上的恢复记录查结果、接着做
+      if (opts.status || opts.finish) {
+        if (opts.status && opts.finish) throw new Error("use --status or --finish, not both");
+        const targetUrl =
+          process.env.BACKUPDRILL_TARGET_DATABASE_URL?.trim() ||
+          (await promptSecret("Target database connection string (BACKUPDRILL_TARGET_DATABASE_URL)"));
+        if (opts.status) {
+          const status = await restoreStatus({ targetDatabaseUrl: targetUrl, restoreRecords: fileRestoreRecords() });
+          console.log(JSON.stringify(status));
+          const finished = status.transaction === "committed" && status.phase === "done";
+          (finished ? log.ok : log.warn)(
+            status.recorded
+              ? `${status.target}: snapshot ${status.snapshot}, transaction ${status.xid} ${status.transaction} — ${status.next}`
+              : `${status.target}: ${status.next}`
+          );
+          return;
+        }
+        const finished = await finishRestore(config, {
+          targetDatabaseUrl: targetUrl,
+          confirmTarget: opts.confirmTarget,
+          restoreRecords: fileRestoreRecords(),
+          snapshot: opts.snapshot,
+        });
+        console.log(JSON.stringify(finished));
+        if ((finished.databaseChecks ?? []).some((c) => !c.pass)) process.exitCode = 1;
+        return;
+      }
       // 凭据形态(决策 D6,2.0 起):env 或隐藏式交互输入,绝不经 argv。
       // --database 只表达意图,秘密自身不上命令行
       // 秘密只随各自的意图旗标读取(评审第 9/10 轮):环境变量残留不能把 storage-only
@@ -333,6 +369,8 @@ program
         storageDir: opts.storageDir,
         snapshot: opts.snapshot,
         skipAuth: opts.skipAuth,
+        // 带 Auth 的恢复把事务号和进度记在本机,供 --status / --finish 用
+        restoreRecords: fileRestoreRecords(),
       });
       // stdout = 机器可读通道(人读日志全在 stderr):完整结构化结果供脚本/报告消费
       console.log(JSON.stringify(result));

@@ -10,6 +10,8 @@ import { parseManifest } from "./manifest.js";
 import type { Manifest } from "./manifest.js";
 import { s3SnapshotStore, type SnapshotStore } from "./snapshot-store.js";
 import {
+  afterCommit,
+  deferredForeignKeysOf,
   restoreDatabaseArtifact,
   userObjectCountSql,
   installExtensions,
@@ -31,9 +33,13 @@ import { connectPg } from "./supabase-ca.js";
 import { orphanedForeignKeysCheck, type OrphanedForeignKey } from "./orphaned-foreign-keys.js";
 import { grantsCheck } from "./grants.js";
 import { localPgRestoreMajor, restoreToolTargetBlocker } from "./pgbin.js";
+import { describeTarget, restoreRecordKey, type RestorePhase, type RestoreRecord, type RestoreRecordStore } from "./restore-record.js";
 import {
+  AUTH_TABLE_KEYS,
   authRestoreFailureMessage,
   authRestoreNotes,
+  targetIdentity,
+  transactionOutcome,
   authRestorePreflight,
   largeObjectEntries,
   psqlProblem,
@@ -712,6 +718,11 @@ export async function runRestore(
      * 也用于用户已经自己把 Auth 用户复制到目标上的情况)
      */
     skipAuth?: boolean;
+    /**
+     * 带 Auth 的恢复把事务号、目标、进度记在这里(写 COMMIT 之前先记),供 restore --status / --finish 用。
+     * CLI 传本机文件(fileRestoreRecords);托管恢复传自己的实现。不传就不记
+     */
+    restoreRecords?: RestoreRecordStore;
   }
 ): Promise<RestoreResult> {
   // 任何 I/O 之前先把源与目标的连接串过一遍覆盖/别名守卫:源串带集群别名或租户覆盖时
@@ -988,6 +999,17 @@ export async function runRestore(
       let engine: Awaited<ReturnType<typeof restoreDatabaseArtifact>>;
       if (authArchive) {
         log.step("Restoring the Auth users and the database into target in one transaction…");
+        const records = opts.restoreRecords;
+        const recordKey = restoreRecordKey(targetUrl);
+        let record: RestoreRecord | null = null;
+        // 提交之后再记进度:记不下只提醒,不能让已经提交的恢复因此报失败
+        const advance = async (phase: RestorePhase) => {
+          if (!records || !record) return;
+          record = { ...record, phase, updatedAt: new Date().toISOString() };
+          await records.save(recordKey, record).catch((error) => {
+            log.warn(`couldn't update the restore record (${(error as Error).message}); restore --status may be out of date`);
+          });
+        };
         const run = await restoreWithAuth({
           dumpPath,
           archive: authArchive,
@@ -997,7 +1019,28 @@ export async function runRestore(
           grants: grantsToRestore,
           listDir: workdir,
           extensions,
+          // 写 COMMIT 之前先记下来;记不下就不提交(抛错 → 回滚)
+          onTransactionId: async (xid, identity) => {
+            if (!records) return;
+            const now = new Date().toISOString();
+            record = {
+              version: 1,
+              snapshot,
+              projectName: manifest.projectName,
+              target: describeTarget(targetUrl),
+              identity,
+              xid,
+              phase: "transaction",
+              startedAt: now,
+              updatedAt: now,
+            };
+            await records.save(recordKey, record);
+          },
+          onOutcome: (transaction) =>
+            transaction === "committed" ? advance("committed") : transaction === "rolled_back" ? advance("rolled_back") : undefined,
+          onGrantsApplied: () => advance("grants"),
         });
+        if (run.transaction === "committed" && run.afterCommit!.pass.failures.length === 0) await advance("done");
         if (run.transaction !== "committed") {
           // 结果由事务本身说了算(没写 COMMIT,或 pg_xact_status 的回答),不再数 schema 里的对象去推断
           throw new Error(authRestoreFailureMessage(run) + restoreFailureAdvice(run.failure ?? ""));
@@ -1170,6 +1213,148 @@ export async function runRestore(
       log.ok(`Storage files written to ${outDir}`);
     }
 
+    return result;
+  } finally {
+    await rm(workdir, { recursive: true, force: true }).catch(() => {});
+  }
+}
+
+export interface RestoreStatus {
+  /** 给人看的目标说明 */
+  target: string;
+  /** 没有记录时为 false,其余字段都没有 */
+  recorded: boolean;
+  snapshot?: string;
+  xid?: string;
+  phase?: RestorePhase;
+  /** 目标对这个事务的回答;目标不是记录里那个库、或者查不了时是 unknown */
+  transaction?: "committed" | "aborted" | "in progress" | "unknown";
+  /** 下一步该做什么,一句话 */
+  next: string;
+}
+
+/**
+ * restore --status:只读。读这台机器上对这个目标的恢复记录,核对目标还是那个库,再用事务号问它提交了没有
+ */
+export async function restoreStatus(opts: { targetDatabaseUrl: string; restoreRecords: RestoreRecordStore }): Promise<RestoreStatus> {
+  assertNoHostOverride(opts.targetDatabaseUrl);
+  const target = describeTarget(opts.targetDatabaseUrl);
+  const record = await opts.restoreRecords.load(restoreRecordKey(opts.targetDatabaseUrl));
+  if (!record) {
+    return { target, recorded: false, next: "There's no record on this machine of a restore with Auth users into this target." };
+  }
+  const base = { target, recorded: true, snapshot: record.snapshot, xid: record.xid, phase: record.phase };
+  let transaction: NonNullable<RestoreStatus["transaction"]> = "unknown";
+  let sameTarget = true;
+  try {
+    const client = await connectPg(opts.targetDatabaseUrl);
+    try {
+      const now = await targetIdentity(client);
+      sameTarget =
+        now.databaseOid === record.identity.databaseOid &&
+        (now.systemIdentifier === null || record.identity.systemIdentifier === null || now.systemIdentifier === record.identity.systemIdentifier);
+      if (sameTarget) {
+        const res = await client.query<{ status: string | null }>("select pg_xact_status($1::xid8) as status", [record.xid]);
+        const status = res.rows[0].status;
+        if (status === "committed" || status === "aborted" || status === "in progress") transaction = status;
+      }
+    } finally {
+      await client.end().catch(() => {});
+    }
+  } catch {
+    transaction = "unknown";
+  }
+  const next = !sameTarget
+    ? "This target isn't the database the record was written for (it was recreated, or the connection points elsewhere). Check it by hand."
+    : transaction === "committed"
+      ? record.phase === "done"
+        ? "Nothing to do: the restore committed and every step after it finished."
+        : "The restore committed, but the grants and foreign keys added after the commit may be missing. Run `backupdrill restore --finish` with the same settings."
+      : transaction === "aborted"
+        ? "The restore was rolled back, so nothing from the snapshot is on the target. Run restore again."
+        : transaction === "in progress"
+          ? "The restore transaction is still open on the target. Wait, then check again."
+          : "The target can't say what happened to this transaction (it couldn't be reached, or the id is too old). Check whether auth.users holds the snapshot's users and the restored schemas hold its tables.";
+  return { ...base, transaction, next };
+}
+
+/**
+ * restore --finish:只做提交之后的步骤(补授权、补外键),和一次正常恢复用同一段代码、同一套规则(孤儿行建成
+ * NOT VALID 等)。只对记录里"已提交、后面的步骤没做完"的那次恢复做;目标不是那个库就拒绝。可以重复执行:
+ * 授权本来就是幂等的,已经加上的外键定义一样就跳过,不一样就停下报告
+ */
+export async function finishRestore(
+  config: BackupConfig,
+  opts: {
+    targetDatabaseUrl: string;
+    confirmTarget?: string;
+    restoreRecords: RestoreRecordStore;
+    snapshot?: string;
+    store?: SnapshotStore;
+  }
+): Promise<RestoreResult> {
+  const targetUrl = opts.targetDatabaseUrl;
+  assertNoHostOverride(targetUrl);
+  const recordKey = restoreRecordKey(targetUrl);
+  let record = await opts.restoreRecords.load(recordKey);
+  if (!record) throw new Error("there's no record on this machine of a restore with Auth users into this target, so there's nothing to finish.");
+  if (opts.snapshot && opts.snapshot !== record.snapshot) {
+    throw new Error(`the restore on record is of snapshot ${record.snapshot}, not ${opts.snapshot}.`);
+  }
+  if (record.phase === "done") {
+    throw new Error("nothing to finish: that restore committed and every step after it already finished.");
+  }
+  const outcome = await transactionOutcome(targetUrl, record.xid, { identity: record.identity, waitMs: 5000 });
+  if (outcome !== "committed") {
+    throw new Error(
+      outcome === "rolled_back"
+        ? "that restore was rolled back, so there's nothing to finish: run restore again."
+        : "the target can't confirm that restore committed (it may be a different database now, or the transaction is still open); run restore --status."
+    );
+  }
+  assertConfirmedTarget(opts.confirmTarget, targetUrl);
+
+  const store = opts.store ?? s3SnapshotStore(config);
+  const reader = await store.openSnapshot(record.snapshot);
+  const manifest = parseManifest(await reader.readManifest());
+  const workdir = await mkdtemp(join(tmpdir(), "backupdrill-finish-"));
+  const save = async (phase: RestorePhase) => {
+    record = { ...record!, phase, updatedAt: new Date().toISOString() };
+    await opts.restoreRecords.save(recordKey, record).catch((error) => {
+      log.warn(`couldn't update the restore record (${(error as Error).message})`);
+    });
+  };
+  try {
+    log.step("Downloading dump…");
+    const dumpPath = join(workdir, "dump.pgcustom");
+    const { sha256 } = await reader.downloadDump(manifest, dumpPath);
+    if (sha256 !== manifest.dump.sha256) {
+      throw new Error(`archive integrity check failed: downloaded sha256 ${sha256.slice(0, 12)}… does not match the manifest`);
+    }
+    log.step("Finishing the steps after the commit: grants, then foreign keys…");
+    const deferred = await deferredForeignKeysOf(dumpPath, workdir, AUTH_TABLE_KEYS);
+    const after = await afterCommit(
+      targetUrl,
+      { schemas: manifest.database.schemas, recorded: manifest.database.grants },
+      deferred,
+      { resume: true, onGrantsApplied: () => save("grants") }
+    );
+    if (after.pass.failures.length) {
+      throw new Error(`finishing the restore failed: ${after.pass.failures.join(" | ")}. Run restore --finish again once the cause is fixed.`);
+    }
+    await save("done");
+    const result: RestoreResult = { snapshot: record.snapshot, restoredToDatabase: true, storageFilesWritten: 0 };
+    log.step("Verifying restored tables…");
+    const verified = await verifyRestored(targetUrl, manifest, dumpPath);
+    result.databaseChecks = verified.checks;
+    if (after.grants) result.databaseChecks.push(grantsCheck(after.grants, "restore"));
+    if (after.orphaned?.length) {
+      result.orphanedForeignKeys = after.orphaned;
+      result.databaseChecks.push(orphanedForeignKeysCheck(after.orphaned));
+    }
+    result.databaseVerified = result.databaseChecks.every((c) => c.pass);
+    for (const check of result.databaseChecks) (check.pass ? log.ok : log.warn)(`${check.name}: ${check.detail}`);
+    log.ok("The restore is finished.");
     return result;
   } finally {
     await rm(workdir, { recursive: true, force: true }).catch(() => {});

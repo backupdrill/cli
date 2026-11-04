@@ -2,7 +2,14 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createServer } from "node:net";
+import { EventEmitter } from "node:events";
+import { PassThrough } from "node:stream";
+import { mkdtempSync, rmSync, statSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { fileRestoreRecords, restoreRecordKey } from "../dist/restore-record.js";
 import {
+  drainOrExit,
   authRestoreFailureMessage,
   emitsRestrict,
   firstPsqlError,
@@ -77,5 +84,48 @@ test("transactionOutcome: a target that never answers gives 'unknown' on time an
   } finally {
     for (const s of sockets) s.destroy();
     await new Promise((resolve) => server.close(resolve));
+  }
+});
+
+test("drainOrExit: every wait takes its listeners off again, so a long restore doesn't pile them up", async () => {
+  const stdin = new PassThrough();
+  const child = new EventEmitter();
+  for (let i = 0; i < 1000; i++) {
+    const waiting = drainOrExit(stdin, child);
+    stdin.emit("drain");
+    await waiting;
+  }
+  assert.equal(stdin.listenerCount("drain"), 0);
+  assert.equal(stdin.listenerCount("error"), 0);
+  assert.equal(child.listenerCount("close"), 0);
+  assert.equal(child.listenerCount("error"), 0);
+  const exiting = drainOrExit(stdin, child);
+  child.emit("close", 0);
+  await exiting;
+  assert.equal(stdin.listenerCount("drain"), 0);
+});
+
+test("restoreRecordKey: one key per target; the direct and pooler URLs of a Supabase project are the same target", () => {
+  const direct = "postgresql://postgres:pw@db.abcdefghijklmnopqrst.supabase.co:5432/postgres";
+  const pooler = "postgresql://postgres.abcdefghijklmnopqrst:pw@aws-0-us-east-1.pooler.supabase.com:5432/postgres";
+  assert.equal(restoreRecordKey(direct), restoreRecordKey(pooler));
+  assert.notEqual(restoreRecordKey("postgresql://u:p@localhost:5432/a"), restoreRecordKey("postgresql://u:p@localhost:5432/b"));
+  assert.doesNotMatch(restoreRecordKey(direct), /abcdefghijklmnopqrst|supabase/);
+});
+
+test("fileRestoreRecords: saves and loads a record, readable only by the user", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "bd-records-"));
+  try {
+    const records = fileRestoreRecords(dir);
+    assert.equal(await records.load("k"), null);
+    const record = {
+      version: 1, snapshot: "s", projectName: "p", target: "t", identity: { databaseOid: "1", systemIdentifier: null },
+      xid: "42", phase: "transaction", startedAt: "x", updatedAt: "x",
+    };
+    await records.save("k", record);
+    assert.deepEqual(await records.load("k"), record);
+    assert.equal(statSync(join(dir, "k.json")).mode & 0o777, 0o600);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
   }
 });

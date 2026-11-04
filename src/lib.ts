@@ -5,7 +5,9 @@ export { runBackup } from "./backup.js";
 // 搭配使用,URL 里的 sslmode=disable 又会把它覆盖掉,等于把这次修掉的绕过再放回去。
 export { SUPABASE_ROOT_CA, pgConnectOptions, PG_CLIENT_OPTIONS, normalizeConnectionTarget } from "./supabase-ca.js";
 export { runDrill, drillDump } from "./drill.js";
-export { runRestore } from "./restore.js";
+export { runRestore, restoreStatus, finishRestore } from "./restore.js";
+export { fileRestoreRecords, restoreRecordKey } from "./restore-record.js";
+export type { RestoreRecord, RestoreRecordStore, RestorePhase } from "./restore-record.js";
 // RECOVERY.md 的授权那一步:worker 的 Drive 版手册和这里的 S3 版用同一份 SQL
 export { recoveryGrantsSql } from "./grants.js";
 // 身份判定三件套对外导出:托管 worker 用它们与 app 侧 shared 的副本做同规则回归(交叉审查)
@@ -52,5 +54,5 @@ export type { GrantedObject, GrantRestore } from "./grants.js";
 export type { DrillReport, DrillCheck, DrillSupervision, DrillPhase } from "./drill.js";
 export type { AuthDrillReport } from "./auth-drill.js";
 export type { OrphanedForeignKey } from "./orphaned-foreign-keys.js";
-export type { RestoreResult, RestoreAuthResult } from "./restore.js";
+export type { RestoreResult, RestoreAuthResult, RestoreStatus } from "./restore.js";
 export type { EgressPricing, EgressProjection } from "./estimate.js";
