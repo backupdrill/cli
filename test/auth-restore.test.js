@@ -396,6 +396,19 @@ test(
         const again = await sql(target, "select count(*)::int as n from pg_constraint where conname in ('profiles_id_fkey', 'notes_owner_fkey', 'links_identity_id_fkey', 'comments_note_id_fkey')");
         assert.equal(again.rows[0].n, 4);
 
+        // dump 没变、manifest 被改过(这里是授权):不照它补授权
+        const original = mem.manifest();
+        mem.setManifest({ ...original, database: { ...original.database, grants: [] } });
+        await records.save(key, { ...(await records.load(key)), phase: "grants" });
+        try {
+          await assert.rejects(
+            finishRestore(config, { targetDatabaseUrl: target, confirmTarget: "127.0.0.1", restoreRecords: records, store: mem.store }),
+            /snapshot snap here isn't the one that was restored/
+          );
+        } finally {
+          mem.setManifest(original);
+        }
+
         // 别的项目里同名的快照:不拿它补授权、加外键
         const otherMem = readableMemoryStore();
         await runBackup({ ...config, projectName: "other", auth: "default" }, { store: otherMem.store });

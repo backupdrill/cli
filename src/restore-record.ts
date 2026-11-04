@@ -34,6 +34,11 @@ export interface RestoreRecord {
    * 别的项目、别的桶里可能有同名的快照,拿它补授权会改错目标上的权限
    */
   dumpSha256: string;
+  /**
+   * 整份 manifest.json 的 sha256:--finish 补的授权、要的 schema 都来自 manifest,dump 没变而 manifest 被改过
+   * 也不能接着做
+   */
+  manifestSha256?: string;
   /** 给人看的目标说明(ref 或 主机/库名),不含密码 */
   target: string;
   identity: TargetIdentity;
@@ -76,6 +81,7 @@ export function fileRestoreRecords(dir = process.env.BACKUPDRILL_STATE_DIR || jo
     async load(key) {
       try {
         const parsed = JSON.parse(await readFile(join(dir, `${key}.json`), "utf8")) as RestoreRecord;
+        // manifestSha256 是后加的:没有它的记录照样能给 --status 看,--finish 会拒绝并说明
         return parsed?.version === 1 && typeof parsed.xid === "string" && typeof parsed.dumpSha256 === "string" ? parsed : null;
       } catch (error) {
         if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;

@@ -77,7 +77,7 @@ All recognized variables:
 | `BACKUPDRILL_DATABASE_URL` | Source connection string (falls back to `DATABASE_URL`) | — (required) |
 | `BACKUPDRILL_PROJECT_NAME` | Readable name used in object keys and the manifest | `supabase` |
 | `BACKUPDRILL_SCHEMAS` | Comma-separated schemas to dump | `public` |
-| `BACKUPDRILL_AUTH` | `on` also backs up Supabase Auth users (`auth.users` + `auth.identities`); if that can't be done the database backup still completes and `backup` exits with code 3 | `off` |
+| `BACKUPDRILL_AUTH` | Supabase Auth users (`auth.users` + `auth.identities`) go into `auth.dump` next to the database dump whenever the role can read them. `off` leaves them out. `on` makes a backup that can't include them exit with code 3; the database backup still completes either way. Also `--auth` / `--no-auth`, or `"auth": true/false` in the config file | on when possible |
 | `BACKUPDRILL_S3_ENDPOINT` | S3-compatible endpoint (R2/B2/self-hosted; omit for AWS S3) | — |
 | `BACKUPDRILL_S3_REGION` | Destination bucket region | `auto` |
 | `BACKUPDRILL_S3_BUCKET` | Destination bucket | — (required) |
@@ -87,6 +87,8 @@ All recognized variables:
 | `BACKUPDRILL_SUPABASE_STORAGE_*` | Storage-file source (endpoint/region/keys/buckets) — see [Backing up Storage files](#backing-up-storage-files-too) | — |
 | `BACKUPDRILL_PG_DUMP` | Path to the `pg_dump` binary to use | `pg_dump` on `PATH` |
 | `BACKUPDRILL_PG_RESTORE` | Path to `pg_restore` (used by `drill` and `restore`) | next to `BACKUPDRILL_PG_DUMP`, else `pg_restore` on `PATH` |
+| `BACKUPDRILL_PSQL` | Path to `psql`, which `restore` uses for snapshots with Auth users | next to `pg_restore`, else `psql` on `PATH` |
+| `BACKUPDRILL_STATE_DIR` | Where `restore` keeps its record of restores with Auth users, for `--status` and `--finish` | `~/.backupdrill/restores` |
 | `BACKUPDRILL_PING_URL` | Healthchecks.io ping URL for `backup` and `drill` — see [Alerts with Healthchecks.io](#alerts-with-healthchecksio) | — |
 
 ### Config file
@@ -159,6 +161,7 @@ backupdrill estimate --plan pro   # measures your DB + Storage, prints the proje
 ```
 <prefix>/<project>/<timestamp>/
   ├── dump.pgcustom              # pg_dump --format=custom (public schema by default)
+  ├── auth.dump                  # Auth users: auth.users + auth.identities (2.10.0+, when the role can read them)
   ├── storage/<bucket>/<key>     # your Storage files (if configured)
   ├── RECOVERY.md                # how to restore this snapshot
   └── manifest.json              # schemas, tables, row counts, grants, file list, sizes + sha256
@@ -179,6 +182,8 @@ backupdrill drill --verify-all-files # also checksum every Storage file, not jus
 Backups record your installed Postgres extensions in the manifest, and the drill pre-installs them in the sandbox before restoring — including switching to a pgvector-enabled sandbox image when your database uses `vector` columns.
 
 The sandbox restore runs up to 4 parallel `pg_restore` jobs, sized from the CPUs and memory Docker reports, so a 2 vCPU / 8 GB machine gets 2. Table data and index builds run in parallel. Foreign keys, triggers and policies run on a single connection to keep their error messages separate, including errors about Supabase-managed objects such as `auth.users`. `backupdrill restore` into a real Supabase project stays on a single connection.
+
+For a snapshot with Auth users, the drill does more once its usual checks are done. In the same sandbox it restores the two Auth tables and compares their row counts with the backup. It adds the foreign keys into them that it otherwise skips, recreates the triggers on them that a restore would recreate (the rest are listed as manual steps), and simulates an email sign-up as `supabase_auth_admin`, the role Supabase Auth uses, then rolls it back. A trigger that would break new sign-ups shows up there. The result is an `auth` section in the report. For now it doesn't change whether the drill passes.
 
 Ctrl+C (or a SIGTERM from whatever runs the drill) stops it and cleans up: the CLI stops a running `--check-cmd` and `pg_restore`, removes the sandbox container and its volume, deletes the downloaded dump, and exits with 130 (143 for SIGTERM). `--keep` doesn't apply to an interrupted drill. Press Ctrl+C a second time to exit without waiting for the cleanup.
 
@@ -210,7 +215,18 @@ Prefer files on disk instead? Skip the Storage target and pass `--storage-dir ./
 
 `--dry-run` writes nothing to the target. Besides checking the target (not the source project, schemas empty, Postgres and `pg_restore` versions, extensions available), it downloads the dump to a temporary directory, checks its sha256 and looks for foreign keys that point outside the backup (see [Tables that reference auth.users](#tables-that-reference-authusers)). The real run repeats those checks before it writes anything; a foreign key into a table that one of the recorded extensions creates is checked again once the extensions are installed. The database restore then runs in a single transaction: if any statement fails, nothing from the snapshot stays on the target, and you can run it again on the same project once you've fixed the cause. (If the connection drops while it commits, the error says so and asks you to check the target first.) Right after that transaction commits, the grants for `anon`, `authenticated` and `service_role` are set in a transaction of their own (see [Grants for anon, authenticated and service_role](#grants-for-anon-authenticated-and-service_role)). Foreign keys between two tables in the backup are the exception to the single transaction: they're added after that, in one more. If rows in your data already break one of them (deleting with triggers switched off, for example under `session_replication_role = replica`, can leave rows like that), the key is added as `NOT VALID` instead of failing the restore. Those rows come back as they are, new writes are still checked, and the report names the key and, when it can count them, how many rows break it. Keys on or into partitioned tables, keys into an extension's tables, and every key in an archive whose foreign key statements BackupDrill can't fully read stay in the main transaction, so a broken one rolls the whole restore back. A key over a generated column is added in the second step but is never relaxed, because the restore recomputes those values; if it breaks, that step fails. Keys added as `NOT VALID` don't fail a drill: the drill passes and lists them in its report. If a step after the main transaction fails for any other reason, the tables and data are already on the target and the error says so. Extensions the run installed stay installed, since the next run needs them too, and the empty-target check doesn't count objects that belong to an extension (except an extension's configuration tables, whose rows a dump can carry). One transaction holds a lock on every table, index and sequence until it commits, so a very large schema can run out of lock slots: on Supabase's smallest compute size, about a thousand tables (partitions count as tables). The restore then stops with nothing written and tells you how to raise `max_locks_per_transaction`.
 
-Or restore the dump by hand — into an **empty** database, without `--clean`:
+Snapshots taken with 2.10.0 or later usually hold the Auth users as well. For those, `restore` writes the Auth users, the database and the triggers on the Auth tables that it can recreate in **one** transaction. Triggers it can't recreate, and policies on the Auth tables, are listed as manual steps. A foreign key like `profiles.id → auth.users` then finds its users. If anything fails before the commit, the target is left as it was. The grants and some foreign keys come after the commit, as with any restore (see above). A few things come with that:
+
+- **`psql` is needed.** It comes from the same PostgreSQL client package as `pg_restore`, and it must be 17.6, 16.10, 15.14, 14.19, 13.22 or newer. Those releases protect psql from commands smuggled into an archive.
+- **The target has to be a new project.** No Auth users, and no triggers or policies of its own on the Auth tables.
+- **Links and codes from before don't work.** Password-reset, email-confirmation and email or phone change links that were pending at backup time are cleared.
+- **Everyone signs in again**, because sessions aren't in the snapshot.
+- **Auth settings are yours to set up again.** Sign-in providers, SMTP, redirect URLs and the site URL live in the Supabase dashboard, not in the database. Users who signed in with Google or GitHub keep that sign-in method; reconfigure the same OAuth app in the new project.
+- **MFA factors aren't backed up.** Users who had MFA sign in with one factor until they enroll again.
+
+If the restore is cut off while it commits, `backupdrill restore --status` (same `BACKUPDRILL_TARGET_DATABASE_URL`, same machine) says whether it committed. If it did, `backupdrill restore --finish --confirm-target <ref>` does the grants and foreign keys that come after the commit, and it can be run again safely. `--skip-auth` leaves the Auth users out and restores the database the way 2.9 did; use it if you already copied the users into the target yourself.
+
+Or restore by hand. For a snapshot with Auth users, follow step 4 of its `RECOVERY.md`, which restores `auth.dump` and `dump.pgcustom` in one transaction. For a snapshot without them, restore the dump into an **empty** database, without `--clean`:
 
 ```bash
 pg_restore --no-owner --no-privileges --dbname "<target-connection-string>" dump.pgcustom
@@ -238,9 +254,9 @@ grant execute on all functions in schema public to anon, authenticated, service_
 
 ### Tables that reference auth.users
 
-By default a backup covers the `public` schema only, so your Auth users are not in it. Plenty of Supabase apps have a table like `profiles` whose `id` is a foreign key to `auth.users(id)`. When the restore recreates that key in a new project, Postgres checks every `profiles` row against `auth.users`, and in a new project that table is empty, so the restore fails.
+This section is about snapshots without Auth users: those taken before 2.10.0, with `--no-auth`, or by a role that couldn't read the Auth tables, and restores with `--skip-auth`. (A snapshot's `manifest.json` says under `auth` whether it has them.) Plenty of Supabase apps have a table like `profiles` whose `id` is a foreign key to `auth.users(id)`. When the restore recreates that key in a new project, Postgres checks every `profiles` row against `auth.users`, and in a new project that table is empty, so the restore fails.
 
-A drill can't catch this. Its sandbox has no `auth.users` at all, so the drill reports that foreign key as a skipped Supabase-managed object and passes. `restore --dry-run` checks it against the real target and tells you how many rows have nothing to point at:
+A drill of such a snapshot can't catch this. Its sandbox has no `auth.users` at all, so the drill reports that foreign key as a skipped Supabase-managed object and passes. `restore --dry-run` checks it against the real target and tells you how many rows have nothing to point at:
 
 ```
 ✗ references outside the backup: public.profiles → auth.users (profiles_id_fkey): 200 of 200 row(s) point at auth.users rows the target doesn't have
@@ -257,9 +273,9 @@ PGPASSWORD="$OLD_PW" pg_dump --data-only --table=auth.users --table=auth.identit
 unset OLD_PW NEW_PW
 ```
 
-`auth.identities` holds each user's sign-in methods; users copied with it can sign in to the new project with their old password. If the old project is gone, the users can only come from a backup that includes the `auth` schema, such as Supabase's own daily backups on a paid plan. A backupdrill snapshot of `public` doesn't have them.
+`auth.identities` holds each user's sign-in methods; users copied with it can sign in to the new project with their old password. If the old project is gone, the users can only come from a backup that includes them: a backupdrill snapshot taken with 2.10.0 or later, or Supabase's own daily backups on a paid plan.
 
-Triggers you created on `auth.users`, such as the common one that inserts a `profiles` row on sign-up, belong to that table, so they aren't in the backup either. Create them again after the restore.
+Triggers you created on `auth.users`, such as the common one that inserts a `profiles` row on sign-up, belong to that table, so a snapshot without Auth users doesn't have them either. Create them again after the restore.
 
 ## 2.0 migration — `restore` flags changed
 
@@ -425,6 +441,7 @@ What a scrape costs: one list request per 1,000 snapshot folders and one per 1,0
 - [x] `restore` — recover a snapshot into a fresh Supabase project: database through the drill-grade engine with verification, Storage uploaded back with per-file reconciliation (local download remains an option)
 - [x] GitHub Action wrapper
 - [x] `exporter` — Prometheus metrics for backups and recorded drills
+- [x] Auth users (`auth.users`, `auth.identities`): backed up, restored in the same transaction as the database, checked in drills
 
 For scheduling, automated restore drills, and alerting, use the hosted service at [backupdrill.com](https://backupdrill.com).
 

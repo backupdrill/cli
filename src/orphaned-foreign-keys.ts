@@ -171,9 +171,28 @@ export function foreignKeyDefinition(fk: ForeignKeyDef): string {
   return match ? match[1] : fk.statement;
 }
 
-/** 比较外键定义:空白归一,NOT VALID 不算差别(源库的孤儿行会让恢复把它建成 NOT VALID) */
+/**
+ * 比较外键定义:引号外的空白归一,NOT VALID 不算差别(源库的孤儿行会让恢复把它建成 NOT VALID)。
+ * 引号里的不动:"parent  table" 和 "parent table" 是两张表
+ */
 export function normalizedConstraintDef(def: string): string {
-  return def.replace(/\s+/g, " ").trim().replace(/ NOT VALID$/, "");
+  let out = "";
+  let quoted = false;
+  let pendingSpace = false;
+  for (const ch of def.trim()) {
+    if (!quoted && /\s/.test(ch)) {
+      pendingSpace = true;
+      continue;
+    }
+    if (pendingSpace) {
+      out += " ";
+      pendingSpace = false;
+    }
+    // "" 是引号里的一个双引号:翻两次,quoted 不变
+    if (ch === '"') quoted = !quoted;
+    out += ch;
+  }
+  return out.replace(/ NOT VALID$/, "");
 }
 
 export async function addForeignKeys(

@@ -8,7 +8,8 @@ import { mkdtempSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileRestoreRecords, restoreRecordKey } from "../dist/restore-record.js";
-import { restoreStatus } from "../dist/restore.js";
+import { finishRestore, restoreStatus } from "../dist/restore.js";
+import { normalizedConstraintDef } from "../dist/orphaned-foreign-keys.js";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { fileURLToPath } from "node:url";
@@ -123,7 +124,7 @@ test("fileRestoreRecords: saves and loads a record, readable only by the user", 
     const records = fileRestoreRecords(dir);
     assert.equal(await records.load("k"), null);
     const record = {
-      version: 1, snapshot: "s", projectName: "p", dumpSha256: "abc", target: "t", identity: { databaseOid: "1", systemIdentifier: null },
+      version: 1, snapshot: "s", projectName: "p", dumpSha256: "abc", manifestSha256: "def", target: "t", identity: { databaseOid: "1", systemIdentifier: null },
       xid: "42", phase: "transaction", startedAt: "x", updatedAt: "x",
     };
     await records.save("k", record);
@@ -176,4 +177,48 @@ test("CLI: restore --status needs only the target (no config, no bucket); --fini
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test("normalizedConstraintDef: whitespace outside quotes and NOT VALID don't matter, whitespace inside quoted names does", () => {
+  assert.equal(
+    normalizedConstraintDef("FOREIGN KEY (a)  REFERENCES public.t(id)\n  NOT VALID"),
+    normalizedConstraintDef("FOREIGN KEY (a) REFERENCES public.t(id)")
+  );
+  assert.notEqual(
+    normalizedConstraintDef('FOREIGN KEY (a) REFERENCES public."parent  table"(id)'),
+    normalizedConstraintDef('FOREIGN KEY (a) REFERENCES public."parent table"(id)')
+  );
+  // "" 是引号里的一个双引号,不结束引号
+  assert.equal(
+    normalizedConstraintDef('FOREIGN KEY (a) REFERENCES public."a""  b"(id)'),
+    'FOREIGN KEY (a) REFERENCES public."a""  b"(id)'
+  );
+});
+
+test("a record without manifestSha256 (pre-release builds) still shows in --status, and --finish refuses it", async () => {
+  const legacy = {
+    version: 1, snapshot: "s", projectName: "p", dumpSha256: "abc", target: "t",
+    identity: { databaseOid: "1", systemIdentifier: null }, xid: "42", phase: "committed", startedAt: "x", updatedAt: "x",
+  };
+  const dir = mkdtempSync(join(tmpdir(), "bd-legacy-"));
+  try {
+    const records = fileRestoreRecords(dir);
+    await records.save("k", legacy);
+    assert.deepEqual(await records.load("k"), legacy);
+    const store = { load: async () => legacy, save: async () => {} };
+    const status = await restoreStatus({ targetDatabaseUrl: "postgresql://u:p@127.0.0.1:1/x", restoreRecords: store, timeoutMs: 500 });
+    assert.equal(status.recorded, true);
+    await assert.rejects(
+      finishRestore({}, { targetDatabaseUrl: "postgresql://u:p@127.0.0.1:1/x", restoreRecords: store }),
+      /pre-release build[\s\S]*restore --status/
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("CLI: backup --help says Auth users are included by default", async () => {
+  const { stdout } = await run(process.execPath, [cli, "backup", "--help"]);
+  assert.match(stdout.replace(/\s+/g, " "), /By default they're included when possible/);
+  assert.doesNotMatch(stdout, /the default for now/);
 });

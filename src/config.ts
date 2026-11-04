@@ -40,7 +40,7 @@ export interface BackupConfig {
   /**
    * 2.10.0 起:是否另外备份 Supabase Auth 用户(auth.users + auth.identities,见 auth-backup.ts)。
    * 库调用方不传 = "off",备份与之前逐字节一致;托管 worker 显式传值才打开。
-   * CLI 的 loadConfig 目前默认 "off",显式打开给 "on"(读端就绪后默认改为 "default")。
+   * CLI 的 loadConfig 默认 "default"(做得了就备,做不了只警告);--auth / BACKUPDRILL_AUTH=on 给 "on",关掉给 "off"。
    */
   auth?: AuthMode;
 }
@@ -227,10 +227,10 @@ export async function loadConfig(opts: {
     };
   }
 
-  // 显式 flag > 环境变量 > 配置文件。都没说 = 先关着:恢复和演练还不读 auth.dump 之前,
-  // 不该默认产出它们用不上的归档。读端就绪、发 2.10.0 时改成 "default"(做得了就备,做不了只警告)
+  // 显式 flag > 环境变量 > 配置文件。都没说 = "default"(2.10.0 起,PRD 决策 D4):做得了就备,
+  // 做不了(角色读不到 auth、目标存不下……)只警告、退出码照旧是 0,定时备份不会因此变红
   const authChoice = [o.auth, env.auth, file.auth].find((v) => typeof v === "boolean");
-  const auth: AuthMode = authChoice === undefined ? "off" : authChoice ? "on" : "off";
+  const auth: AuthMode = authChoice === undefined ? "default" : authChoice ? "on" : "off";
 
   return {
     databaseUrl: databaseUrl!,

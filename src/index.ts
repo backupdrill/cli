@@ -79,10 +79,11 @@ program
   // 先定义 --auth 再定义 --no-auth:两个都不传时值是 undefined(= 默认行为),而不是 true
   .option(
     "--auth",
-    "also back up Supabase Auth users (auth.users + auth.identities), or BACKUPDRILL_AUTH=on; " +
-      "if it can't be done the database backup still completes and the command exits with code 3"
+    "require the Supabase Auth users (auth.users + auth.identities) in the backup, or BACKUPDRILL_AUTH=on; " +
+      "if they can't be included the database backup still completes and the command exits with code 3. " +
+      "By default they're included when possible; BACKUPDRILL_AUTH or the config file can change that"
   )
-  .option("--no-auth", "don't back up Supabase Auth users (the default for now)")
+  .option("--no-auth", "don't back up the Supabase Auth users (emails, password hashes, sign-in methods), or BACKUPDRILL_AUTH=off")
   .option(PING_FLAG, PING_HELP)
   .action(async (opts) => {
     const ping = createPinger(await resolvePingUrl({ flag: opts.pingUrl, configPath: opts.config }));
