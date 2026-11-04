@@ -22,13 +22,40 @@ case "$BACKUPDRILL_CRON" in
     ;;
 esac
 
+# supercronic -test alone would accept a comment ("# off") or a VAR=value line and
+# then sit there with no job, so backups would silently never run. Only allow cron
+# syntax: a descriptor like @daily, or 5 to 7 fields made of cron characters.
+invalid_schedule() {
+  echo "BACKUPDRILL_CRON is not a valid cron expression: \"$BACKUPDRILL_CRON\"" >&2
+  exit 64
+}
+case "$BACKUPDRILL_CRON" in
+  @* | [0-9*]*) ;;
+  *) invalid_schedule ;;
+esac
+case "$BACKUPDRILL_CRON" in
+  *[!0-9A-Za-z*/,?@#\ -]*) invalid_schedule ;;
+esac
+# Word splitting is the point here (count the fields); set -f stops "*" from
+# expanding to file names in the working directory.
+set -f
+# shellcheck disable=SC2086
+set -- $BACKUPDRILL_CRON
+set +f
+# "#" is valid inside a field (0#2 = second Sunday) but a field that starts with it
+# would turn the rest of the crontab line, the backup command, into a comment.
+for field in "$@"; do
+  case "$field" in \#*) invalid_schedule ;; esac
+done
+case "$1" in
+  @*) [ "$#" -eq 1 ] || invalid_schedule ;;
+  *) { [ "$#" -ge 5 ] && [ "$#" -le 7 ]; } || invalid_schedule ;;
+esac
+
 crontab_file="$(mktemp)"
 printf '%s backupdrill backup\n' "$BACKUPDRILL_CRON" > "$crontab_file"
 # Check the expression up front so a typo fails at container start, not silently.
-if ! supercronic -test "$crontab_file" >/dev/null 2>&1; then
-  echo "BACKUPDRILL_CRON is not a valid cron expression: \"$BACKUPDRILL_CRON\"" >&2
-  exit 64
-fi
+supercronic -test "$crontab_file" >/dev/null 2>&1 || invalid_schedule
 
 echo "backupdrill: scheduled \`backupdrill backup\` at \"$BACKUPDRILL_CRON\" (TZ=${TZ:-UTC})"
 # supercronic skips a run while the previous one is still going, so two backups

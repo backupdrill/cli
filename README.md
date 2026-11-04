@@ -338,7 +338,7 @@ Before switching to a **daily** schedule, read the egress-cost section above —
 
 ## Docker / scheduled backups on your own server
 
-If you'd rather run backups on a machine you already have (a home server, a NAS, Unraid, any Docker host), use the image at `ghcr.io/backupdrill/backupdrill`. It has the CLI and `pg_dump` 17, and nothing else: no credentials are in the image, every setting comes from the same `BACKUPDRILL_*` environment variables listed above.
+If you'd rather run backups on a machine you already have (a home server, a NAS, Unraid, any Docker host), use the image at `ghcr.io/backupdrill/backupdrill`. The image includes the CLI and `pg_dump` 17. It contains no credentials; configure it with the `BACKUPDRILL_*` environment variables listed above.
 
 Set `BACKUPDRILL_CRON` and the container stays up and runs `backupdrill backup` on that schedule. The time zone comes from `TZ` (UTC if unset). A run that's still going when the next one is due makes the next one wait its turn rather than overlap.
 
