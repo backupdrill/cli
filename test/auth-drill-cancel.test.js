@@ -9,7 +9,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pgRestoreOutput, spawnPgRestore } from "../dist/restore-engine.js";
 import { connectCancellable } from "../dist/auth-backup.js";
-import { runAuthDrill, stopAuthSessions } from "../dist/auth-drill.js";
+import { authDrillSection, runAuthDrill, stopAuthSessions } from "../dist/auth-drill.js";
 
 /**
  * 假 Postgres。answerStartup 为 true 时对启动包回 AuthenticationOk + ReadyForQuery(客户端认为连上了),
@@ -157,5 +157,89 @@ test("stopAuthSessions:沙箱连握手都不回,到点就放手并关掉连接",
     assert.equal(pgServer.closed(), 1, "清理连接到点后没有关掉");
   } finally {
     await pgServer.stop();
+  }
+});
+
+// 托管 worker 叫停 Auth 附加检查(Auth PRD §0.1:Auth 不改变演练结论)
+const includedManifest = {
+  auth: { status: "included", dump: { key: "k", format: "custom", bytes: 1, sha256: "x" }, rows: { users: 1, identities: 1 } },
+  database: { schemas: ["public"] },
+};
+// 拒绝连接的端口:叫停后的会话清理当场失败,不拖住测试
+const REFUSED = "postgresql://u:p@127.0.0.1:1/db";
+
+test("authDrillSection:supervisor 不让做(begin 被拒绝)就跳过这一节、停掉下载,不抛错", async () => {
+  let stopped = 0;
+  const report = await authDrillSection(REFUSED, includedManifest, "/nonexistent", new Promise(() => {}), () => stopped++, {
+    begin: async () => {
+      throw new Error("not now");
+    },
+  });
+  assert.deepEqual(report, { status: "not_checked", summary: "the drill runner didn't allow the Auth check this time" });
+  assert.equal(stopped, 1);
+});
+
+test("authDrillSection:运行中被 supervisor 叫停,立刻记 not_checked 并带上原因;已经叫停的不再开始", async () => {
+  let release;
+  const authDump = new Promise((resolve) => (release = resolve));
+  let begun = 0;
+  const stop = new AbortController();
+  const started = Date.now();
+  const pending = authDrillSection(REFUSED, includedManifest, "/nonexistent", authDump, () => release({ error: "stopped" }), {
+    begin: async () => {
+      begun++;
+    },
+    stop: stop.signal,
+  });
+  await new Promise((r) => setTimeout(r, 20));
+  stop.abort("low disk space on the drill host");
+  const report = await pending;
+  assert.equal(begun, 1);
+  assert.deepEqual(report, { status: "not_checked", summary: "the drill runner stopped the Auth check (low disk space on the drill host)" });
+  assert.ok(Date.now() - started < 2000, "returned right away");
+
+  const already = new AbortController();
+  already.abort("low disk space on the drill host");
+  let downloadStopped = 0;
+  const skipped = await authDrillSection(REFUSED, includedManifest, "/nonexistent", new Promise(() => {}), () => downloadStopped++, {
+    stop: already.signal,
+  });
+  assert.equal(skipped.status, "not_checked");
+  assert.equal(downloadStopped, 1);
+});
+
+test("authDrillSection:supervisor 迟迟不回 begin 时照样能叫停:立刻返回、停掉下载、不再开始检查", async () => {
+  let downloadStopped = 0;
+  const stop = new AbortController();
+  const pending = authDrillSection(REFUSED, includedManifest, "/nonexistent", new Promise(() => {}), () => downloadStopped++, {
+    begin: () => new Promise(() => {}),
+    stop: stop.signal,
+  });
+  await new Promise((r) => setTimeout(r, 20));
+  stop.abort("low disk space on the drill host");
+  const started = Date.now();
+  const report = await pending;
+  assert.equal(report.summary, "the drill runner stopped the Auth check (low disk space on the drill host)");
+  assert.ok(Date.now() - started < 500);
+  assert.equal(downloadStopped, 1);
+});
+
+test("authDrillSection:提前退出后下载那边才失败,不留下没人接的 rejection", async () => {
+  const unhandled = [];
+  const onUnhandled = (reason) => unhandled.push(reason);
+  process.on("unhandledRejection", onUnhandled);
+  try {
+    let failDownload;
+    const authDump = new Promise((_resolve, reject) => (failDownload = reject));
+    const report = await authDrillSection(REFUSED, includedManifest, "/nonexistent", authDump, () => failDownload(new Error("download stopped")), {
+      begin: async () => {
+        throw new Error("not now");
+      },
+    });
+    assert.equal(report.status, "not_checked");
+    await new Promise((r) => setTimeout(r, 20));
+    assert.deepEqual(unhandled, []);
+  } finally {
+    process.off("unhandledRejection", onUnhandled);
   }
 });

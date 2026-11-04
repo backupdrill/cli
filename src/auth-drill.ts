@@ -438,33 +438,76 @@ export async function authDrillSection(
   manifest: Manifest,
   mainDumpPath: string,
   authDump: Promise<AuthDumpForDrill> | undefined,
-  stopDownload?: () => void
+  stopDownload?: () => void,
+  /**
+   * 托管 worker:begin 在开始前告诉它进入 Auth 阶段(被拒绝就不做这一节);stop 是它叫停这一节的信号。
+   * 两者都只影响这一节,演练结论不变
+   */
+  runner: { begin?: () => Promise<void>; stop?: AbortSignal } = {}
 ): Promise<AuthDrillReport | undefined> {
   if (manifest.auth?.status !== "included" || !authDump) return undefined;
   if (interrupted()) return undefined;
-  const cancel = new AbortController();
-  const work = (async () => runAuthDrill(sandboxConnString, manifest, mainDumpPath, await authDump, cancel.signal))();
-  work.catch(() => {});
+  // 不管从哪条路提前退出,下载那边后来的失败都得有人接住(没人接的 rejection 会把 worker 带走)
+  authDump.catch(() => {});
+  const stoppedByRunner = (): AuthDrillReport => {
+    const why = runner.stop?.reason;
+    return {
+      status: "not_checked",
+      summary: `the drill runner stopped the Auth check${typeof why === "string" && why ? ` (${why})` : ""}`,
+    };
+  };
   const timedOut: AuthDrillReport = {
     status: "not_checked",
     summary: `the Auth check didn't finish within ${AUTH_DRILL_LIMITS.totalMs / 60000} minutes`,
   };
+  const cancel = new AbortController();
+  let work: Promise<AuthDrillReport> | undefined;
+  // 叫停(超时或 supervisor):不再开始任何新的一步,自己的连接、pg_restore、下载当场停掉;
+  // 已经开始的那部分,收尾放到后台:等它真正退出,再把服务端还没收手的会话终止掉——
+  // --keep 留下的沙箱事后不会再被改动
+  const halt = () => {
+    cancel.abort();
+    stopDownload?.();
+    const started = work;
+    if (started) {
+      void (async () => {
+        await waitAtMost(started, 10_000);
+        await stopAuthSessions(sandboxConnString);
+      })();
+    }
+  };
   let timer: NodeJS.Timeout | undefined;
+  let onRunnerStop: (() => void) | undefined;
   try {
+    // 叫停和时限在进入 Auth 阶段之前就装好:supervisor 迟迟不回 begin 时同样能叫停、同样到点放弃
     return await Promise.race([
-      work,
+      (async (): Promise<AuthDrillReport> => {
+        if (runner.begin) {
+          try {
+            await runner.begin();
+          } catch {
+            stopDownload?.();
+            return { status: "not_checked", summary: "the drill runner didn't allow the Auth check this time" };
+          }
+        }
+        // 等 begin 的时候已经被叫停或到点了:比赛已经有了结果,这里不再开始
+        if (cancel.signal.aborted) return stoppedByRunner();
+        work = runAuthDrill(sandboxConnString, manifest, mainDumpPath, await authDump, cancel.signal);
+        return await work;
+      })(),
+      new Promise<AuthDrillReport>((resolve) => {
+        if (!runner.stop) return;
+        onRunnerStop = () => {
+          halt();
+          resolve(stoppedByRunner());
+        };
+        if (runner.stop.aborted) onRunnerStop();
+        else runner.stop.addEventListener("abort", onRunnerStop, { once: true });
+      }),
       new Promise<AuthDrillReport>((resolve) => {
         timer = setTimeout(() => {
-          // 超时结果立刻返回,收尾放到后台、每一步都有时限,绝不让演练等它:
-          //  - 叫停:不再开始任何新的一步,自己的连接当场断开,自己的 pg_restore 当场停掉;下载停掉;
-          //  - 等这一节真正退出(那之后它不会再开任何连接),再把服务端还没收手的会话终止掉
-          //    (比如还在等锁的语句)——--keep 留下的沙箱事后不会再被改动
-          cancel.abort();
-          stopDownload?.();
-          void (async () => {
-            await waitAtMost(work, 10_000);
-            await stopAuthSessions(sandboxConnString);
-          })();
+          // 超时结果立刻返回,收尾在后台、每一步都有时限,绝不让演练等它
+          halt();
           resolve(timedOut);
         }, AUTH_DRILL_LIMITS.totalMs);
       }),
@@ -473,5 +516,6 @@ export async function authDrillSection(
     return { status: "not_checked", summary: `the Auth check couldn't run: ${safeError(error)}` };
   } finally {
     clearTimeout(timer);
+    if (onRunnerStop) runner.stop?.removeEventListener("abort", onRunnerStop);
   }
 }

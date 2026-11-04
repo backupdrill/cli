@@ -1383,6 +1383,18 @@ export async function finishRestore(
     }
     result.databaseVerified = result.databaseChecks.every((c) => c.pass);
     for (const check of result.databaseChecks) (check.pass ? log.ok : log.warn)(`${check.name}: ${check.detail}`);
+    // 只有带 Auth 的单事务恢复才写恢复记录:能接着做,就说明 Auth 用户已经随那次提交写进了目标。
+    // 结果里照实带上(和一次做完的恢复一样),调用方的报告才不会说"Auth 用户没恢复"
+    if (manifest.auth?.status === "included" && manifest.auth.rows) {
+      const { notes, manual } = authRestoreNotes(manifest.auth, manifest.database.schemas);
+      result.auth = {
+        restored: true,
+        users: manifest.auth.rows.users,
+        identities: manifest.auth.rows.identities,
+        notes,
+        manual,
+      };
+    }
     log.ok("The restore is finished.");
     return result;
   } finally {
