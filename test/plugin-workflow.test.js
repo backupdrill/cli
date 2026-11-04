@@ -21,8 +21,6 @@ const NOT_BACKUP_SETTINGS = new Set([
   "BACKUPDRILL_SANDBOX_URL",
   "BACKUPDRILL_TUS_THRESHOLD",
   "BACKUPDRILL_PG_DUMP",
-  // 工作流固定装 backupdrill@2.9.2,那个版本不认它;发 2.10.0、升级固定版本时再加进工作流
-  "BACKUPDRILL_AUTH",
 ]);
 
 function settingsTheCliReads() {

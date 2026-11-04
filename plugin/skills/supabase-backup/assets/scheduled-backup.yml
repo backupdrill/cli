@@ -26,6 +26,10 @@
 #   BACKUPDRILL_SCHEMAS               Comma-separated schemas to dump, e.g. public,audit
 #                                     (default: public). Use the same value as your
 #                                     local runs, or scheduled backups miss schemas.
+#   BACKUPDRILL_AUTH                  Supabase Auth users (auth.users + auth.identities)
+#                                     are backed up when the database role can read
+#                                     them. "off" leaves them out; "on" makes a backup
+#                                     that can't include them exit with code 3.
 #   BACKUPDRILL_S3_PREFIX             Key prefix in the bucket (default: backupdrill).
 #                                     Keep it the same as local runs so drills and
 #                                     restores find these snapshots.
@@ -95,7 +99,7 @@ jobs:
 
       - name: Run backupdrill
         # Pinned so every run uses the same CLI. Raise it on purpose when you upgrade.
-        run: npx -y backupdrill@2.9.2 backup
+        run: npx -y backupdrill@2.10.0 backup
         env:
           # --- required ---
           BACKUPDRILL_DATABASE_URL: ${{ secrets.BACKUPDRILL_DATABASE_URL }}
@@ -107,6 +111,7 @@ jobs:
           BACKUPDRILL_S3_REGION: ${{ secrets.BACKUPDRILL_S3_REGION }}
           BACKUPDRILL_PROJECT_NAME: ${{ secrets.BACKUPDRILL_PROJECT_NAME }}
           BACKUPDRILL_SCHEMAS: ${{ secrets.BACKUPDRILL_SCHEMAS }}
+          BACKUPDRILL_AUTH: ${{ secrets.BACKUPDRILL_AUTH }}
           BACKUPDRILL_S3_PREFIX: ${{ secrets.BACKUPDRILL_S3_PREFIX }}
           BACKUPDRILL_S3_FORCE_PATH_STYLE: ${{ secrets.BACKUPDRILL_S3_FORCE_PATH_STYLE }}
           # --- optional: also back up Supabase Storage files (set all four) ---
