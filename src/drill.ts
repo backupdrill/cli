@@ -24,6 +24,7 @@ import { orphanedForeignKeysCheck, type OrphanedForeignKey } from "./orphaned-fo
 import { grantsCheck, type GrantRestore, type GrantedObject } from "./grants.js";
 import { localPgRestoreMajor, restoreToolBreaksOnTarget, sandboxMajorFor } from "./pgbin.js";
 import { log } from "./log.js";
+import { authDrillSection, type AuthDrillReport, type AuthDumpForDrill } from "./auth-drill.js";
 import { onInterrupt, stopOnInterrupt, throwIfInterrupted } from "./interrupt.js";
 
 const execFileAsync = promisify(execFile);
@@ -77,6 +78,11 @@ export interface DrillReport {
   keptSandbox?: { containerId: string; connString: string };
   /** 源库自带孤儿行的外键:演练和真实恢复都把它们建成 NOT VALID,不算失败。没有时不出现 */
   orphanedForeignKeys?: OrphanedForeignKey[];
+  /**
+   * 2.10.0 起,快照带 Auth 用户时的附加校验(见 auth-drill.ts)。**不参与 pass 的判定**;
+   * 快照不带 Auth 时不出现
+   */
+  auth?: AuthDrillReport;
 }
 
 // ── 临时 Postgres 容器编排 ──────────────────────────────────────────
@@ -676,7 +682,13 @@ export async function drillDump(
   manifest: Manifest,
   snapshot: string,
   preChecks: DrillCheck[] = [],
-  opts: { appCheckCommand?: string; keepSandboxOnFailure?: boolean; supervision?: DrillSupervision } = {}
+  opts: {
+    appCheckCommand?: string;
+    keepSandboxOnFailure?: boolean;
+    supervision?: DrillSupervision;
+    /** 快照带 Auth 用户时由 runDrill 下载好的 auth.dump(或下载失败的原因) */
+    authDump?: AuthDumpForDrill;
+  } = {}
 ): Promise<DrillReport> {
   // 空/纯空白命令 = 危险的假配置(CI 里变量没展开的典型形态):跑了会以 exit 0
   // 假通过,忽略会让用户以为检查在跑。拒绝,且要在起沙箱之前拒绝。
@@ -805,6 +817,15 @@ export async function drillDump(
       restoredRowTotal: verify.rowTotal,
     };
     if (orphaned.length) report.orphanedForeignKeys = orphaned;
+    // Auth 附加校验:结论(pass)上面已经定了,这里只往报告里加一节。它在同一个沙箱里补外键、
+    // 建触发器、模拟注册——放在所有正式检查之后,不影响它们;自己出错也只记在这一节里
+    const authSection = await authDrillSection(pg.connString, manifest, dumpPath, opts.authDump);
+    if (authSection) {
+      report.auth = authSection;
+      const line = `Auth users: ${authSection.summary}`;
+      if (authSection.status === "verified") log.ok(line);
+      else log.warn(line);
+    }
     if (opts.keepSandboxOnFailure && !pass) {
       // 写进报告让 --keep 可被脚本消费(拿连接串排查),不只靠人眼看日志
       report.keptSandbox = { containerId: pg.containerId, connString: pg.connString };
@@ -905,10 +926,27 @@ export async function runDrill(
       );
     }
 
+    // 快照带 Auth 用户:把 auth.dump 也取下来给附加校验用。取不到只记进报告的 Auth 一节,不影响演练
+    let authDump: AuthDumpForDrill | undefined;
+    if (manifest.auth?.status === "included") {
+      if (!reader.downloadAuthDump) {
+        authDump = { error: "this snapshot location can't read the Auth archive" };
+      } else {
+        const authPath = join(workdir, "auth.dump");
+        try {
+          await reader.downloadAuthDump(manifest, authPath);
+          authDump = { path: authPath };
+        } catch (error) {
+          authDump = { error: String((error as Error).message ?? error).split("\n")[0].slice(0, 300) };
+        }
+      }
+    }
+
     return await drillDump(dumpPath, manifest, snapshot, preChecks, {
       appCheckCommand: opts.appCheckCommand,
       keepSandboxOnFailure: opts.keepSandboxOnFailure,
       supervision: opts.supervision,
+      authDump,
     });
   } finally {
     if (!opts.supervision) await rm(workdir, { recursive: true, force: true }).catch(() => {});
