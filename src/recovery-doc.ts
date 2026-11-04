@@ -86,9 +86,11 @@ export function renderRecoveryDoc(manifest: Manifest, ctx: RecoveryDocContext): 
       : "";
   // 空目标检查用的 schema 列表(SQL 字符串字面量,单引号按 SQL 规则加倍)
   // 含 Auth 的快照里 schemas 全是普通名字(见 authInSchemas),按 pg_dump 的规则规范化后逐个比较
+  // plainSchemaName 只放行 [a-z0-9_],拼进 SQL 字面量是安全的;万一出现别的(不该发生),整项不放进去
   const schemaListSql = db.schemas
-    .map((name) => plainSchemaName(name) ?? name)
-    .map((name) => `'${name.replace(/'/g, "''")}'`)
+    .map((name) => plainSchemaName(name))
+    .filter((name): name is string => name !== null)
+    .map((name) => `'${name}'`)
     .join(", ");
   // 自动补建的只有 restorableAuthObjects 认可的触发器(名字都是普通标识符,拼进命令也安全);
   // 其余写进下面的手工步骤
@@ -191,26 +193,31 @@ ${authObjects.length ? `  pg_restore -l auth.dump > auth.full.list
 ` : ""}  {
     cat <<'SQL'
 lock table auth.users, auth.identities in share row exclusive mode;
-do $$ begin
+do $bd$ begin
   if exists (select 1 from auth.users) then
     raise exception 'auth.users is not empty: restore only into a new project';
+  end if;
+  if exists (select 1 from pg_trigger
+              where tgrelid in ('auth.users'::regclass, 'auth.identities'::regclass) and not tgisinternal)
+     or exists (select 1 from pg_policy where polrelid in ('auth.users'::regclass, 'auth.identities'::regclass)) then
+    raise exception 'the Auth tables already have triggers or policies: restore only into a new project';
   end if;
   if exists (select 1 from pg_class c join pg_namespace n on n.oid = c.relnamespace
               where n.nspname = any (array[${schemaListSql}]) and c.relkind in ('r', 'p', 'v', 'm', 'f')
                 and not exists (select 1 from pg_depend d where d.objid = c.oid and d.deptype = 'e')) then
-    raise exception 'the target already has tables in ${db.schemas.join(", ").replace(/'/g, "")}: restore only into a new project';
+    raise exception 'the target already has tables in the restored schemas: restore only into a new project';
   end if;
-end $$;
+end $bd$;
 SQL
     pg_restore --data-only --no-owner --no-privileges -n auth -t users -f - auth.dump
     pg_restore --data-only --no-owner --no-privileges -n auth -t identities -f - auth.dump
     cat <<'SQL'
 ${CLEAR_PENDING_AUTH_SQL}
-do $$ begin
+do $bd$ begin
   if (select count(*) from auth.users) <> ${auth.rows!.users} or (select count(*) from auth.identities) <> ${auth.rows!.identities} then
     raise exception 'the Auth row counts differ from this snapshot';
   end if;
-end $$;
+end $bd$;
 SQL
     pg_restore --no-owner --no-privileges -L database.list -f - dump.pgcustom
 ${authObjects.length ? `    pg_restore --no-owner --no-privileges -L auth-objects.list -f - auth.dump
@@ -232,8 +239,9 @@ psql -X --single-transaction -v ON_ERROR_STOP=1 \\
 unset PGPASSWORD
 \`\`\`
 
-The script stops if the target already has Auth users or tables in the restored
-schemas, so it never merges into an existing project. The Auth users go in first, so foreign keys into
+The script stops if the target already has Auth users, triggers or policies on the
+Auth tables, or tables in the restored schemas, so it never merges into an
+existing project. The Auth users go in first, so foreign keys into
 \`auth.users\` resolve, and their count is checked against this snapshot. Links
 and codes for password resets, email confirmations and email or phone changes
 that were pending at backup time are cleared. ${

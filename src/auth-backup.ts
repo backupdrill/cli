@@ -76,11 +76,13 @@ export function authInSchemas(schemas: string[]): "yes" | "maybe" | "no" {
   return maybe ? "maybe" : "no";
 }
 
-/** 普通 schema 名字(不带任何模式字符)按 pg_dump 的规则规范化:不加引号折成小写,加了引号原样;是模式就返回 null */
+/**
+ * 普通 schema 名字:不加引号、只有字母数字和下划线,按 pg_dump 的规则折成小写。其余一律返回 null,
+ * 按模式写法处理(不另备 Auth)。名字会进 RECOVERY.md 里给人复制的 SQL 和 shell,只收这种最朴素的,
+ * 加引号的名字(可以含换行、引号、$$)不给任何拼接出错的机会
+ */
 export function plainSchemaName(pattern: string): string | null {
-  if (/^[A-Za-z_][A-Za-z0-9_$]*$/.test(pattern)) return pattern.toLowerCase();
-  const quoted = /^"((?:[^"]|"")+)"$/.exec(pattern);
-  return quoted ? quoted[1].replace(/""/g, '"') : null;
+  return /^[A-Za-z_][A-Za-z0-9_]*$/.test(pattern) ? pattern.toLowerCase() : null;
 }
 
 /** 默认模式用:确定会、或说不准,都算"可能已含 auth"——宁可少做,不碰现有备份 */

@@ -38,11 +38,11 @@ test("schemasMayIncludeAuth: false only when every entry is a plain schema name 
   ]) {
     assert.equal(schemasMayIncludeAuth(schemas), true, JSON.stringify(schemas));
   }
-  for (const schemas of [["public"], ["public", "audit"], ["authz"], ['"Auth"'], ["public", "private"], ['"a*"']]) {
+  for (const schemas of [["public"], ["public", "audit"], ["authz"], ["public", "private"]]) {
     assert.equal(schemasMayIncludeAuth(schemas), false, JSON.stringify(schemas));
   }
-  // 模式写法一律不另备 Auth(说不准它最终选中哪些 schema),哪怕看起来匹配不到 auth
-  for (const schemas of [["pub*"], ["p*"], ["auth?"]]) {
+  // 模式写法、加引号的名字、带 $ 的名字一律不另备 Auth(说不准选中哪些 schema,也不让它们进 RECOVERY.md)
+  for (const schemas of [["pub*"], ["p*"], ["auth?"], ['"Auth"'], ['"a*"'], ["audit$$archive"], ['"SQL\nx"']]) {
     assert.equal(schemasMayIncludeAuth(schemas), true, JSON.stringify(schemas));
   }
 });
@@ -452,10 +452,23 @@ test(
         await sql(target2, AUTH_DDL + "create table public.existing (x int);");
         await assert.rejects(
           x("psql", ["-X", "--single-transaction", "-v", "ON_ERROR_STOP=1", "--dbname", target2, "-f", "restore.sql"], { cwd: dir }),
-          /the target already has tables in public/
+          /the target already has tables in the restored schemas/
         );
         const t2 = await sql(target2, "select (select count(*)::int from auth.users) as users");
         assert.equal(t2.rows[0].users, 0);
+        // Auth 表上已有触发器(会悄悄改掉恢复进去的数据)的目标也拒绝
+        await sql(admin, "create database target3");
+        const target3 = `postgresql://postgres:pw@127.0.0.1:${port}/target3`;
+        await sql(
+          target3,
+          AUTH_DDL +
+            `create function public.touch() returns trigger language plpgsql as 'begin return new; end';
+             create trigger touch before insert on auth.users for each row execute function public.touch();`
+        );
+        await assert.rejects(
+          x("psql", ["-X", "--single-transaction", "-v", "ON_ERROR_STOP=1", "--dbname", target3, "-f", "restore.sql"], { cwd: dir }),
+          /already have triggers or policies/
+        );
         const again = await sql(targetUrl, "select (select count(*)::int from auth.users) as users, (select count(*)::int from public.profiles) as profiles");
         assert.deepEqual(again.rows[0], { users: 4, profiles: 4 });
       });
