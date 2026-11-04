@@ -44,7 +44,8 @@ export const AUTH_DDL = `
   create table auth.users (
     instance_id uuid, id uuid primary key, email text, encrypted_password text,
     is_anonymous boolean not null default false, is_sso_user boolean not null default false,
-    raw_user_meta_data jsonb,
+    raw_user_meta_data jsonb, raw_app_meta_data jsonb,
+    created_at timestamptz, updated_at timestamptz,
     confirmation_token varchar(255) default '', recovery_token varchar(255) default '',
     email_change_token_new varchar(255) default '', email_change_token_current varchar(255) default '',
     phone_change_token varchar(255) default '', reauthentication_token varchar(255) default '',

@@ -104,6 +104,12 @@ function syntheticValue(type: string, column: string): string | null {
   if (column === "provider") return "'email'";
   if (column === "provider_id") return `'${SIGNUP_USER_ID}'`;
   if (column === "identity_data") return `jsonb_build_object('sub', '${SIGNUP_USER_ID}', 'email', '${SIGNUP_EMAIL}')`;
+  // 和 GoTrue 一次邮箱注册写进去的一样:触发器常按 provider 分支,或者读这些元数据
+  if (column === "raw_app_meta_data") return `jsonb_build_object('provider', 'email', 'providers', jsonb_build_array('email'))`;
+  if (column === "raw_user_meta_data") {
+    return `jsonb_build_object('sub', '${SIGNUP_USER_ID}', 'email', '${SIGNUP_EMAIL}', 'email_verified', false, 'phone_verified', false)`;
+  }
+  if (column === "created_at" || column === "updated_at") return "now()";
   if (/^uuid$/.test(type)) return "'00000000-0000-4000-8000-000000000001'::uuid";
   if (/^(text|character varying|character)\b/.test(type)) return "'drill'";
   if (/^jsonb?$/.test(type)) return "'{}'";
@@ -125,8 +131,8 @@ async function insertStatement(client: Client, table: "users" | "identities"): P
   // 一次正常注册会写的几列总带上;再补齐所有必填列
   const wanted = new Set(
     table === "users"
-      ? ["id", "email", "raw_user_meta_data", "raw_app_meta_data", "aud", "role"]
-      : ["user_id", "provider", "provider_id", "identity_data"]
+      ? ["id", "email", "raw_user_meta_data", "raw_app_meta_data", "aud", "role", "created_at", "updated_at"]
+      : ["user_id", "provider", "provider_id", "identity_data", "created_at", "updated_at"]
   );
   const names: string[] = [];
   const values: string[] = [];
@@ -357,6 +363,28 @@ export async function runAuthDrill(
   }
 }
 
+/** 终止沙箱里除这条连接以外的所有会话:Auth 这一节开的 pg_restore 和查询都会随之结束(正式演练早已做完) */
+async function stopAuthSessions(sandboxConnString: string): Promise<void> {
+  try {
+    const client = await connectPg(sandboxConnString);
+    try {
+      await client.query(
+        "select pg_terminate_backend(pid) from pg_stat_activity where pid <> pg_backend_pid() and datname = current_database()"
+      );
+    } finally {
+      await client.end().catch(() => {});
+    }
+  } catch {
+    // 沙箱可能已经不在了:那就没什么要停的
+  }
+}
+
+async function waitAtMost(p: Promise<unknown>, ms: number): Promise<void> {
+  let t: NodeJS.Timeout | undefined;
+  await Promise.race([p.then(() => {}, () => {}), new Promise<void>((resolve) => (t = setTimeout(resolve, ms)))]);
+  clearTimeout(t);
+}
+
 /** Auth 这一节最多花多久(下载等待 + 恢复两张表 + 外键 + 触发器 + 模拟注册);到点记 not_checked */
 export const AUTH_DRILL_LIMITS = { totalMs: 15 * 60 * 1000 };
 
@@ -376,18 +404,29 @@ export async function authDrillSection(
   if (interrupted()) return undefined;
   const work = (async () => runAuthDrill(sandboxConnString, manifest, mainDumpPath, await authDump))();
   work.catch(() => {});
+  const timedOut: AuthDrillReport = {
+    status: "not_checked",
+    summary: `the Auth check didn't finish within ${AUTH_DRILL_LIMITS.totalMs / 60000} minutes`,
+  };
+  let didTimeOut = false;
   let timer: NodeJS.Timeout | undefined;
   try {
-    return await Promise.race([
+    const result = await Promise.race([
       work,
       new Promise<AuthDrillReport>((resolve) => {
         timer = setTimeout(() => {
-          // 下载停掉;数据库那边的活随沙箱销毁一起断开
+          didTimeOut = true;
           stopDownload?.();
-          resolve({ status: "not_checked", summary: `the Auth check didn't finish within ${AUTH_DRILL_LIMITS.totalMs / 60000} minutes` });
+          // 数据库那边的活也停掉:不等沙箱销毁(--keep 时沙箱会留着),把这一节在沙箱里开的会话
+          // 全部终止,正在跑的 pg_restore 随之退出,保留下来的沙箱不会再被改动
+          void stopAuthSessions(sandboxConnString)
+            .then(() => waitAtMost(work, 10_000))
+            .finally(() => resolve(timedOut));
         }, AUTH_DRILL_LIMITS.totalMs);
       }),
     ]);
+    // 叫停之后 work 可能先以"下载失败"之类收场:超时了就如实报超时
+    return didTimeOut ? timedOut : result;
   } catch (error) {
     return { status: "not_checked", summary: `the Auth check couldn't run: ${safeError(error)}` };
   } finally {

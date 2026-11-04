@@ -190,6 +190,40 @@ id" uuid references auth.users (id) on delete set null)`);
         }
       });
 
+      await t.test("the test sign-up looks like a real email sign-up (timestamps, provider metadata)", async () => {
+        // 照抄 NEW.created_at 进必填列、按 provider 分支的触发器:健康的就该判注册成功
+        await sql(admin, `
+          create table public.signups (user_id uuid primary key, signed_up_at timestamptz not null, provider text not null);
+          create function public.track_signup() returns trigger language plpgsql security definer set search_path = '' as $$
+          begin
+            if new.raw_app_meta_data ->> 'provider' = 'email' then
+              insert into public.signups values (new.id, new.created_at, new.raw_app_meta_data ->> 'provider');
+            end if;
+            return new;
+          end $$;
+          create trigger track_signup after insert on auth.users for each row execute function public.track_signup();`);
+        try {
+          const mem = await backup("default");
+          const report = await runDrill(config, { store: mem.store });
+          assert.deepEqual(report.auth.signup, { ran: true, ok: true }, JSON.stringify(report.auth));
+        } finally {
+          await sql(admin, "drop trigger track_signup on auth.users; drop function public.track_signup(); drop table public.signups");
+        }
+      });
+
+      await t.test("a timeout also stops the Auth work in the sandbox", async () => {
+        const mem = await backup("default");
+        const previous = AUTH_DRILL_LIMITS.totalMs;
+        AUTH_DRILL_LIMITS.totalMs = 1; // 立刻超时:这一节刚开始就被叫停
+        try {
+          const report = await runDrill(config, { store: mem.store });
+          assert.deepEqual(verdict(report), verdict(baseline));
+          assert.equal(report.auth.status, "not_checked");
+        } finally {
+          AUTH_DRILL_LIMITS.totalMs = previous;
+        }
+      });
+
       await t.test("a deferred trigger that fails at commit is caught by the test sign-up", async () => {
         await sql(admin, `
           create function public.fail_late() returns trigger language plpgsql security definer set search_path = '' as $$
