@@ -12,7 +12,7 @@ Every backup taken from outside the project counts as egress on the user's Supab
 
 ## Use the Session pooler connection string
 
-In the dashboard, **Connect** → **Session pooler**: port 5432, user `postgres.<project-ref>`. Without the IPv4 add-on, the direct connection needs IPv6, so on an IPv4-only home or CI network it won't connect. Don't use port 6543, the transaction pooler: `pg_dump` needs a session.
+In the dashboard, **Connect** → **Session pooler**: port 5432, user `postgres.<project-ref>`. Copy the host from there as it is; it can't be worked out from the region. Without the IPv4 add-on, the direct connection needs IPv6, so on an IPv4-only home or CI network it won't connect. Don't use port 6543, the transaction pooler: `pg_dump` needs a session.
 
 ## Match client and server versions
 
@@ -24,11 +24,11 @@ In the dashboard, **Connect** → **Session pooler**: port 5432, user `postgres.
 Keep the password off the command line, where other users on the machine can see it in the process list. Ask the user to add one line to `~/.pgpass` themselves and make the file private (`chmod 600 ~/.pgpass`); `pg_dump`, `pg_restore` and `psql` read it, so the connection string carries no password:
 
 ```
-aws-0-<region>.pooler.supabase.com:5432:postgres:postgres.<project-ref>:<password>
+<pooler-host>:5432:postgres:postgres.<project-ref>:<password>
 ```
 
 ```sh
-export DB_URL="postgresql://postgres.<project-ref>@aws-0-<region>.pooler.supabase.com:5432/postgres?sslmode=require"
+export DB_URL="postgresql://postgres.<project-ref>@<pooler-host>:5432/postgres?sslmode=require"
 export BACKUP_FILE="backup-$(date +%Y%m%dT%H%M%S).dump"
 
 # umask 077 in a subshell: the dump is production data, so only the user can read it
@@ -39,6 +39,7 @@ export BACKUP_FILE="backup-$(date +%Y%m%dT%H%M%S).dump"
 - `sslmode=require` encrypts the connection. To also check the server's certificate, download the CA certificate from the project's database settings (SSL Configuration) and use `sslmode=verify-full&sslrootcert=<path to the certificate>`.
 - `--format=custom` writes an archive that only `pg_restore` reads; it allows selective and parallel restores. A plain-text dump goes through `psql` instead.
 - `--schema=public` leaves out Supabase-managed schemas, including `auth`, so Auth users aren't in this file. Add `--schema=<name>` for each of the app's own schemas.
+- With `--schema`, `pg_dump` also leaves out large objects (the `lo_*` / `oid` kind, not Storage files). If the app uses them, add `--large-objects`.
 - Never ask for the password in the chat. With the CLI, it lives in `.env.backupdrill` as `SKILL.md` describes.
 
 ## Test the restore by hand
@@ -60,7 +61,8 @@ If it prints `container: not started` (port 55432 already taken, for example) or
 export TEST_DB="postgresql://postgres:drill@127.0.0.1:55432/postgres"
 
 # The dump creates schema public itself, so drop the empty one first. Then add stand-ins
-# for what a Supabase project provides, so policies and grants that mention them restore.
+# for what a Supabase project provides, so policies that mention them restore.
+# --no-privileges skips GRANT and REVOKE: this test checks the data, not who can read it.
 psql "$TEST_DB" --set ON_ERROR_STOP=1 -c "
   drop schema public;
   create role anon; create role authenticated; create role service_role;
