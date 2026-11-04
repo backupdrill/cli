@@ -119,6 +119,25 @@ async function connectCancellable(databaseUrl: string, signal?: AbortSignal): Pr
   return client;
 }
 
+/** 引号个数是奇数 = 有一个没闭合(文字在值中间被截断了):从最后那个引号起到结尾都当成值 */
+function closeDanglingQuote(text: string, quote: "'" | '"'): string {
+  const count = text.split(quote).length - 1;
+  if (count % 2 === 0) return text;
+  return `${text.slice(0, text.lastIndexOf(quote))}${quote}…${quote}`;
+}
+
+/**
+ * 报错文字里可能是用户数据的部分换成 "…":冒号后面引起来的值(例如 invalid input syntax for type uuid: "…")、
+ * 单引号字面量、邮箱、UUID。表名、约束名这类标识符(relation "x"、constraint "y")留着,排查要用
+ */
+export function redactValues(text: string): string {
+  return closeDanglingQuote(closeDanglingQuote(text, "'"), '"')
+    .replace(/:\s*"(?:[^"]|"")*"/g, ': "…"')
+    .replace(/'(?:[^']|'')*'/g, "'…'")
+    .replace(/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/g, "…")
+    .replace(/\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b/gi, "…");
+}
+
 /** 共享快照:导出快照的连接 + 快照号。导出连接只需活到两份 pg_dump 都导入快照为止 */
 export interface SharedSnapshot {
   id: string;

@@ -60,7 +60,7 @@ export interface SnapshotReader {
   /** 断点续传下载转储到本地文件,返回实际落盘的字节数与 sha256 */
   downloadDump(manifest: Manifest, dest: string): Promise<{ bytes: number; sha256: string }>;
   /** 可选(2.10.0 起):下载 auth.dump。没实现时,带 Auth 的快照按不带 Auth 处理 */
-  downloadAuthDump?(manifest: Manifest, dest: string): Promise<{ bytes: number; sha256: string }>;
+  downloadAuthDump?(manifest: Manifest, dest: string, opts?: { signal?: AbortSignal }): Promise<{ bytes: number; sha256: string }>;
   /** 这份快照的 Storage 文件从哪读;实现不支持 Storage 文件时为 null */
   storageFiles(manifest: Manifest): StorageFilesLocation | null;
 }
@@ -156,11 +156,11 @@ export function s3SnapshotStore(config: BackupConfig): SnapshotStore {
         name: prefix.replace(/\/$/, "").split("/").pop()!,
         readManifest: () => getObjectText(s3(), storage.bucket, `${prefix}manifest.json`),
         downloadDump: (manifest, dest) => downloadToFile(s3(), storage.bucket, manifest.dump.key, dest),
-        downloadAuthDump: (manifest, dest) => {
+        downloadAuthDump: (manifest, dest, opts) => {
           if (manifest.auth?.status !== "included" || !manifest.auth.dump) {
             throw new Error("this snapshot has no Auth archive");
           }
-          return downloadToFile(s3(), storage.bucket, manifest.auth.dump.key, dest);
+          return downloadToFile(s3(), storage.bucket, manifest.auth.dump.key, dest, { signal: opts?.signal });
         },
         storageFiles: (manifest) => ({ s3: s3(), bucket: storage.bucket, base: storageBaseOf(manifest) }),
       };

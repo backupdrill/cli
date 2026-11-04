@@ -24,6 +24,7 @@ import { orphanedForeignKeysCheck, type OrphanedForeignKey } from "./orphaned-fo
 import { grantsCheck, type GrantRestore, type GrantedObject } from "./grants.js";
 import { localPgRestoreMajor, restoreToolBreaksOnTarget, sandboxMajorFor } from "./pgbin.js";
 import { log } from "./log.js";
+import { authDrillSection, type AuthDrillReport, type AuthDumpForDrill } from "./auth-drill.js";
 import { onInterrupt, stopOnInterrupt, throwIfInterrupted } from "./interrupt.js";
 
 const execFileAsync = promisify(execFile);
@@ -77,6 +78,11 @@ export interface DrillReport {
   keptSandbox?: { containerId: string; connString: string };
   /** 源库自带孤儿行的外键:演练和真实恢复都把它们建成 NOT VALID,不算失败。没有时不出现 */
   orphanedForeignKeys?: OrphanedForeignKey[];
+  /**
+   * 2.10.0 起,快照带 Auth 用户时的附加校验(见 auth-drill.ts)。**不参与 pass 的判定**;
+   * 快照不带 Auth 时不出现
+   */
+  auth?: AuthDrillReport;
 }
 
 // ── 临时 Postgres 容器编排 ──────────────────────────────────────────
@@ -676,7 +682,15 @@ export async function drillDump(
   manifest: Manifest,
   snapshot: string,
   preChecks: DrillCheck[] = [],
-  opts: { appCheckCommand?: string; keepSandboxOnFailure?: boolean; supervision?: DrillSupervision } = {}
+  opts: {
+    appCheckCommand?: string;
+    keepSandboxOnFailure?: boolean;
+    supervision?: DrillSupervision;
+    /** 快照带 Auth 用户时 runDrill 在后台下载的 auth.dump(和正式演练同时进行) */
+    authDump?: Promise<AuthDumpForDrill>;
+    /** Auth 那一节超时放弃时,叫停还没下完的 auth.dump */
+    stopAuthDownload?: () => void;
+  } = {}
 ): Promise<DrillReport> {
   // 空/纯空白命令 = 危险的假配置(CI 里变量没展开的典型形态):跑了会以 exit 0
   // 假通过,忽略会让用户以为检查在跑。拒绝,且要在起沙箱之前拒绝。
@@ -805,6 +819,15 @@ export async function drillDump(
       restoredRowTotal: verify.rowTotal,
     };
     if (orphaned.length) report.orphanedForeignKeys = orphaned;
+    // Auth 附加校验:结论(pass)上面已经定了,这里只往报告里加一节。它在同一个沙箱里补外键、
+    // 建触发器、模拟注册——放在所有正式检查之后,不影响它们;自己出错也只记在这一节里
+    const authSection = await authDrillSection(pg.connString, manifest, dumpPath, opts.authDump, opts.stopAuthDownload);
+    if (authSection) {
+      report.auth = authSection;
+      const line = `Auth users: ${authSection.summary}`;
+      if (authSection.status === "verified") log.ok(line);
+      else log.warn(line);
+    }
     if (opts.keepSandboxOnFailure && !pass) {
       // 写进报告让 --keep 可被脚本消费(拿连接串排查),不只靠人眼看日志
       report.keptSandbox = { containerId: pg.containerId, connString: pg.connString };
@@ -847,6 +870,12 @@ export async function runDrill(
     supervision?: DrillSupervision;
     /** 快照从哪读;省略 = config.storage 指的 S3 兼容桶 */
     store?: SnapshotStore;
+    /**
+     * 快照带 Auth 用户时做不做附加的 Auth 校验(不影响结论,见 auth-drill.ts)。默认:没有 supervision 时做
+     * (CLI);有 supervision(托管 worker)时不做——auth.dump 不在它按 dumpBytes 算的磁盘预算里,
+     * 等 worker 把两份都算进预算再显式打开
+     */
+    authCheck?: boolean;
   } = {}
 ): Promise<DrillReport> {
   validateSupervision(opts.supervision, opts.appCheckCommand, opts.keepSandboxOnFailure);
@@ -860,6 +889,7 @@ export async function runDrill(
   const workdir = opts.supervision?.workdir ?? await mkdtemp(join(tmpdir(), "backupdrill-"));
   const dumpPath = join(workdir, "dump.pgcustom");
   // 下载的 dump 在这里;托管模式的目录归 supervisor 管
+  const authDownloadStop = new AbortController();
   const forgetWorkdir = opts.supervision
     ? () => {}
     : onInterrupt(() => rm(workdir, { recursive: true, force: true }).catch(() => {}));
@@ -905,12 +935,35 @@ export async function runDrill(
       );
     }
 
+    // 快照带 Auth 用户:在后台把 auth.dump 取下来给附加校验用,和正式演练同时进行、不让它等。
+    // 取不到只记进报告的 Auth 一节
+    let authDump: Promise<AuthDumpForDrill> | undefined;
+    if (manifest.auth?.status === "included" && (opts.authCheck ?? !opts.supervision)) {
+      const authPath = join(workdir, "auth.dump");
+      const download = reader.downloadAuthDump;
+      const stopAuthDownload = authDownloadStop;
+      // 下载出错的原文不进报告(里面可能有凭据、对象键之类),只给固定的说法;
+      // 同步抛出的错误也在这个 Promise 里接住,绝不冒到演练本身
+      authDump = download
+        ? Promise.resolve()
+            .then(() => download.call(reader, manifest, authPath, { signal: stopAuthDownload.signal }))
+            .then(
+              (): AuthDumpForDrill => ({ path: authPath }),
+              (): AuthDumpForDrill => ({ error: "the Auth archive couldn't be downloaded" })
+            )
+        : Promise.resolve({ error: "this snapshot location can't read the Auth archive" });
+    }
+
     return await drillDump(dumpPath, manifest, snapshot, preChecks, {
       appCheckCommand: opts.appCheckCommand,
       keepSandboxOnFailure: opts.keepSandboxOnFailure,
       supervision: opts.supervision,
+      authDump,
+      stopAuthDownload: () => authDownloadStop.abort(),
     });
   } finally {
+    // 演练怎么结束都一样:还在下的 auth.dump 立刻停掉,不留着连接把进程拖住
+    authDownloadStop.abort();
     if (!opts.supervision) await rm(workdir, { recursive: true, force: true }).catch(() => {});
     forgetWorkdir();
   }

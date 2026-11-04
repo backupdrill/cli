@@ -12,9 +12,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import pg from "pg";
 import { runBackup, mainDumpArgs, AUTH_TIMEOUTS } from "../dist/backup.js";
-import { schemasMayIncludeAuth, restorableAuthObjects, manualAuthObjects } from "../dist/auth-backup.js";
+import { schemasMayIncludeAuth, restorableAuthObjects, manualAuthObjects, redactValues } from "../dist/auth-backup.js";
 import { parseManifest } from "../dist/manifest.js";
 import { renderRecoveryDoc } from "../dist/recovery-doc.js";
+import { AUTH_DDL, SETUP, sql, startPostgres } from "./auth-fixtures.js";
 
 const x = promisify(execFile);
 const realPgDump = process.env.BACKUPDRILL_PG_DUMP || "pg_dump";
@@ -93,6 +94,20 @@ test("RECOVERY.md never puts an object name into a shell command unless it is a 
   assert.equal(doc.includes("backupdrill restore \\"), false, "no CLI restore recipe until the CLI restores Auth users");
 });
 
+test("redactValues: values that may be user data go, identifiers stay", () => {
+  assert.equal(
+    redactValues('ERROR:  invalid input syntax for type uuid: "bob@example.com"'),
+    'ERROR:  invalid input syntax for type uuid: "…"'
+  );
+  assert.equal(
+    redactValues('ERROR:  duplicate key value violates unique constraint "users_pkey"'),
+    'ERROR:  duplicate key value violates unique constraint "users_pkey"'
+  );
+  assert.equal(redactValues("value 'secret-token' for user 0b1c2d3e-0000-4000-8000-123456789abc at a@b.io"), "value '…' for user … at …");
+  // 没闭合的引号:后面整段都当成值
+  assert.equal(redactValues('ERROR:  invalid input syntax for type uuid: "$2a$10$abcdefghij'), 'ERROR:  invalid input syntax for type uuid: "…"');
+});
+
 const baseManifest = () => ({
   schemaVersion: 2,
   tool: "backupdrill-cli",
@@ -151,96 +166,6 @@ test("manifest: statuses and reasons this version doesn't know are accepted, so 
 });
 
 // ---------- 真实 Postgres ----------
-
-async function startPostgres(ids) {
-  const { stdout } = await x("docker", [
-    "run", "-d", "--rm", "--tmpfs", "/var/lib/postgresql/data", "-e", "POSTGRES_PASSWORD=pw",
-    "-p", "127.0.0.1:0:5432", "postgres:17-alpine",
-  ]);
-  const id = stdout.trim();
-  ids.push(id);
-  const port = (await x("docker", ["port", id, "5432/tcp"])).stdout.trim().split("\n")[0].split(":").pop();
-  for (let i = 0; i < 60; i++) {
-    try {
-      await x("docker", ["exec", id, "pg_isready", "-h", "127.0.0.1", "-U", "postgres", "-q"]);
-      return port;
-    } catch {
-      await new Promise((r) => setTimeout(r, 500));
-    }
-  }
-  throw new Error("postgres did not become ready");
-}
-
-async function sql(url, text) {
-  const client = new pg.Client({ connectionString: url });
-  await client.connect();
-  try {
-    return await client.query(text);
-  } finally {
-    await client.end();
-  }
-}
-
-// 新项目里平台建好的 auth 两张表(空的),源库和恢复目标都用它
-const AUTH_DDL = `
-  create schema auth;
-  create table auth.users (
-    instance_id uuid, id uuid primary key, email text, encrypted_password text,
-    is_anonymous boolean not null default false, is_sso_user boolean not null default false,
-    raw_user_meta_data jsonb,
-    confirmation_token varchar(255) default '', recovery_token varchar(255) default '',
-    email_change_token_new varchar(255) default '', email_change_token_current varchar(255) default '',
-    phone_change_token varchar(255) default '', reauthentication_token varchar(255) default '',
-    email_change varchar(255) default '', phone_change text default '', email_change_confirm_status smallint default 0,
-    confirmation_sent_at timestamptz, recovery_sent_at timestamptz, email_change_sent_at timestamptz,
-    phone_change_sent_at timestamptz, reauthentication_sent_at timestamptz
-  );
-  create table auth.identities (
-    id uuid primary key default gen_random_uuid(),
-    user_id uuid not null references auth.users (id) on delete cascade,
-    provider text not null, provider_id text not null, identity_data jsonb
-  );
-  alter table auth.users enable row level security;
-  alter table auth.identities enable row level security;
-`;
-
-// 和 Supabase 同形的最小 auth:两张表开 RLS、identities 外键指向 users;public.profiles 外键指向 auth.users,
-// auth.users 上挂注册时建 profile 的触发器;auth.users 上一条策略引用了不在备份里的 private schema 的函数
-const SETUP = `
-${AUTH_DDL}
-  create table public.profiles (id uuid primary key references auth.users (id), name text);
-  create function public.handle_new_user() returns trigger language plpgsql security definer set search_path = '' as $$
-  begin insert into public.profiles (id, name) values (new.id, new.email); return new; end $$;
-  create trigger on_auth_user_created after insert on auth.users for each row execute function public.handle_new_user();
-  create schema private;
-  create function private.uid() returns uuid language sql stable as 'select null::uuid';
-  create policy self_read on auth.users for select using (id = private.uid());
-  insert into auth.users (id, email, encrypted_password, is_anonymous) values
-    ('11111111-1111-1111-1111-111111111111', 'pw@example.test', '$2a$10$abcdefghijklmnopqrstuuABCDEFGHIJKLMNOPQRSTUVWXYZ0123', false),
-    ('22222222-2222-2222-2222-222222222222', 'oauth@example.test', null, false),
-    ('33333333-3333-3333-3333-333333333333', 'enc@example.test',
-     '{"key_id":"k1","alg":"aes-gcm-hkdf","data":"AAAA","nonce":"AAAAAAAAAAAAAAAA"}', false),
-    ('44444444-4444-4444-4444-444444444444', null, '', true);
-  update auth.users set recovery_token = 'pending-reset', recovery_sent_at = now()
-   where id = '11111111-1111-1111-1111-111111111111';
-  insert into auth.identities (user_id, provider, provider_id) values
-    ('11111111-1111-1111-1111-111111111111', 'email', '11111111-1111-1111-1111-111111111111'),
-    ('22222222-2222-2222-2222-222222222222', 'google', '1000001'),
-    ('22222222-2222-2222-2222-222222222222', 'github', '2000002'),
-    ('33333333-3333-3333-3333-333333333333', 'email', '33333333-3333-3333-3333-333333333333');
-  create table public."archived SCHEMA - public data" (x int);
-  insert into public."archived SCHEMA - public data" values (1);
-  create role reader_limited login password 'r' bypassrls connection limit 2;
-  grant pg_read_all_data to reader_limited;
-  create role authenticated nologin;
-  grant select on auth.users to authenticated;
-  create role reader_ok login password 'r' bypassrls;
-  grant pg_read_all_data to reader_ok;
-  create role reader_norls login password 'r';
-  grant pg_read_all_data to reader_norls;
-  create role reader_nousage login password 'r';
-  grant select on all tables in schema public to reader_nousage;
-`;
 
 /** 记下每次 pg_dump 的参数(--dbname 后面的连接串去掉),按环境变量注入失败,然后交给真的 pg_dump */
 function writeWrapper(dir) {
