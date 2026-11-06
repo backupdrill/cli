@@ -59,6 +59,19 @@ if [ "$WITH_LOGIN" = 1 ]; then
     *) PSQL=psql ;;
   esac
   command -v "$PSQL" >/dev/null 2>&1 || { echo "--with-login needs psql ($PSQL), which the CLI uses for the restore" >&2; exit 1; }
+  # CLI 的 Auth 恢复(auth-restore.ts 的 psqlProblem)拒绝不带 \restrict 的 pg_restore(17 要 17.6 起)
+  # 和比 pg_restore 旧的 psql。在这里先拦,不然要等备份和演练都跑完才在恢复那一步失败
+  version_of() { "$1" --version | sed -E 's/.* ([0-9]+)\.([0-9]+).*/\1 \2/'; }
+  read -r restore_major restore_minor <<< "$(version_of "$PG_RESTORE")"
+  read -r psql_major psql_minor <<< "$(version_of "$PSQL")"
+  if [ "$restore_major" -eq 17 ] && [ "$restore_minor" -lt 6 ]; then
+    echo "--with-login needs pg_restore 17.6 or newer (found $restore_major.$restore_minor); the CLI's Auth restore refuses older ones" >&2
+    exit 1
+  fi
+  if [ "$psql_major" -lt "$restore_major" ] || { [ "$psql_major" -eq "$restore_major" ] && [ "$psql_minor" -lt "$restore_minor" ]; }; then
+    echo "psql $psql_major.$psql_minor is older than pg_restore $restore_major.$restore_minor; --with-login needs psql from the same client package" >&2
+    exit 1
+  fi
 fi
 
 RUN_ID="$$"

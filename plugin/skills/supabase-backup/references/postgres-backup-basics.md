@@ -51,7 +51,7 @@ A dump that has never been restored is a guess. Restore it into a throwaway Post
 ```sh
 TEST_PW="$(openssl rand -hex 16)"
 # docker run can print an ID and still fail (port taken), so only a zero exit counts.
-# -e with no value makes docker read the password from its own environment, off the process list.
+# -e with no value makes docker read the password from its own environment, not from its arguments.
 cid="$(POSTGRES_PASSWORD="$TEST_PW" docker run -d --rm -e POSTGRES_PASSWORD -p 127.0.0.1:55432:5432 postgres:17-alpine)" || cid=""
 [ -n "$cid" ] \
 && for i in $(seq 60); do docker exec "$cid" pg_isready -q -h 127.0.0.1 -U postgres && break; sleep 1; done \

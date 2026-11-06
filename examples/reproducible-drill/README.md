@@ -11,8 +11,9 @@ pnpm install --frozen-lockfile && pnpm build   # run.sh calls ../../dist, which 
 ```
 
 Requires Docker, Node ≥ 20, and `pg_dump`/`pg_restore` ≥ 17 on your `PATH` (or
-point `PG_BIN` at them); `--with-login` also needs `psql` from the same client
-package. It starts two fixture containers — Postgres and an S3-compatible store —
+point `PG_BIN` at them); `--with-login` also needs `pg_restore` 17.6 or newer
+and `psql` from the same client package, because the CLI's Auth restore refuses
+older ones. It starts two fixture containers — Postgres and an S3-compatible store —
 and the drill starts a third for its restore sandbox. `--with-login` then starts
 two more on a Docker network of their own, once the sandbox is gone: Supabase's
 Postgres image (`supabase/postgres`, about 1.7 GB to pull) and GoTrue, the
