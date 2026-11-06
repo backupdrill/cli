@@ -1,6 +1,6 @@
 {
   "name": "backupdrill/supabase-backup",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "description": "Back up a Supabase project to your own S3, R2 or B2 bucket with the open-source backupdrill CLI, run a restore drill to prove the snapshot restores, and restore into a new project. Includes plain pg_dump and pg_restore notes for Supabase and what the Free plan does and doesn't back up.",
   "private": false,
   "skills": "./skills/"

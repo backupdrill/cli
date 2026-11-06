@@ -7,7 +7,7 @@ description: Use when the user wants to back up a Supabase project to their own 
 
 backupdrill is an open-source (MIT) command-line tool. `backup` dumps the project's Postgres database with `pg_dump`, copies Storage files too once their S3 keys are set, and writes everything to a bucket the user owns, with a checksummed `manifest.json` and a `RECOVERY.md` in every snapshot. `drill` restores a snapshot into a throwaway Postgres in Docker and checks that it came back. The CLI runs on the user's machine. It talks to their Supabase project, their bucket and the local Docker daemon, and sends nothing to BackupDrill.
 
-Always run it as `npx -y backupdrill@2.10.0 <command>`, so every run uses the same version. Every command and option is documented at [backupdrill.com/docs/cli](https://backupdrill.com/docs/cli); check there before using an option this skill doesn't mention.
+Always run it as `npx -y backupdrill@2.10.1 <command>`, so every run uses the same version. Every command and option is documented at [backupdrill.com/docs/cli](https://backupdrill.com/docs/cli); check there before using an option this skill doesn't mention.
 
 If the user asks what Supabase already backs up on their plan, wants a plain `pg_dump` backup without the CLI, or wants to test a restore by hand, read [references/postgres-backup-basics.md](references/postgres-backup-basics.md).
 
@@ -71,7 +71,7 @@ Every backup reads the whole database, and every configured Storage file, out of
 ```sh
 ( set +x; unset DATABASE_URL $(env | sed -n 's/^\(BACKUPDRILL_[A-Za-z0-9_]*\)=.*/\1/p')
   set -a; . ./.env.backupdrill 2>/dev/null || { echo ".env.backupdrill could not be loaded" >&2; exit 1; }; set +a
-  npx -y backupdrill@2.10.0 estimate --plan pro )
+  npx -y backupdrill@2.10.1 estimate --plan pro )
 ```
 
 Use `--plan free`, `pro` or `team` to match their Supabase plan, and read the projection back before suggesting a daily schedule. On a large database, suggest weekly.
@@ -82,7 +82,7 @@ Use `--plan free`, `pro` or `team` to match their Supabase plan, and read the pr
 report="$(mktemp "${TMPDIR:-/tmp}/backupdrill-backup.XXXXXX")" || exit 1; echo "stdout → $report"
 ( set +x; unset DATABASE_URL $(env | sed -n 's/^\(BACKUPDRILL_[A-Za-z0-9_]*\)=.*/\1/p')
   set -a; . ./.env.backupdrill 2>/dev/null || { echo ".env.backupdrill could not be loaded" >&2; exit 1; }; set +a
-  npx -y backupdrill@2.10.0 backup ) > "$report"
+  npx -y backupdrill@2.10.1 backup ) > "$report"
 ```
 
 - The progress lines on stderr show where everything went (`Dumping → s3://…`, `Manifest written → s3://…`) and end with `Backup complete — N tables + M Storage files`. stdout goes to the file named on the first line, a new one each run that only the user can read: one line of JSON with the whole manifest, which lists every table and Storage file, so read only the fields you need from it.
@@ -95,7 +95,7 @@ report="$(mktemp "${TMPDIR:-/tmp}/backupdrill-backup.XXXXXX")" || exit 1; echo "
 ```sh
 ( set +x; unset DATABASE_URL $(env | sed -n 's/^\(BACKUPDRILL_[A-Za-z0-9_]*\)=.*/\1/p')
   set -a; . ./.env.backupdrill 2>/dev/null || { echo ".env.backupdrill could not be loaded" >&2; exit 1; }; set +a
-  npx -y backupdrill@2.10.0 drill )
+  npx -y backupdrill@2.10.1 drill )
 ```
 
 - It reads the latest snapshot from the bucket, restores it into a throwaway Postgres container, runs its checks and removes the container. It doesn't connect to the Supabase project. The first run pulls a Postgres image from Docker Hub.
@@ -114,7 +114,7 @@ A restore writes data, so go step by step and let the user drive.
    ```sh
    ( set +x; unset DATABASE_URL $(env | sed -n 's/^\(BACKUPDRILL_[A-Za-z0-9_]*\)=.*/\1/p')
      set -a; . ./.env.backupdrill 2>/dev/null || { echo ".env.backupdrill could not be loaded" >&2; exit 1; }; set +a
-     npx -y backupdrill@2.10.0 restore --database --target-supabase-url https://<target-ref>.supabase.co --dry-run )
+     npx -y backupdrill@2.10.1 restore --database --target-supabase-url https://<target-ref>.supabase.co --dry-run )
    ```
 
    Leave out `--target-supabase-url` when the snapshot is database only. To write Storage files to a local folder instead of the new project, use `--storage-dir ./recovered`.
