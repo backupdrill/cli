@@ -56,13 +56,12 @@ are the platform-specific ones:
   back" only judges tables that had rows at backup time
 
 Seed: 14 tables, 1,496,250 rows, ~199 MB on disk, the 1,000 Auth users, plus 250
-files (35 MB) in an S3-compatible store standing in for Supabase Storage. Every
-value any published number depends on is generated deterministically — the
-file bytes, so per-file sha256 reproduces exactly, the row values behind the
-invariant totals, and the Auth users' IDs, emails and timestamps. Three things
-are deliberately not deterministic and do not feed any published figure: uuid
-primary keys (`gen_random_uuid()`), the `now()` timestamps on eight tables, and
-the bcrypt salts in the password hashes.
+files (35 MB) in an S3-compatible store standing in for Supabase Storage. The
+file bytes (so per-file sha256 reproduces exactly), the row values behind the
+invariant totals, and the Auth users' IDs, emails and timestamps are
+deterministic. The uuid primary keys (`gen_random_uuid()`), the `now()`
+timestamps on eight tables and the bcrypt salts in the password hashes vary
+between runs, which is why the dump hashes differ every time.
 
 The source's superuser is called `source_admin`, not `postgres`. `--with-login`
 restores into the second database as `postgres`, and `restore` refuses a target
