@@ -1,5 +1,5 @@
 {
-  "databaseUrl": "postgresql://postgres:__PG_PASSWORD__@127.0.0.1:__PG_PORT__/appdb",
+  "databaseUrl": "postgresql://source_admin:__PG_PASSWORD__@127.0.0.1:__PG_PORT__/appdb",
   "projectName": "acme-prod",
   "schemas": ["public"],
   "storage": {
