@@ -18,7 +18,7 @@ two more on a Docker network of their own, once the sandbox is gone: Supabase's
 Postgres image (`supabase/postgres`, about 1.7 GB to pull) and GoTrue, the
 Supabase Auth server. All of them, and the network, are removed on exit.
 
-Nothing touches a real project, and that is enforced rather than promised:
+The script connects only to the containers it starts:
 credentials are generated per run and never written to a tracked file, every
 container binds to `127.0.0.1` only, and the CLI is invoked with a scrubbed
 environment so a `BACKUPDRILL_*` or `DATABASE_URL` already exported in your
@@ -184,17 +184,17 @@ restored into a container on the same laptop. Your number depends on dump size,
 disk, and network — which is the point of measuring it on a schedule instead of
 guessing.
 
-## Three honest gaps in this fixture
+## Three gaps in this fixture
 
 1. The source is a local Postgres, not a hosted Supabase project, so the backup
-   cannot read `storage.buckets` and records bucket attributes as **absent**
-   rather than inventing them. Against a real project they are captured.
+   cannot read `storage.buckets` and records bucket attributes as **absent**.
+   Against a real project they are captured.
 2. Your RLS policies are **restored, not tested**. The sandbox creates stub
    `authenticated` / `anon` roles and `auth.uid()`-style functions so the
    policies can be created (CLI 2.1.0, which produced the July report, listed
-   them as five expected skips instead), but nothing exercises them. Verifying
-   RLS behavior takes an authenticated client stack with real JWTs, which no
-   restore sandbox can fake.
+   them as five expected skips instead), but nothing exercises them. Testing
+   RLS takes requests to the Data API with real users' JWTs, and this run makes
+   none: `--with-login` stops at signing in.
 3. The sign-in target runs Supabase's own Postgres image and GoTrue on your
    machine; it is not a hosted project. Only password sign-in is exercised: the
    400 Google users are restored, but signing them in needs a Google OAuth
