@@ -252,25 +252,33 @@ async function startEphemeralPostgres(image: string, major: number, resourceName
   await ensureImage(image);
   // 名字先定好:Ctrl+C 可能落在 docker run 还没返回 ID 的时候,按名字才删得掉
   const name = resourceName ?? `backupdrill-drill-${randomBytes(6).toString("hex")}`;
+  // 沙箱里是恢复出来的生产数据。端口只绑 127.0.0.1,但同机的其他系统账号照样连得上,
+  // 固定密码等于没设:每个沙箱一个随机密码。只写 "-e POSTGRES_PASSWORD" 不带值,
+  // docker 从它自己的环境变量取值,密码就不进 argv(ps 看得到 argv)
+  const password = randomBytes(16).toString("hex");
   throwIfInterrupted();
-  const started = execFileAsync("docker", [
-    "run",
-    "-d",
-    "--rm",
-    "--name",
-    name,
-    ...(resourceName ? ["--mount", `type=volume,source=${resourceName},target=${dataVolumeTarget}`] : []),
-    "-e",
-    "POSTGRES_PASSWORD=drill",
-    "-e",
-    "POSTGRES_DB=postgres",
-    "-p",
-    "127.0.0.1:0:5432", // 随机主机端口,避免撞端口
-    `--shm-size=${tuning.shmSize}`,
-    image,
-    "postgres",
-    ...tuning.settings.flatMap((kv) => ["-c", kv]),
-  ]);
+  const started = execFileAsync(
+    "docker",
+    [
+      "run",
+      "-d",
+      "--rm",
+      "--name",
+      name,
+      ...(resourceName ? ["--mount", `type=volume,source=${resourceName},target=${dataVolumeTarget}`] : []),
+      "-e",
+      "POSTGRES_PASSWORD",
+      "-e",
+      "POSTGRES_DB=postgres",
+      "-p",
+      "127.0.0.1:0:5432", // 随机主机端口,避免撞端口
+      `--shm-size=${tuning.shmSize}`,
+      image,
+      "postgres",
+      ...tuning.settings.flatMap((kv) => ["-c", kv]),
+    ],
+    { env: { ...process.env, POSTGRES_PASSWORD: password } }
+  );
   // 删容器只有一份:正常收尾(drillDump 的 finally)和中断收尾(interrupt.ts)等的是同一个 promise。
   // 两边各发一次 docker rm 会撞上 "removal already in progress",后到的那个报删除失败,
   // 进程又在真正删完之前就退出了(信号测试抓到的竞争)。
@@ -343,7 +351,7 @@ async function startEphemeralPostgres(image: string, major: number, resourceName
     ]);
     // 形如 "127.0.0.1:54321"
     const port = portOut.stdout.trim().split(":").pop()!.trim();
-    const connString = `postgresql://postgres:drill@127.0.0.1:${port}/postgres`;
+    const connString = `postgresql://postgres:${password}@127.0.0.1:${port}/postgres`;
 
     // 等就绪(容器内 pg_isready),最多 ~30s。
     // 必须 -h 127.0.0.1 强制走 TCP:官方镜像 initdb 阶段先起一个只听 unix socket 的临时

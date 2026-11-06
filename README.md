@@ -360,7 +360,7 @@ docker run -d --name backupdrill --restart unless-stopped \
 - Arguments go straight to the CLI: `docker run --rm -e … ghcr.io/backupdrill/backupdrill estimate` or `… --help`. To start a backup now in a running scheduled container: `docker exec backupdrill backupdrill backup`.
 - `BACKUPDRILL_CRON` takes a standard 5-field expression or a shortcut such as `@daily`. Anything else stops the container at start (exit code 64) instead of leaving it idle.
 - `drill` needs Docker to start its throwaway Postgres, and the image doesn't get access to your Docker daemon, so run drills where Docker is available (your machine, or the GitHub Action with `drill: "true"`).
-- Tags: `latest`, the CLI version (e.g. `2.10.0`), and `sha-<commit>`. Images are built for amd64 and arm64.
+- Tags: `latest`, the CLI version (e.g. `2.10.1`), and `sha-<commit>`. Images are built for amd64 and arm64.
 
 ## Alerts with Healthchecks.io
 

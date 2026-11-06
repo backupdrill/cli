@@ -5,7 +5,7 @@ Read this when the user asks what Supabase already backs up for them, wants a pl
 ## What Supabase keeps for you
 
 - **Free plan:** no access to automatic backups. Supabase's docs tell Free projects to export their data themselves (`supabase db dump`) and keep off-site copies. Free projects are paused after a week of inactivity; the pause snapshot lets the user restore the paused project from the dashboard for up to a year.
-- **Pro and Team:** daily backups, kept 7 days on Pro and 14 on Team, restorable from the dashboard. On the physical backup process that current projects use they can't be downloaded. Point-in-time recovery is a paid add-on: about $100/month per project for 7 days of history, and it needs a Small compute add-on or larger.
+- **Pro and Team:** daily backups, kept 7 days on Pro and 14 on Team, restorable from the dashboard. On the physical backup process that current projects use they can't be downloaded. Point-in-time recovery is a paid add-on: about $100/month per project for 7 days of history.
 - **Storage files are not in any database backup.** A database restore brings back the `storage.objects` rows, which only point at files. The files themselves need a separate copy (the CLI copies them once the Storage S3 keys are set).
 
 Every backup taken from outside the project counts as egress on the user's Supabase bill. Free includes 5 GB a month, shared with whatever the app already serves. Run `backupdrill estimate --plan free` for an upper-bound estimate of the project's backup egress. As a rough guide, if each run transfers 500 MB (the Free database limit), weekly backups use about 2 GB a month and daily ones about 15 GB, three times the allowance.
@@ -46,11 +46,13 @@ export BACKUP_FILE="backup-$(date +%Y%m%dT%H%M%S).dump"
 
 ## Test the restore by hand
 
-A dump that has never been restored is a guess. Restore it into a throwaway Postgres and look at the data. Start the container and wait until it accepts connections:
+A dump that has never been restored is a guess. Restore it into a throwaway Postgres and look at the data. The container will hold a copy of production data, and every account on the machine can reach a port on `127.0.0.1`, so give it a new random password. Start the container and wait until it accepts connections:
 
 ```sh
-# docker run can print an ID and still fail (port taken), so only a zero exit counts
-cid="$(docker run -d --rm -e POSTGRES_PASSWORD=drill -p 127.0.0.1:55432:5432 postgres:17-alpine)" || cid=""
+TEST_PW="$(openssl rand -hex 16)"
+# docker run can print an ID and still fail (port taken), so only a zero exit counts.
+# -e with no value makes docker read the password from its own environment, not from its arguments.
+cid="$(POSTGRES_PASSWORD="$TEST_PW" docker run -d --rm -e POSTGRES_PASSWORD -p 127.0.0.1:55432:5432 postgres:17-alpine)" || cid=""
 [ -n "$cid" ] \
 && for i in $(seq 60); do docker exec "$cid" pg_isready -q -h 127.0.0.1 -U postgres && break; sleep 1; done \
 && docker exec "$cid" pg_isready -h 127.0.0.1 -U postgres
@@ -60,12 +62,14 @@ echo "container: ${cid:-not started}"
 If it prints `container: not started` (port 55432 already taken, for example) or the last `pg_isready` says `no response`, stop and fix that first. Then restore and check:
 
 ```sh
-export TEST_DB="postgresql://postgres:drill@127.0.0.1:55432/postgres"
+export TEST_DB="postgresql://postgres@127.0.0.1:55432/postgres"
+# PGPASSWORD goes on each command, not exported: exported, it would also replace
+# ~/.pgpass for the production connection in this shell.
 
 # The dump creates schema public itself, so drop the empty one first. Then add stand-ins
 # for what a Supabase project provides, so policies that mention them restore.
 # --no-privileges skips GRANT and REVOKE: this test checks the data, not who can read it.
-psql "$TEST_DB" --set ON_ERROR_STOP=1 -c "
+PGPASSWORD="$TEST_PW" psql "$TEST_DB" --set ON_ERROR_STOP=1 -c "
   drop schema public;
   create role anon; create role authenticated; create role service_role;
   create schema auth;
@@ -73,10 +77,10 @@ psql "$TEST_DB" --set ON_ERROR_STOP=1 -c "
   create function auth.role()  returns text  language sql stable as 'select null::text';
   create function auth.email() returns text  language sql stable as 'select null::text';
   create function auth.jwt()   returns jsonb language sql stable as 'select null::jsonb';" \
-&& pg_restore --no-owner --no-privileges --dbname "$TEST_DB" "$BACKUP_FILE"
+&& PGPASSWORD="$TEST_PW" pg_restore --no-owner --no-privileges --dbname "$TEST_DB" "$BACKUP_FILE"
 
-psql "$TEST_DB" -c "select count(*) from pg_tables where schemaname = 'public';"
-psql "$TEST_DB" -c "select count(*) from public.<a table that must never be empty>;"
+PGPASSWORD="$TEST_PW" psql "$TEST_DB" -c "select count(*) from pg_tables where schemaname = 'public';"
+PGPASSWORD="$TEST_PW" psql "$TEST_DB" -c "select count(*) from public.<a table that must never be empty>;"
 ```
 
 When you're done, remove only the container you started: `docker rm -f "$cid"`.
