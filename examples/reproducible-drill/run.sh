@@ -51,10 +51,14 @@ for bin in "$PG_DUMP" "$PG_RESTORE"; do
   major="$("$bin" --version | sed -E 's/.* ([0-9]+).*/\1/')"
   [ "${major:-0}" -ge 17 ] 2>/dev/null || { echo "$bin is major $major; needs >= 17 to handle this fixture's PostgreSQL 17 source" >&2; exit 1; }
 done
-# 带 Auth 的恢复由 psql 跑单事务,CLI 在 pg_restore 的同一目录找它(PATH 上的 pg_restore 就找 PATH 上的 psql)
+# 带 Auth 的恢复由 psql 跑单事务。找法和 CLI 的 resolvePsqlBin() 一样:pg_restore 名字就叫 pg_restore 时
+# 换成同目录的 psql,别的名字(pg_restore-17、包装脚本)就用 PATH 上的 psql
 if [ "$WITH_LOGIN" = 1 ]; then
-  case "$PG_RESTORE" in */pg_restore) PSQL="${PG_RESTORE%pg_restore}psql" ;; pg_restore) PSQL=psql ;; *) PSQL="" ;; esac
-  [ -n "$PSQL" ] && command -v "$PSQL" >/dev/null 2>&1 || { echo "--with-login needs psql next to $PG_RESTORE" >&2; exit 1; }
+  case "$PG_RESTORE" in
+    pg_restore | */pg_restore) PSQL="${PG_RESTORE%pg_restore}psql" ;;
+    *) PSQL=psql ;;
+  esac
+  command -v "$PSQL" >/dev/null 2>&1 || { echo "--with-login needs psql ($PSQL), which the CLI uses for the restore" >&2; exit 1; }
 fi
 
 RUN_ID="$$"
