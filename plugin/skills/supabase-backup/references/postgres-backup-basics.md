@@ -5,7 +5,7 @@ Read this when the user asks what Supabase already backs up for them, wants a pl
 ## What Supabase keeps for you
 
 - **Free plan:** no access to automatic backups. Supabase's docs tell Free projects to export their data themselves (`supabase db dump`) and keep off-site copies. Free projects are paused after a week of inactivity; the pause snapshot lets the user restore the paused project from the dashboard for up to a year.
-- **Pro and Team:** daily backups, kept 7 days on Pro and 14 on Team, restorable from the dashboard. On the physical backup process that current projects use they can't be downloaded. Point-in-time recovery is a paid add-on: about $100/month per project for 7 days of history, and it needs a Small compute add-on or larger.
+- **Pro and Team:** daily backups, kept 7 days on Pro and 14 on Team, restorable from the dashboard. On the physical backup process that current projects use they can't be downloaded. Point-in-time recovery is a paid add-on: about $100/month per project for 7 days of history.
 - **Storage files are not in any database backup.** A database restore brings back the `storage.objects` rows, which only point at files. The files themselves need a separate copy (the CLI copies them once the Storage S3 keys are set).
 
 Every backup taken from outside the project counts as egress on the user's Supabase bill. Free includes 5 GB a month, shared with whatever the app already serves. Run `backupdrill estimate --plan free` for an upper-bound estimate of the project's backup egress. As a rough guide, if each run transfers 500 MB (the Free database limit), weekly backups use about 2 GB a month and daily ones about 15 GB, three times the allowance.
