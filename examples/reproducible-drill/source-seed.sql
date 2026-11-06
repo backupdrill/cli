@@ -51,5 +51,52 @@ select 'user:' || (g % 20000),
        now() - (g % 120) * interval '1 hour'
 from generate_series(1, 250000) g;
 
+-- 1,000 个 Auth 用户:前 600 个用邮箱 + 密码登录(密码 demo-password-<g>,--with-login 拿第 1 个去登录),
+-- 后 400 个用 Google 登录、没有密码。ID、邮箱、时间、identity 全是确定的;只有 bcrypt 的盐是随机的。
+-- 字段的写法照 GoTrue 自己注册时写的:token 列是空串不是 null(GoTrue 读到 null 会报错)。
+-- 每 120 个密码用户里有一个在备份时还挂着没用的重置密码链接(共 5 个),恢复时这些要清掉。
+-- 插入时 on_auth_user_created 触发器顺手给每人建一行 public.profiles。
+insert into auth.users (
+  instance_id, id, aud, role, email, encrypted_password, email_confirmed_at,
+  confirmation_token, recovery_token, recovery_sent_at, email_change_token_new, email_change,
+  last_sign_in_at, raw_app_meta_data, raw_user_meta_data, is_super_admin, created_at, updated_at)
+select
+  '00000000-0000-0000-0000-000000000000', u.id, 'authenticated', 'authenticated', u.email,
+  case when u.password_user then extensions.crypt('demo-password-' || g, extensions.gen_salt('bf', 10)) else '' end,
+  u.created_at,
+  '',
+  case when u.password_user and g % 120 = 0 then encode(sha224(convert_to('recovery:' || g, 'UTF8')), 'hex') else '' end,
+  case when u.password_user and g % 120 = 0 then timestamptz '2026-10-01 12:00:00+00' end,
+  '', '',
+  u.created_at + interval '2 days',
+  case when u.password_user
+       then jsonb_build_object('provider', 'email', 'providers', jsonb_build_array('email'))
+       else jsonb_build_object('provider', 'google', 'providers', jsonb_build_array('google')) end,
+  case when u.password_user
+       then jsonb_build_object('sub', u.id, 'email', u.email, 'email_verified', true, 'phone_verified', false)
+       else jsonb_build_object('iss', 'https://accounts.google.com', 'sub', u.google_sub, 'name', 'Customer ' || g,
+                               'full_name', 'Customer ' || g, 'email', u.email, 'email_verified', true,
+                               'phone_verified', false, 'provider_id', u.google_sub) end,
+  false, u.created_at, u.created_at + interval '2 days'
+from generate_series(1, 1000) g
+cross join lateral (
+  select md5('backupdrill-demo-user:' || g)::uuid as id,
+         'user' || g || '@example.com' as email,
+         g <= 600 as password_user,
+         '1' || lpad(g::text, 20, '0') as google_sub,
+         timestamptz '2026-05-01 00:00:00+00' + g * interval '37 minutes' as created_at
+) u;
+
+insert into auth.identities (id, provider_id, user_id, identity_data, provider, last_sign_in_at, created_at, updated_at)
+select md5('backupdrill-demo-identity:' || u.id)::uuid,
+       case when u.raw_app_meta_data ->> 'provider' = 'email' then u.id::text else u.raw_user_meta_data ->> 'sub' end,
+       u.id,
+       case when u.raw_app_meta_data ->> 'provider' = 'email'
+            then jsonb_build_object('sub', u.id, 'email', u.email, 'email_verified', false, 'phone_verified', false)
+            else u.raw_user_meta_data end,
+       u.raw_app_meta_data ->> 'provider',
+       u.last_sign_in_at, u.created_at, u.updated_at
+from auth.users u;
+
 refresh materialized view public.order_totals;
 analyze;
