@@ -6,6 +6,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { existsSync, readFileSync, writeFileSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import pg from "pg";
 import {
   drillDump,
   classifyPostDataErrors,
@@ -237,6 +238,16 @@ test(
         "inspect", "-f", "{{.State.Running}}", kept.keptSandbox.containerId,
       ]);
       assert.equal(running.trim(), "true", "kept sandbox container must still be running");
+      // 沙箱密码每次随机(同机其他账号能连 127.0.0.1),连接串里的密码要真能登录,旧的固定密码不行
+      const sandboxUrl = new URL(kept.keptSandbox.connString);
+      assert.match(sandboxUrl.password, /^[0-9a-f]{32}$/, "sandbox password must be random");
+      const client = new pg.Client({ connectionString: kept.keptSandbox.connString });
+      await client.connect();
+      await client.end();
+      sandboxUrl.password = "drill";
+      const stale = new pg.Client({ connectionString: sandboxUrl.toString() });
+      await assert.rejects(stale.connect(), /password authentication failed/);
+      await stale.end().catch(() => {});
     } finally {
       // 断言失败也不能把容器留在机器上(xreview:测试自身不许泄漏沙箱)
       await x("docker", ["rm", "-f", "-v", kept.keptSandbox.containerId]).catch(() => {});
