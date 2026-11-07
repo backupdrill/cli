@@ -113,6 +113,15 @@ test(
         }
       );
       assert.equal(await countRowsInDump(join(tmp, "missing.pgcustom")), null);
+      // 临时目录建不了:返回 null(演练判"数不出来"),不能抛出去变成没人接的 rejection
+      const savedTmp = process.env.TMPDIR;
+      process.env.TMPDIR = join(tmp, "no-such-dir");
+      try {
+        assert.equal(await countRowsInDump(dumpPath), null);
+      } finally {
+        if (savedTmp === undefined) delete process.env.TMPDIR;
+        else process.env.TMPDIR = savedTmp;
+      }
 
       const names = [
         "Odd Name", "a.b", "animals", "dogs", "empty_table", "events", "events_2025", "events_2026",

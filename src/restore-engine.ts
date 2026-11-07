@@ -1446,6 +1446,16 @@ export function copyRowCounter(): { feed(chunk: string): void; finish(): Map<str
  * pg_restore 起不来、出错退出、被中断,或者输出读不懂,都返回 null,由调用方按"数不出来"处理。
  */
 export async function countRowsInDump(dumpPath: string): Promise<Map<string, number> | null> {
+  // 绝不抛错:调用方是在逐表 count(*) 之前就把它挂在后台的,临时目录建不了、写不进、删不掉,
+  // 都只能落成"数不出来",不能变成没人接的 rejection 把演练进程带崩
+  try {
+    return await countRowsInDumpOrThrow(dumpPath);
+  } catch {
+    return null;
+  }
+}
+
+async function countRowsInDumpOrThrow(dumpPath: string): Promise<Map<string, number> | null> {
   if (interrupted()) return null;
   const bin = resolvePgRestoreBin();
   let listing: { code: number | null; stdout: string };
