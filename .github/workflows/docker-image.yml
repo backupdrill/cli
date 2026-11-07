@@ -1,7 +1,9 @@
 # Builds the container image on every PR that touches it, smoke-tests it, and on
-# main publishes it to ghcr.io/backupdrill/backupdrill (latest + the package.json
-# version + the commit SHA). Credentials never enter the image; the only secret
-# used here is the workflow's own GITHUB_TOKEN, to push to GHCR.
+# main publishes it to ghcr.io/backupdrill/backupdrill and, once the
+# DOCKERHUB_TOKEN secret is set, to Docker Hub as backupdrill/cli (latest + the
+# package.json version + the commit SHA). Credentials never enter the image; the
+# secrets used here are the workflow's own GITHUB_TOKEN, to push to GHCR, and a
+# Docker Hub access token with read & write scope for the backupdrill account.
 name: docker-image
 
 on:
@@ -37,6 +39,11 @@ concurrency:
 
 env:
   IMAGE: ghcr.io/backupdrill/backupdrill
+  DOCKERHUB_IMAGE: docker.io/backupdrill/cli
+  DOCKERHUB_USERNAME: backupdrill
+  # Docker Hub publishing stays off until the token secret exists, so main keeps
+  # publishing to GHCR in the meantime.
+  HAS_DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN != '' }}
 
 jobs:
   image:
@@ -83,6 +90,11 @@ jobs:
             echo "$IMAGE:latest"
             echo "$IMAGE:$version"
             echo "$IMAGE:sha-${GITHUB_SHA::7}"
+            if [ "$HAS_DOCKERHUB_TOKEN" = "true" ]; then
+              echo "$DOCKERHUB_IMAGE:latest"
+              echo "$DOCKERHUB_IMAGE:$version"
+              echo "$DOCKERHUB_IMAGE:sha-${GITHUB_SHA::7}"
+            fi
             echo "EOF"
           } >> "$GITHUB_OUTPUT"
 
@@ -93,6 +105,13 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Log in to Docker Hub
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main' && env.HAS_DOCKERHUB_TOKEN == 'true'
+        uses: docker/login-action@v3
+        with:
+          username: ${{ env.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: Build and push (amd64 + arm64)
         if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
