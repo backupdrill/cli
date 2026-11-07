@@ -467,6 +467,7 @@ export function rowCountsCheck(
   inBackup: Map<string, number> | null,
   manifest: Manifest,
   restoredTables: RestoredTable[],
+  /** 键 = tableKey */
   restoredRows: Map<string, number>
 ): DrillCheck {
   const name = "row counts match the backup";
@@ -489,7 +490,7 @@ export function rowCountsCheck(
     }
     compared++;
     rows += expected;
-    const restored = restoredRows.get(label) ?? 0;
+    const restored = restoredRows.get(tableKey(t)) ?? 0;
     if (restored !== expected) differ.push(`${label} has ${format(restored)}, the backup has ${format(expected)}`);
   }
   const problems = [...differ, ...notInFile.map((label) => `${label} has no data section in the backup file`)];
@@ -553,7 +554,8 @@ export async function verifyRestored(
     const unpopulatedMatviews = new Set<string>();
     let rowTotal = 0;
     for (const t of restoredTables) {
-      const key = `${t.schema}.${t.name}`;
+      // tableKey(NUL 分隔),不用点号拼:public."a.b" 和 "public.a".b 拼出来都是 public.a.b,会串表
+      const key = tableKey(t);
       // 未填充的 matview 无法 count(*)(Postgres 直接报错)。它要么备份时就没数据
       // (dump 里本来就没有 REFRESH),要么 REFRESH 在 post-data 阶段失败——后者已由
       // post-data 检查如实记录,这里按 0 行处理即可。
@@ -589,7 +591,7 @@ export async function verifyRestored(
     // 2. manifest 里的每张表都还原出来了
     const restoredSet = new Set(counts.keys());
     const missing = manifest.database.tables.filter(
-      (t) => !restoredSet.has(`${t.schema}.${t.name}`)
+      (t) => !restoredSet.has(tableKey(t))
     );
     checks.push({
       name: "no missing tables",
@@ -607,8 +609,8 @@ export async function verifyRestored(
     const restoredEmpty = manifest.database.tables.filter(
       (t) =>
         t.estimatedRows > 0 &&
-        !unpopulatedMatviews.has(`${t.schema}.${t.name}`) &&
-        (counts.get(`${t.schema}.${t.name}`) ?? 0) === 0
+        !unpopulatedMatviews.has(tableKey(t)) &&
+        (counts.get(tableKey(t)) ?? 0) === 0
     );
     // manifest 的行数是 pg_dump 之前另开连接取的 n_live_tup(统计估算),和 dump 不是同一个快照。
     // 队列、会话、一次性密钥这类表,取统计时有行、dump 时已经删光,恢复出 0 行是对的

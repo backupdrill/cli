@@ -75,37 +75,62 @@ test(
           'create table "Odd Name"(id int); insert into "Odd Name" values (1), (2); ' +
           "create materialized view orders_mv as select id from orders where id <= 10;"
       );
+      // 交叉审查复现的三种:
+      // 1. 点号拼键会串表:public."a.b" 和 "public.a".b 拼出来都是 public.a.b
+      // 2. 序列名里带换行和 "COPY ...":setval 的字符串字面量里会出现一行以 COPY 开头的假头
+      // 3. 1600 列、列名 63 字节带引号:COPY 头超过十万字符,仍是合法的
+      const wideColumns = Array.from({ length: 1600 }, (_, i) => `"${'"'.repeat(20)}${String(i).padStart(4, "0")}${"c".repeat(39)}" int`);
+      await psql(
+        source.id,
+        'create table "a.b"(id int); insert into "a.b" values (1), (2), (3); ' +
+          'create schema "public.a"; create table "public.a".b(id int); insert into "public.a".b values (1); ' +
+          'create table fake_target(id int); insert into fake_target values (1), (2); ' +
+          'create sequence "s\nCOPY public.fake_target (id) FROM stdin;\n9"; ' +
+          `create table wide(${wideColumns.join(", ")}); insert into wide ("${'"'.repeat(20)}0000${"c".repeat(39)}") values (1), (2);`
+      );
       await x(pgDump, [
-        "--format=custom", "--no-owner", "--no-privileges", "--schema=public", "--dbname", source.conn, "-f", dumpPath,
+        "--format=custom", "--no-owner", "--no-privileges", "--schema=public", '--schema="public.a"', "--dbname", source.conn, "-f", dumpPath,
       ]);
 
       // 1. 备份文件里的确切行数
       const inBackup = await countRowsInDump(dumpPath);
       assert.deepEqual(
-        Object.fromEntries([...inBackup].map(([k, v]) => [k.replace("\u0000", "."), v]).sort()),
+        // 用 | 拼,不用点号:测的就是点号会串表
+        Object.fromEntries([...inBackup].map(([k, v]) => [k.replace("\u0000", "|"), v])),
         {
-          "public.Odd Name": 2,
-          "public.animals": 2,
-          "public.dogs": 3,
-          "public.empty_table": 0,
-          "public.events_2025": 213,
-          "public.events_2026": 187,
-          "public.nocols": 3,
-          "public.orders": 1000,
+          "public|Odd Name": 2,
+          "public|a.b": 3,
+          "public.a|b": 1,
+          "public|animals": 2,
+          "public|dogs": 3,
+          "public|empty_table": 0,
+          "public|events_2025": 213,
+          "public|events_2026": 187,
+          "public|fake_target": 2,
+          "public|nocols": 3,
+          "public|orders": 1000,
+          "public|wide": 2,
         }
       );
       assert.equal(await countRowsInDump(join(tmp, "missing.pgcustom")), null);
 
-      const names = ["Odd Name", "animals", "dogs", "empty_table", "events", "events_2025", "events_2026", "nocols", "orders", "orders_mv"];
+      const names = [
+        "Odd Name", "a.b", "animals", "dogs", "empty_table", "events", "events_2025", "events_2026",
+        "fake_target", "nocols", "orders", "orders_mv", "wide",
+      ];
+      const tables = [
+        ...names.map((name) => ({ schema: "public", name, estimatedRows: 0 })),
+        { schema: "public.a", name: "b", estimatedRows: 0 },
+      ];
       const buf = readFileSync(dumpPath);
       const manifest = {
         tool: "backupdrill-cli", toolVersion: "test", createdAt: "2026-11-07T00:00:00.000Z",
         projectName: "test",
         database: {
-          serverVersion: "17.4", pgDumpVersion: "test", schemas: ["public"],
-          tableCount: names.length, estimatedRowTotal: 0,
+          serverVersion: "17.4", pgDumpVersion: "test", schemas: ["public", "public.a"],
+          tableCount: tables.length, estimatedRowTotal: 0,
           // 估算全写 0:逐表比对只认备份文件里数出来的数,和 manifest 的估算无关
-          tables: names.map((name) => ({ schema: "public", name, estimatedRows: 0 })),
+          tables,
         },
         dump: {
           key: "seed/dump.pgcustom", format: "custom", bytes: buf.length,
@@ -120,7 +145,7 @@ test(
       assert.deepEqual(rows, {
         name: "row counts match the backup",
         pass: true,
-        detail: "all 8 tables match the backup exactly (1,410 rows)",
+        detail: "all 12 tables match the backup exactly (1,418 rows)",
       });
       assert.equal(report.pass, true, JSON.stringify(report.checks));
 
@@ -129,11 +154,12 @@ test(
       // dump 自带 CREATE SCHEMA public,新库里已有同名 schema 会让 pg_restore 退出码非 0
       await psql(target.id, "drop schema public cascade;");
       await x(pgRestore, ["--no-owner", "--no-privileges", "--dbname", target.conn, dumpPath]);
-      await psql(target.id, "delete from orders where id = 500; insert into dogs values (6, 'd');");
+      // "a.b" 少一行、"public.a".b 不动:键串了的话两张表会被当成一张,这一行就漏掉
+      await psql(target.id, "delete from orders where id = 500; insert into dogs values (6, 'd'); delete from \"a.b\" where id = 1;");
       const verified = await verifyRestored(target.conn, manifest, dumpPath);
       const check = verified.checks.find((c) => c.name === "row counts match the backup");
       assert.equal(check.pass, false);
-      assert.equal(check.detail, "public.dogs has 4, the backup has 3; public.orders has 999, the backup has 1,000");
+      assert.equal(check.detail, "public.a.b has 2, the backup has 3; public.dogs has 4, the backup has 3; public.orders has 999, the backup has 1,000");
       assert.equal(verified.checks.find((c) => c.name === "populated tables came back").pass, true);
 
       // 4. 不给 dump 路径(老调用方式):没有可比的确切行数,这一项不出现

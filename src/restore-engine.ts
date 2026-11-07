@@ -1439,31 +1439,50 @@ export function copyRowCounter(): { feed(chunk: string): void; finish(): Map<str
 }
 
 /**
- * 备份文件里每张表的确切行数:让 pg_restore 把整份 dump 的数据段写成 SQL,边读边数(copyRowCounter)。
+ * 备份文件里每张表的确切行数:让 pg_restore 把 dump 的数据段写成 SQL,边读边数(copyRowCounter)。
+ * 只写 TABLE DATA 条目(--use-list):序列的 setval、大对象这些 SQL 里有字符串字面量,
+ * 带换行的名字能在里面造出一行以 "COPY " 开头的假头,混进来就会多数行。
  * 不连库,也不碰源库。matview 的数据是 REFRESH、分区父表没有自己的数据,都不会出现在结果里。
  * pg_restore 起不来、出错退出、被中断,或者输出读不懂,都返回 null,由调用方按"数不出来"处理。
  */
-export function countRowsInDump(dumpPath: string): Promise<Map<string, number> | null> {
-  if (interrupted()) return Promise.resolve(null);
-  return new Promise((resolve) => {
-    // 和 pgRestoreOutput 一样钉 C locale
-    const proc = spawn(resolvePgRestoreBin(), ["--data-only", "--file=-", dumpPath], {
-      stdio: ["ignore", "pipe", "ignore"],
-      env: libpqChildEnv(),
+export async function countRowsInDump(dumpPath: string): Promise<Map<string, number> | null> {
+  if (interrupted()) return null;
+  const bin = resolvePgRestoreBin();
+  let listing: { code: number | null; stdout: string };
+  try {
+    listing = await pgRestoreOutput(bin, ["--list", dumpPath]);
+  } catch {
+    return null;
+  }
+  if (listing.code !== 0) return null;
+  const dataEntries = listing.stdout.split("\n").filter((line) => /^\d+; 0 \d+ TABLE DATA /.test(line));
+  if (dataEntries.length === 0) return new Map();
+  const listDir = await mkdtemp(join(tmpdir(), "backupdrill-rowcount-"));
+  try {
+    const listFile = join(listDir, "table-data.list");
+    await writeFile(listFile, dataEntries.join("\n") + "\n");
+    return await new Promise((resolve) => {
+      // 和 pgRestoreOutput 一样钉 C locale
+      const proc = spawn(bin, ["--data-only", `--use-list=${listFile}`, "--file=-", dumpPath], {
+        stdio: ["ignore", "pipe", "ignore"],
+        env: libpqChildEnv(),
+      });
+      const forget = stopOnInterrupt(proc);
+      const counter = copyRowCounter();
+      // 按流解码:多字节字符可能被拆在两块里
+      proc.stdout.setEncoding("utf8");
+      proc.stdout.on("data", (chunk: string) => counter.feed(chunk));
+      let settled = false;
+      const settle = (result: Map<string, number> | null) => {
+        if (settled) return;
+        settled = true;
+        forget();
+        resolve(result);
+      };
+      proc.on("error", () => settle(null));
+      proc.on("close", (code) => settle(code === 0 ? counter.finish() : null));
     });
-    const forget = stopOnInterrupt(proc);
-    const counter = copyRowCounter();
-    // 按流解码:多字节字符可能被拆在两块里
-    proc.stdout.setEncoding("utf8");
-    proc.stdout.on("data", (chunk: string) => counter.feed(chunk));
-    let settled = false;
-    const settle = (result: Map<string, number> | null) => {
-      if (settled) return;
-      settled = true;
-      forget();
-      resolve(result);
-    };
-    proc.on("error", () => settle(null));
-    proc.on("close", (code) => settle(code === 0 ? counter.finish() : null));
-  });
+  } finally {
+    await rm(listDir, { recursive: true, force: true });
+  }
 }

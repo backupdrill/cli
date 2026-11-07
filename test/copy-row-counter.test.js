@@ -59,7 +59,7 @@ test("copyRowCounter: anything it can't read exactly gives no counts at all", ()
   // 读不懂的 COPY 头
   assert.equal(count("COPY public.t WITH garbage FROM stdin;\n1\n\\.\n"), null);
   // 头超长
-  assert.equal(count('COPY public."' + "x".repeat(100_001)), null);
+  assert.equal(count('COPY public."' + "x".repeat(1_000_001)), null);
   // 输出停在数据段中间、或者停在多行头中间(pg_restore 没写完)
   assert.equal(count("COPY public.t (id) FROM stdin;\n1\n2\n"), null);
   assert.equal(count('COPY public."half\n'), null);
@@ -79,7 +79,7 @@ test("rowCountsCheck: every table equal passes, with the totals", () => {
     new Map([[key("public", "a"), 1000], [key("public", "b"), 0]]),
     manifest(["a", "b"]),
     [table("a"), table("b")],
-    new Map([["public.a", 1000], ["public.b", 0]])
+    new Map([[key("public", "a"), 1000], [key("public", "b"), 0]])
   );
   assert.deepEqual(check, {
     name: "row counts match the backup",
@@ -93,7 +93,7 @@ test("rowCountsCheck: one row short fails and names the table", () => {
     new Map([[key("public", "orders"), 10_000]]),
     manifest(["orders"]),
     [table("orders")],
-    new Map([["public.orders", 9_990]])
+    new Map([[key("public", "orders"), 9_990]])
   );
   assert.equal(check.pass, false);
   assert.equal(check.detail, "public.orders has 9,990, the backup has 10,000");
@@ -104,17 +104,17 @@ test("rowCountsCheck: matviews, partition parents and extension tables aren't co
     new Map([[key("public", "spatial_ref_sys"), 2]]),
     manifest(["mv", "parted", "spatial_ref_sys"]),
     [table("mv", "m"), table("parted", "p"), table("spatial_ref_sys", "r", true)],
-    new Map([["public.mv", 5], ["public.parted", 7], ["public.spatial_ref_sys", 8_500]])
+    new Map([[key("public", "mv"), 5], [key("public", "parted"), 7], [key("public", "spatial_ref_sys"), 8_500]])
   );
   assert.deepEqual(check, { name: "row counts match the backup", pass: true, detail: "no tables to compare" });
 });
 
 test("rowCountsCheck: no counts from the backup file, or a table missing from it, fails", () => {
-  const none = rowCountsCheck(null, manifest(["a"]), [table("a")], new Map([["public.a", 1]]));
+  const none = rowCountsCheck(null, manifest(["a"]), [table("a")], new Map([[key("public", "a"), 1]]));
   assert.equal(none.pass, false);
   assert.match(none.detail, /couldn't count the rows in the backup file/);
 
-  const missing = rowCountsCheck(new Map(), manifest(["a"]), [table("a")], new Map([["public.a", 1]]));
+  const missing = rowCountsCheck(new Map(), manifest(["a"]), [table("a")], new Map([[key("public", "a"), 1]]));
   assert.equal(missing.pass, false);
   assert.equal(missing.detail, "public.a has no data section in the backup file");
 });
@@ -125,7 +125,7 @@ test("rowCountsCheck: lists at most five problems", () => {
     new Map(names.map((n) => [key("public", n), 2])),
     manifest(names),
     names.map((n) => table(n)),
-    new Map(names.map((n) => [`public.${n}`, 1]))
+    new Map(names.map((n) => [key("public", n), 1]))
   );
   assert.equal(check.pass, false);
   assert.match(check.detail, /^public\.t1 has 1, the backup has 2; .*public\.t5 has 1, the backup has 2; and 2 more$/);

@@ -157,8 +157,12 @@ export function parseGeneratedColumns(sql: string): Map<string, Set<string>> {
   return tables;
 }
 
-/** 一个 COPY 头最长读这么多字符;超过就当作读不了,免得坏归档把内存吃满。 */
-export const MAX_COPY_HEADER = 100_000;
+/**
+ * 一个 COPY 头最长读这么多字符;超过就当作读不了,免得坏归档把内存吃满。
+ * 合法的头可以很长:1600 列(上限)、每个列名 63 字节且带引号要转义时,光列清单就有二十多万字符。
+ * 1 MB 留足余量,仍然挡得住坏归档。
+ */
+export const MAX_COPY_HEADER = 1_000_000;
 
 /**
  * 数据段的 COPY 头(dumpTableData_copy):"COPY <表> <列清单> FROM stdin;"。没有列的表列清单是空串,
