@@ -71,7 +71,7 @@ check is what stops a restore from overwriting the project it backed up.
 
 ## What we measured
 
-Run on 2026-11-06 with CLI 2.10.0 and the PostgreSQL 17 client tools
+Run on 2026-11-07 with CLI 2.11.0 and the PostgreSQL 17 client tools
 (`pg_dump`/`pg_restore`/`psql` 17.11), the same major version the hosted service
 uses.
 
@@ -80,8 +80,8 @@ Backup:
 ```
 → Inspecting database…
 ✓ Postgres 17.6 — schema(s) public: 14 tables, ~1,496,499 rows
-→ Dumping → s3://acme-backups/backupdrill/acme-prod/2026-11-06T03-58-17-486Z/dump.pgcustom
-✓ Database dumped (21.6 MB, sha256 f160e1c9536d…)
+→ Dumping → s3://acme-backups/backupdrill/acme-prod/2026-11-07T11-35-38-795Z/dump.pgcustom
+✓ Database dumped (21.6 MB, sha256 c5617d2f2cdf…)
 ✓ Auth users backed up (1,000 users, 1,000 sign-in identities, 0.2 MB)
 → Syncing Storage files…
 →   user-uploads: 250 files
@@ -97,18 +97,19 @@ Drill:
 ```
 ✓ Auth users: 1,000 users restored (1,000 identities); 1 foreign key(s) into the Auth tables created; 1 trigger(s) recreated; a test sign-up worked
 
-✓ archive integrity — sha256 matches (f160e1c9536d…)
+✓ archive integrity — sha256 matches (c5617d2f2cdf…)
 ✓ storage file integrity — all 250 files match their manifest checksums
 ✓ sandbox extensions — installed pg_trgm, pgcrypto
-✓ pg_restore — completed in 1.9s (2 parallel jobs)
+✓ pg_restore — completed in 1.8s (2 parallel jobs)
 ✓ post-data objects — user objects restored; 1 Supabase-managed object(s) skipped (they reference tables such as auth.users, which the drill sandbox doesn't have; restoring into a new project needs the rows they point at to be there first)
 ✓ table count — restored 14, manifest 14
 ✓ no missing tables — all manifest tables present
 ✓ populated tables came back — no populated table restored empty
+✓ row counts match the backup — all 12 tables match the backup exactly (1,476,250 rows)
 ✓ API grants — access for anon, authenticated and service_role set as it was at backup time on 24 object(s)
 ✓ app checks — command exited 0 in 0.1s
 
-✓ Drill PASSED — snapshot 2026-11-06T03-58-17-486Z, 14 tables / 1,496,250 rows restored in 1.9s
+✓ Drill PASSED — snapshot 2026-11-07T11-35-38-795Z, 14 tables / 1,496,250 rows restored in 1.8s
 ```
 
 The Auth line is printed first but runs last: once the checks below it have
@@ -121,9 +122,10 @@ reports on its own line and does not change the verdict.
 inside the sandbox container — the drill hands it the sandbox's connection
 string via `BACKUPDRILL_SANDBOX_URL`, so it needs whatever runtime your check
 is written in, and it has your machine's privileges, not a container's. It
-asserts
-the exact row count of five tables and the exact revenue total, so losing part
-of the data fails the drill. Its other two assertions — no orphaned foreign
+asserts the exact row count of five tables and the exact revenue total. The row
+counts repeat what the drill's own "row counts match the backup" check already
+covers for every table; the revenue total is the kind of check only your code
+can make. Its other two assertions — no orphaned foreign
 keys, materialized view agreeing with its base table — are near-tautologies a
 completed restore forces to hold; they are in there as a template for the
 assertions only your own code can make.
@@ -144,13 +146,14 @@ as in a new project:
 ✓ table count: restored 14, manifest 14
 ✓ no missing tables: all manifest tables present
 ✓ populated tables came back: no populated table restored empty
+✓ row counts match the backup: all 12 tables match the backup exactly (1,476,250 rows)
 ✓ API grants: access for anon, authenticated and service_role set as it was at backup time on 24 object(s)
 ✓ Database restored (14 tables, 1,496,250 rows)
 ✓ Auth users restored: 1,000 users (1,000 identities); trigger(s) recreated: on_auth_user_created
 ! Everyone signs in again: sessions aren't in the snapshot. Reconfigure Auth in the Supabase dashboard before switching your app over: sign-in providers (OAuth client IDs and secrets), SMTP, redirect URLs, the site URL and SSO.
 → Downloading 250 Storage files → …/recovered-files
 ✓ Storage files written to …/recovered-files
-✓ Restore complete — snapshot 2026-11-06T03-58-17-486Z: database restored, 250 Storage files written to …/recovered-files
+✓ Restore complete — snapshot 2026-11-07T11-35-38-795Z: database restored, 250 Storage files written to …/recovered-files
 ==> sign in on the restored project
   ✓ user1@example.com signed in with the password it had before the backup (HTTP 200, access token issued)
   ✓ the same account with a wrong password is refused (HTTP 400)
@@ -163,8 +166,8 @@ output; they are cut here for length.
 
 ## What is and isn't identical when you rerun this
 
-We ran it three times in July 2026, again in October, and again in November
-after adding the Auth users. Worth knowing before you compare:
+We ran it three times in July 2026, again in October, and twice in November:
+after adding the Auth users, and after adding the row count check. Worth knowing before you compare:
 
 | Value | Stable across runs? | Why |
 |---|---|---|
@@ -173,13 +176,17 @@ after adding the Auth users. Worth knowing before you compare:
 | Dump and `auth.dump` sha256 | **No** | Two reasons: the random uuid keys, `now()` stamps and bcrypt salts above mean the bytes genuinely differ, and `pg_dump` writes a creation timestamp into the archive header, so even identical data would not hash the same |
 | `pg_restore` seconds | **No** | Hardware |
 
-The first two rows are the reason the drill measures instead of trusting the
-manifest: on one of our runs the manifest claimed 250,000 more rows than the
-database actually held, and the drill's count was right anyway. The manifest's
-row counts are estimates, which is exactly why the check is "every table that
-had rows came back non-empty" rather than "the row counts match".
+The first two rows are the reason the drill never compares against the
+manifest's row counts: on one of our runs the manifest claimed 250,000 more rows
+than the database actually held. "Row counts match the backup" counts the rows
+of each table in the dump file itself and compares them with the restored
+tables, one table at a time. 12 of the 14 tables are compared that way; the
+partitioned parent `events` has no rows of its own in the dump, and the
+materialized view `order_totals` is rebuilt by `REFRESH`, so those two are only
+checked for being non-empty. That is why 1,476,250 rows are compared out of the
+1,496,250 restored: the difference is the view's 20,000 rows.
 
-**Restore time is hardware, not a product claim.** 1.9 s is a 21.6 MB dump
+**Restore time is hardware, not a product claim.** 1.8 s is a 21.6 MB dump
 restored into a container on the same laptop. Your number depends on dump size,
 disk, and network — which is the point of measuring it on a schedule instead of
 guessing.

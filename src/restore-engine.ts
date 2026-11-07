@@ -1352,3 +1352,118 @@ export function tableDataInDump(
     });
   });
 }
+
+/**
+ * 逐块读 `pg_restore --data-only -f -` 的整份输出,数出每个 COPY 段的数据行数(键 = tableKey)。
+ * 返回喂数据的 feed 和收尾的 finish;读不懂的 COPY 头、超长的头、没收尾的 COPY 段都让 finish 返回 null:
+ * 数不准就不给数,绝不拿半截结果去比。纯函数,方便单测。
+ *
+ * COPY 文本格式里一行就是一条记录(值里的换行被转义成 \n),所以数 \n 就是数行;结束符是只有 \. 的一行,
+ * 数据里以 \. 开头的值会被转义成 \\.。数据行只记前三个字符,不缓存整行:大 bytea 行能有几百 MB。
+ * COPY 头的多行拼接和解析与 copyDataProbe 相同(带引号的名字里可以有换行)。
+ */
+export function copyRowCounter(): { feed(chunk: string): void; finish(): Map<string, number> | null } {
+  const counts = new Map<string, number>();
+  let broken = false;
+  // 不在数据段时:当前行已读到的内容(只在它可能是 COPY 头时才攒),以及攒到一半的多行 COPY 头
+  let line = "";
+  let skippingLine = false;
+  let header: string | null = null;
+  // 在数据段时:正在数的表、已数的行数、当前行的前三个字符
+  let current: string | null = null;
+  let rows = 0;
+  let linePrefix = "";
+
+  const endOfHeaderLine = (complete: string) => {
+    header = header === null ? complete : `${header}\n${complete}`;
+    const balanced = (header.split('"').length - 1) % 2 === 0;
+    if (!(balanced && header.endsWith(" FROM stdin;"))) {
+      if (header.length > MAX_COPY_HEADER) broken = true;
+      return;
+    }
+    const parsed = parseCopyHeader(header);
+    header = null;
+    if (!parsed) {
+      broken = true;
+      return;
+    }
+    current = tableKey(parsed.table);
+    rows = 0;
+    linePrefix = "";
+  };
+
+  return {
+    feed(chunk) {
+      let at = 0;
+      while (!broken && at < chunk.length) {
+        const newline = chunk.indexOf("\n", at);
+        const end = newline < 0 ? chunk.length : newline;
+        if (current !== null) {
+          if (linePrefix.length < 3) linePrefix += chunk.slice(at, Math.min(end, at + 3 - linePrefix.length));
+          if (newline < 0) break;
+          if (linePrefix === "\\.") {
+            counts.set(current, (counts.get(current) ?? 0) + rows);
+            current = null;
+          } else {
+            rows++;
+          }
+          linePrefix = "";
+        } else if (skippingLine) {
+          if (newline < 0) break;
+          skippingLine = false;
+        } else {
+          line += chunk.slice(at, end);
+          // 不在拼 COPY 头、这一行也不以 COPY 开头:SET、注释、setval、大对象数据,整行跳过不攒
+          if (header === null && line.length >= 5 && !line.startsWith("COPY ")) {
+            line = "";
+            skippingLine = newline < 0;
+            if (newline < 0) break;
+          } else if ((header?.length ?? 0) + line.length > MAX_COPY_HEADER) {
+            broken = true;
+            break;
+          } else if (newline >= 0) {
+            const complete = line;
+            line = "";
+            if (header !== null || complete.startsWith("COPY ")) endOfHeaderLine(complete);
+          }
+        }
+        at = end + 1;
+      }
+    },
+    finish() {
+      // 输出停在 COPY 段或 COPY 头中间 = pg_restore 没写完,不给数
+      if (broken || current !== null || header !== null) return null;
+      return counts;
+    },
+  };
+}
+
+/**
+ * 备份文件里每张表的确切行数:让 pg_restore 把整份 dump 的数据段写成 SQL,边读边数(copyRowCounter)。
+ * 不连库,也不碰源库。matview 的数据是 REFRESH、分区父表没有自己的数据,都不会出现在结果里。
+ * pg_restore 起不来、出错退出、被中断,或者输出读不懂,都返回 null,由调用方按"数不出来"处理。
+ */
+export function countRowsInDump(dumpPath: string): Promise<Map<string, number> | null> {
+  if (interrupted()) return Promise.resolve(null);
+  return new Promise((resolve) => {
+    // 和 pgRestoreOutput 一样钉 C locale
+    const proc = spawn(resolvePgRestoreBin(), ["--data-only", "--file=-", dumpPath], {
+      stdio: ["ignore", "pipe", "ignore"],
+      env: libpqChildEnv(),
+    });
+    const forget = stopOnInterrupt(proc);
+    const counter = copyRowCounter();
+    // 按流解码:多字节字符可能被拆在两块里
+    proc.stdout.setEncoding("utf8");
+    proc.stdout.on("data", (chunk: string) => counter.feed(chunk));
+    let settled = false;
+    const settle = (result: Map<string, number> | null) => {
+      if (settled) return;
+      settled = true;
+      forget();
+      resolve(result);
+    };
+    proc.on("error", () => settle(null));
+    proc.on("close", (code) => settle(code === 0 ? counter.finish() : null));
+  });
+}

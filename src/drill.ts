@@ -18,9 +18,10 @@ import {
   restoreDatabaseArtifact,
   installSandboxShim,
   tableDataInDump,
+  countRowsInDump,
 } from "./restore-engine.js";
 import { connectPg } from "./supabase-ca.js";
-import { orphanedForeignKeysCheck, type OrphanedForeignKey } from "./orphaned-foreign-keys.js";
+import { orphanedForeignKeysCheck, tableKey, type OrphanedForeignKey } from "./orphaned-foreign-keys.js";
 import { grantsCheck, type GrantRestore, type GrantedObject } from "./grants.js";
 import { localPgRestoreMajor, restoreToolBreaksOnTarget, sandboxMajorFor } from "./pgbin.js";
 import { log } from "./log.js";
@@ -448,13 +449,74 @@ async function pgRestore(
 
 // ── 校验 ────────────────────────────────────────────────────────────
 
+/** 恢复出的一张表(verifyRestored 里查到的口径) */
+interface RestoredTable {
+  schema: string;
+  name: string;
+  kind: string;
+  extension_member: boolean;
+}
+
+/**
+ * 第 4 项检查:恢复后每张表的行数和备份文件里的确切行数逐表相等。
+ * 只比普通表(含分区的叶子):matview 的数据是 REFRESH、分区父表不存行,dump 里都没有行可数;
+ * 扩展建的表 dump 里只有一部分行(见 verifyRestored 的 extension_member)。
+ * 备份文件数不出来、某张表在备份文件里找不到数据段,都判失败:比不了就是没验证过,不拿估算顶上。
+ */
+export function rowCountsCheck(
+  inBackup: Map<string, number> | null,
+  manifest: Manifest,
+  restoredTables: RestoredTable[],
+  restoredRows: Map<string, number>
+): DrillCheck {
+  const name = "row counts match the backup";
+  if (!inBackup) {
+    return { name, pass: false, detail: "couldn't count the rows in the backup file, so row counts weren't compared" };
+  }
+  const inManifest = new Set(manifest.database.tables.map((t) => tableKey(t)));
+  const format = (n: number) => n.toLocaleString("en-US");
+  const differ: string[] = [];
+  const notInFile: string[] = [];
+  let compared = 0;
+  let rows = 0;
+  for (const t of restoredTables) {
+    if (t.kind !== "r" || t.extension_member || !inManifest.has(tableKey(t))) continue;
+    const label = `${t.schema}.${t.name}`;
+    const expected = inBackup.get(tableKey(t));
+    if (expected === undefined) {
+      notInFile.push(label);
+      continue;
+    }
+    compared++;
+    rows += expected;
+    const restored = restoredRows.get(label) ?? 0;
+    if (restored !== expected) differ.push(`${label} has ${format(restored)}, the backup has ${format(expected)}`);
+  }
+  const problems = [...differ, ...notInFile.map((label) => `${label} has no data section in the backup file`)];
+  if (problems.length > 0) {
+    const shown = problems.slice(0, 5).join("; ");
+    const more = problems.length > 5 ? `; and ${problems.length - 5} more` : "";
+    return { name, pass: false, detail: `${shown}${more}` };
+  }
+  return {
+    name,
+    pass: true,
+    detail:
+      compared === 0
+        ? "no tables to compare"
+        : `all ${format(compared)} tables match the backup exactly (${format(rows)} rows)`,
+  };
+}
+
 /** 导出:真实恢复(restore.ts)复用同一套表级验证——两条路径对同一快照必须同一结论。 */
 export async function verifyRestored(
   connString: string,
   manifest: Manifest,
-  /** 恢复用的那份 dump:恢复出空表时回查它,见第 3 项检查 */
+  /** 恢复用的那份 dump:逐表行数从它里面数(第 4 项检查),恢复出空表时也回查它(第 3 项) */
   dumpPath?: string
 ): Promise<{ checks: DrillCheck[]; tableCount: number; rowTotal: number }> {
+  // 备份文件里的确切行数只读本地文件、不连库,和下面逐表 count(*) 同时跑,省掉一段等待
+  const backupRowsP = dumpPath ? countRowsInDump(dumpPath) : null;
   // pgConnectOptions:真实 Supabase 目标(restore 复用本函数)需要打包根 CA;
   // 沙箱的 docker 连接串非 Supabase 主机,原样透传,行为不变
   const client = await connectPg(connString);
@@ -469,9 +531,14 @@ export async function verifyRestored(
       name: string;
       kind: string;
       populated: boolean;
+      extension_member: boolean;
     }>(
+      // extension_member:扩展建的表(比如装在 public 里的 PostGIS spatial_ref_sys)。CREATE EXTENSION 会自带
+      // 初始行,dump 里只有过了扩展过滤条件的那部分,恢复后的行数天然比 dump 多,不做逐行比对
       `select n.nspname as schema, c.relname as name,
-              c.relkind as kind, c.relispopulated as populated
+              c.relkind as kind, c.relispopulated as populated,
+              exists (select 1 from pg_depend d
+                       where d.classid = 'pg_class'::regclass and d.objid = c.oid and d.deptype = 'e') as extension_member
          from pg_class c
          join pg_namespace n on n.oid = c.relnamespace
         where c.relkind in ('r', 'p', 'm')
@@ -497,8 +564,11 @@ export async function verifyRestored(
       }
       // 名字来自恢复出的库(= 来自 dump = 桶里的数据):必须走标识符转义,
       // 内嵌引号的合法名不炸,构造名不注入
+      // 普通表用 only:老式继承的父表 count(*) 会连子表的行一起算,dump 里父表只有它自己的行。
+      // 分区父表本身不存行,照旧数全部分区(只用于"有没有数据",不参与逐表比对)
+      const only = t.kind === "r" ? "only " : "";
       const c = await client.query<{ n: string }>(
-        `select count(*)::bigint as n from ${quoteIdent(t.schema)}.${quoteIdent(t.name)}`
+        `select count(*)::bigint as n from ${only}${quoteIdent(t.schema)}.${quoteIdent(t.name)}`
       );
       const n = Number(c.rows[0].n);
       counts.set(key, n);
@@ -561,6 +631,11 @@ export async function verifyRestored(
             ? `no populated table restored empty (already empty in the backup: ${names(emptyInBackup)})`
             : "no populated table restored empty",
     });
+
+    // 4. 逐表行数和备份文件里一模一样。manifest 的行数是统计估算,只能管"别变空";确切的备份行数
+    // 从 dump 本身数(dump 是 pg_dump 在一个一致快照里导出的,它的行数就是这次备份下来的行数),
+    // 不去源库 count(*):那要在用户的库上全表扫一遍。数不出来就判失败,不退回估算
+    if (backupRowsP) checks.push(rowCountsCheck(await backupRowsP, manifest, restoredTables, counts));
 
     return { checks, tableCount: restoredTables.length, rowTotal };
   } finally {
