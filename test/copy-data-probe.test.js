@@ -54,7 +54,7 @@ test("copyDataProbe: quoted names may hold CR, CRLF or a whole fake header", () 
 test("copyDataProbe: another table's header or an unreadable one is unknown, never a verdict", () => {
   assert.equal(feed("public", "t", "COPY public.other (id) FROM stdin;\n\\.\n"), "unknown");
   assert.equal(feed("public", "t", "COPY public.t WITH garbage FROM stdin;\n\\.\n"), "unknown");
-  assert.equal(feed("public", "t", 'COPY public."' + "x".repeat(100_001)), "unknown");
+  assert.equal(feed("public", "t", 'COPY public."' + "x".repeat(1_000_001)), "unknown");
   // 输出里没有 COPY 段(比如 matview 只有 REFRESH):喂完也没有结论,调用方按查不清处理
   assert.equal(feed("public", "mv", PREAMBLE + "REFRESH MATERIALIZED VIEW public.mv;\n"), null);
 });

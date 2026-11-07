@@ -179,6 +179,8 @@ backupdrill drill                    # latest snapshot; add --snapshot <timestam
 backupdrill drill --verify-all-files # also checksum every Storage file, not just a sample
 ```
 
+After the restore, the drill counts the rows of every table in the sandbox and compares each count with the number of rows that table has in the backup file. One row more or less in any table fails the drill. The backup's count comes from reading the dump itself, not from your database, so this adds no queries against production; it costs the drill one extra read of the dump. Materialized views and partitioned parent tables have no rows of their own in the dump, and tables created by an extension hold rows the extension adds itself, so these are checked for being non-empty instead. `restore` runs the same comparison on the target project.
+
 Backups record your installed Postgres extensions in the manifest, and the drill pre-installs them in the sandbox before restoring — including switching to a pgvector-enabled sandbox image when your database uses `vector` columns.
 
 The sandbox restore runs up to 4 parallel `pg_restore` jobs, sized from the CPUs and memory Docker reports, so a 2 vCPU / 8 GB machine gets 2. Table data and index builds run in parallel. Foreign keys, triggers and policies run on a single connection to keep their error messages separate, including errors about Supabase-managed objects such as `auth.users`. `backupdrill restore` into a real Supabase project stays on a single connection.

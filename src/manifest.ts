@@ -11,7 +11,8 @@ export interface TableStat {
   schema: string;
   name: string;
   // 来自 n_live_tup:是估算值(planner 统计),不是精确 count(*);分区父表恒为 0。
-  // 对"体积/行数骤降"这类异常检测足够;需要精确值时云版会在演练里重新计数。
+  // 只用于展示、异常检测和演练的"有行的表别变空"。演练的逐表确切比对不用它:
+  // 确切行数从备份文件本身数(restore-engine countRowsInDump),不在源库上 count(*)。
   estimatedRows: number;
   // ---- 以下为验证升级包预留字段(恢复闭环 PRD §5.1.2 / §0.1 D3):随 v2 一并定稿
   // 以免二次升版,但本期不生成。只存聚合结果,绝不落抽样行原始值或 PII。
