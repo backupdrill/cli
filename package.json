@@ -1,7 +1,7 @@
 {
   "name": "backupdrill",
   "version": "2.11.0",
-  "description": "Open-source CLI to back up a Supabase project — Postgres database and Storage files — to your own S3/R2/B2 bucket, with a checksummed manifest.",
+  "description": "Open-source CLI to back up a Supabase project to your own S3/R2/B2 bucket (the Postgres database, Auth users when your role can read them, and Storage files once you add the project's Storage S3 keys), then run a restore drill that proves the backup restores.",
   "type": "module",
   "bin": {
     "backupdrill": "dist/index.js"
@@ -50,6 +50,8 @@
     "cloudflare-r2",
     "backblaze-b2",
     "disaster-recovery",
+    "supabase-auth",
+    "backup-verification",
     "healthchecks",
     "pi-package"
   ],

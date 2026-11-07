@@ -30,7 +30,7 @@ RUN ln -s /app/dist/index.js /usr/local/bin/backupdrill \
   && chmod 755 /usr/local/bin/backupdrill-entrypoint
 
 LABEL org.opencontainers.image.source="https://github.com/backupdrill/cli" \
-      org.opencontainers.image.description="Back up a Supabase project's Postgres database and Storage files to your own S3/R2/B2 bucket on a schedule." \
+      org.opencontainers.image.description="Back up a Supabase project's Postgres database, Auth users (when your role can read them) and Storage files (once you add the project's Storage S3 keys) to your own S3/R2/B2 bucket on a schedule." \
       org.opencontainers.image.licenses="MIT"
 
 USER node
