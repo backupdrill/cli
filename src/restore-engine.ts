@@ -1472,6 +1472,9 @@ async function countRowsInDumpOrThrow(dumpPath: string, signal?: AbortSignal): P
   try {
     const listFile = join(listDir, "table-data.list");
     await writeFile(listFile, dataEntries.join("\n") + "\n");
+    // 建临时目录、写清单的这两步里也可能被叫停。abort 事件已经发过,后面挂的监听收不到,
+    // 不在这里再看一眼,起来的 pg_restore 就会把整份 dump 读完。这一眼和下面挂监听在同一拍里,中间没有空档
+    if (signal?.aborted) return null;
     return await new Promise((resolve) => {
       // 和 pgRestoreOutput 一样钉 C locale
       const proc = spawn(bin, ["--data-only", `--use-list=${listFile}`, "--file=-", dumpPath], {

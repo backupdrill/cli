@@ -5,7 +5,7 @@ import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { createHash } from "node:crypto";
-import { readFileSync, mkdtempSync, rmSync } from "node:fs";
+import { readFileSync, mkdtempSync, rmSync, mkdirSync, writeFileSync, readdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { drillDump, verifyRestored } from "../dist/drill.js";
@@ -118,6 +118,35 @@ test(
       const stopped = countRowsInDump(dumpPath, stop.signal);
       stop.abort();
       assert.equal(await stopped, null);
+      // 在建临时目录到起 pg_restore 之间叫停:abort 事件发在挂监听之前,也不能再起 pg_restore。
+      // 时机靠真 AbortSignal 卡不准,用一个"临时目录一建出来就算已叫停"的 signal 把它钉死;
+      // 包一层 pg_restore 记下每次调用,看有没有起 --data-only 那一遍
+      const scratch = join(tmp, "scratch");
+      mkdirSync(scratch);
+      const calls = join(tmp, "pg_restore.calls");
+      const wrapper = join(tmp, "pg_restore-wrapper.sh");
+      writeFileSync(wrapper, `#!/bin/sh\necho "$@" >> '${calls}'\nexec '${pgRestore}' "$@"\n`, { mode: 0o755 });
+      const lateStop = {
+        get aborted() {
+          return readdirSync(scratch).some((name) => name.startsWith("backupdrill-rowcount-"));
+        },
+        addEventListener() {},
+        removeEventListener() {},
+      };
+      const savedEnv = { TMPDIR: process.env.TMPDIR, BACKUPDRILL_PG_RESTORE: process.env.BACKUPDRILL_PG_RESTORE };
+      process.env.TMPDIR = scratch;
+      process.env.BACKUPDRILL_PG_RESTORE = wrapper;
+      try {
+        assert.equal(await countRowsInDump(dumpPath, lateStop), null);
+      } finally {
+        for (const [name, value] of Object.entries(savedEnv)) {
+          if (value === undefined) delete process.env[name];
+          else process.env[name] = value;
+        }
+      }
+      const invoked = readFileSync(calls, "utf8");
+      assert.match(invoked, /--list/, "the wrapper was used");
+      assert.doesNotMatch(invoked, /--data-only/, "no pg_restore started after the caller stopped");
       // 临时目录建不了:返回 null(演练判"数不出来"),不能抛出去变成没人接的 rejection
       const savedTmp = process.env.TMPDIR;
       process.env.TMPDIR = join(tmp, "no-such-dir");
