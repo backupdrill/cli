@@ -1445,28 +1445,29 @@ export function copyRowCounter(): { feed(chunk: string): void; finish(): Map<str
  * 不连库,也不碰源库。matview 的数据是 REFRESH、分区父表没有自己的数据,都不会出现在结果里。
  * pg_restore 起不来、出错退出、被中断,或者输出读不懂,都返回 null,由调用方按"数不出来"处理。
  */
-export async function countRowsInDump(dumpPath: string): Promise<Map<string, number> | null> {
+export async function countRowsInDump(dumpPath: string, signal?: AbortSignal): Promise<Map<string, number> | null> {
   // 绝不抛错:调用方是在逐表 count(*) 之前就把它挂在后台的,临时目录建不了、写不进、删不掉,
   // 都只能落成"数不出来",不能变成没人接的 rejection 把演练进程带崩
   try {
-    return await countRowsInDumpOrThrow(dumpPath);
+    return await countRowsInDumpOrThrow(dumpPath, signal);
   } catch {
     return null;
   }
 }
 
-async function countRowsInDumpOrThrow(dumpPath: string): Promise<Map<string, number> | null> {
-  if (interrupted()) return null;
+async function countRowsInDumpOrThrow(dumpPath: string, signal?: AbortSignal): Promise<Map<string, number> | null> {
+  if (interrupted() || signal?.aborted) return null;
   const bin = resolvePgRestoreBin();
   let listing: { code: number | null; stdout: string };
   try {
-    listing = await pgRestoreOutput(bin, ["--list", dumpPath]);
+    listing = await pgRestoreOutput(bin, ["--list", dumpPath], { signal });
   } catch {
     return null;
   }
   if (listing.code !== 0) return null;
   const dataEntries = listing.stdout.split("\n").filter((line) => /^\d+; 0 \d+ TABLE DATA /.test(line));
   if (dataEntries.length === 0) return new Map();
+  if (signal?.aborted) return null;
   const listDir = await mkdtemp(join(tmpdir(), "backupdrill-rowcount-"));
   try {
     const listFile = join(listDir, "table-data.list");
@@ -1489,8 +1490,14 @@ async function countRowsInDumpOrThrow(dumpPath: string): Promise<Map<string, num
         forget();
         resolve(result);
       };
+      // 调用方叫停(演练别处已经失败):停掉 pg_restore,不在后台把整份 dump 读完
+      const stop = () => proc.kill("SIGTERM");
+      signal?.addEventListener("abort", stop, { once: true });
       proc.on("error", () => settle(null));
-      proc.on("close", (code) => settle(code === 0 ? counter.finish() : null));
+      proc.on("close", (code) => {
+        signal?.removeEventListener("abort", stop);
+        settle(code === 0 && !signal?.aborted ? counter.finish() : null);
+      });
     });
   } finally {
     await rm(listDir, { recursive: true, force: true });

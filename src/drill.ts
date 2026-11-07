@@ -516,11 +516,13 @@ export async function verifyRestored(
   /** 恢复用的那份 dump:逐表行数从它里面数(第 4 项检查),恢复出空表时也回查它(第 3 项) */
   dumpPath?: string
 ): Promise<{ checks: DrillCheck[]; tableCount: number; rowTotal: number }> {
-  // 备份文件里的确切行数只读本地文件、不连库,和下面逐表 count(*) 同时跑,省掉一段等待
-  const backupRowsP = dumpPath ? countRowsInDump(dumpPath) : null;
   // pgConnectOptions:真实 Supabase 目标(restore 复用本函数)需要打包根 CA;
   // 沙箱的 docker 连接串非 Supabase 主机,原样透传,行为不变
   const client = await connectPg(connString);
+  // 备份文件里的确切行数只读本地文件、不连库,和下面逐表 count(*) 同时跑,省掉一段等待。
+  // 连上库之后才开始;这一步中途失败时由 finally 停掉它,不让它在演练收尾之后还在后台读整份 dump
+  const stopCounting = new AbortController();
+  const backupRowsP = dumpPath ? countRowsInDump(dumpPath, stopCounting.signal) : null;
   try {
     const schemas = manifest.database.schemas;
     // 口径必须与 manifest 统计端(backup.ts inspectDatabase)完全一致:
@@ -641,6 +643,9 @@ export async function verifyRestored(
 
     return { checks, tableCount: restoredTables.length, rowTotal };
   } finally {
+    // 正常走完时它早已结束,这两步什么都不做
+    stopCounting.abort();
+    await backupRowsP;
     await client.end();
   }
 }

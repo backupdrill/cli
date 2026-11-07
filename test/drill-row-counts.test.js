@@ -113,6 +113,11 @@ test(
         }
       );
       assert.equal(await countRowsInDump(join(tmp, "missing.pgcustom")), null);
+      // 叫停:返回 null,不读完整份 dump
+      const stop = new AbortController();
+      const stopped = countRowsInDump(dumpPath, stop.signal);
+      stop.abort();
+      assert.equal(await stopped, null);
       // 临时目录建不了:返回 null(演练判"数不出来"),不能抛出去变成没人接的 rejection
       const savedTmp = process.env.TMPDIR;
       process.env.TMPDIR = join(tmp, "no-such-dir");
@@ -171,7 +176,15 @@ test(
       assert.equal(check.detail, "public.a.b has 2, the backup has 3; public.dogs has 4, the backup has 3; public.orders has 999, the backup has 1,000");
       assert.equal(verified.checks.find((c) => c.name === "populated tables came back").pass, true);
 
-      // 4. 不给 dump 路径(老调用方式):没有可比的确切行数,这一项不出现
+      // 4. 校验中途失败(这个角色读不了 orders,count(*) 报错):verifyRestored 照样抛错,
+      // 但后台数 dump 的 pg_restore 要一起停掉,不能在演练收尾之后还在读
+      await psql(target.id, "create role limited login password 'lim'; grant usage on schema public to limited; grant select on all tables in schema public to limited; revoke select on orders from limited;");
+      const limitedConn = target.conn.replace("postgres:seed@", "limited:lim@");
+      await assert.rejects(verifyRestored(limitedConn, manifest, dumpPath), /permission denied/);
+      const leftover = await x("pgrep", ["-f", dumpPath]).then((r) => r.stdout.trim(), () => "");
+      assert.equal(leftover, "", "no pg_restore still reading the dump");
+
+      // 5. 不给 dump 路径(老调用方式):没有可比的确切行数,这一项不出现
       const withoutDump = await verifyRestored(target.conn, manifest);
       assert.equal(withoutDump.checks.find((c) => c.name === "row counts match the backup"), undefined);
     } finally {
