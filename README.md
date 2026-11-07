@@ -33,14 +33,14 @@ npx backupdrill backup
 
 ## Use it from Claude Code or Cursor
 
-The [`plugin/`](plugin/) folder is a plugin for Claude Code and Cursor. It teaches the agent to run `estimate`, `backup`, `drill` and `restore` for you, keeps your keys in a gitignored `.env.backupdrill` that the agent never opens, and always does a dry run before a restore. In Claude Code:
+The [`plugin/`](https://github.com/backupdrill/cli/tree/main/plugin) folder is a plugin for Claude Code and Cursor. It teaches the agent to run `estimate`, `backup`, `drill` and `restore` for you, keeps your keys in a gitignored `.env.backupdrill` that the agent never opens, and always does a dry run before a restore. In Claude Code:
 
 ```
 /plugin marketplace add backupdrill/cli
 /plugin install backupdrill@backupdrill
 ```
 
-Details are in [plugin/README.md](plugin/README.md).
+Details are in [plugin/README.md](https://github.com/backupdrill/cli/blob/main/plugin/README.md).
 
 ## Use it from Pi
 
@@ -50,7 +50,7 @@ This npm package is also a Pi package. Installing it gives Pi the same skill the
 pi install npm:backupdrill
 ```
 
-Start a new Pi session and ask it to back up your Supabase project or run a restore drill. The skill runs the CLI through `npx`, so Node.js 20 or newer has to be on your `PATH`. Everything else it needs, and where your keys go, is in [plugin/README.md](plugin/README.md).
+Start a new Pi session and ask it to back up your Supabase project or run a restore drill. The skill runs the CLI through `npx`, so Node.js 20 or newer has to be on your `PATH`. Everything else it needs, and where your keys go, is in [plugin/README.md](https://github.com/backupdrill/cli/blob/main/plugin/README.md).
 
 ## Usage
 
@@ -334,7 +334,7 @@ Add the secrets under Settings → Secrets and variables → Actions:
 
 The action's README lists every input and output.
 
-Prefer a plain workflow file? [`examples/scheduled-backup.yml`](examples/scheduled-backup.yml) runs the backup without the action and without a drill. Copy it into your own repo at `.github/workflows/scheduled-backup.yml` and add the same secrets. (It lives under `examples/` here so GitHub doesn't try to run it in this repo.) It runs daily and can also be started by hand from the Actions tab.
+Prefer a plain workflow file? [`examples/scheduled-backup.yml`](https://github.com/backupdrill/cli/blob/main/examples/scheduled-backup.yml) runs the backup without the action and without a drill. Copy it into your own repo at `.github/workflows/scheduled-backup.yml` and add the same secrets. (It lives under `examples/` here so GitHub doesn't try to run it in this repo.) It runs daily and can also be started by hand from the Actions tab.
 
 Before switching to a **daily** schedule, read the egress-cost section above — every run is egress on your Supabase bill.
 
