@@ -493,6 +493,14 @@ before 1.0 have no `schemaVersion` and are treated as version 1, so older backup
 The package's **JavaScript exports are internal** to the hosted BackupDrill product and are not
 covered by this promise; they may change in any release. Use the CLI if you need a stable contract.
 
+## Elsewhere
+
+- The PostgreSQL.org software catalogue lists backupdrill under [Administration/development tools](https://www.postgresql.org/download/products/1-administrationdevelopment-tools/).
+- The [pgAdmin blog aggregator](https://www.pgadmin.org/blogs/) carries our guide to backing up a Supabase database with pgAdmin's Backup and Restore dialogs.
+- [backupdrill on StackShare](https://stackshare.io/backupdrill).
+- A [ZAP success story](https://www.zaproxy.org/success/backupdrill/) describes the weekly ZAP baseline scan we run against our website.
+- The agent skill in [`plugin/`](https://github.com/backupdrill/cli/tree/main/plugin) is also published on the [Tessl registry](https://tessl.io/registry/backupdrill/supabase-backup) and [LobeHub](https://lobehub.com/skills/backupdrill-cli-supabase-backup).
+
 ## License
 
 MIT
