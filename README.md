@@ -33,7 +33,7 @@ npx backupdrill backup
 
 ## Use it from Claude Code or Cursor
 
-The [`plugin/`](https://github.com/backupdrill/cli/tree/main/plugin) folder is a plugin for Claude Code and Cursor. It teaches the agent to run `estimate`, `backup`, `drill` and `restore` for you, keeps your keys in a gitignored `.env.backupdrill` that the agent never opens, and always does a dry run before a restore. In Claude Code:
+The [`plugin/`](https://github.com/backupdrill/cli/tree/main/plugin) folder is a plugin for Claude Code and Cursor. It teaches the agent to run `estimate`, `backup`, `drill` and `restore` for you. Its instructions keep your keys in a gitignored `.env.backupdrill` that the agent is told never to open, and have it do a dry run before every restore. In Claude Code:
 
 ```
 /plugin marketplace add backupdrill/cli
@@ -180,6 +180,8 @@ backupdrill drill --verify-all-files # also checksum every Storage file, not jus
 ```
 
 After the restore, the drill counts the rows of every table in the sandbox and compares each count with the number of rows that table has in the backup file. One row more or less in any table fails the drill. The backup's count comes from reading the dump itself, not from your database, so this adds no queries against production; it costs the drill one extra read of the dump. Materialized views and partitioned parent tables have no rows of their own in the dump, and tables created by an extension hold rows the extension adds itself, so these are checked for being non-empty instead. `restore` runs the same comparison on the target project.
+
+If you also keep a written record of each drill for your team or an audit (which snapshot, how long the restore took, who checked the app afterwards), there's a free [restore drill log template](https://tally.so/templates/database-restore-drill-log/mZBx5m) on Tally with those fields. `--record` below stores the machine-readable side of the same result in your bucket.
 
 Backups record your installed Postgres extensions in the manifest, and the drill pre-installs them in the sandbox before restoring — including switching to a pgvector-enabled sandbox image when your database uses `vector` columns.
 
@@ -483,8 +485,8 @@ following is the stable public surface — breaking it requires a major version 
 - the layout written to your bucket, and the shape of `manifest.json` and the drill record files
 - the names and meaning of the metrics `exporter` serves
 
-`manifest.json` carries a `schemaVersion` so the format can evolve safely. A snapshot written by
-a newer release is **refused with a clear message** rather than parsed on a best-effort basis —
+`manifest.json` carries a `schemaVersion` so the format can evolve safely. A snapshot whose
+`schemaVersion` is newer than this CLI supports is **refused with a clear message** rather than parsed on a best-effort basis —
 for a backup tool, silently misreading an archive is the worst possible failure. Snapshots taken
 before 1.0 have no `schemaVersion` and are treated as version 1, so older backups stay readable.
 
