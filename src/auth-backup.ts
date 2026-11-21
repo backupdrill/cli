@@ -371,21 +371,33 @@ export async function inspectAuth(
   }
 }
 
+/** Supabase(GoTrue)自带、抹过的值一定过得了的 CHECK:pg_get_constraintdef 的原文,逐字比较(PG16/17 实测一致) */
+const STOCK_CHECKS = ["CHECK (((email_change_confirm_status >= 0) AND (email_change_confirm_status <= 2)))"];
+
+/**
+ * Supabase 自带的 token 唯一索引的 WHERE 条件(pg_get_expr 的原文):数字和空格组成的值不进索引,
+ * 抹成的空串因此也不进。varchar 列带 ::text,text 列不带
+ */
+const stockTokenPredicates = (column: string) => [`((${column})::text !~ '^[0-9 ]*$'::text)`, `(${column} !~ '^[0-9 ]*$'::text)`];
+
 /**
  * 2.11.1 起 auth.dump 里待处理的 token 被抹成空串、发送时间成 NULL、确认状态成 0(见 auth-archive.ts)。
  * 用户自己在 auth.users 上加的约束可能不接受这些值:例如 CHECK (recovery_token <> '')、发送时间 NOT NULL、
  * token 列上不带条件的唯一索引(所有行都成了 '',撞在一起)。原样的归档恢复得了、抹过的却恢复不了,
- * 这比不抹更糟,所以备份时就在同一个只读快照里查:把每一行换成抹过的样子,逐条套用会在 COPY 时检查的约束
- * (NOT NULL、CHECK、唯一索引),套不上就不写 auth.dump,Auth 这一节记失败、写明原因。
- * 精确判断不了的(域类型、排他约束、外键)一律按冲突处理。Supabase 自带的结构能过:
- * token 上的唯一索引带着 WHERE token !~ '^[0-9 ]*$',空串不在索引里;确认状态的 CHECK 是 0 到 2。
- * 只读:全是 select,跑在 inspectAuth 已经开着的 REPEATABLE READ READ ONLY 事务里,不另开连接。
- * 某一条检查自己出错(比如约束里调用了角色没权限的函数)也按冲突处理,宁可这次不备 Auth
+ * 这比不抹更糟,所以备份时先查,有可能被拒就不写 auth.dump,Auth 这一节记失败、写明是哪条约束。
+ *
+ * **只读系统目录,不执行任何用户定义的东西**:约束表达式里可以调用用户函数(dblink、http、很慢或有副作用的),
+ * 不能拿备份角色的权限在生产库上跑它们。所以按定义的原文静态判断,而且偏保守:
+ *  - 被抹成 NULL 的列是 NOT NULL,或者被抹的列是域类型 → 冲突;
+ *  - 用到被抹的列的 CHECK,除非和 Supabase 自带的那条逐字相同 → 冲突;
+ *  - 用到被抹的列的唯一索引(键、表达式或 WHERE 条件里),除非正是 Supabase 自带的样子
+ *    (单个 token 列,WHERE 是 !~ '^[0-9 ]*$')→ 冲突;
+ *  - 用到被抹的列的外键、排他约束 → 冲突。
+ * 跑在 inspectAuth 已经开着的 REPEATABLE READ READ ONLY 事务里,不另开连接
  */
 async function pendingTokenConflicts(client: pg.Client): Promise<string[]> {
-  const columns = await client.query<{ attnum: number; name: string; type: string; notnull: boolean; domain: boolean }>(
-    `select a.attnum, a.attname as name, format_type(a.atttypid, a.atttypmod) as type, a.attnotnull as notnull,
-            t.typtype = 'd' as domain
+  const columns = await client.query<{ attnum: number; name: string; notnull: boolean; domain: boolean }>(
+    `select a.attnum, a.attname as name, a.attnotnull as notnull, t.typtype = 'd' as domain
        from pg_attribute a join pg_type t on t.oid = a.atttypid
       where a.attrelid = 'auth.users'::regclass and a.attnum > 0 and not a.attisdropped
       order by a.attnum`
@@ -395,53 +407,23 @@ async function pendingTokenConflicts(client: pg.Client): Promise<string[]> {
   if (!touched.length) return [];
   const conflicts: string[] = [];
   for (const c of touched) {
-    if (c.domain) conflicts.push(`column ${c.name} has a domain type`);
-    if (c.notnull && blanked.get(c.name) === "\\N") conflicts.push(`column ${c.name} is NOT NULL`);
+    if (c.domain) conflicts.push(`column ${c.name}, which has a domain type`);
+    if (c.notnull && blanked.get(c.name) === "\\N") conflicts.push(`NOT NULL column ${c.name}`);
   }
-  if (conflicts.length) return conflicts;
-  const ident = (name: string) => `"${name.replace(/"/g, '""')}"`;
-  const literal = (copyValue: string, type: string) =>
-    copyValue === "\\N" ? `null::${type}` : `${client.escapeLiteral(copyValue)}::${type}`;
-  // 每一行抹过之后的样子;生成列在 COPY 里没有,照原样带上(约束里也可能用到)
-  const rows =
-    `(select ${columns.rows
-      .map((c) => (blanked.has(c.name) ? `${literal(blanked.get(c.name)!, c.type)} as ${ident(c.name)}` : ident(c.name)))
-      .join(", ")} from auth.users) u`;
   const attnums = touched.map((c) => c.attnum);
-  // 一条检查出错只算这一条冲突,不连累别的检查和外面的事务
-  const holds = async (what: string, sql: string) => {
-    await client.query("savepoint scrub_check");
-    try {
-      const r = await client.query<{ bad: boolean }>(sql);
-      await client.query("release savepoint scrub_check");
-      if (r.rows[0]?.bad) conflicts.push(what);
-    } catch {
-      await client.query("rollback to savepoint scrub_check");
-      conflicts.push(`${what} (couldn't be checked)`);
-    }
-  };
-  const constraints = await client.query<{ name: string; type: string; expr: string | null }>(
-    `select conname as name, contype::text as type,
-            case when contype = 'c' then pg_get_expr(conbin, conrelid) end as expr
+  const constraints = await client.query<{ name: string; type: string; def: string }>(
+    `select conname as name, contype::text as type, pg_get_constraintdef(oid) as def
        from pg_constraint
       where conrelid = 'auth.users'::regclass and conkey && $1::int2[] and contype in ('c', 'f', 'x')
       order by 1`,
     [attnums]
   );
   for (const k of constraints.rows) {
-    if (k.type !== "c" || !k.expr) {
-      conflicts.push(`${k.type === "f" ? "foreign key" : "exclusion constraint"} ${k.name}`);
-      continue;
-    }
-    // CHECK 结果为 NULL 也算通过,和 Postgres 自己一样
-    await holds(`check constraint ${k.name}`, `select exists (select 1 from ${rows} where not coalesce((${k.expr}), true)) as bad`);
+    if (k.type === "c" && STOCK_CHECKS.includes(k.def)) continue;
+    conflicts.push(`${k.type === "c" ? "check constraint" : k.type === "f" ? "foreign key" : "exclusion constraint"} ${k.name}`);
   }
-  // 唯一索引:键列、表达式或 WHERE 条件里用到了被抹的列。索引键和条件按定义原样套在抹过的行上找重复
-  const indexes = await client.query<{ name: string; keys: string[]; pred: string | null; nulls_distinct: boolean }>(
-    `select c.relname as name,
-            array(select pg_get_indexdef(i.indexrelid, k, true) from generate_series(1, i.indnkeyatts) k) as keys,
-            pg_get_expr(i.indpred, i.indrelid) as pred,
-            not coalesce((to_jsonb(i) ->> 'indnullsnotdistinct')::boolean, false) as nulls_distinct
+  const indexes = await client.query<{ name: string; keys: number[]; pred: string | null }>(
+    `select c.relname as name, i.indkey::int2[] as keys, pg_get_expr(i.indpred, i.indrelid) as pred
        from pg_index i join pg_class c on c.oid = i.indexrelid
       where i.indrelid = 'auth.users'::regclass and i.indisunique
         and (i.indkey::int2[] && $1::int2[]
@@ -452,11 +434,10 @@ async function pendingTokenConflicts(client: pg.Client): Promise<string[]> {
     [attnums]
   );
   for (const ix of indexes.rows) {
-    const where = [ix.pred ? `(${ix.pred})` : "true", ...(ix.nulls_distinct ? ix.keys.map((key) => `(${key}) is not null`) : [])];
-    await holds(
-      `unique index ${ix.name}`,
-      `select exists (select 1 from ${rows} where ${where.join(" and ")} group by ${ix.keys.map((key) => `(${key})`).join(", ")} having count(*) > 1) as bad`
-    );
+    // Supabase 自带的样子:只有一个键,是被抹成空串的那一列本身(不是表达式),WHERE 正是那一句
+    const column = ix.keys.length === 1 ? touched.find((c) => c.attnum === ix.keys[0]) : undefined;
+    const stock = column && blanked.get(column.name) === "" && ix.pred !== null && stockTokenPredicates(column.name).includes(ix.pred);
+    if (!stock) conflicts.push(`unique index ${ix.name}`);
   }
   return conflicts;
 }

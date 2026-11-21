@@ -507,7 +507,34 @@ test(
           assert.equal(r.files.has("auth.dump"), false);
           assert.ok(r.files.get("dump.pgcustom").length > 0);
 
-          await sql(admin, "alter table auth.users drop constraint recovery_token_set; create unique index recovery_token_unique on auth.users (recovery_token)");
+          // 约束里调用了用户函数:备份只读系统目录里的定义,绝不在源库上执行它。函数一旦被调用就抛错,
+          // 那样这里就会变成"检查 Auth 表失败",而不是写明是哪条约束
+          await sql(admin, `alter table auth.users drop constraint recovery_token_set;
+            create function public.never_call_me(t text) returns boolean language plpgsql as $$
+            begin raise exception 'called on the source database'; end $$;
+            alter table auth.users add constraint token_checked_by_function check (public.never_call_me(recovery_token)) not valid`);
+          r = await run("scrub-function", { databaseUrl: okUrl, auth: "default" });
+          assert.equal(r.manifest.auth.status, "failed");
+          assert.equal(
+            r.manifest.auth.reason,
+            "Auth archive not written: clearing the pending Auth tokens would break check constraint token_checked_by_function on auth.users"
+          );
+          assert.equal(r.files.has("auth.dump"), false);
+          assert.ok(r.files.get("dump.pgcustom").length > 0);
+
+          // 被抹成 NULL 的发送时间列是 NOT NULL
+          await sql(admin, `alter table auth.users drop constraint token_checked_by_function;
+            update auth.users set reauthentication_sent_at = now() where reauthentication_sent_at is null;
+            alter table auth.users alter column reauthentication_sent_at set not null`);
+          r = await run("scrub-notnull", { databaseUrl: okUrl, auth: "default" });
+          assert.equal(
+            r.manifest.auth.reason,
+            "Auth archive not written: clearing the pending Auth tokens would break NOT NULL column reauthentication_sent_at on auth.users"
+          );
+          assert.equal(r.files.has("auth.dump"), false);
+          await sql(admin, "alter table auth.users alter column reauthentication_sent_at drop not null; update auth.users set reauthentication_sent_at = null");
+
+          await sql(admin, "create unique index recovery_token_unique on auth.users (recovery_token)");
           r = await run("scrub-unique", { databaseUrl: okUrl, auth: "default" });
           assert.equal(r.manifest.auth.status, "failed");
           assert.equal(
@@ -519,6 +546,9 @@ test(
         } finally {
           await sql(admin, `drop index if exists auth.recovery_token_unique;
             alter table auth.users drop constraint if exists recovery_token_set;
+            alter table auth.users drop constraint if exists token_checked_by_function;
+            drop function if exists public.never_call_me(text);
+            alter table auth.users alter column reauthentication_sent_at drop not null;
             update auth.users set recovery_token = '' where recovery_token like 'r-%'`);
         }
         // 去掉之后照常:Supabase 自带的那些(fixture 里有)不挡
