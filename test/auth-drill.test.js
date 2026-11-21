@@ -6,7 +6,7 @@ import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { runBackup } from "../dist/backup.js";
-import { runDrill } from "../dist/drill.js";
+import { OFFLINE_SIGNUP_LIMITS, offlineSandbox, runDrill } from "../dist/drill.js";
 import { AUTH_DRILL_LIMITS, authDrillSection } from "../dist/auth-drill.js";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { randomUUID } from "node:crypto";
@@ -427,53 +427,89 @@ id" uuid references auth.users (id) on delete set null)`);
       const inContainer = async (id, query) =>
         (await x("docker", ["exec", id, "psql", "-U", "postgres", "-X", "-tA", "-c", query])).stdout.trim();
 
-      await t.test("a sandbox kept with --keep after the test sign-up stays off the network and says how to get in", async () => {
+      await t.test("--keep keeps a reachable sandbox: the test sign-up is skipped, connString works as in 2.11.0", async () => {
         const mem = await backup("default");
         const report = await runDrill(config, { store: mem.store, appCheckCommand: "exit 1", keepSandboxOnFailure: true });
         assert.ok(report.keptSandbox, "a failed drill with --keep leaves the sandbox");
         const id = report.keptSandbox.containerId;
         try {
-          assert.deepEqual(report.auth.signup, { ran: true, ok: true });
-          assert.equal(report.keptSandbox.offline, true);
-          assert.equal(report.keptSandbox.connString, undefined, "no host URL for a sandbox that has no network");
+          assert.deepEqual(report.auth.signup, { ran: false, detail: "skipped because --keep keeps the sandbox reachable" });
+          assert.equal(report.pass, false, "the verdict comes from the app check, as before");
+          assert.ok((await networksOf(id)).length > 0, "never taken off the network");
+          const kept = await sql(report.keptSandbox.connString, "select count(*)::int as n from auth.users");
+          assert.equal(kept.rows[0].n, 4, "connString answers; no test user was ever inserted");
           assert.equal(report.keptSandbox.inspect, `docker exec -it ${id.slice(0, 12)} psql -U postgres`);
-          assert.deepEqual(await networksOf(id), [], "never put back on the network");
-          assert.equal(await inContainer(id, "select count(*) from auth.users"), "4", "the test sign-up was rolled back");
         } finally {
           await x("docker", ["rm", "-f", "-v", id]).catch(() => {});
         }
+        // --keep 但演练通过了:沙箱不会留下,模拟注册照常(断网)跑
+        const passed = await runDrill(config, { store: mem.store, keepSandboxOnFailure: true });
+        assert.equal(passed.pass, true);
+        assert.equal(passed.keptSandbox, undefined);
+        assert.deepEqual(passed.auth.signup, { ran: true, ok: true });
       });
 
-      await t.test("an Auth check that times out during the offline sign-up: the kept sandbox is reported offline, its sessions ended", async () => {
+      await t.test("an Auth check that times out during the offline sign-up: not checked, and the drill finishes", async () => {
         await sql(admin, `
           create function public.slow_signup() returns trigger language plpgsql security definer set search_path = '' as $$
           begin perform pg_sleep(120); return new; end $$;
           create trigger slow_signup after insert on auth.users for each row execute function public.slow_signup();`);
         const previous = AUTH_DRILL_LIMITS.totalMs;
-        let id;
         try {
           const mem = await backup("default");
           AUTH_DRILL_LIMITS.totalMs = 20_000;
-          const report = await runDrill(config, { store: mem.store, appCheckCommand: "exit 1", keepSandboxOnFailure: true });
-          id = report.keptSandbox?.containerId;
-          assert.ok(id, "a failed drill with --keep leaves the sandbox");
+          const started = Date.now();
+          const report = await runDrill(config, { store: mem.store });
           assert.equal(report.auth.status, "not_checked", report.auth.summary);
-          assert.equal(report.keptSandbox.offline, true, JSON.stringify(report.keptSandbox));
-          assert.equal(report.keptSandbox.connString, undefined);
-          assert.deepEqual(await networksOf(id), []);
-          // 收尾在后台:很快就没有还在跑的模拟注册了
-          let left = "1";
-          for (let i = 0; i < 60 && left !== "0"; i++) {
-            left = await inContainer(id, "select count(*) from pg_stat_activity where backend_type = 'client backend' and pid <> pg_backend_pid()");
-            if (left !== "0") await new Promise((r) => setTimeout(r, 500));
-          }
-          assert.equal(left, "0", "no test sign-up session left in the kept sandbox");
-          assert.equal(await inContainer(id, "select count(*) from auth.users"), "4");
+          assert.deepEqual(verdict(report).pass, baseline.pass);
+          assert.ok(Date.now() - started < 90_000, `took ${Date.now() - started} ms`);
         } finally {
           AUTH_DRILL_LIMITS.totalMs = previous;
-          if (id) await x("docker", ["rm", "-f", "-v", id]).catch(() => {});
           await sql(admin, "drop trigger slow_signup on auth.users; drop function public.slow_signup()");
         }
+      });
+
+      await t.test("offline sandbox: cancelled first means no network is touched; a local timeout or a stop ends the sign-up inside", async () => {
+        await startPostgres(ids);
+        const id = ids.at(-1);
+        const sandbox = { containerId: id, offline: false };
+        const offline = offlineSandbox(sandbox);
+        const marker = () => randomUUID().replace(/-/g, "").slice(0, 16);
+        const sleepy = (m) => `select 'm${m}', pg_sleep(120);\n`;
+        const leftovers = async (m) => ({
+          sessions: await inContainer(id, `select count(*) from pg_stat_activity where query like '%m${m}%' and pid <> pg_backend_pid()`),
+          psql: (await x("docker", ["exec", id, "sh", "-c", "cat /proc/[0-9]*/comm 2>/dev/null | grep -c '^psql$' || true"])).stdout.trim(),
+        });
+
+        // 叫停在先:一个网络都不摘,沙箱照样在线
+        const early = new AbortController();
+        early.abort();
+        await assert.rejects(offline.runOffline(sleepy(marker()), marker(), early.signal), /stopped/);
+        assert.equal(sandbox.offline, false);
+        assert.ok((await networksOf(id)).length > 0);
+
+        // 本地的 docker exec 等到点被杀:容器里的那次注册也被停掉,才交出结果
+        const previous = OFFLINE_SIGNUP_LIMITS.psqlMs;
+        OFFLINE_SIGNUP_LIMITS.psqlMs = 3000;
+        try {
+          const m = marker();
+          const result = await offline.runOffline(sleepy(m), m);
+          assert.equal(result.code, null, "killed at the local timeout");
+          assert.equal(sandbox.offline, true);
+          assert.deepEqual(await networksOf(id), []);
+          assert.deepEqual(await leftovers(m), { sessions: "0", psql: "0" });
+        } finally {
+          OFFLINE_SIGNUP_LIMITS.psqlMs = previous;
+        }
+
+        // 运行中被叫停:同样停掉容器里的注册
+        const m = marker();
+        const stop = new AbortController();
+        setTimeout(() => stop.abort(), 1500);
+        const result = await offline.runOffline(sleepy(m), m, stop.signal);
+        assert.equal(result.code, null);
+        assert.deepEqual(await leftovers(m), { sessions: "0", psql: "0" });
+        assert.deepEqual(await networksOf(id), [], "and still never put back on the network");
       });
 
       await t.test("a backed-up row count that doesn't match is a problem, the verdict doesn't move", async () => {

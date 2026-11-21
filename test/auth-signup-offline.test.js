@@ -8,13 +8,11 @@ const hex = (s) => Buffer.from(s, "utf8").toString("hex");
 const out = (state, context = "") => ({ code: 0, stdout: `backupdrill-signup ${state} ${hex(context)}\n` });
 const OWN_BLOCK = 'SQL statement "insert into auth.users (id) values (1)"\nPL/pgSQL function inline_code_block line 9 at SQL statement';
 
-test("signupScript: rolls back, runs as supabase_auth_admin, and uses a fresh dollar-quote tag the inserts can't close", () => {
-  const a = signupScript("insert into auth.users (\"$bd_x$\") values (1)", "insert into auth.identities (id) values (1)");
-  const b = signupScript("insert into auth.users (id) values (1)", "insert into auth.identities (id) values (1)");
-  const tagA = /^do (\$bd_[0-9a-f]{16}\$)$/m.exec(a)[1];
-  const tagB = /^do (\$bd_[0-9a-f]{16}\$)$/m.exec(b)[1];
-  assert.notEqual(tagA, tagB);
-  assert.equal(a.split(tagA).length, 3, "the tag only opens and closes the block");
+test("signupScript: rolls back, runs as supabase_auth_admin, and quotes the block with this sign-up's random marker", () => {
+  const marker = "0123456789abcdef";
+  const a = signupScript("insert into auth.users (\"$bd_x$\") values (1)", "insert into auth.identities (id) values (1)", marker);
+  assert.match(a, /^do \$bd_0123456789abcdef\$$/m);
+  assert.equal(a.split("$bd_0123456789abcdef$").length, 3, "the marker only opens and closes the block");
   assert.match(a, /set local role supabase_auth_admin;/);
   assert.match(a, /set constraints all immediate;/);
   assert.match(a.trimEnd(), /rollback;$/);
@@ -53,6 +51,13 @@ test("signupOutcome: only a failure caused by the missing network is 'not tested
     const r = signupOutcome(out("XX000", `${statement}\nPL/pgSQL function public.tell_crm() line 2 at PERFORM\n${OWN_BLOCK}`));
     assert.equal(r.ran, false, statement);
   }
+  // 出错的就是 dblink 调用,但原因是权限(42501)或者 dblink 根本没装(42883):都是真问题,不算"没网"
+  const deniedDblink = signupOutcome(out("42501", dblinkCall));
+  assert.equal(deniedDblink.ok, false, JSON.stringify(deniedDblink));
+  assert.match(deniedDblink.detail, /^a new sign-up would fail: permission denied \(SQLSTATE 42501\)/);
+  const missingDblink = signupOutcome(out("42883", dblinkCall));
+  assert.equal(missingDblink.ok, false, JSON.stringify(missingDblink));
+  assert.match(missingDblink.detail, /^a new sign-up would fail: a function doesn't exist \(SQLSTATE 42883\)/);
   // 沙箱里装着 dblink,但触发器是因为权限失败的:照实报成注册会失败,不藏成"没测成"
   const denied = signupOutcome(
     out("42501", `SQL statement "insert into private.audit values (new.id)"\nPL/pgSQL function public.tell_crm() line 4 at SQL statement\n${OWN_BLOCK}`)

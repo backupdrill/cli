@@ -52,11 +52,12 @@ export interface AuthDumpForDrill {
  */
 export interface OfflineSandbox {
   /**
-   * 断开沙箱容器的全部网络,用容器里的 psql(走 unix socket)跑 script。**之后再也不接回网络**:
+   * 断开沙箱容器的全部网络,用容器里的 psql(走 unix socket)跑 script。marker 是这次注册的随机标记
+   * (也是 script 里 DO 块的引号标签),被叫停或超时时靠它找到并停掉容器里那次注册。**之后再也不接回网络**:
    * 只确认 SQL 会话都退出了,不能证明触发器没有留下别的东西(还没起来的 docker exec、后台进程),
    * 接回去它们就又能连出去。所以模拟注册是这个沙箱上做的最后一件事。断不开就抛错,一句 SQL 都不跑
    */
-  runOffline(script: string, signal?: AbortSignal): Promise<{ code: number | null; stdout: string }>;
+  runOffline(script: string, marker: string, signal?: AbortSignal): Promise<{ code: number | null; stdout: string }>;
   /** 是否已经开始断网(断网后经主机端口的连接都连不上了) */
   offline(): boolean;
   /** 断网之后叫停时用:经 docker exec 终止沙箱里所有客户端会话 */
@@ -182,8 +183,8 @@ async function insertStatement(client: Client, table: "users" | "identities"): P
  * 只进 stderr,改不了这一行。成功路径最后覆盖写一遍,触发器事先写进去的值不算数。整个事务最后回滚。
  * 美元引号的标签每次随机:插入语句里的列名来自归档,不能让它把 DO 块提前截断
  */
-export function signupScript(userInsert: string, identityInsert: string): string {
-  const tag = `$bd_${randomBytes(8).toString("hex")}$`;
+export function signupScript(userInsert: string, identityInsert: string, marker: string): string {
+  const tag = `$bd_${marker}$`;
   return [
     "set statement_timeout = '5min';",
     "set lock_timeout = '1min';",
@@ -221,6 +222,12 @@ export function signupScript(userInsert: string, identityInsert: string): string
  * COPY ... PROGRAM。上下文里是用户函数里出错的那条语句的原文,用户可以写成别的样子(动态 SQL 等),
  * 认不出就按真失败报——宁可报一次需要人看的失败,也不把真问题藏成"没测成"
  */
+/**
+ * 不管出错在哪个调用上都是真问题的 SQLSTATE:没权限、函数/对象/schema/表/列不存在。先认它们,
+ * 再看是不是网络:dblink_connect 因为权限失败(42501),或者 dblink 根本没装(42883),都不是"没网"
+ */
+const REAL_FAILURES = ["42501", "42883", "42704", "3F000", "42P01", "42703"];
+
 const NETWORK_CALL = /\b(dblink\w*|http(_\w+)?|net\.http_\w+)\s*\(|\bforeign table\b|\bremote SQL command\b|\b(to|from)\s+program\b/i;
 
 /** psql 的输出 → 报告里的 signup。只用 SQLSTATE 和"错在不在触发器里",错误原文不进报告(见 safeError) */
@@ -243,7 +250,7 @@ export function signupOutcome(result: { code: number | null; stdout: string }): 
     ["23503", "23505", "42501", "42883", "42P01", "42703", "3F000", "P0001"].includes(state);
   // 沙箱断着网:只有失败本身是连不出去造成的(连接类 SQLSTATE,或者出错的正是一个要联网的调用),
   // 才算"没测成";光是装着 dblink 之类的扩展不改结论——那样会把 42501 这种真问题也藏起来
-  if (triggerPath && (state.startsWith("08") || NETWORK_CALL.test(where))) {
+  if (triggerPath && !REAL_FAILURES.includes(state) && (state.startsWith("08") || NETWORK_CALL.test(where))) {
     return {
       ran: false,
       detail:
@@ -262,7 +269,9 @@ export async function runAuthDrill(
   mainDumpPath: string,
   authDump: AuthDumpForDrill,
   signal?: AbortSignal,
-  sandbox?: OfflineSandbox
+  sandbox?: OfflineSandbox,
+  /** 不跑模拟注册的原因(例如 --keep 要留下一个连得上的沙箱);报告里记 ran: false */
+  skipSignup?: string
 ): Promise<AuthDrillReport> {
   const auth = manifest.auth!;
   // 这一节的所有会话都带上 application_name,超时时 authDrillSection 只终止它们
@@ -441,6 +450,8 @@ export async function runAuthDrill(
       const identityInsert = await insertStatement(client, "identities");
       if (!userInsert || !identityInsert) {
         signup = { ran: false, detail: "couldn't build a test sign-up for this Auth table layout" };
+      } else if (skipSignup) {
+        signup = { ran: false, detail: skipSignup };
       } else if (!sandbox) {
         signup = { ran: false, detail: "the sandbox couldn't be cut off from the network, so no test sign-up was run" };
       } else {
@@ -450,7 +461,8 @@ export async function runAuthDrill(
         stopIfCancelled();
         let result: { code: number | null; stdout: string } | null = null;
         try {
-          result = await sandbox.runOffline(signupScript(userInsert, identityInsert), signal);
+          const marker = randomBytes(8).toString("hex");
+          result = await sandbox.runOffline(signupScript(userInsert, identityInsert, marker), marker, signal);
         } catch {
           signup = { ran: false, detail: "the sandbox couldn't be cut off from the network, so no test sign-up was run" };
         }
@@ -539,7 +551,7 @@ export async function authDrillSection(
    * 托管 worker:begin 在开始前告诉它进入 Auth 阶段(被拒绝就不做这一节);stop 是它叫停这一节的信号。
    * 两者都只影响这一节,演练结论不变
    */
-  runner: { begin?: () => Promise<void>; stop?: AbortSignal; sandbox?: OfflineSandbox } = {}
+  runner: { begin?: () => Promise<void>; stop?: AbortSignal; sandbox?: OfflineSandbox; skipSignup?: string } = {}
 ): Promise<AuthDrillReport | undefined> {
   if (manifest.auth?.status !== "included" || !authDump) return undefined;
   if (interrupted()) return undefined;
@@ -590,7 +602,7 @@ export async function authDrillSection(
         }
         // 等 begin 的时候已经被叫停或到点了:比赛已经有了结果,这里不再开始
         if (cancel.signal.aborted) return stoppedByRunner();
-        work = runAuthDrill(sandboxConnString, manifest, mainDumpPath, await authDump, cancel.signal, runner.sandbox);
+        work = runAuthDrill(sandboxConnString, manifest, mainDumpPath, await authDump, cancel.signal, runner.sandbox, runner.skipSignup);
         return await work;
       })(),
       new Promise<AuthDrillReport>((resolve) => {
