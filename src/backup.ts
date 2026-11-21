@@ -618,7 +618,8 @@ function logAuthOutcome(auth: AuthSection, schemas: string[]): void {
     }
     return;
   }
-  const why = AUTH_SKIP_TEXT[auth.reason ?? ""] ?? auth.reason ?? "unknown reason";
+  // 有的原因本身就是完整的句子(以句号结尾),后面还要接一句,去掉它的句号免得出现 ".."
+  const why = (AUTH_SKIP_TEXT[auth.reason ?? ""] ?? auth.reason ?? "unknown reason").replace(/\.$/, "");
   if (auth.status === "skipped") {
     // 不是 Supabase 库时这是正常情况,不该显得像个问题
     if (auth.reason === "no_auth_schema") log.step(`Auth users: skipped (${why}).`);
