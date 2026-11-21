@@ -507,7 +507,7 @@ test(
       });
 
       await t.test("anything on auth.users beyond Supabase's own: no auth.dump, Auth failed naming it, database backed up", async () => {
-        const reasonFor = (what) => `Could not write auth.dump. auth.users has ${what} that clearing pending Auth tokens could conflict with.`;
+        const reasonFor = (what) => `BackupDrill stopped before writing auth.dump. Clearing pending Auth tokens could cause a restore to fail because of ${what} on auth.users.`;
         const expectRefused = async (name, what) => {
           const r = await run(name, { databaseUrl: okUrl, auth: "default" });
           assert.equal(r.manifest.auth.status, "failed", JSON.stringify(r.manifest.auth));

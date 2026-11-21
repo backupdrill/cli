@@ -438,7 +438,7 @@ async function prepareAuthDump(
       kind: "settled",
       section: {
         status: "failed",
-        reason: `Could not write auth.dump. auth.users has ${inspection.nonStockObject} that clearing pending Auth tokens could conflict with.`,
+        reason: `BackupDrill stopped before writing auth.dump. Clearing pending Auth tokens could cause a restore to fail because of ${inspection.nonStockObject} on auth.users.`,
       },
     };
   }
