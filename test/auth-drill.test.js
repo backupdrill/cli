@@ -377,6 +377,51 @@ id" uuid references auth.users (id) on delete set null)`);
         }
       });
 
+      await t.test("the test sign-up runs with the sandbox off the network: a dblink trigger can't write anywhere else", async () => {
+        // "别的系统"就用源库本身:沙箱平时在默认网桥上,按容器 IP 连得到它。2.11.0 时这条触发器会在
+        // 模拟注册里经 dblink 往 public.leaks 写一行,并且不随回滚撤销
+        const sourceIp = (
+          await x("docker", ["inspect", "-f", "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}", ids[0]])
+        ).stdout.trim();
+        assert.match(sourceIp, /^\d+\.\d+\.\d+\.\d+$/);
+        await sql(admin, `
+          create extension dblink;
+          create table public.leaks (at timestamptz not null default now());
+          create function public.tell_crm() returns trigger language plpgsql security definer set search_path = '' as $$
+          begin
+            perform public.dblink_exec('host=${sourceIp} port=5432 user=postgres password=pw dbname=postgres connect_timeout=5',
+                                       'insert into public.leaks default values');
+            return new;
+          end $$;
+          create trigger tell_crm after insert on auth.users for each row execute function public.tell_crm();`);
+        try {
+          const mem = await backup("default");
+          const report = await runDrill(config, { store: mem.store });
+          assert.equal(report.pass, true, JSON.stringify(report.checks));
+          assert.ok(report.auth.triggers.created.includes("tell_crm"), JSON.stringify(report.auth));
+          assert.equal(report.auth.signup.ran, false, JSON.stringify(report.auth.signup));
+          assert.match(report.auth.signup.detail, /cut off from the network/);
+          assert.match(report.auth.signup.detail, /dblink/);
+          const leaks = await sql(admin, "select count(*)::int as n from public.leaks");
+          assert.equal(leaks.rows[0].n, 0, "nothing reached the other database");
+        } finally {
+          await sql(admin, "drop trigger tell_crm on auth.users; drop function public.tell_crm(); drop table public.leaks; drop extension dblink");
+        }
+      });
+
+      await t.test("a sandbox kept with --keep is back on the network after the test sign-up, at its new port", async () => {
+        const mem = await backup("default");
+        const report = await runDrill(config, { store: mem.store, appCheckCommand: "exit 1", keepSandboxOnFailure: true });
+        assert.ok(report.keptSandbox, "a failed drill with --keep leaves the sandbox");
+        try {
+          assert.deepEqual(report.auth.signup, { ran: true, ok: true });
+          const kept = await sql(report.keptSandbox.connString, "select count(*)::int as n from auth.users");
+          assert.equal(kept.rows[0].n, 4, "the test sign-up was rolled back, and the kept sandbox answers on its connection string");
+        } finally {
+          await x("docker", ["rm", "-f", "-v", report.keptSandbox.containerId]).catch(() => {});
+        }
+      });
+
       await t.test("a backed-up row count that doesn't match is a problem, the verdict doesn't move", async () => {
         const mem = await backup("default");
         const m = mem.manifest();

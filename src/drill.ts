@@ -25,7 +25,7 @@ import { orphanedForeignKeysCheck, tableKey, type OrphanedForeignKey } from "./o
 import { grantsCheck, type GrantRestore, type GrantedObject } from "./grants.js";
 import { localPgRestoreMajor, restoreToolBreaksOnTarget, sandboxMajorFor } from "./pgbin.js";
 import { log } from "./log.js";
-import { authDrillSection, type AuthDrillReport, type AuthDumpForDrill } from "./auth-drill.js";
+import { authDrillSection, type AuthDrillReport, type AuthDumpForDrill, type OfflineSandbox } from "./auth-drill.js";
 import { onInterrupt, stopOnInterrupt, throwIfInterrupted } from "./interrupt.js";
 
 const execFileAsync = promisify(execFile);
@@ -381,6 +381,125 @@ async function startEphemeralPostgres(image: string, major: number, resourceName
     await teardown();
     forgetInterruptCleanup();
     throw error;
+  }
+}
+
+// ── 断网跑 SQL(模拟注册用,2.11.1)────────────────────────────────
+
+/** 沙箱容器当前接着的 Docker 网络 */
+async function containerNetworks(containerId: string): Promise<string[]> {
+  const { stdout } = await execFileAsync("docker", ["inspect", "-f", "{{json .NetworkSettings.Networks}}", containerId], {
+    timeout: 15_000,
+  });
+  return Object.keys((JSON.parse(stdout.trim() || "null") as Record<string, unknown> | null) ?? {});
+}
+
+/** 在容器里用 psql 跑 SQL(走 unix socket,不经网络)。官方镜像对本地 socket 是 trust */
+function containerPsql(
+  containerId: string,
+  args: string[],
+  opts: { input?: string; timeoutMs: number; signal?: AbortSignal }
+): Promise<{ code: number | null; stdout: string }> {
+  return new Promise((resolve) => {
+    const proc = spawn(
+      "docker",
+      ["exec", ...(opts.input !== undefined ? ["-i"] : []), containerId, "psql", "-X", "-q", "-tA", "-v", "ON_ERROR_STOP=1", "-U", "postgres", "-d", "postgres", ...args],
+      { stdio: [opts.input !== undefined ? "pipe" : "ignore", "pipe", "ignore"] }
+    );
+    let stdout = "";
+    proc.stdout!.on("data", (d: Buffer) => {
+      // 只要我们自己 select 出来的那一行;封顶,不让输出无限长
+      if (stdout.length < 64 * 1024) stdout += d.toString();
+    });
+    const kill = () => proc.kill("SIGKILL");
+    const timer = setTimeout(kill, opts.timeoutMs);
+    opts.signal?.addEventListener("abort", kill, { once: true });
+    proc.on("error", () => {});
+    proc.on("close", (code) => {
+      clearTimeout(timer);
+      opts.signal?.removeEventListener("abort", kill);
+      resolve({ code, stdout });
+    });
+    if (opts.input !== undefined) {
+      proc.stdin!.on("error", () => {});
+      proc.stdin!.end(opts.input);
+    }
+  });
+}
+
+/**
+ * 终止沙箱里所有客户端会话,并等到它们真的退出。断网期间能连进沙箱的只有我们经 docker exec 起的 psql,
+ * 所以不按名字挑(触发器能改 application_name)。确认不了就返回 false
+ */
+async function endSandboxSessions(containerId: string): Promise<boolean> {
+  const others = "from pg_stat_activity where backend_type = 'client backend' and pid <> pg_backend_pid()";
+  for (let i = 0; i < 20; i++) {
+    // 数出还在的会话,同时把它们终止掉;数到 0 才算都退出了
+    const r = await containerPsql(containerId, ["-c", `select count(pg_terminate_backend(pid)) ${others}`], {
+      timeoutMs: 15_000,
+    });
+    if (r.code !== 0) return false;
+    if (r.stdout.trim() === "0") return true;
+    await new Promise((resolve) => setTimeout(resolve, 500));
+  }
+  return false;
+}
+
+/**
+ * 模拟注册用的"断网跑 SQL"(见 auth-drill.ts OfflineSandbox)。
+ *
+ * 为什么是临时断网,而不是一开始就不给沙箱联网:CLI 和 pg_restore 都从主机经发布的端口连沙箱,
+ * --network none 和 --internal 网络都发布不了端口。所以平时照旧,只在模拟注册这一步把容器从所有网络上
+ * 摘下来(只剩 loopback),经 docker exec 里的 psql 走 unix socket 跑;跑完先终止并确认所有会话都退出了
+ * (触发器还在跑时接回网络,它就又能连出去),再接回原来的网络。接回后 Docker 会重新分配主机端口,
+ * 连接串随之更新(--keep 留下的沙箱要用)。摘不干净就不跑;确认不了会话已退出就不接回网络
+ * (沙箱反正马上销毁;--keep 时打警告)
+ */
+function offlineSandbox(pg: Ephemeral): OfflineSandbox {
+  return {
+    connString: () => pg.connString,
+    async runOffline(script, signal) {
+      if (signal?.aborted) throw new Error("stopped");
+      const networks = await containerNetworks(pg.containerId);
+      const disconnected: string[] = [];
+      let offline = false;
+      try {
+        for (const network of networks) {
+          await execFileAsync("docker", ["network", "disconnect", network, pg.containerId], { timeout: 30_000 });
+          disconnected.push(network);
+        }
+        const left = await containerNetworks(pg.containerId);
+        if (left.length) throw new Error(`the sandbox is still on ${left.join(", ")}`);
+        offline = true;
+        if (signal?.aborted) throw new Error("stopped");
+        return await containerPsql(pg.containerId, [], { input: script, timeoutMs: 6 * 60 * 1000, signal });
+      } finally {
+        await reconnectSandbox(pg, disconnected, offline);
+      }
+    },
+  };
+}
+
+async function reconnectSandbox(pg: Ephemeral, networks: string[], wasOffline: boolean): Promise<void> {
+  if (!networks.length) return;
+  try {
+    if (wasOffline && !(await endSandboxSessions(pg.containerId))) {
+      log.warn("Couldn't confirm the test sign-up's session ended, so the drill sandbox stays off the network.");
+      return;
+    }
+    for (const network of networks) {
+      await execFileAsync("docker", ["network", "connect", network, pg.containerId], { timeout: 30_000 });
+    }
+    const portOut = await execFileAsync("docker", ["port", pg.containerId, "5432/tcp"], { timeout: 15_000 });
+    const port = portOut.stdout.trim().split("\n")[0].split(":").pop()!.trim();
+    const url = new URL(pg.connString);
+    url.port = port;
+    pg.port = port;
+    pg.connString = url.toString();
+  } catch (error) {
+    // 超时或中断后沙箱可能已经销毁了:那就没什么要接回的。还在的(--keep 留下的)这时连不上,如实提示
+    if (/No such container/i.test(String((error as { stderr?: string }).stderr ?? error))) return;
+    log.warn("Couldn't put the drill sandbox back on the network after the test sign-up.");
   }
 }
 
@@ -920,6 +1039,7 @@ export async function drillDump(
       // 托管 worker 在这一步前后换磁盘守卫的规则:Auth 阶段吃紧只叫停这一节,不判演练失败
       begin: opts.supervision ? () => opts.supervision!.observe({ phase: "auth" }) : undefined,
       stop: opts.supervision?.authStop,
+      sandbox: offlineSandbox(pg),
     });
     if (authSection) {
       report.auth = authSection;

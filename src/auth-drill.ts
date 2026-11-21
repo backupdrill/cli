@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { createReadStream } from "node:fs";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -16,7 +16,8 @@ import { interrupted } from "./interrupt.js";
  * 演练里的 Auth 校验(2.10.0 起,附加模式)。
  *
  * 在演练照旧做完、通过与否已经定下之后,在同一个沙箱里:把 auth.dump 的两张表建出来、灌数据,
- * 补上之前因为沙箱没有 auth 表而跳过的外键,建可以自动恢复的触发器,再以 GoTrue 的身份模拟一次注册。
+ * 补上之前因为沙箱没有 auth 表而跳过的外键,建可以自动恢复的触发器,再以 GoTrue 的身份模拟一次注册
+ * (2.11.1 起断网跑,见 OfflineSandbox)。
  * 结果只写进报告的 auth 一节,**不改变演练结论**,自己出错也只记在这一节里——上线初期先观察,
  * 是否计入结论由以后决定(PRD 增补 §0.1 第 5 条)。
  */
@@ -44,6 +45,24 @@ export interface AuthDumpForDrill {
   error?: string;
 }
 
+/**
+ * 2.11.1 起:模拟注册只在断了网的沙箱里跑。注册会触发用户挂在 auth.users 上的触发器,触发器经 dblink、
+ * postgres_fdw、http 之类的扩展连出去写的东西,不会跟着事务回滚——演练不能替用户往外部系统里写一个测试用户。
+ * 由演练(drill.ts)提供:它管着沙箱容器。
+ */
+export interface OfflineSandbox {
+  /**
+   * 断开沙箱容器的全部网络,用容器里的 psql(走 unix socket)跑 script;确认这段 SQL 开的会话都已退出,
+   * 再接回网络。断不开就抛错,一句 SQL 都不跑
+   */
+  runOffline(script: string, signal?: AbortSignal): Promise<{ code: number | null; stdout: string }>;
+  /** 接回网络后主机端口会变:当前的连接串 */
+  connString(): string;
+}
+
+/** 能让触发器连到沙箱外面的扩展。沙箱断网后,用到它们的触发器在这里会失败,而在真实项目上不一定 */
+const NETWORK_EXTENSIONS = ["dblink", "postgres_fdw", "http", "pg_net", "wrappers"];
+
 // 报告会发给用户、进运营者告警,**一律不放报错原文**:触发器能在任何错误码下抛出自定义消息、
 // 伪造对象名字段,里面可以是任意数据,靠脱敏堵不干净。只给 SQLSTATE 映射出的固定说法和 SQLSTATE 本身
 const SQLSTATE_TEXT: Record<string, string> = {
@@ -63,6 +82,8 @@ const SQLSTATE_TEXT: Record<string, string> = {
   "57014": "a statement timed out or was cancelled",
   "40P01": "a deadlock",
   P0001: "an exception was raised",
+  "08001": "a connection couldn't be made",
+  "08006": "a connection failed",
 };
 
 function safeError(error: unknown): string {
@@ -155,12 +176,89 @@ async function insertStatement(client: Client, table: "users" | "identities"): P
   return `insert into auth.${table} (${names.join(", ")}) values (${values.join(", ")})`;
 }
 
+/**
+ * 模拟注册的 SQL,交给容器里的 psql 跑。注册放在 DO 块的子事务里:出错时接住,只把 SQLSTATE 和
+ * 出错位置(错误上下文)写进两个会话变量;最后一行输出由我们自己的 select 拼出来——触发器的 NOTICE
+ * 只进 stderr,改不了这一行。成功路径最后覆盖写一遍,触发器事先写进去的值不算数。整个事务最后回滚。
+ * 美元引号的标签每次随机:插入语句里的列名来自归档,不能让它把 DO 块提前截断
+ */
+export function signupScript(userInsert: string, identityInsert: string): string {
+  const tag = `$bd_${randomBytes(8).toString("hex")}$`;
+  return [
+    "set statement_timeout = '5min';",
+    "set lock_timeout = '1min';",
+    "begin;",
+    `do ${tag}`,
+    "declare",
+    "  state text;",
+    "  context text;",
+    "begin",
+    "  begin",
+    "    set local role supabase_auth_admin;",
+    `    ${userInsert};`,
+    `    ${identityInsert};`,
+    // 延迟检查的约束和约束触发器平时在提交时才跑:这里立刻跑完,才算这次注册真的能成
+    "    set constraints all immediate;",
+    "  exception when others then",
+    "    get stacked diagnostics state = returned_sqlstate, context = pg_exception_context;",
+    "    perform set_config('backupdrill.signup_state', state, true);",
+    "    perform set_config('backupdrill.signup_context', context, true);",
+    "    return;",
+    "  end;",
+    "  perform set_config('backupdrill.signup_state', 'ok', true);",
+    "  perform set_config('backupdrill.signup_context', '', true);",
+    "end",
+    `${tag};`,
+    "select 'backupdrill-signup ' || current_setting('backupdrill.signup_state') || ' ' ||",
+    "       encode(convert_to(current_setting('backupdrill.signup_context'), 'UTF8'), 'hex');",
+    "rollback;",
+    "",
+  ].join("\n");
+}
+
+/** psql 的输出 → 报告里的 signup。只用 SQLSTATE 和"错在不在触发器里",错误原文不进报告(见 safeError) */
+export function signupOutcome(
+  result: { code: number | null; stdout: string },
+  networkExtensions: string[]
+): NonNullable<AuthDrillReport["signup"]> {
+  const line = /^backupdrill-signup (\S+) ([0-9a-f]*)$/m.exec(result.stdout);
+  if (result.code !== 0 || !line) {
+    // 超时(57014 接不住)或 psql 本身出错:没模拟成
+    return { ran: false, detail: "couldn't simulate a sign-up: it didn't finish" };
+  }
+  const [, state, contextHex] = line;
+  if (state === "ok") return { ran: true, ok: true };
+  // 去掉我们自己那层 DO 块的上下文,剩下的才是表结构或用户的函数
+  const where = Buffer.from(contextHex, "hex")
+    .toString("utf8")
+    .split("\n")
+    .filter((l) => !/inline_code_block/.test(l))
+    .join("\n");
+  const triggerPath =
+    /PL\/pgSQL function|SQL function|trigger/i.test(where) ||
+    ["23503", "23505", "42501", "42883", "42P01", "42703", "3F000", "P0001"].includes(state);
+  // 沙箱断着网:连不出去(SQLSTATE 08 类),或者装着能连外网的扩展时,失败可能只是因为没网,不能报成"注册会失败"
+  if (triggerPath && (state.startsWith("08") || networkExtensions.length)) {
+    const why = networkExtensions.length ? `the sandbox has ${networkExtensions.join(", ")}` : "it tried to connect somewhere";
+    return {
+      ran: false,
+      detail:
+        `a trigger failed (${describeSqlstate(state)}) and may need the network (${why}); ` +
+        `the test sign-up runs with the sandbox cut off from the network, so it can't write to your other systems`,
+    };
+  }
+  return triggerPath
+    ? { ran: true, ok: false, detail: `a new sign-up would fail: ${describeSqlstate(state)}${SIGNUP_TESTED_AS}` }
+    : { ran: false, detail: `couldn't simulate a sign-up: ${describeSqlstate(state)}` };
+}
+
 export async function runAuthDrill(
   sandboxConnString: string,
   manifest: Manifest,
   mainDumpPath: string,
   authDump: AuthDumpForDrill,
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  sandbox?: OfflineSandbox
 ): Promise<AuthDrillReport> {
   const auth = manifest.auth!;
   // 这一节的所有会话都带上 application_name,超时时 authDrillSection 只终止它们
@@ -331,34 +429,33 @@ export async function runAuthDrill(
 
     stopIfCancelled();
     // ── 4. 以 GoTrue 的身份(supabase_auth_admin,非超级用户)模拟一次邮箱注册,事后回滚 ──
+    // 断网跑(见 OfflineSandbox):触发器的副作用只能留在沙箱里
     let signup: NonNullable<AuthDrillReport["signup"]> = { ran: false, detail: "no triggers of your own on the Auth tables" };
     if (triggers.created.length) {
       await client.query("alter table auth.users owner to supabase_auth_admin; alter table auth.identities owner to supabase_auth_admin");
       const userInsert = await insertStatement(client, "users");
       const identityInsert = await insertStatement(client, "identities");
+      const networkExtensions = (
+        await client.query<{ name: string }>("select extname as name from pg_extension where extname = any($1::text[]) order by 1", [
+          NETWORK_EXTENSIONS,
+        ])
+      ).rows.map((r) => r.name);
       if (!userInsert || !identityInsert) {
         signup = { ran: false, detail: "couldn't build a test sign-up for this Auth table layout" };
+      } else if (!sandbox) {
+        signup = { ran: false, detail: "the sandbox couldn't be cut off from the network, so no test sign-up was run" };
       } else {
-        await client.query("begin");
+        // 断网之后这条 TCP 连接就断了:先关掉,后面不再用它
+        await client.end().catch(() => {});
+        client = undefined;
+        stopIfCancelled();
+        let result: { code: number | null; stdout: string } | null = null;
         try {
-          await client.query("set local role supabase_auth_admin");
-          await client.query(userInsert);
-          await client.query(identityInsert);
-          // 延迟检查的约束和约束触发器平时在提交时才跑:这里立刻跑完,才算这次注册真的能成
-          await client.query("set constraints all immediate");
-          signup = { ran: true, ok: true };
-        } catch (error) {
-          const e = error as Error & { where?: string; code?: string };
-          // 只有错在触发器里才算触发器的问题;造的测试行本身不合表结构,算没模拟成
-          const triggerPath =
-            /PL\/pgSQL function|SQL function|trigger/i.test(e.where ?? "") ||
-            ["23503", "23505", "42501", "42883", "42P01", "42703", "3F000", "P0001"].includes(e.code ?? "");
-          signup = triggerPath
-            ? { ran: true, ok: false, detail: `a new sign-up would fail: ${safeError(e)}${SIGNUP_TESTED_AS}` }
-            : { ran: false, detail: `couldn't simulate a sign-up: ${safeError(e)}` };
-        } finally {
-          await client.query("rollback").catch(() => {});
+          result = await sandbox.runOffline(signupScript(userInsert, identityInsert), signal);
+        } catch {
+          signup = { ran: false, detail: "the sandbox couldn't be cut off from the network, so no test sign-up was run" };
         }
+        if (result) signup = signupOutcome(result, networkExtensions);
       }
       if (signup.ran && !signup.ok) problems.push(signup.detail!);
       // 有要验证的触发器,却没能模拟成注册:不能报"全部对上"
@@ -443,7 +540,7 @@ export async function authDrillSection(
    * 托管 worker:begin 在开始前告诉它进入 Auth 阶段(被拒绝就不做这一节);stop 是它叫停这一节的信号。
    * 两者都只影响这一节,演练结论不变
    */
-  runner: { begin?: () => Promise<void>; stop?: AbortSignal } = {}
+  runner: { begin?: () => Promise<void>; stop?: AbortSignal; sandbox?: OfflineSandbox } = {}
 ): Promise<AuthDrillReport | undefined> {
   if (manifest.auth?.status !== "included" || !authDump) return undefined;
   if (interrupted()) return undefined;
@@ -472,7 +569,8 @@ export async function authDrillSection(
     if (started) {
       void (async () => {
         await waitAtMost(started, 10_000);
-        await stopAuthSessions(sandboxConnString);
+        // 模拟注册接回网络后端口会变,按当前的连接串去终止
+        await stopAuthSessions(runner.sandbox?.connString() ?? sandboxConnString);
       })();
     }
   };
@@ -492,7 +590,7 @@ export async function authDrillSection(
         }
         // 等 begin 的时候已经被叫停或到点了:比赛已经有了结果,这里不再开始
         if (cancel.signal.aborted) return stoppedByRunner();
-        work = runAuthDrill(sandboxConnString, manifest, mainDumpPath, await authDump, cancel.signal);
+        work = runAuthDrill(sandboxConnString, manifest, mainDumpPath, await authDump, cancel.signal, runner.sandbox);
         return await work;
       })(),
       new Promise<AuthDrillReport>((resolve) => {
