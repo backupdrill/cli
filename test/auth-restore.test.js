@@ -6,6 +6,7 @@ import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import pg from "pg";
@@ -165,6 +166,37 @@ test(
         await sql(target, "insert into auth.users (id, email) values ('55555555-5555-5555-5555-555555555555', 'new@example.test')");
         const profile = await sql(target, "select name from public.profiles where id = '55555555-5555-5555-5555-555555555555'");
         assert.equal(profile.rows[0]?.name, "new@example.test");
+      });
+
+      await t.test("an Auth archive written before 2.11.1, with the pending tokens still in it, restores with them cleared", async () => {
+        // 2.10 / 2.11.0 的 auth.dump:同样的 pg_dump 参数、不改写
+        const { stdout: legacy } = await x(
+          pgDump,
+          ["--format=custom", "--no-owner", "--no-privileges", "--table=auth.users", "--table=auth.identities", "--dbname", okUrl],
+          { encoding: "buffer", maxBuffer: 64 * 1024 * 1024 }
+        );
+        const legacyPath = join(work, "legacy-auth.dump");
+        writeFileSync(legacyPath, legacy);
+        const legacyData = (await x(realPgRestore, ["--data-only", "-t", "users", "-f", "-", legacyPath])).stdout;
+        assert.ok(legacyData.includes("pending-reset"), "the old-style archive really has the pending token");
+        const old = readableMemoryStore();
+        for (const [k, v] of mem.files) old.files.set(k, v);
+        old.files.set("auth.dump", legacy);
+        const m = mem.manifest();
+        old.setManifest({
+          ...m,
+          auth: { ...m.auth, dump: { ...m.auth.dump, bytes: legacy.length, sha256: createHash("sha256").update(legacy).digest("hex") } },
+        });
+        const target = await freshTarget();
+        const result = await runRestore(config, { store: old.store, targetDatabaseUrl: target, confirmTarget: "127.0.0.1" });
+        assert.equal(result.auth.restored, true);
+        const after = await sql(
+          target,
+          `select count(*)::int as users,
+                  count(*) filter (where recovery_token <> '' or recovery_sent_at is not null)::int as pending
+             from auth.users`
+        );
+        assert.deepEqual(after.rows[0], { users: 4, pending: 0 });
       });
 
       await t.test("dry run: passes on a new project, and stops on a target that already has Auth users", async () => {

@@ -330,6 +330,17 @@ test(
         assert.match(listing, /TABLE DATA auth identities/);
         assert.match(listing, /TRIGGER auth users on_auth_user_created/);
         assert.match(listing, /POLICY auth users self_read/);
+        // 2.11.1 起:待处理的找回密码 token 和发送时间不进桶(源库里 pw@ 那个用户有一个没用掉的)
+        const usersData = (
+          await x(process.env.BACKUPDRILL_PG_RESTORE || "pg_restore", ["--data-only", "-t", "users", "-f", "-", archive])
+        ).stdout.split("\n");
+        const header = usersData.find((l) => l.startsWith("COPY auth.users "));
+        const columns = header.slice(header.indexOf("(") + 1, header.indexOf(")")).split(", ");
+        const row = usersData.map((l) => l.split("\t")).find((f) => f[columns.indexOf("id")] === "11111111-1111-1111-1111-111111111111");
+        assert.equal(row[columns.indexOf("recovery_token")], "");
+        assert.equal(row[columns.indexOf("recovery_sent_at")], "\\N");
+        assert.equal(row[columns.indexOf("email")], "pw@example.test", "everything else is still there");
+        assert.ok(!r.files.get("auth.dump").includes("pending-reset"));
         // 主 dump 不受影响:就是一份正常的 public 备份
         assert.ok(r.files.get("dump.pgcustom").length > 0);
         assert.equal(r.manifest.dump.bytes, r.files.get("dump.pgcustom").length);

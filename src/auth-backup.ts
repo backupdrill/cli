@@ -7,7 +7,8 @@ import type { AuthSection, AuthTriggerInfo, AuthPolicyInfo } from "./manifest.js
  *
  * 只备这两张表:用户 ID、邮箱、密码哈希、metadata、登录方式。sessions、refresh token、MFA 因子、
  * SSO 配置一律不备——恢复到新项目后用户重新登录一次即可,MFA 因子可能用旧项目的密钥加密过,
- * 带过去反而可能把用户锁在外面。
+ * 带过去反而可能把用户锁在外面。2.11.1 起 auth.users 里待处理的找回密码、邮箱确认等 token 在上传前就抹掉
+ * (见 auth-archive.ts),pg_dump 的参数不变。
  *
  * 不打扰现有备份是硬约束:
  *  - "off"(库调用的默认值)时,备份命令、上传的文件、manifest 与没有这个功能时逐字节一致。
