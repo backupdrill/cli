@@ -166,8 +166,13 @@ function copyLineScrubber(columns: string[], replace: Map<number, Buffer>): Tran
   let skipping = false; // 当前字段要抹:它的字节不写出
   let lineLength = 0; // 当前行到目前为止的字节数(只用来认结束标记,到 3 就不再数)
   let lineHead = 0; // 当前行的头两个字节
-  // pg_dump 在数据末尾写 "\." 再跟几个空行;结束标记之后不是数据,原样照抄
+  // pg_dump 在每段 COPY 数据末尾写 "\.",后面只跟几个空行。结束标记必须有,之后只许是空行:
+  // 别的字节都说明这不是 pg_dump 写的样子,宁可失败也不上传
   let afterEndMarker = false;
+  const afterEndError = () => new ArchiveError("the data of auth.users has something after its end marker");
+  const onlyNewlines = (chunk: Buffer, from: number) => {
+    for (let i = from; i < chunk.length; i++) if (chunk[i] !== 0x0a) throw afterEndError();
+  };
   const fieldCountError = (fields: number) =>
     new ArchiveError(`a row of auth.users has ${fields} fields, but the COPY statement lists ${columns.length} columns`);
   const scan = (chunk: Buffer, out: Buffer[]): void => {
@@ -198,6 +203,7 @@ function copyLineScrubber(columns: string[], replace: Map<number, Buffer>): Tran
         lineHead = 0;
         if (endMarker) {
           afterEndMarker = true;
+          onlyNewlines(chunk, i + 1);
           out.push(chunk.subarray(start));
           return;
         }
@@ -212,8 +218,11 @@ function copyLineScrubber(columns: string[], replace: Map<number, Buffer>): Tran
   };
   return new Transform({
     transform(chunk: Buffer, _encoding, callback) {
-      if (afterEndMarker) return callback(null, chunk);
       try {
+        if (afterEndMarker) {
+          onlyNewlines(chunk, 0);
+          return callback(null, chunk);
+        }
         const out: Buffer[] = [];
         scan(chunk, out);
         callback(null, out.length === 1 ? out[0] : Buffer.concat(out));
@@ -222,11 +231,8 @@ function copyLineScrubber(columns: string[], replace: Map<number, Buffer>): Tran
       }
     },
     flush(callback) {
-      // 最后一行没有换行结尾(pg_dump 不会这样写):照样核对字段数、补上要抹的值
-      if (!afterEndMarker && (lineLength > 0 || field > 0)) {
-        if (field !== columns.length - 1) return callback(fieldCountError(field + 1));
-        if (skipping) return callback(null, replace.get(field));
-      }
+      // 没有结束标记 = 数据不完整(或者不是 pg_dump 写的):不能当成抹干净了
+      if (!afterEndMarker) return callback(new ArchiveError("the data of auth.users has no end marker"));
       callback();
     },
   });

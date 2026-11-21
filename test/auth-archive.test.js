@@ -229,3 +229,15 @@ test("one huge, highly compressible row streams through in bounded memory and li
   assert.ok(peakArrayBuffers < 64 * 1024 * 1024, `buffered ${Math.round(peakArrayBuffers / 1024 / 1024)} MiB for a ${fieldMiB} MiB row`);
   assert.ok(Date.now() - started < 30_000, `took ${Date.now() - started} ms`);
 });
+
+test("the auth.users data must end with pg_dump's end marker, followed by nothing but blank lines", async () => {
+  const rows = [userRow(1), userRow(2)].map((r) => `${r}\n`).join("");
+  const archiveWith = (text) => buildArchive({ compression: "none", users: 2, usersPayload: Buffer.from(text) });
+  // 和 pg_dump 一样:结束标记后跟空行
+  await scrub(archiveWith(`${rows}\\.\n\n\n`));
+  // 没有结束标记
+  await assert.rejects(scrub(archiveWith(rows)), /no end marker/);
+  // 结束标记之后还有别的字节(多一行数据,或者垃圾)
+  await assert.rejects(scrub(archiveWith(`${rows}\\.\n${userRow(3)}\n`)), /something after its end marker/);
+  await assert.rejects(scrub(archiveWith(`${rows}\\.\n\nx`)), /something after its end marker/);
+});
