@@ -1112,7 +1112,7 @@ export async function drillDump(
       sandbox: offlineSandbox(pg),
       // --keep 要留下这个沙箱时不跑模拟注册:断了网就不能再接回,留下的沙箱就连不上了(脚本靠 keptSandbox.connString)。
       // 结论(pass)这时已经定了,只有真的会留沙箱(演练没通过)才跳过
-      skipSignup: opts.keepSandboxOnFailure && !pass ? "skipped: --keep leaves the sandbox reachable for inspection" : undefined,
+      skipSignup: opts.keepSandboxOnFailure && !pass ? "--keep leaves the sandbox connected so you can inspect it" : undefined,
     });
     if (authSection) {
       report.auth = authSection;

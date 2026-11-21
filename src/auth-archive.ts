@@ -340,7 +340,7 @@ export function scrubPendingAuthTokens(input: Readable): Readable {
     while (!(await reader.atEnd())) {
       if ((await take(1))[0] !== BLK_DATA) throw new ArchiveError("the Auth archive has a data block of an unexpected type");
       const dumpId = await readInt();
-      if (!withData.delete(dumpId)) throw new ArchiveError("the Auth archive has a data block the TOC doesn't declare, or one twice");
+      if (!withData.delete(dumpId)) throw new ArchiveError("the Auth archive contains a duplicate data block or one missing from its table of contents");
       if (dumpId !== target.dumpId) {
         for (let length = await readInt(); length !== 0; length = await readInt()) {
           if (length < 0) throw new ArchiveError("the archive has a malformed data chunk");

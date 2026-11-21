@@ -38,7 +38,7 @@ test("signupOutcome: 'may need network access' only with evidence of a connectio
   const httpCall = inTrigger(`SQL statement "SELECT http_post('https://crm.example/hook', '{}', 'application/json')"`);
   const notTested = (r) => {
     assert.equal(r.ran, false, JSON.stringify(r));
-    assert.match(r.detail, /^the test sign-up hit an error in the offline sandbox \(.+\)\. The failing operation may need network access$/);
+    assert.match(r.detail, /^an operation in the offline sandbox may need network access — .+$/);
   };
   // 连接类 SQLSTATE(dblink、postgres_fdw 连不上)
   notTested(signupOutcome(out("08001", dblinkCall, "could not establish connection")));

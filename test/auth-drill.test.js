@@ -450,7 +450,7 @@ id" uuid references auth.users (id) on delete set null)`);
         assert.ok(report.keptSandbox, "a failed drill with --keep leaves the sandbox");
         const id = report.keptSandbox.containerId;
         try {
-          assert.deepEqual(report.auth.signup, { ran: false, detail: "skipped: --keep leaves the sandbox reachable for inspection" });
+          assert.deepEqual(report.auth.signup, { ran: false, detail: "--keep leaves the sandbox connected so you can inspect it" });
           assert.equal(report.pass, false, "the verdict comes from the app check, as before");
           assert.ok((await networksOf(id)).length > 0, "never taken off the network");
           const kept = await sql(report.keptSandbox.connString, "select count(*)::int as n from auth.users");

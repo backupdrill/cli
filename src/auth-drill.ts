@@ -267,7 +267,7 @@ export function signupOutcome(result: { code: number | null; stdout: string }): 
   if (triggerPath && failedForLackOfNetwork(state, where.split("\n")[0] ?? "", message)) {
     return {
       ran: false,
-      detail: `the test sign-up hit an error in the offline sandbox (${describeSqlstate(state)}). The failing operation may need network access`,
+      detail: `an operation in the offline sandbox may need network access — ${describeSqlstate(state)}`,
     };
   }
   return triggerPath
