@@ -500,8 +500,8 @@ covered by this promise; they may change in any release. Use the CLI if you need
 - [backupdrill on StackShare](https://stackshare.io/backupdrill).
 - A [ZAP success story](https://www.zaproxy.org/success/backupdrill/) describes the weekly ZAP baseline scan we run against our website.
 - The agent skill in [`plugin/`](https://github.com/backupdrill/cli/tree/main/plugin) is also published on the [Tessl registry](https://tessl.io/registry/backupdrill/supabase-backup) and [LobeHub](https://lobehub.com/skills/backupdrill-cli-supabase-backup).
-- On CircleCI, the [backupdrill/supabase-backup orb](https://circleci.com/developer/orbs/orb/backupdrill/supabase-backup) runs the same backups and drills from your pipeline.
-- [Our HackerNoon author page](https://hackernoon.com/u/superlede) lists our article on five Supabase backup failure modes and how to restore-test for them.
+- The [backupdrill/supabase-backup orb](https://circleci.com/developer/orbs/orb/backupdrill/supabase-backup) runs backups and restore drills in CircleCI pipelines.
+- [Our HackerNoon author page](https://hackernoon.com/u/superlede), with an article on five ways Supabase backups fail and how to test restores for each.
 
 ## License
 
