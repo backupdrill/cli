@@ -38,7 +38,7 @@ test("signupOutcome: 'may need network access' only with evidence of a connectio
   const httpCall = inTrigger(`SQL statement "SELECT http_post('https://crm.example/hook', '{}', 'application/json')"`);
   const notTested = (r) => {
     assert.equal(r.ran, false, JSON.stringify(r));
-    assert.match(r.detail, /^an operation in the offline sandbox may need network access — .+$/);
+    assert.match(r.detail, /^a database operation failed to connect while the sandbox was offline \(SQLSTATE \w{5}\)$/);
   };
   // 连接类 SQLSTATE(dblink、postgres_fdw 连不上)
   notTested(signupOutcome(out("08001", dblinkCall, "could not establish connection")));
@@ -70,10 +70,10 @@ test("signupOutcome: 'may need network access' only with evidence of a connectio
 });
 
 test("signupOutcome: psql that didn't finish (timeout, killed) or printed no result line means no sign-up was simulated", () => {
-  assert.deepEqual(signupOutcome({ code: 3, stdout: "" }), { ran: false, detail: "psql returned no usable sign-up test result" });
+  assert.deepEqual(signupOutcome({ code: 3, stdout: "" }), { ran: false, detail: "psql did not confirm a sign-up result" });
   assert.deepEqual(signupOutcome({ code: null, stdout: "backupdrill-signup ok  \n" }), {
     ran: false,
-    detail: "psql returned no usable sign-up test result",
+    detail: "psql did not confirm a sign-up result",
   });
   assert.equal(signupOutcome({ code: 0, stdout: "something else\n" }).ran, false);
 });

@@ -245,7 +245,7 @@ export function signupOutcome(result: { code: number | null; stdout: string }): 
   const line = /^backupdrill-signup (\S+) ([0-9a-f]*) ([0-9a-f]*)$/m.exec(result.stdout);
   if (result.code !== 0 || !line) {
     // 超时(57014 接不住)或 psql 本身出错:没模拟成
-    return { ran: false, detail: "psql returned no usable sign-up test result" };
+    return { ran: false, detail: "psql did not confirm a sign-up result" };
   }
   const [, state, contextHex, messageHex] = line;
   if (state === "ok") return { ran: true, ok: true };
@@ -262,7 +262,7 @@ export function signupOutcome(result: { code: number | null; stdout: string }): 
   if (triggerPath && failedForLackOfNetwork(state, where.split("\n")[0] ?? "", message)) {
     return {
       ran: false,
-      detail: `an operation in the offline sandbox may need network access — ${describeSqlstate(state)}`,
+      detail: `a database operation failed to connect while the sandbox was offline (SQLSTATE ${state})`,
     };
   }
   return triggerPath
@@ -471,7 +471,7 @@ export async function runAuthDrill(
           const marker = randomBytes(8).toString("hex");
           result = await sandbox.runOffline(signupScript(userInsert, identityInsert, marker), marker, signal);
         } catch {
-          signup = { ran: false, detail: "couldn't get a result from the offline sign-up test" };
+          signup = { ran: false, detail: "the offline test stopped before returning a result" };
         }
         if (result) signup = signupOutcome(result);
       }

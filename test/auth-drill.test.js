@@ -403,7 +403,7 @@ id" uuid references auth.users (id) on delete set null)`);
           assert.equal(report.checks.find((c) => c.name === "app checks")?.pass, true, "the online control call ran");
           assert.ok(report.auth.triggers.created.includes("tell_crm"), JSON.stringify(report.auth));
           assert.equal(report.auth.signup.ran, false, JSON.stringify(report.auth.signup));
-          assert.match(report.auth.signup.detail, /^an operation in the offline sandbox may need network access — /);
+          assert.match(report.auth.signup.detail, /^a database operation failed to connect while the sandbox was offline \(SQLSTATE /);
           const leaks = await sql(admin, "select count(*)::int as n from public.leaks");
           assert.equal(leaks.rows[0].n, 1, "only the online control wrote a row; the offline test sign-up wrote nothing");
 

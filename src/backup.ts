@@ -431,7 +431,7 @@ async function prepareAuthDump(
       kind: "settled",
       section: {
         status: "failed",
-        reason: `Auth archive not written: clearing the pending Auth tokens would break ${listed} on auth.users`,
+        reason: `Could not write auth.dump. Clearing pending Auth tokens could conflict with ${listed} on auth.users.`,
       },
     };
   }

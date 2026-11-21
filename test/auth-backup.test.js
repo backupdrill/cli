@@ -502,7 +502,7 @@ test(
           assert.equal(r.manifest.auth.status, "failed");
           assert.equal(
             r.manifest.auth.reason,
-            "Auth archive not written: clearing the pending Auth tokens would break check constraint recovery_token_set on auth.users"
+            "Could not write auth.dump. Clearing pending Auth tokens could conflict with check constraint recovery_token_set on auth.users."
           );
           assert.equal(r.files.has("auth.dump"), false);
           assert.ok(r.files.get("dump.pgcustom").length > 0);
@@ -517,7 +517,7 @@ test(
           assert.equal(r.manifest.auth.status, "failed");
           assert.equal(
             r.manifest.auth.reason,
-            "Auth archive not written: clearing the pending Auth tokens would break check constraint token_checked_by_function on auth.users"
+            "Could not write auth.dump. Clearing pending Auth tokens could conflict with check constraint token_checked_by_function on auth.users."
           );
           assert.equal(r.files.has("auth.dump"), false);
           assert.ok(r.files.get("dump.pgcustom").length > 0);
@@ -529,7 +529,7 @@ test(
           r = await run("scrub-notnull", { databaseUrl: okUrl, auth: "default" });
           assert.equal(
             r.manifest.auth.reason,
-            "Auth archive not written: clearing the pending Auth tokens would break NOT NULL column reauthentication_sent_at on auth.users"
+            "Could not write auth.dump. Clearing pending Auth tokens could conflict with NOT NULL column reauthentication_sent_at on auth.users."
           );
           assert.equal(r.files.has("auth.dump"), false);
           await sql(admin, "alter table auth.users alter column reauthentication_sent_at drop not null; update auth.users set reauthentication_sent_at = null");
@@ -539,7 +539,7 @@ test(
           assert.equal(r.manifest.auth.status, "failed");
           assert.equal(
             r.manifest.auth.reason,
-            "Auth archive not written: clearing the pending Auth tokens would break unique index recovery_token_unique on auth.users"
+            "Could not write auth.dump. Clearing pending Auth tokens could conflict with unique index recovery_token_unique on auth.users."
           );
           assert.equal(r.files.has("auth.dump"), false);
           assert.ok(r.files.get("dump.pgcustom").length > 0);
