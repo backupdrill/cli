@@ -334,6 +334,10 @@ export async function inspectAuth(
         order by 1, 2, 3`
     );
 
+    // 比对的是 pg_get_*def 打印出来的原文:让它和白名单记下时的打印方式一样,不受角色/库级设置影响
+    // (quote_all_identifiers 会给每个名字加引号;search_path 决定名字前带不带 schema)
+    await client.query("set local quote_all_identifiers = off");
+    await client.query("set local search_path = ''");
     const nonStockObject = await firstNonStockObject(client);
 
     await client.query("commit");
@@ -394,14 +398,15 @@ export function quotedName(name: string): string {
 const STOCK_AUTH_USERS = {
   /** CHECK / FOREIGN KEY / EXCLUDE 约束;自带的只有这一条 CHECK,没有外键和排他约束 */
   constraints: ["CHECK (((email_change_confirm_status >= 0) AND (email_change_confirm_status <= 2)))"],
-  /** 唯一索引(含主键、UNIQUE 约束背后的索引) */
-  uniqueIndexes: [
+  /** 索引:唯一索引(含主键、UNIQUE 约束背后的索引),以及带表达式的普通索引 */
+  indexes: [
     "CREATE UNIQUE INDEX ON auth.users USING btree (id)",
     "CREATE UNIQUE INDEX ON auth.users USING btree (phone)",
     "CREATE UNIQUE INDEX ON auth.users USING btree (email) WHERE (is_sso_user = false)",
     ...["confirmation_token", "recovery_token", "email_change_token_current", "email_change_token_new", "reauthentication_token"].map(
       (column) => `CREATE UNIQUE INDEX ON auth.users USING btree (${column}) WHERE ((${column})::text !~ '^[0-9 ]*$'::text)`
     ),
+    "CREATE INDEX ON auth.users USING btree (instance_id, lower((email)::text))",
   ],
   /** 生成列 → 表达式 */
   generated: new Map([["confirmed_at", "LEAST(email_confirmed_at, phone_confirmed_at)"]]),
@@ -429,7 +434,8 @@ function indexDefWithoutName(def: string): string {
  *  - 外键:只看 conkey;
  *  - 被抹成 NULL 的列不能是 NOT NULL,被抹的列不能是域类型。
  * 要比对的对象类型:CHECK、外键、排他约束(pg_get_constraintdef 原文),唯一索引和排他约束背后的索引
- * (去掉名字的 pg_get_indexdef 原文;普通索引拒绝不了 COPY,不管),生成列(列名和表达式原文)。
+ * (去掉名字的 pg_get_indexdef 原文),带表达式或 WHERE 条件的普通索引(恢复时重建要算它们;只按列建的普通索引
+ * 重建不会失败,不管),生成列(列名和表达式原文)。和 pg_dump 一样只看有效的索引。
  *
  * **只读系统目录,不执行任何用户定义的东西**:约束表达式里可以调用用户函数,不能拿备份角色的权限在生产库上跑。
  * 跑在 inspectAuth 已经开着的 REPEATABLE READ READ ONLY 事务里,不另开连接。返回第一个对不上的对象(没有就是 null)
@@ -481,18 +487,25 @@ async function firstNonStockObject(client: pg.Client): Promise<string | null> {
     return `a custom ${k.type === "c" ? "check constraint" : "foreign key"} ${quotedName(k.name)}`;
   }
 
-  const indexes = await client.query<{ name: string; def: string; keys: number[]; exprs: string | null; pred: string | null; exclusion: boolean }>(
+  // pg_dump 导出的索引(和它一样只要 indisvalid、indisready 的:CONCURRENTLY 建失败留下的无效索引不进归档)。
+  // 恢复时每个索引都要在抹过的数据上重建:唯一索引、排他约束会因重复值失败;普通索引只要有表达式或 WHERE
+  // 条件,也会在重建时算它们(例如 1 / length(recovery_token) 碰到 '' 就除零)。只按列建的普通索引重建不会失败,不管
+  const indexes = await client.query<{
+    name: string; def: string; keys: number[]; exprs: string | null; pred: string | null; unique: boolean; exclusion: boolean;
+  }>(
     `select c.relname as name, pg_get_indexdef(i.indexrelid) as def, i.indkey::int2[] as keys,
-            i.indexprs::text as exprs, i.indpred::text as pred, i.indisexclusion as exclusion
+            i.indexprs::text as exprs, i.indpred::text as pred, i.indisunique as unique, i.indisexclusion as exclusion
        from pg_index i join pg_class c on c.oid = i.indexrelid
-      where i.indrelid = 'auth.users'::regclass and (i.indisunique or i.indisexclusion)
+      where i.indrelid = 'auth.users'::regclass and i.indisvalid and i.indisready
       order by c.relname`
   );
   for (const ix of indexes.rows) {
+    if (!ix.unique && !ix.exclusion && ix.exprs === null && ix.pred === null) continue;
     // 键列里的 0 是"这一列是表达式"的占位,表达式用到的列从表达式树里读
     const referenced = [...ix.keys.filter((n) => n !== 0), ...columnsIn(ix.exprs, ix.pred)];
-    if (!mayTouch(referenced) || STOCK_AUTH_USERS.uniqueIndexes.includes(indexDefWithoutName(ix.def))) continue;
-    return `a custom ${ix.exclusion ? "exclusion constraint" : "unique index"} ${quotedName(ix.name)}`;
+    if (!mayTouch(referenced) || STOCK_AUTH_USERS.indexes.includes(indexDefWithoutName(ix.def))) continue;
+    const kind = ix.exclusion ? "exclusion constraint" : ix.unique ? "unique index" : "index";
+    return `a custom ${kind} ${quotedName(ix.name)}`;
   }
   return null;
 }

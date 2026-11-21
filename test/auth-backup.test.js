@@ -14,7 +14,7 @@ import pg from "pg";
 import { runBackup, mainDumpArgs, AUTH_TIMEOUTS } from "../dist/backup.js";
 import { schemasMayIncludeAuth, restorableAuthObjects, manualAuthObjects, redactValues, quotedName } from "../dist/auth-backup.js";
 import { parseManifest } from "../dist/manifest.js";
-import { authRecoveryText, markdownText, renderRecoveryDoc } from "../dist/recovery-doc.js";
+import { authRecoveryText, markdownCode, renderRecoveryDoc } from "../dist/recovery-doc.js";
 import { AUTH_DDL, SETUP, sql, startPostgres } from "./auth-fixtures.js";
 
 const x = promisify(execFile);
@@ -101,9 +101,13 @@ test("names from the catalog are shown safely: control characters escaped, Markd
   assert.equal(quotedName("plain"), '"plain"');
   assert.equal(quotedName('a"b\\c'), '"a\\"b\\\\c"');
   assert.equal(quotedName("x\ny\rz\tw\u0007\u009b\u2028"), '"x\\ny\\rz\\tw\\u0007\\u009b\\u2028"');
-  const shown = markdownText(`has ${quotedName("evil\n[click](https://example.com) <b>*x*</b> `code`")}`);
+  // RECOVERY.md 里放进代码段:包住它的反引号比里面最长的一串多一个,两边各留一个空格
+  const reason = `has ${quotedName("evil\n[click](https://example.com) <b>*x*</b> `code` ``x``")}`;
+  const shown = markdownCode(reason);
+  assert.equal(shown, `\`\`\` ${reason} \`\`\``);
   assert.equal(shown.includes("\n"), false);
-  assert.equal(shown, 'has "evil\\\\n\\[click\\]\\(https://example.com\\) \\<b\\>\\*x\\*\\</b\\> \\`code\\`"');
+  assert.equal(markdownCode("plain https://example.com"), "` plain https://example.com `");
+  assert.equal(markdownCode("bell\u0007"), "` bell\\u0007 `");
 });
 
 test("redactValues: values that may be user data go, identifiers stay", () => {
@@ -543,6 +547,9 @@ test(
           // token 上的表达式唯一索引
           ["expression-unique", "create unique index token_lower_unique on auth.users (lower(recovery_token))",
             'a custom unique index "token_lower_unique"', "drop index auth.token_lower_unique"],
+          // 普通索引,但表达式会在恢复重建时算:抹成 '' 之后 1 / length(recovery_token) 除零
+          ["expression-index", "create index token_ratio on auth.users ((1 / length(recovery_token)))",
+            'a custom index "token_ratio"', "drop index auth.token_ratio"],
         ];
         try {
           for (const [name, add, what, drop] of cases) {
@@ -562,8 +569,9 @@ test(
             const doc = renderRecoveryDoc(r.manifest, { snapshot: "s", bucket: "b", prefix: "p", projectName: "p" });
             const line = doc.split("\n").find((l) => l.startsWith("- **Supabase Auth users**: not in this snapshot"));
             assert.ok(line, doc);
-            assert.ok(line.includes("evil\\\\n\\[click\\]\\(https://example.com\\)"), line);
-            assert.equal(doc.includes("[click](https://example.com)"), false, "the name never becomes a Markdown link");
+            // 整段原因在代码段里:名字里的链接和裸网址都只是文字
+            assert.ok(line.includes(`(\` ${r.manifest.auth.reason} \`)`), line);
+            assert.ok(r.manifest.auth.reason.includes("https://example.com"));
           } finally {
             await sql(admin, `alter table auth.users drop constraint "${evil.replace(/"/g, '""')}"`);
           }
@@ -573,6 +581,26 @@ test(
         // 都去掉之后照常:Supabase 自带的那些(fixture 里有)不挡
         const ok = await run("scrub-stock", { databaseUrl: okUrl, auth: "default" });
         assert.equal(ok.manifest.auth.status, "included", JSON.stringify(ok.manifest.auth));
+
+        // 比对不受角色级设置影响:quote_all_identifiers 会给名字加引号,search_path 决定名字前带不带 schema
+        await sql(admin, "alter role reader_ok set quote_all_identifiers = on; alter role reader_ok set search_path = auth, public");
+        try {
+          const quoted = await run("scrub-quoted", { databaseUrl: okUrl, auth: "default" });
+          assert.equal(quoted.manifest.auth.status, "included", JSON.stringify(quoted.manifest.auth));
+        } finally {
+          await sql(admin, "alter role reader_ok reset quote_all_identifiers; alter role reader_ok reset search_path");
+        }
+
+        // CONCURRENTLY 建失败留下的无效索引 pg_dump 不导出,也就不挡(这里有重复的 '',唯一索引一定建不成)
+        await assert.rejects(sql(admin, "create unique index concurrently token_left_invalid on auth.users (recovery_token)"));
+        try {
+          const invalid = await sql(admin, "select indisvalid from pg_index where indexrelid = 'auth.token_left_invalid'::regclass");
+          assert.equal(invalid.rows[0].indisvalid, false);
+          const r = await run("scrub-invalid-index", { databaseUrl: okUrl, auth: "default" });
+          assert.equal(r.manifest.auth.status, "included", JSON.stringify(r.manifest.auth));
+        } finally {
+          await sql(admin, "drop index if exists auth.token_left_invalid");
+        }
 
         // 碰不到被抹的列的,不在白名单上也放过:和 token 无关的改动、GoTrue 以后新加的索引不能让 Auth 备份停掉
         await sql(admin, `

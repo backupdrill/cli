@@ -76,7 +76,7 @@ All recognized variables:
 |---|---|---|
 | `BACKUPDRILL_DATABASE_URL` | Source connection string (falls back to `DATABASE_URL`) | — (required) |
 | `BACKUPDRILL_PROJECT_NAME` | Readable name used in object keys and the manifest | `supabase` |
-| `BACKUPDRILL_SCHEMAS` | Comma-separated schemas to dump | `public` |
+| `BACKUPDRILL_SCHEMAS` | Comma-separated schemas to dump. If you add `auth`, `dump.pgcustom` holds the Auth tables as they are, including pending password-reset and confirmation tokens; only `auth.dump` has those cleared | `public` |
 | `BACKUPDRILL_AUTH` | Supabase Auth users (`auth.users` + `auth.identities`) go into `auth.dump` next to the database dump whenever the role can read them. `off` leaves them out. `on` makes a backup that can't include them exit with code 3; the database backup still completes either way. Also `--auth` / `--no-auth`, or `"auth": true/false` in the config file | on when possible |
 | `BACKUPDRILL_S3_ENDPOINT` | S3-compatible endpoint (R2/B2/self-hosted; omit for AWS S3) | — |
 | `BACKUPDRILL_S3_REGION` | Destination bucket region | `auto` |

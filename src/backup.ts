@@ -367,6 +367,14 @@ type AuthPlan =
  * 主 dump 永远不因 Auth 受影响。返回 dump 时,共享快照已经导出,调用方负责释放。
  */
 async function planAuth(config: BackupConfig, writer: SnapshotWriter, mode: AuthMode): Promise<AuthPlan> {
+  // 2.11.1 起只有 auth.dump 抹掉待处理 token;schemas 里明写了 auth 时,主 dump 里的 Auth 表还是原样(含 token),
+  // 每次备份提醒一句。不管 Auth 备份开没开都提醒:主 dump 的内容和它无关
+  if (authInSchemas(config.schemas) === "yes") {
+    log.warn(
+      "Your schema list includes auth, so dump.pgcustom holds the Auth tables as they are, " +
+        "including pending password-reset and confirmation tokens. Only auth.dump has them cleared."
+    );
+  }
   if (mode === "off") return { kind: "none" };
   // schemas 已经(可能)把 auth 带进主 dump:今天怎样以后还怎样,不另备一份。
   // 确定包含 → skipped(数据就在主 dump 里);说不准 → 默认模式也 skipped,显式要求时记 failed,
