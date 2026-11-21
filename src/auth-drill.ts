@@ -52,16 +52,16 @@ export interface AuthDumpForDrill {
  */
 export interface OfflineSandbox {
   /**
-   * 断开沙箱容器的全部网络,用容器里的 psql(走 unix socket)跑 script;确认这段 SQL 开的会话都已退出,
-   * 再接回网络。断不开就抛错,一句 SQL 都不跑
+   * 断开沙箱容器的全部网络,用容器里的 psql(走 unix socket)跑 script。**之后再也不接回网络**:
+   * 只确认 SQL 会话都退出了,不能证明触发器没有留下别的东西(还没起来的 docker exec、后台进程),
+   * 接回去它们就又能连出去。所以模拟注册是这个沙箱上做的最后一件事。断不开就抛错,一句 SQL 都不跑
    */
   runOffline(script: string, signal?: AbortSignal): Promise<{ code: number | null; stdout: string }>;
-  /** 接回网络后主机端口会变:当前的连接串 */
-  connString(): string;
+  /** 是否已经开始断网(断网后经主机端口的连接都连不上了) */
+  offline(): boolean;
+  /** 断网之后叫停时用:经 docker exec 终止沙箱里所有客户端会话 */
+  stopOfflineSessions(): Promise<void>;
 }
-
-/** 能让触发器连到沙箱外面的扩展。沙箱断网后,用到它们的触发器在这里会失败,而在真实项目上不一定 */
-const NETWORK_EXTENSIONS = ["dblink", "postgres_fdw", "http", "pg_net", "wrappers"];
 
 // 报告会发给用户、进运营者告警,**一律不放报错原文**:触发器能在任何错误码下抛出自定义消息、
 // 伪造对象名字段,里面可以是任意数据,靠脱敏堵不干净。只给 SQLSTATE 映射出的固定说法和 SQLSTATE 本身
@@ -216,11 +216,15 @@ export function signupScript(userInsert: string, identityInsert: string): string
   ].join("\n");
 }
 
+/**
+ * 错误上下文里能看出"出错的是一个要联网的调用":dblink、http 扩展、pg_net、外部表(postgres_fdw 等)、
+ * COPY ... PROGRAM。上下文里是用户函数里出错的那条语句的原文,用户可以写成别的样子(动态 SQL 等),
+ * 认不出就按真失败报——宁可报一次需要人看的失败,也不把真问题藏成"没测成"
+ */
+const NETWORK_CALL = /\b(dblink\w*|http(_\w+)?|net\.http_\w+)\s*\(|\bforeign table\b|\bremote SQL command\b|\b(to|from)\s+program\b/i;
+
 /** psql 的输出 → 报告里的 signup。只用 SQLSTATE 和"错在不在触发器里",错误原文不进报告(见 safeError) */
-export function signupOutcome(
-  result: { code: number | null; stdout: string },
-  networkExtensions: string[]
-): NonNullable<AuthDrillReport["signup"]> {
+export function signupOutcome(result: { code: number | null; stdout: string }): NonNullable<AuthDrillReport["signup"]> {
   const line = /^backupdrill-signup (\S+) ([0-9a-f]*)$/m.exec(result.stdout);
   if (result.code !== 0 || !line) {
     // 超时(57014 接不住)或 psql 本身出错:没模拟成
@@ -237,14 +241,14 @@ export function signupOutcome(
   const triggerPath =
     /PL\/pgSQL function|SQL function|trigger/i.test(where) ||
     ["23503", "23505", "42501", "42883", "42P01", "42703", "3F000", "P0001"].includes(state);
-  // 沙箱断着网:连不出去(SQLSTATE 08 类),或者装着能连外网的扩展时,失败可能只是因为没网,不能报成"注册会失败"
-  if (triggerPath && (state.startsWith("08") || networkExtensions.length)) {
-    const why = networkExtensions.length ? `the sandbox has ${networkExtensions.join(", ")}` : "it tried to connect somewhere";
+  // 沙箱断着网:只有失败本身是连不出去造成的(连接类 SQLSTATE,或者出错的正是一个要联网的调用),
+  // 才算"没测成";光是装着 dblink 之类的扩展不改结论——那样会把 42501 这种真问题也藏起来
+  if (triggerPath && (state.startsWith("08") || NETWORK_CALL.test(where))) {
     return {
       ran: false,
       detail:
-        `a trigger failed (${describeSqlstate(state)}) and may need the network (${why}); ` +
-        `the test sign-up runs with the sandbox cut off from the network, so it can't write to your other systems`,
+        `a trigger needed the network (${describeSqlstate(state)}); the test sign-up runs with the sandbox ` +
+        `cut off from the network, so it can't write to your other systems`,
     };
   }
   return triggerPath
@@ -435,11 +439,6 @@ export async function runAuthDrill(
       await client.query("alter table auth.users owner to supabase_auth_admin; alter table auth.identities owner to supabase_auth_admin");
       const userInsert = await insertStatement(client, "users");
       const identityInsert = await insertStatement(client, "identities");
-      const networkExtensions = (
-        await client.query<{ name: string }>("select extname as name from pg_extension where extname = any($1::text[]) order by 1", [
-          NETWORK_EXTENSIONS,
-        ])
-      ).rows.map((r) => r.name);
       if (!userInsert || !identityInsert) {
         signup = { ran: false, detail: "couldn't build a test sign-up for this Auth table layout" };
       } else if (!sandbox) {
@@ -455,7 +454,7 @@ export async function runAuthDrill(
         } catch {
           signup = { ran: false, detail: "the sandbox couldn't be cut off from the network, so no test sign-up was run" };
         }
-        if (result) signup = signupOutcome(result, networkExtensions);
+        if (result) signup = signupOutcome(result);
       }
       if (signup.ran && !signup.ok) problems.push(signup.detail!);
       // 有要验证的触发器,却没能模拟成注册:不能报"全部对上"
@@ -569,8 +568,9 @@ export async function authDrillSection(
     if (started) {
       void (async () => {
         await waitAtMost(started, 10_000);
-        // 模拟注册接回网络后端口会变,按当前的连接串去终止
-        await stopAuthSessions(runner.sandbox?.connString() ?? sandboxConnString);
+        // 模拟注册已经把沙箱断了网:经主机端口连不上了,改经 docker exec 终止
+        if (runner.sandbox?.offline()) await runner.sandbox.stopOfflineSessions();
+        else await stopAuthSessions(sandboxConnString);
       })();
     }
   };

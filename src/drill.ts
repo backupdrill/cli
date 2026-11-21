@@ -81,7 +81,11 @@ export interface DrillReport {
   restoredTableCount: number;
   restoredRowTotal: number;
   /** --keep 且演练失败时:被保留的沙箱(供排查/脚本消费);其余情况不存在 */
-  keptSandbox?: { containerId: string; connString: string };
+  /**
+   * 2.11.1 起:跑过 Auth 的模拟注册后沙箱没有网络(offline: true),这时没有 connString,
+   * 只能按 inspect 给的命令进容器看
+   */
+  keptSandbox?: { containerId: string; connString?: string; offline?: true; inspect: string };
   /** 源库自带孤儿行的外键:演练和真实恢复都把它们建成 NOT VALID,不算失败。没有时不出现 */
   orphanedForeignKeys?: OrphanedForeignKey[];
   /**
@@ -97,6 +101,8 @@ interface Ephemeral {
   containerId: string;
   port: string;
   connString: string;
+  /** 2.11.1:模拟注册之前把沙箱断了网(之后不再接回),connString 从此连不上 */
+  offline: boolean;
   /** pg_restore 并行路数,随调参一起按 Docker 的内存和 CPU 定(见 sandboxTuning) */
   restoreJobs: number;
   /** 删容器和数据卷;幂等,正常收尾和中断收尾共用 */
@@ -371,7 +377,7 @@ async function startEphemeralPostgres(image: string, major: number, resourceName
           "postgres",
           "-q",
         ]);
-        return { containerId, port, connString, restoreJobs: tuning.restoreJobs, teardown, forgetInterruptCleanup };
+        return { containerId, port, connString, offline: false, restoreJobs: tuning.restoreJobs, teardown, forgetInterruptCleanup };
       } catch {
         await new Promise((r) => setTimeout(r, 500));
       }
@@ -449,58 +455,61 @@ async function endSandboxSessions(containerId: string): Promise<boolean> {
  * 模拟注册用的"断网跑 SQL"(见 auth-drill.ts OfflineSandbox)。
  *
  * 为什么是临时断网,而不是一开始就不给沙箱联网:CLI 和 pg_restore 都从主机经发布的端口连沙箱,
- * --network none 和 --internal 网络都发布不了端口。所以平时照旧,只在模拟注册这一步把容器从所有网络上
- * 摘下来(只剩 loopback),经 docker exec 里的 psql 走 unix socket 跑;跑完先终止并确认所有会话都退出了
- * (触发器还在跑时接回网络,它就又能连出去),再接回原来的网络。接回后 Docker 会重新分配主机端口,
- * 连接串随之更新(--keep 留下的沙箱要用)。摘不干净就不跑;确认不了会话已退出就不接回网络
- * (沙箱反正马上销毁;--keep 时打警告)
+ * --network none 和 --internal 网络都发布不了端口。所以恢复、校验照旧,只在最后的模拟注册之前把容器从所有
+ * 网络上摘下来(只剩 loopback),经 docker exec 里的 psql 走 unix socket 跑。
+ *
+ * **断了就不再接回**:能确认的只有 SQL 会话都退出了,确认不了触发器有没有留下别的东西(被叫停时还没起来的
+ * docker exec、触发器起的后台进程),一接回它们就又能连出去。所以模拟注册是这个沙箱上的最后一件事:
+ * 不带 --keep 时照常销毁;--keep 留下的沙箱没有网络,只能 docker exec 进去看(见 keptSandboxInfo)。
+ * 摘不干净就不跑。
  */
 function offlineSandbox(pg: Ephemeral): OfflineSandbox {
   return {
-    connString: () => pg.connString,
+    offline: () => pg.offline,
+    async stopOfflineSessions() {
+      await waitAtMost(endSandboxSessions(pg.containerId), 15_000);
+    },
     async runOffline(script, signal) {
       if (signal?.aborted) throw new Error("stopped");
       const networks = await containerNetworks(pg.containerId);
-      const disconnected: string[] = [];
-      let offline = false;
+      // 从摘第一个网络起就算断网了:摘到一半失败也不接回去,沙箱照样不能再经主机端口用
+      if (networks.length) pg.offline = true;
+      for (const network of networks) {
+        await execFileAsync("docker", ["network", "disconnect", network, pg.containerId], { timeout: 30_000 });
+      }
+      const left = await containerNetworks(pg.containerId);
+      if (left.length) throw new Error(`the sandbox is still on ${left.join(", ")}`);
+      pg.offline = true;
+      if (signal?.aborted) throw new Error("stopped");
       try {
-        for (const network of networks) {
-          await execFileAsync("docker", ["network", "disconnect", network, pg.containerId], { timeout: 30_000 });
-          disconnected.push(network);
-        }
-        const left = await containerNetworks(pg.containerId);
-        if (left.length) throw new Error(`the sandbox is still on ${left.join(", ")}`);
-        offline = true;
-        if (signal?.aborted) throw new Error("stopped");
         return await containerPsql(pg.containerId, [], { input: script, timeoutMs: 6 * 60 * 1000, signal });
       } finally {
-        await reconnectSandbox(pg, disconnected, offline);
+        // 被叫停或超时时 psql 可能还在容器里跑:把会话终止掉,--keep 留下的沙箱事后不再被改动
+        if (signal?.aborted) await waitAtMost(endSandboxSessions(pg.containerId), 15_000);
       }
     },
   };
 }
 
-async function reconnectSandbox(pg: Ephemeral, networks: string[], wasOffline: boolean): Promise<void> {
-  if (!networks.length) return;
-  try {
-    if (wasOffline && !(await endSandboxSessions(pg.containerId))) {
-      log.warn("Couldn't confirm the test sign-up's session ended, so the drill sandbox stays off the network.");
-      return;
-    }
-    for (const network of networks) {
-      await execFileAsync("docker", ["network", "connect", network, pg.containerId], { timeout: 30_000 });
-    }
-    const portOut = await execFileAsync("docker", ["port", pg.containerId, "5432/tcp"], { timeout: 15_000 });
-    const port = portOut.stdout.trim().split("\n")[0].split(":").pop()!.trim();
-    const url = new URL(pg.connString);
-    url.port = port;
-    pg.port = port;
-    pg.connString = url.toString();
-  } catch (error) {
-    // 超时或中断后沙箱可能已经销毁了:那就没什么要接回的。还在的(--keep 留下的)这时连不上,如实提示
-    if (/No such container/i.test(String((error as { stderr?: string }).stderr ?? error))) return;
-    log.warn("Couldn't put the drill sandbox back on the network after the test sign-up.");
-  }
+async function waitAtMost(p: Promise<unknown>, ms: number): Promise<void> {
+  let timer: NodeJS.Timeout | undefined;
+  await Promise.race([p.then(() => {}, () => {}), new Promise<void>((resolve) => (timer = setTimeout(resolve, ms)))]);
+  clearTimeout(timer);
+}
+
+/** --keep 留下的沙箱怎么看:模拟注册之后它没有网络,主机端口不再可用,只能 docker exec 进去 */
+function keptSandboxInfo(pg: Ephemeral): NonNullable<DrillReport["keptSandbox"]> {
+  const inspect = `docker exec -it ${pg.containerId.slice(0, 12)} psql -U postgres`;
+  return pg.offline
+    ? { containerId: pg.containerId, offline: true, inspect }
+    : { containerId: pg.containerId, connString: pg.connString, inspect };
+}
+
+function keptSandboxText(pg: Ephemeral): string {
+  return pg.offline
+    ? `container ${pg.containerId.slice(0, 12)}, which has no network since the Auth test sign-up ` +
+        `(inspect it with: docker exec -it ${pg.containerId.slice(0, 12)} psql -U postgres)`
+    : pg.connString;
 }
 
 // installExtensions 已上移到统一引擎(restore-engine.ts):沙箱与真实恢复共用,
@@ -1049,7 +1058,7 @@ export async function drillDump(
     }
     if (opts.keepSandboxOnFailure && !pass) {
       // 写进报告让 --keep 可被脚本消费(拿连接串排查),不只靠人眼看日志
-      report.keptSandbox = { containerId: pg.containerId, connString: pg.connString };
+      report.keptSandbox = keptSandboxInfo(pg);
     }
     return report;
   } catch (error) {
@@ -1057,14 +1066,14 @@ export async function drillDump(
     // 错误信息,让脚本和人都拿得到被保留容器的清理线索
     if (opts.keepSandboxOnFailure) {
       (error as Error).message +=
-        ` [sandbox kept: ${pg.connString} — remove with: docker rm -f ${pg.containerId.slice(0, 12)}]`;
+        ` [sandbox kept: ${keptSandboxText(pg)} — remove with: docker rm -f ${pg.containerId.slice(0, 12)}]`;
     }
     throw error;
   } finally {
     if (opts.keepSandboxOnFailure && !pass) {
       // --rm 容器不 docker rm 就一直活着;用户排查完 stop/rm 时 --rm 自动清理
       log.warn(
-        `--keep: sandbox left running for inspection — ${pg.connString} ` +
+        `--keep: sandbox left running for inspection — ${keptSandboxText(pg)} ` +
           `(remove with: docker rm -f ${pg.containerId.slice(0, 12)})`
       );
     } else {

@@ -378,47 +378,101 @@ id" uuid references auth.users (id) on delete set null)`);
       });
 
       await t.test("the test sign-up runs with the sandbox off the network: a dblink trigger can't write anywhere else", async () => {
-        // "别的系统"就用源库本身:沙箱平时在默认网桥上,按容器 IP 连得到它。2.11.0 时这条触发器会在
-        // 模拟注册里经 dblink 往 public.leaks 写一行,并且不随回滚撤销
+        // "别的系统"就用源库本身:沙箱平时在默认网桥上,按容器 IP 连得到它
         const sourceIp = (
           await x("docker", ["inspect", "-f", "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}", ids[0]])
         ).stdout.trim();
         assert.match(sourceIp, /^\d+\.\d+\.\d+\.\d+$/);
+        const dblinkCall = `public.dblink_exec('host=${sourceIp} port=5432 user=postgres password=pw dbname=postgres connect_timeout=5', 'insert into public.leaks default values')`;
         await sql(admin, `
           create extension dblink;
           create table public.leaks (at timestamptz not null default now());
           create function public.tell_crm() returns trigger language plpgsql security definer set search_path = '' as $$
           begin
-            perform public.dblink_exec('host=${sourceIp} port=5432 user=postgres password=pw dbname=postgres connect_timeout=5',
-                                       'insert into public.leaks default values');
+            perform ${dblinkCall};
             return new;
           end $$;
           create trigger tell_crm after insert on auth.users for each row execute function public.tell_crm();`);
         try {
           const mem = await backup("default");
-          const report = await runDrill(config, { store: mem.store });
+          // 对照:同一个沙箱在线时(--check-cmd 在模拟注册之前跑),同一句 dblink 调用确实写得进源库。
+          // 证明这个测试里"别的系统"是连得到的,下面的 0 才有意义
+          const control = `psql "$BACKUPDRILL_SANDBOX_URL" -X -q -v ON_ERROR_STOP=1 -c "select ${dblinkCall.replace(/"/g, '\\"')}"`;
+          const report = await runDrill(config, { store: mem.store, appCheckCommand: control });
           assert.equal(report.pass, true, JSON.stringify(report.checks));
+          assert.equal(report.checks.find((c) => c.name === "app checks")?.pass, true, "the online control call ran");
           assert.ok(report.auth.triggers.created.includes("tell_crm"), JSON.stringify(report.auth));
           assert.equal(report.auth.signup.ran, false, JSON.stringify(report.auth.signup));
-          assert.match(report.auth.signup.detail, /cut off from the network/);
-          assert.match(report.auth.signup.detail, /dblink/);
+          assert.match(report.auth.signup.detail, /needed the network/);
           const leaks = await sql(admin, "select count(*)::int as n from public.leaks");
-          assert.equal(leaks.rows[0].n, 0, "nothing reached the other database");
+          assert.equal(leaks.rows[0].n, 1, "only the online control wrote a row; the offline test sign-up wrote nothing");
+
+          // dblink 照样装着,触发器却是因为权限失败:报成注册会失败,不藏成"没测成"
+          await sql(admin, `
+            create or replace function public.tell_crm() returns trigger language plpgsql security definer set search_path = '' as $$
+            begin raise exception 'no access' using errcode = '42501'; end $$;`);
+          const denied = await runDrill(config, { store: (await backup("default")).store });
+          assert.equal(denied.auth.signup.ok, false, JSON.stringify(denied.auth.signup));
+          assert.equal(
+            denied.auth.signup.detail,
+            "a new sign-up would fail: permission denied (SQLSTATE 42501) (tested as an email sign-up with no user metadata)"
+          );
         } finally {
           await sql(admin, "drop trigger tell_crm on auth.users; drop function public.tell_crm(); drop table public.leaks; drop extension dblink");
         }
       });
 
-      await t.test("a sandbox kept with --keep is back on the network after the test sign-up, at its new port", async () => {
+      const networksOf = async (id) =>
+        Object.keys(JSON.parse((await x("docker", ["inspect", "-f", "{{json .NetworkSettings.Networks}}", id])).stdout.trim()) ?? {});
+      const inContainer = async (id, query) =>
+        (await x("docker", ["exec", id, "psql", "-U", "postgres", "-X", "-tA", "-c", query])).stdout.trim();
+
+      await t.test("a sandbox kept with --keep after the test sign-up stays off the network and says how to get in", async () => {
         const mem = await backup("default");
         const report = await runDrill(config, { store: mem.store, appCheckCommand: "exit 1", keepSandboxOnFailure: true });
         assert.ok(report.keptSandbox, "a failed drill with --keep leaves the sandbox");
+        const id = report.keptSandbox.containerId;
         try {
           assert.deepEqual(report.auth.signup, { ran: true, ok: true });
-          const kept = await sql(report.keptSandbox.connString, "select count(*)::int as n from auth.users");
-          assert.equal(kept.rows[0].n, 4, "the test sign-up was rolled back, and the kept sandbox answers on its connection string");
+          assert.equal(report.keptSandbox.offline, true);
+          assert.equal(report.keptSandbox.connString, undefined, "no host URL for a sandbox that has no network");
+          assert.equal(report.keptSandbox.inspect, `docker exec -it ${id.slice(0, 12)} psql -U postgres`);
+          assert.deepEqual(await networksOf(id), [], "never put back on the network");
+          assert.equal(await inContainer(id, "select count(*) from auth.users"), "4", "the test sign-up was rolled back");
         } finally {
-          await x("docker", ["rm", "-f", "-v", report.keptSandbox.containerId]).catch(() => {});
+          await x("docker", ["rm", "-f", "-v", id]).catch(() => {});
+        }
+      });
+
+      await t.test("an Auth check that times out during the offline sign-up: the kept sandbox is reported offline, its sessions ended", async () => {
+        await sql(admin, `
+          create function public.slow_signup() returns trigger language plpgsql security definer set search_path = '' as $$
+          begin perform pg_sleep(120); return new; end $$;
+          create trigger slow_signup after insert on auth.users for each row execute function public.slow_signup();`);
+        const previous = AUTH_DRILL_LIMITS.totalMs;
+        let id;
+        try {
+          const mem = await backup("default");
+          AUTH_DRILL_LIMITS.totalMs = 20_000;
+          const report = await runDrill(config, { store: mem.store, appCheckCommand: "exit 1", keepSandboxOnFailure: true });
+          id = report.keptSandbox?.containerId;
+          assert.ok(id, "a failed drill with --keep leaves the sandbox");
+          assert.equal(report.auth.status, "not_checked", report.auth.summary);
+          assert.equal(report.keptSandbox.offline, true, JSON.stringify(report.keptSandbox));
+          assert.equal(report.keptSandbox.connString, undefined);
+          assert.deepEqual(await networksOf(id), []);
+          // 收尾在后台:很快就没有还在跑的模拟注册了
+          let left = "1";
+          for (let i = 0; i < 60 && left !== "0"; i++) {
+            left = await inContainer(id, "select count(*) from pg_stat_activity where backend_type = 'client backend' and pid <> pg_backend_pid()");
+            if (left !== "0") await new Promise((r) => setTimeout(r, 500));
+          }
+          assert.equal(left, "0", "no test sign-up session left in the kept sandbox");
+          assert.equal(await inContainer(id, "select count(*) from auth.users"), "4");
+        } finally {
+          AUTH_DRILL_LIMITS.totalMs = previous;
+          if (id) await x("docker", ["rm", "-f", "-v", id]).catch(() => {});
+          await sql(admin, "drop trigger slow_signup on auth.users; drop function public.slow_signup()");
         }
       });
 

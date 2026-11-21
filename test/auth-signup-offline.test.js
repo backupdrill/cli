@@ -22,36 +22,53 @@ test("signupScript: rolls back, runs as supabase_auth_admin, and uses a fresh do
 });
 
 test("signupOutcome: ok, a trigger that fails, and a test row that doesn't fit the table", () => {
-  assert.deepEqual(signupOutcome(out("ok"), []), { ran: true, ok: true });
+  assert.deepEqual(signupOutcome(out("ok")), { ran: true, ok: true });
   assert.deepEqual(
-    signupOutcome(out("P0001", `PL/pgSQL function public.handle_new_user() line 3 at RAISE\n${OWN_BLOCK}`), []),
+    signupOutcome(out("P0001", `PL/pgSQL function public.handle_new_user() line 3 at RAISE\n${OWN_BLOCK}`)),
     { ran: true, ok: false, detail: "a new sign-up would fail: an exception was raised (SQLSTATE P0001) (tested as an email sign-up with no user metadata)" }
   );
   // 错在我们造的那一行本身(只有我们自己那层 DO 块的上下文):不算触发器的问题
-  assert.deepEqual(signupOutcome(out("23502", OWN_BLOCK), []), {
+  assert.deepEqual(signupOutcome(out("23502", OWN_BLOCK)), {
     ran: false,
     detail: "couldn't simulate a sign-up: a not-null constraint was violated (SQLSTATE 23502)",
   });
 });
 
-test("signupOutcome: a trigger failing while the sandbox is off the network isn't reported as a broken sign-up", () => {
-  const trigger = `PL/pgSQL function public.tell_crm() line 2 at PERFORM\n${OWN_BLOCK}`;
-  const viaExtension = signupOutcome(out("XX000", trigger), ["dblink"]);
-  assert.equal(viaExtension.ran, false);
-  assert.match(viaExtension.detail, /the sandbox has dblink/);
-  assert.match(viaExtension.detail, /cut off from the network/);
-  const connecting = signupOutcome(out("08001", trigger), []);
+test("signupOutcome: only a failure caused by the missing network is 'not tested'; anything else is a real sign-up failure", () => {
+  const dblinkCall =
+    `SQL statement "SELECT public.dblink_exec('host=10.0.0.1', 'insert into t default values')"\n` +
+    `PL/pgSQL function public.tell_crm() line 2 at PERFORM\n${OWN_BLOCK}`;
+  // dblink 连不上:SQLSTATE 08001,出错的就是 dblink 调用
+  const connecting = signupOutcome(out("08001", dblinkCall));
   assert.equal(connecting.ran, false);
-  assert.match(connecting.detail, /a connection couldn't be made \(SQLSTATE 08001\)/);
-  // 和网络无关的失败照旧报出来(没装能连外网的扩展)
-  assert.equal(signupOutcome(out("P0001", trigger), []).ok, false);
+  assert.match(connecting.detail, /needed the network \(a connection couldn't be made \(SQLSTATE 08001\)\)/);
+  assert.match(connecting.detail, /cut off from the network/);
+  // 不是连接类的错,但出错的正是要联网的调用(http 扩展、pg_net、COPY ... PROGRAM、外部表)
+  for (const statement of [
+    `SQL statement "SELECT http_post('https://crm.example/hook', '{}', 'application/json')"`,
+    `SQL statement "SELECT net.http_post(url := 'https://crm.example/hook')"`,
+    `SQL statement "copy (select 1) to program 'wget -q https://crm.example/hook'"`,
+    "remote SQL command: INSERT INTO public.signups(id) VALUES ($1)",
+  ]) {
+    const r = signupOutcome(out("XX000", `${statement}\nPL/pgSQL function public.tell_crm() line 2 at PERFORM\n${OWN_BLOCK}`));
+    assert.equal(r.ran, false, statement);
+  }
+  // 沙箱里装着 dblink,但触发器是因为权限失败的:照实报成注册会失败,不藏成"没测成"
+  const denied = signupOutcome(
+    out("42501", `SQL statement "insert into private.audit values (new.id)"\nPL/pgSQL function public.tell_crm() line 4 at SQL statement\n${OWN_BLOCK}`)
+  );
+  assert.deepEqual(denied, {
+    ran: true,
+    ok: false,
+    detail: "a new sign-up would fail: permission denied (SQLSTATE 42501) (tested as an email sign-up with no user metadata)",
+  });
 });
 
 test("signupOutcome: psql that didn't finish (timeout, killed) or printed no result line means no sign-up was simulated", () => {
-  assert.deepEqual(signupOutcome({ code: 3, stdout: "" }, []), { ran: false, detail: "couldn't simulate a sign-up: it didn't finish" });
-  assert.deepEqual(signupOutcome({ code: null, stdout: "backupdrill-signup ok \n" }, []), {
+  assert.deepEqual(signupOutcome({ code: 3, stdout: "" }), { ran: false, detail: "couldn't simulate a sign-up: it didn't finish" });
+  assert.deepEqual(signupOutcome({ code: null, stdout: "backupdrill-signup ok \n" }), {
     ran: false,
     detail: "couldn't simulate a sign-up: it didn't finish",
   });
-  assert.equal(signupOutcome({ code: 0, stdout: "something else\n" }, []).ran, false);
+  assert.equal(signupOutcome({ code: 0, stdout: "something else\n" }).ran, false);
 });
