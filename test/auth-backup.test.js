@@ -537,9 +537,12 @@ test(
           ["generated", `alter table auth.users add column token_length int generated always as (length(recovery_token)) stored;
               alter table auth.users add constraint token_length_positive check (token_length > 0)`,
             'a custom generated column "token_length"', "alter table auth.users drop column token_length"],
-          // 表达式上的排他约束(conkey 是 {0},按列号对不出来)
+          // 表达式上的排他约束(conkey 是 {0},按它背后索引的表达式树认出用到了 recovery_token)
           ["exclusion", "alter table auth.users add constraint token_exclusive exclude using btree (lower(recovery_token) with =)",
             'a custom exclusion constraint "token_exclusive"', "alter table auth.users drop constraint token_exclusive"],
+          // token 上的表达式唯一索引
+          ["expression-unique", "create unique index token_lower_unique on auth.users (lower(recovery_token))",
+            'a custom unique index "token_lower_unique"', "drop index auth.token_lower_unique"],
         ];
         try {
           for (const [name, add, what, drop] of cases) {
@@ -552,7 +555,7 @@ test(
           }
           // 名字里带换行和 Markdown 链接:日志、manifest 里转义成可见的文字,RECOVERY.md 里不会变成链接或多出一行
           const evil = 'evil\n[click](https://example.com)';
-          await sql(admin, `alter table auth.users add constraint "${evil.replace(/"/g, '""')}" check (true)`);
+          await sql(admin, `alter table auth.users add constraint "${evil.replace(/"/g, '""')}" check (recovery_token is not null)`);
           try {
             const r = await expectRefused("scrub-evil-name", 'a custom check constraint "evil\\n[click](https://example.com)"');
             assert.equal(r.manifest.auth.reason.includes("\n"), false, "no raw newline in the reason");
@@ -570,6 +573,22 @@ test(
         // 都去掉之后照常:Supabase 自带的那些(fixture 里有)不挡
         const ok = await run("scrub-stock", { databaseUrl: okUrl, auth: "default" });
         assert.equal(ok.manifest.auth.status, "included", JSON.stringify(ok.manifest.auth));
+
+        // 碰不到被抹的列的,不在白名单上也放过:和 token 无关的改动、GoTrue 以后新加的索引不能让 Auth 备份停掉
+        await sql(admin, `
+          alter table auth.users add constraint users_email_key unique (email);
+          alter table auth.users add column extra text unique;
+          create unique index users_lower_email on auth.users (lower(email));
+          create table public.instances (id uuid primary key);
+          alter table auth.users add constraint users_instance_fk foreign key (instance_id) references public.instances (id);`);
+        try {
+          const unrelated = await run("scrub-unrelated", { databaseUrl: okUrl, auth: "default" });
+          assert.equal(unrelated.manifest.auth.status, "included", JSON.stringify(unrelated.manifest.auth));
+          assert.ok(unrelated.files.get("auth.dump").length > 0);
+        } finally {
+          await sql(admin, `alter table auth.users drop constraint users_instance_fk, drop constraint users_email_key, drop column extra;
+            drop index auth.users_lower_email; drop table public.instances`);
+        }
       });
 
       await t.test("the main dump can't import the snapshot: it is redone the old way, Auth marked unavailable", async () => {

@@ -519,6 +519,8 @@ test(
         const srcConfig = { ...config, databaseUrl: `postgresql://reader_ok:r@127.0.0.1:${port}/emailsource`, projectName: "emailfk" };
         const srcMem = readableMemoryStore();
         await runBackup({ ...srcConfig, auth: "default" }, { store: srcMem.store });
+        // email 不是被抹的列,UNIQUE (email) 不挡 Auth 备份:这条检查走的是带 Auth 的恢复
+        assert.equal(srcMem.manifest().auth.status, "included", JSON.stringify(srcMem.manifest().auth));
         const target = await freshTarget();
         const run = (extra) => runRestore(srcConfig, { store: srcMem.store, targetDatabaseUrl: target, confirmTarget: "127.0.0.1", ...extra });
         await assert.rejects(run({ dryRun: true }), /auth\.users on the target has no unique index on \(email\)/);

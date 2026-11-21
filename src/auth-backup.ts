@@ -417,53 +417,82 @@ function indexDefWithoutName(def: string): string {
  * 用户自己在 auth.users 上加的约束可能不接受这些值(例如 CHECK (recovery_token <> '')、token 列上不带条件的
  * 唯一索引、从 token 算出来的生成列再加 CHECK):原样的归档恢复得了、抹过的却恢复不了,这比不抹更糟。
  *
- * 所以用严格的白名单:只有 auth.users 上所有会在 COPY 时起作用的东西都和 Supabase 自带的一模一样,才写 auth.dump,
- * 否则不写、Auth 这一节记失败并点名第一个对不上的对象。逐条分析"这条约束会不会拒绝抹过的值"靠不住
- * (生成列、表达式排他约束都会漏),白名单不会漏。要比对的:
- *  - 所有 CHECK、外键、排他约束(按 pg_get_constraintdef 原文);
- *  - 所有唯一索引和排他约束背后的索引(按去掉名字的 pg_get_indexdef 原文;普通索引拒绝不了 COPY,不管);
- *  - 所有生成列(按列名和表达式原文);
+ * 规则:**可能碰到被抹的列**的东西,必须和 Supabase 自带的一模一样,否则不写 auth.dump、Auth 这一节记失败并点名
+ * 第一个对不上的对象。碰不到的(UNIQUE (email)、新加的非 token 列上的唯一索引、instance_id 上的外键)一律放过——
+ * 不然和 token 无关的改动、或者 GoTrue 以后新加的索引,都会让 Auth 备份悄悄停掉。"可能碰到"按系统目录判断:
+ *  - 约束的 conkey、索引的键列里有被抹的列(CHECK 的 conkey 就是它引用的全部列,0 = 整行);
+ *  - 索引的表达式和 WHERE 条件、生成列的表达式:读系统目录里存的表达式树(indexprs / indpred / adbin 的文本),
+ *    里面每个列引用都是 ":varattno N",0 = 整行。不用 pg_depend:全是表达式的索引在那里总记着对整张表(列号 0)
+ *    的依赖,分不出 lower(email) 和真的整行引用;
+ *  - 排他约束按它背后的索引判断;
+ *  - 生成列的表达式引用了被抹的列:它本身要和自带的一样,用到它的约束、索引也算可能碰到;
+ *  - 外键:只看 conkey;
  *  - 被抹成 NULL 的列不能是 NOT NULL,被抹的列不能是域类型。
+ * 要比对的对象类型:CHECK、外键、排他约束(pg_get_constraintdef 原文),唯一索引和排他约束背后的索引
+ * (去掉名字的 pg_get_indexdef 原文;普通索引拒绝不了 COPY,不管),生成列(列名和表达式原文)。
  *
  * **只读系统目录,不执行任何用户定义的东西**:约束表达式里可以调用用户函数,不能拿备份角色的权限在生产库上跑。
  * 跑在 inspectAuth 已经开着的 REPEATABLE READ READ ONLY 事务里,不另开连接。返回第一个对不上的对象(没有就是 null)
  */
 async function firstNonStockObject(client: pg.Client): Promise<string | null> {
   const blanked = new Map(PENDING_AUTH_COPY_VALUES);
-  const columns = await client.query<{ name: string; notnull: boolean; domain: boolean; generated: boolean; expr: string | null }>(
-    `select a.attname as name, a.attnotnull as notnull, t.typtype = 'd' as domain,
-            a.attgenerated <> '' as generated,
-            case when a.attgenerated <> '' then pg_get_expr(d.adbin, d.adrelid) end as expr
-       from pg_attribute a
-       join pg_type t on t.oid = a.atttypid
-       left join pg_attrdef d on d.adrelid = a.attrelid and d.adnum = a.attnum
+  const columns = await client.query<{ attnum: number; name: string; notnull: boolean; domain: boolean }>(
+    `select a.attnum, a.attname as name, a.attnotnull as notnull, t.typtype = 'd' as domain
+       from pg_attribute a join pg_type t on t.oid = a.atttypid
       where a.attrelid = 'auth.users'::regclass and a.attnum > 0 and not a.attisdropped
       order by a.attnum`
   );
+  // 被抹的列,加上从它们算出来的生成列:碰到这些列的东西才要比对
+  const touched = new Set<number>();
   for (const c of columns.rows) {
-    if (blanked.has(c.name) && c.domain) return `a domain-typed column ${quotedName(c.name)}`;
+    if (!blanked.has(c.name)) continue;
+    touched.add(c.attnum);
+    if (c.domain) return `a domain-typed column ${quotedName(c.name)}`;
     if (blanked.get(c.name) === "\\N" && c.notnull) return `a NOT NULL column ${quotedName(c.name)}`;
-    if (c.generated && STOCK_AUTH_USERS.generated.get(c.name) !== c.expr) return `a custom generated column ${quotedName(c.name)}`;
   }
-  const constraints = await client.query<{ name: string; type: string; def: string }>(
-    `select conname as name, contype::text as type, pg_get_constraintdef(oid) as def
+  // 列号 0 = 整行,什么列都可能碰到
+  const mayTouch = (referenced: number[]) => referenced.some((n) => n === 0 || touched.has(n));
+  /** 表达式树(pg_node_tree 的文本)里引用的列号;表达式里的常量是按字节存的,不会被误认成列引用 */
+  const columnsIn = (...trees: Array<string | null>) =>
+    trees.flatMap((tree) => [...(tree ?? "").matchAll(/:varattno (-?\d+)/g)].map((m) => Number(m[1])));
+
+  const generated = await client.query<{ attnum: number; name: string; expr: string; tree: string }>(
+    `select a.attnum, a.attname as name, pg_get_expr(d.adbin, d.adrelid) as expr, d.adbin::text as tree
+       from pg_attribute a join pg_attrdef d on d.adrelid = a.attrelid and d.adnum = a.attnum
+      where a.attrelid = 'auth.users'::regclass and a.attgenerated <> '' and not a.attisdropped
+      order by a.attnum`
+  );
+  for (const g of generated.rows) {
+    if (!mayTouch(columnsIn(g.tree))) continue;
+    if (STOCK_AUTH_USERS.generated.get(g.name) !== g.expr) return `a custom generated column ${quotedName(g.name)}`;
+    touched.add(g.attnum);
+  }
+
+  // CHECK 的 conkey 是它引用的全部列;外键只有自己的列。排他约束在下面按它背后的索引判断
+  const constraints = await client.query<{ name: string; type: string; def: string; keys: number[] }>(
+    `select conname as name, contype::text as type, pg_get_constraintdef(oid) as def, coalesce(conkey::int[], '{}') as keys
        from pg_constraint
-      where conrelid = 'auth.users'::regclass and contype in ('c', 'f', 'x')
+      where conrelid = 'auth.users'::regclass and contype in ('c', 'f')
       order by conname`
   );
   for (const k of constraints.rows) {
-    if (STOCK_AUTH_USERS.constraints.includes(k.def)) continue;
-    const kind = k.type === "c" ? "check constraint" : k.type === "f" ? "foreign key" : "exclusion constraint";
-    return `a custom ${kind} ${quotedName(k.name)}`;
+    const could = k.type === "f" ? k.keys.some((n) => touched.has(n)) : mayTouch(k.keys);
+    if (!could || STOCK_AUTH_USERS.constraints.includes(k.def)) continue;
+    return `a custom ${k.type === "c" ? "check constraint" : "foreign key"} ${quotedName(k.name)}`;
   }
-  const indexes = await client.query<{ name: string; def: string }>(
-    `select c.relname as name, pg_get_indexdef(i.indexrelid) as def
+
+  const indexes = await client.query<{ name: string; def: string; keys: number[]; exprs: string | null; pred: string | null; exclusion: boolean }>(
+    `select c.relname as name, pg_get_indexdef(i.indexrelid) as def, i.indkey::int2[] as keys,
+            i.indexprs::text as exprs, i.indpred::text as pred, i.indisexclusion as exclusion
        from pg_index i join pg_class c on c.oid = i.indexrelid
       where i.indrelid = 'auth.users'::regclass and (i.indisunique or i.indisexclusion)
       order by c.relname`
   );
   for (const ix of indexes.rows) {
-    if (!STOCK_AUTH_USERS.uniqueIndexes.includes(indexDefWithoutName(ix.def))) return `a custom unique index ${quotedName(ix.name)}`;
+    // 键列里的 0 是"这一列是表达式"的占位,表达式用到的列从表达式树里读
+    const referenced = [...ix.keys.filter((n) => n !== 0), ...columnsIn(ix.exprs, ix.pred)];
+    if (!mayTouch(referenced) || STOCK_AUTH_USERS.uniqueIndexes.includes(indexDefWithoutName(ix.def))) continue;
+    return `a custom ${ix.exclusion ? "exclusion constraint" : "unique index"} ${quotedName(ix.name)}`;
   }
   return null;
 }
