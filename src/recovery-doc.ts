@@ -11,6 +11,19 @@ import { recoveryGrantsSql } from "./grants.js";
 import { plainSchemaName, restorableAuthObjects } from "./auth-backup.js";
 import { authRestoreNotes, CLEAR_PENDING_AUTH_SQL } from "./auth-restore.js";
 
+/**
+ * 原样写进 RECOVERY.md 的一段文字(例如 Auth 失败的原因,里面有从系统目录读来的约束名、索引名):放进代码段里,
+ * Markdown 不再解释里面的任何东西(链接、强调、HTML,GFM 也不会把裸网址自动变成链接)。按 CommonMark 的规则,
+ * 包住它的反引号要比里面最长的一串反引号多一个;两边各加一个空格,文字本身以反引号或空格开头结尾也不受影响。
+ * 控制字符换成可见的转义,名字里的换行不会让这一段断开
+ */
+export function markdownCode(text: string): string {
+  const visible = text.replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029]/g, (ch) => `\\u${ch.charCodeAt(0).toString(16).padStart(4, "0")}`);
+  const longestRun = Math.max(0, ...[...visible.matchAll(/`+/g)].map((m) => m[0].length));
+  const fence = "`".repeat(longestRun + 1);
+  return `${fence} ${visible} ${fence}`;
+}
+
 /** 生成手册所需的非秘密快照坐标。刻意不收连接串/密钥类型——签名即防线。 */
 export interface RecoveryDocContext {
   snapshot: string; // 快照时间戳目录名
@@ -75,7 +88,7 @@ export function authRecoveryText(manifest: Manifest, place: RecoveryDocPlace): A
   (pg_dump custom format, ${mb(auth.dump!.bytes)} MB, sha256 \`${auth.dump!.sha256}\`) — ${auth.rows!.users.toLocaleString("en-US")} users, ${auth.rows!.identities.toLocaleString("en-US")} sign-in identities
 `
     : manifest.auth
-      ? `- **Supabase Auth users**: not in this snapshot (${AUTH_NOT_INCLUDED_TEXT[manifest.auth.reason ?? ""] ?? manifest.auth.reason ?? "not captured"})
+      ? `- **Supabase Auth users**: not in this snapshot (${AUTH_NOT_INCLUDED_TEXT[manifest.auth.reason ?? ""] ?? markdownCode(manifest.auth.reason ?? "not captured")})
 `
       : "";
   // 空目标检查用的 schema 列表(SQL 字符串字面量,单引号按 SQL 规则加倍)

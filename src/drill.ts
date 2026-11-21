@@ -25,7 +25,7 @@ import { orphanedForeignKeysCheck, tableKey, type OrphanedForeignKey } from "./o
 import { grantsCheck, type GrantRestore, type GrantedObject } from "./grants.js";
 import { localPgRestoreMajor, restoreToolBreaksOnTarget, sandboxMajorFor } from "./pgbin.js";
 import { log } from "./log.js";
-import { authDrillSection, type AuthDrillReport, type AuthDumpForDrill } from "./auth-drill.js";
+import { authDrillSection, type AuthDrillReport, type AuthDumpForDrill, type OfflineSandbox } from "./auth-drill.js";
 import { onInterrupt, stopOnInterrupt, throwIfInterrupted } from "./interrupt.js";
 
 const execFileAsync = promisify(execFile);
@@ -81,7 +81,8 @@ export interface DrillReport {
   restoredTableCount: number;
   restoredRowTotal: number;
   /** --keep 且演练失败时:被保留的沙箱(供排查/脚本消费);其余情况不存在 */
-  keptSandbox?: { containerId: string; connString: string };
+  /** inspect(2.11.1 起):进沙箱的 docker exec 命令 */
+  keptSandbox?: { containerId: string; connString: string; inspect?: string };
   /** 源库自带孤儿行的外键:演练和真实恢复都把它们建成 NOT VALID,不算失败。没有时不出现 */
   orphanedForeignKeys?: OrphanedForeignKey[];
   /**
@@ -97,6 +98,8 @@ interface Ephemeral {
   containerId: string;
   port: string;
   connString: string;
+  /** 2.11.1:模拟注册之前把沙箱断了网(确认摘掉之后才记,之后不再接回),connString 从此连不上 */
+  offline: boolean;
   /** pg_restore 并行路数,随调参一起按 Docker 的内存和 CPU 定(见 sandboxTuning) */
   restoreJobs: number;
   /** 删容器和数据卷;幂等,正常收尾和中断收尾共用 */
@@ -371,7 +374,7 @@ async function startEphemeralPostgres(image: string, major: number, resourceName
           "postgres",
           "-q",
         ]);
-        return { containerId, port, connString, restoreJobs: tuning.restoreJobs, teardown, forgetInterruptCleanup };
+        return { containerId, port, connString, offline: false, restoreJobs: tuning.restoreJobs, teardown, forgetInterruptCleanup };
       } catch {
         await new Promise((r) => setTimeout(r, 500));
       }
@@ -382,6 +385,204 @@ async function startEphemeralPostgres(image: string, major: number, resourceName
     forgetInterruptCleanup();
     throw error;
   }
+}
+
+// ── 断网跑 SQL(模拟注册用,2.11.1)────────────────────────────────
+
+/** 沙箱容器当前接着的 Docker 网络 */
+async function containerNetworks(containerId: string): Promise<string[]> {
+  const { stdout } = await execFileAsync("docker", ["inspect", "-f", "{{json .NetworkSettings.Networks}}", containerId], {
+    timeout: 15_000,
+  });
+  return Object.keys((JSON.parse(stdout.trim() || "null") as Record<string, unknown> | null) ?? {});
+}
+
+/** 在容器里跑一条命令(docker exec);timeoutMs 或 signal 到了就杀掉本地的 docker exec 客户端 */
+function containerExec(
+  containerId: string,
+  command: string[],
+  opts: { input?: string; timeoutMs: number; signal?: AbortSignal; env?: string[] }
+): Promise<{ code: number | null; stdout: string; killed: boolean }> {
+  return new Promise((resolve) => {
+    const proc = spawn(
+      "docker",
+      [
+        "exec",
+        ...(opts.input !== undefined ? ["-i"] : []),
+        ...(opts.env ?? []).flatMap((kv) => ["-e", kv]),
+        containerId,
+        ...command,
+      ],
+      { stdio: [opts.input !== undefined ? "pipe" : "ignore", "pipe", "ignore"] }
+    );
+    let stdout = "";
+    proc.stdout!.on("data", (d: Buffer) => {
+      // 只要我们自己 select 出来的那一行;封顶,不让输出无限长
+      if (stdout.length < 64 * 1024) stdout += d.toString();
+    });
+    let killed = false;
+    const kill = () => {
+      killed = true;
+      proc.kill("SIGKILL");
+    };
+    const timer = setTimeout(kill, opts.timeoutMs);
+    if (opts.signal?.aborted) kill();
+    opts.signal?.addEventListener("abort", kill, { once: true });
+    proc.on("error", () => {});
+    proc.on("close", (code) => {
+      clearTimeout(timer);
+      opts.signal?.removeEventListener("abort", kill);
+      resolve({ code, stdout, killed });
+    });
+    if (opts.input !== undefined) {
+      proc.stdin!.on("error", () => {});
+      proc.stdin!.end(opts.input);
+    }
+  });
+}
+
+/** 容器里用 psql 跑 SQL(默认走 unix socket,不经网络)。官方镜像对本地 socket 和 127.0.0.1 都是 trust */
+const PSQL = ["psql", "-X", "-q", "-tA", "-v", "ON_ERROR_STOP=1", "-U", "postgres", "-d", "postgres"];
+
+/** 模拟注册在容器里的几样痕迹,都带同一个随机标记:取消标记文件、psql 的 pid 文件、会话的 application_name */
+function signupTraces(marker: string) {
+  if (!/^[0-9a-f]{16}$/.test(marker)) throw new Error("bad sign-up marker");
+  return {
+    cancelFile: `/tmp/backupdrill-signup-${marker}.cancel`,
+    pidFile: `/tmp/backupdrill-signup-${marker}.pid`,
+    appName: `backupdrill-signup-${marker}`,
+  };
+}
+
+/**
+ * 模拟注册本地那一侧(docker exec 客户端)最多等多久;导出供测试调短,产品里不改。
+ * launchPauseSeconds 只给测试用:在启动脚本"看过取消标记"和"exec psql"之间停一会儿,复现最坏的时序
+ */
+export const OFFLINE_SIGNUP_LIMITS = { psqlMs: 6 * 60 * 1000, launchPauseSeconds: 0 };
+
+/**
+ * 容器里启动模拟注册的脚本。和 stopSignup 的约定:**先占位、再看取消**。
+ *  - 启动脚本先独占创建 pid 文件(set -C),写进自己的 pid,然后才看取消标记,有就退出;
+ *  - stopSignup 先建取消标记,然后才看 pid 文件。
+ * 所以 stopSignup 没看到 pid 文件,启动脚本之后一定会看到取消标记而退出;看到了,就按 pid 杀掉它——
+ * 不管它还是 sh(停在 exec 之前)还是已经 exec 成了 psql,pid 都是同一个。
+ *
+ * psql 经 127.0.0.1 连(断网后 loopback 还在):走 unix socket 时 inet_client_addr() 是 NULL,
+ * 真实注册经 TCP 进来,要客户端地址的触发器会被误判成坏的。官方镜像 loopback 是 trust;
+ * 万一不是,用容器自己的 POSTGRES_PASSWORD
+ */
+function signupLauncher(marker: string): string {
+  const { cancelFile, pidFile } = signupTraces(marker);
+  const pause = Math.max(0, Math.floor(OFFLINE_SIGNUP_LIMITS.launchPauseSeconds));
+  return (
+    `set -C; echo $$ > ${pidFile} || exit 99; [ -e ${cancelFile} ] && exit 99; ` +
+    (pause ? `sleep ${pause}; ` : "") +
+    `PGPASSWORD="$POSTGRES_PASSWORD" exec ${PSQL.join(" ")} -h 127.0.0.1`
+  );
+}
+
+/**
+ * 停掉一次没有正常结束的模拟注册,并等到它在容器里确实没了,到 deadline(时间戳)为止。本地的 docker exec 客户端被杀掉
+ * (超时、叫停)时,容器里的那次启动照样在跑,甚至可能还没起来。按 signupLauncher 的约定:
+ *  1. 先建取消标记,再看 pid 文件:没有 pid 文件 = 它以后也不会启动;有 = 那个进程(sh 或 psql)还活着就杀掉;
+ *  2. 终止它的会话(按 application_name,或者语句里带着这次的随机标记——触发器能改 application_name)。
+ * 进程没了、会话也没了才算停下来。每条 docker 命令的时限也截在 deadline 之内,整体不会超过它
+ */
+async function stopSignup(containerId: string, marker: string, deadline: number): Promise<boolean> {
+  const { cancelFile, pidFile, appName } = signupTraces(marker);
+  // 输出 "alive":还有进程(刚杀掉,或者 pid 文件刚建、还没写进 pid),下一轮再看
+  const killLauncher =
+    `touch ${cancelFile}; if [ -e ${pidFile} ]; then p=$(cat ${pidFile}); ` +
+    `if [ -z "$p" ]; then echo alive; ` +
+    `else c=$(cat /proc/$p/comm 2>/dev/null); if [ "$c" = sh ] || [ "$c" = psql ]; then kill -9 "$p"; echo alive; fi; fi; fi; true`;
+  const sessions =
+    `select count(pg_terminate_backend(pid)) from pg_stat_activity where pid <> pg_backend_pid() ` +
+    `and (application_name = '${appName}' or query like '%${marker}%')`;
+  const left = () => deadline - Date.now();
+  while (left() > 0) {
+    const killed = await containerExec(containerId, ["sh", "-c", killLauncher], { timeoutMs: Math.max(1, left()) });
+    if (killed.code !== 0 || left() <= 0) return false;
+    const sessionsLeft = await containerExec(containerId, [...PSQL, "-c", sessions], { timeoutMs: Math.max(1, left()) });
+    if (sessionsLeft.code !== 0) return false;
+    if (killed.stdout.trim() === "" && sessionsLeft.stdout.trim() === "0") return true;
+    await new Promise((resolve) => setTimeout(resolve, Math.min(500, Math.max(0, left()))));
+  }
+  return false;
+}
+
+/** 停掉模拟注册最多等多久(整体,从开始停算起) */
+const STOP_SIGNUP_MS = 15_000;
+
+/**
+ * 模拟注册用的"断网跑 SQL"(见 auth-drill.ts OfflineSandbox)。
+ *
+ * 为什么是临时断网,而不是一开始就不给沙箱联网:CLI 和 pg_restore 都从主机经发布的端口连沙箱,
+ * --network none 和 --internal 网络都发布不了端口。所以恢复、校验照旧,只在最后的模拟注册之前把容器从所有
+ * 网络上摘下来(只剩 loopback),经 docker exec 里的 psql 连 127.0.0.1 跑(见 signupLauncher)。
+ *
+ * **断了就不再接回**:能确认的只有会话和那个 psql 都没了,确认不了触发器有没有留下别的东西(后台进程等),
+ * 一接回它们就又能连出去。所以模拟注册是这个沙箱上的最后一件事,跑完沙箱就销毁。--keep 要留下沙箱时
+ * 根本不跑模拟注册(见 drillDump),留下的沙箱和 2.11.0 一样连得上。
+ * 每一步之前都看一眼是否已被叫停:叫停后(报告可能已经出了)不再断开任何网络。摘不干净就不跑。
+ */
+/** @internal 演练内部用;导出只为测试能直接对一个容器验证断网、叫停和超时收尾 */
+export function offlineSandbox(pg: { containerId: string; offline: boolean }): OfflineSandbox {
+  let running: string | null = null;
+  // 同一次注册的收尾只做一次:本地超时、叫停、演练那边的 stopOfflineSessions 谁先来谁启动,其余的等同一个结果
+  const stopping = new Map<string, Promise<boolean>>();
+  const stopOnce = (marker: string) => {
+    let p = stopping.get(marker);
+    if (!p) stopping.set(marker, (p = stopSignup(pg.containerId, marker, Date.now() + STOP_SIGNUP_MS)));
+    return p;
+  };
+  return {
+    offline: () => pg.offline,
+    async stopOfflineSessions() {
+      if (running) await stopOnce(running);
+    },
+    async runOffline(script, marker, signal) {
+      const { appName } = signupTraces(marker);
+      const stopped = () => {
+        if (signal?.aborted) throw new Error("stopped");
+      };
+      stopped();
+      const networks = await containerNetworks(pg.containerId);
+      for (const network of networks) {
+        stopped();
+        await execFileAsync("docker", ["network", "disconnect", network, pg.containerId], { timeout: 30_000 });
+        // 只记确认过的状态:这一个网络已经摘掉了,之后不会再接回
+        pg.offline = true;
+      }
+      const left = await containerNetworks(pg.containerId);
+      if (left.length) throw new Error(`the sandbox is still on ${left.join(", ")}`);
+      pg.offline = true;
+      stopped();
+      running = marker;
+      const result = await containerExec(
+        pg.containerId,
+        ["sh", "-c", signupLauncher(marker)],
+        { input: script, timeoutMs: OFFLINE_SIGNUP_LIMITS.psqlMs, signal, env: [`PGAPPNAME=${appName}`] }
+      );
+      // 本地超时或被叫停:容器里的那次模拟注册可能还在跑,先确实停掉它,再交出结果(之后沙箱才会被销毁)
+      if (result.killed || signal?.aborted) {
+        // 超时收尾时演练可能正同时销毁沙箱:容器已经停了(或没了),里面的注册也就跟着没了,不必提示
+        const stillThere = () =>
+          execFileAsync("docker", ["inspect", "-f", "{{.State.Running}}", pg.containerId], { timeout: 10_000 }).then(
+            (r) => r.stdout.trim() === "true",
+            () => false
+          );
+        if (!(await stopOnce(marker)) && (await stillThere())) {
+          log.warn("Couldn't confirm the stopped test sign-up ended inside the drill sandbox; it stays off the network until it is removed.");
+        }
+      }
+      return { code: result.killed ? null : result.code, stdout: result.stdout };
+    },
+  };
+}
+
+/** --keep 留下的沙箱:和 2.11.0 一样给连接串(留沙箱时不跑模拟注册,它一直连得上),另给一条进容器的命令 */
+function keptSandboxInfo(pg: Ephemeral): NonNullable<DrillReport["keptSandbox"]> {
+  return { containerId: pg.containerId, connString: pg.connString, inspect: `docker exec -it ${pg.containerId.slice(0, 12)} psql -U postgres` };
 }
 
 // installExtensions 已上移到统一引擎(restore-engine.ts):沙箱与真实恢复共用,
@@ -920,6 +1121,10 @@ export async function drillDump(
       // 托管 worker 在这一步前后换磁盘守卫的规则:Auth 阶段吃紧只叫停这一节,不判演练失败
       begin: opts.supervision ? () => opts.supervision!.observe({ phase: "auth" }) : undefined,
       stop: opts.supervision?.authStop,
+      sandbox: offlineSandbox(pg),
+      // --keep 要留下这个沙箱时不跑模拟注册:断了网就不能再接回,留下的沙箱就连不上了(脚本靠 keptSandbox.connString)。
+      // 结论(pass)这时已经定了,只有真的会留沙箱(演练没通过)才跳过
+      skipSignup: opts.keepSandboxOnFailure && !pass ? "--keep leaves the sandbox connected so you can inspect it" : undefined,
     });
     if (authSection) {
       report.auth = authSection;
@@ -929,7 +1134,7 @@ export async function drillDump(
     }
     if (opts.keepSandboxOnFailure && !pass) {
       // 写进报告让 --keep 可被脚本消费(拿连接串排查),不只靠人眼看日志
-      report.keptSandbox = { containerId: pg.containerId, connString: pg.connString };
+      report.keptSandbox = keptSandboxInfo(pg);
     }
     return report;
   } catch (error) {

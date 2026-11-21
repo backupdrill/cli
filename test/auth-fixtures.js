@@ -60,6 +60,15 @@ export const AUTH_DDL = `
   );
   alter table auth.users enable row level security;
   alter table auth.identities enable row level security;
+  -- Supabase 自带的约束和索引:token 上的唯一索引带 WHERE 条件,空串不在索引里;确认状态只能是 0 到 2。
+  -- 备份时抹掉待处理 token 必须过得了它们(见 pendingTokenConflicts)
+  alter table auth.users add constraint users_email_change_confirm_status_check
+    check (email_change_confirm_status >= 0 and email_change_confirm_status <= 2);
+  create unique index confirmation_token_idx on auth.users (confirmation_token) where confirmation_token::text !~ '^[0-9 ]*$';
+  create unique index recovery_token_idx on auth.users (recovery_token) where recovery_token::text !~ '^[0-9 ]*$';
+  create unique index email_change_token_current_idx on auth.users (email_change_token_current) where email_change_token_current::text !~ '^[0-9 ]*$';
+  create unique index email_change_token_new_idx on auth.users (email_change_token_new) where email_change_token_new::text !~ '^[0-9 ]*$';
+  create unique index reauthentication_token_idx on auth.users (reauthentication_token) where reauthentication_token::text !~ '^[0-9 ]*$';
 `;
 
 // 和 Supabase 同形的最小 auth:两张表开 RLS、identities 外键指向 users;public.profiles 外键指向 auth.users,

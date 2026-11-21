@@ -17,6 +17,7 @@ import {
   type AuthMode,
   type SharedSnapshot,
 } from "./auth-backup.js";
+import { scrubPendingAuthTokens } from "./auth-archive.js";
 import { syncStorage } from "./storage.js";
 import { inspectBucketAttrs } from "./storage-catalog.js";
 import { projectRefOf, refFromStorageEndpoint, assertNoHostOverride } from "./restore-engine.js";
@@ -184,6 +185,11 @@ async function streamPgDump(opts: {
   endOnlyOnSuccess?: boolean;
   /** 失败时等上传中止最多 5 秒(Auth 那些新路径用;主 dump 的老路径不传,照旧等到中止完成) */
   boundedCleanup?: boolean;
+  /**
+   * 上传前改写 pg_dump 的输出(只有 auth.dump 用:抹掉待处理的 token,见 auth-archive.ts)。
+   * 字节数、sha256、大小上限都按改写后的内容算,和桶里的文件一致。要求同时传 endOnlyOnSuccess
+   */
+  rewrite?: (stdout: Readable) => Readable;
 }): Promise<{ bytes: number; sha256: string }> {
   const hash = createHash("sha256");
   let bytes = 0;
@@ -235,11 +241,30 @@ async function streamPgDump(opts: {
   });
   // endOnlyOnSuccess(auth.dump 用):pg_dump 成功退出才结束上传流,失败就带错中断,上传因此完不成——
   // 不在用户桶里留下一个空的或半截的 auth.dump。主 dump 不传这个选项,行为与之前一致
-  dump.stdout.pipe(meter, { end: !opts.endOnlyOnSuccess });
+  const output = opts.rewrite ? opts.rewrite(dump.stdout) : dump.stdout;
+  output.pipe(meter, { end: !opts.endOnlyOnSuccess });
   if (opts.endOnlyOnSuccess) {
+    // 改写的那一步要把最后一段也交给 meter 才算完:pg_dump 0 退出 + 改写端读完,两样都到了才结束上传流
+    const rewriteFinished = opts.rewrite
+      ? new Promise<void>((resolve) => output.once("end", resolve))
+      : Promise.resolve();
     dump.on("close", (code) => {
-      if (code === 0) meter.end();
+      if (code === 0) void rewriteFinished.then(() => meter.end());
       else meter.destroy(new Error(`pg_dump exited with code ${code}`));
+    });
+  }
+  if (opts.rewrite) {
+    // 改写失败 = 没能抹干净:这份归档绝不能上传成功。pg_dump 自己中途失败时改写端也会先报"归档被截断",
+    // 那时等它退出(最多 2 秒),原因以 pg_dump 的报错为准(上面的 close 处理);否则停掉 pg_dump、带着改写的错误中止
+    output.on("error", (error) => {
+      void (async () => {
+        if (dump.exitCode === null && dump.signalCode === null) {
+          await waitAtMost(new Promise((resolve) => dump.once("close", resolve)), 2000);
+        }
+        if (dump.exitCode !== null && dump.exitCode !== 0) return;
+        dump.kill("SIGKILL");
+        meter.destroy(error);
+      })();
     });
   }
 
@@ -273,6 +298,7 @@ async function streamPgDump(opts: {
     dumpDone.catch(() => {}); // 没走到 Promise.all 时,被杀的 pg_dump 的退出也得有人接住
     dump.kill("SIGKILL");
     meter.destroy();
+    if (output !== dump.stdout) output.destroy();
     // 被叫停时中止上传但不等它(可能正卡在那)。可叫停的调用(Auth、共享快照那次)自己失败时,
     // 等中止最多 5 秒——中止本身也可能卡住,不能让调用方跟着卡。主 dump 的老路径照旧等中止完成
     if (opts.signal?.aborted) void upload?.abort().catch(() => {});
@@ -341,6 +367,14 @@ type AuthPlan =
  * 主 dump 永远不因 Auth 受影响。返回 dump 时,共享快照已经导出,调用方负责释放。
  */
 async function planAuth(config: BackupConfig, writer: SnapshotWriter, mode: AuthMode): Promise<AuthPlan> {
+  // 2.11.1 起只有 auth.dump 抹掉待处理 token;schemas 里明写了 auth 时,主 dump 里的 Auth 表还是原样(含 token),
+  // 每次备份提醒一句。不管 Auth 备份开没开都提醒:主 dump 的内容和它无关
+  if (authInSchemas(config.schemas) === "yes") {
+    log.warn(
+      "Your schema list includes auth, so dump.pgcustom holds the Auth tables as they are, " +
+        "including pending password-reset and confirmation tokens. Only auth.dump has them cleared."
+    );
+  }
   if (mode === "off") return { kind: "none" };
   // schemas 已经(可能)把 auth 带进主 dump:今天怎样以后还怎样,不另备一份。
   // 确定包含 → skipped(数据就在主 dump 里);说不准 → 默认模式也 skipped,显式要求时记 failed,
@@ -397,6 +431,17 @@ async function prepareAuthDump(
     await shared.release();
     return { kind: "settled", section: authNotDone(mode, inspection.reason) };
   }
+  // auth.users 上有不是 Supabase 自带的约束、唯一索引或生成列:抹过的 auth.dump 可能恢复不了,不写(见 firstNonStockObject)
+  if (inspection.nonStockObject) {
+    await shared.release();
+    return {
+      kind: "settled",
+      section: {
+        status: "failed",
+        reason: `BackupDrill stopped before writing auth.dump. Clearing pending Auth tokens could cause a restore to fail because of ${inspection.nonStockObject} on auth.users.`,
+      },
+    };
+  }
   const uploadAuthDump = writer.uploadAuthDump!.bind(writer);
   return { kind: "dump", shared, inspection, key: writer.authDumpKey!, upload: (body) => uploadAuthDump(body) };
 }
@@ -432,6 +477,8 @@ async function dumpWithAuth(
     maxBytes: AUTH_DUMP_MAX_BYTES,
     signal: authAbort.signal,
     endOnlyOnSuccess: true,
+    // 2.11.1 起:待处理的找回密码、邮箱确认等 token 不进桶(见 auth-archive.ts)
+    rewrite: scrubPendingAuthTokens,
   }).then(
     (result) => ({ ok: true as const, ...result }),
     (error: unknown) => ({ ok: false as const, error })
@@ -579,7 +626,8 @@ function logAuthOutcome(auth: AuthSection, schemas: string[]): void {
     }
     return;
   }
-  const why = AUTH_SKIP_TEXT[auth.reason ?? ""] ?? auth.reason ?? "unknown reason";
+  // 有的原因本身就是完整的句子(以句号结尾),后面还要接一句,去掉它的句号免得出现 ".."
+  const why = (AUTH_SKIP_TEXT[auth.reason ?? ""] ?? auth.reason ?? "unknown reason").replace(/\.$/, "");
   if (auth.status === "skipped") {
     // 不是 Supabase 库时这是正常情况,不该显得像个问题
     if (auth.reason === "no_auth_schema") log.step(`Auth users: skipped (${why}).`);

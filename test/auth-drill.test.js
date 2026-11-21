@@ -6,7 +6,7 @@ import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { runBackup } from "../dist/backup.js";
-import { runDrill } from "../dist/drill.js";
+import { OFFLINE_SIGNUP_LIMITS, offlineSandbox, runDrill } from "../dist/drill.js";
 import { AUTH_DRILL_LIMITS, authDrillSection } from "../dist/auth-drill.js";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { randomUUID } from "node:crypto";
@@ -375,6 +375,198 @@ id" uuid references auth.users (id) on delete set null)`);
         } finally {
           rmSync(workdir, { recursive: true, force: true });
         }
+      });
+
+      await t.test("the test sign-up runs with the sandbox off the network: a dblink trigger can't write anywhere else", async () => {
+        // "别的系统"就用源库本身:沙箱平时在默认网桥上,按容器 IP 连得到它
+        const sourceIp = (
+          await x("docker", ["inspect", "-f", "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}", ids[0]])
+        ).stdout.trim();
+        assert.match(sourceIp, /^\d+\.\d+\.\d+\.\d+$/);
+        const dblinkCall = `public.dblink_exec('host=${sourceIp} port=5432 user=postgres password=pw dbname=postgres connect_timeout=5', 'insert into public.leaks default values')`;
+        await sql(admin, `
+          create extension dblink;
+          create table public.leaks (at timestamptz not null default now());
+          create function public.tell_crm() returns trigger language plpgsql security definer set search_path = '' as $$
+          begin
+            perform ${dblinkCall};
+            return new;
+          end $$;
+          create trigger tell_crm after insert on auth.users for each row execute function public.tell_crm();`);
+        try {
+          const mem = await backup("default");
+          // 对照:同一个沙箱在线时(--check-cmd 在模拟注册之前跑),同一句 dblink 调用确实写得进源库。
+          // 证明这个测试里"别的系统"是连得到的,下面的 0 才有意义
+          const control = `psql "$BACKUPDRILL_SANDBOX_URL" -X -q -v ON_ERROR_STOP=1 -c "select ${dblinkCall.replace(/"/g, '\\"')}"`;
+          const report = await runDrill(config, { store: mem.store, appCheckCommand: control });
+          assert.equal(report.pass, true, JSON.stringify(report.checks));
+          assert.equal(report.checks.find((c) => c.name === "app checks")?.pass, true, "the online control call ran");
+          assert.ok(report.auth.triggers.created.includes("tell_crm"), JSON.stringify(report.auth));
+          assert.equal(report.auth.signup.ran, false, JSON.stringify(report.auth.signup));
+          assert.match(report.auth.signup.detail, /^a database operation failed to connect while the sandbox was offline \(SQLSTATE /);
+          const leaks = await sql(admin, "select count(*)::int as n from public.leaks");
+          assert.equal(leaks.rows[0].n, 1, "only the online control wrote a row; the offline test sign-up wrote nothing");
+
+          // dblink 照样装着,触发器却是因为权限失败:报成注册会失败,不藏成"没测成"
+          await sql(admin, `
+            create or replace function public.tell_crm() returns trigger language plpgsql security definer set search_path = '' as $$
+            begin raise exception 'no access' using errcode = '42501'; end $$;`);
+          const denied = await runDrill(config, { store: (await backup("default")).store });
+          assert.equal(denied.auth.signup.ok, false, JSON.stringify(denied.auth.signup));
+          assert.equal(
+            denied.auth.signup.detail,
+            "a new sign-up would fail: permission denied (SQLSTATE 42501) (tested as an email sign-up with no user metadata)"
+          );
+        } finally {
+          await sql(admin, "drop trigger tell_crm on auth.users; drop function public.tell_crm(); drop table public.leaks; drop extension dblink");
+        }
+      });
+
+      const networksOf = async (id) =>
+        Object.keys(JSON.parse((await x("docker", ["inspect", "-f", "{{json .NetworkSettings.Networks}}", id])).stdout.trim()) ?? {});
+      const inContainer = async (id, query) =>
+        (await x("docker", ["exec", id, "psql", "-U", "postgres", "-X", "-tA", "-c", query])).stdout.trim();
+
+      await t.test("a trigger whose ASSERT fails is reported as a failing sign-up (WHEN OTHERS doesn't catch it)", async () => {
+        await sql(admin, `
+          create function public.assert_signup() returns trigger language plpgsql security definer set search_path = '' as $$
+          begin assert new.email like '%@example.com', 'only example.com'; return new; end $$;
+          create trigger assert_signup after insert on auth.users for each row execute function public.assert_signup();`);
+        try {
+          const report = await runDrill(config, { store: (await backup("default")).store });
+          assert.deepEqual(report.auth.signup, {
+            ran: true,
+            ok: false,
+            detail: "a new sign-up would fail: an assertion failed (SQLSTATE P0004) (tested as an email sign-up with no user metadata)",
+          });
+        } finally {
+          await sql(admin, "drop trigger assert_signup on auth.users; drop function public.assert_signup()");
+        }
+      });
+
+      await t.test("the offline test sign-up arrives over TCP like a real one: a trigger that needs the client address works", async () => {
+        await sql(admin, `
+          create function public.needs_client_addr() returns trigger language plpgsql security definer set search_path = '' as $$
+          begin
+            if pg_catalog.inet_client_addr() is null then raise exception 'no client address'; end if;
+            return new;
+          end $$;
+          create trigger needs_client_addr after insert on auth.users for each row execute function public.needs_client_addr();`);
+        try {
+          const report = await runDrill(config, { store: (await backup("default")).store });
+          assert.ok(report.auth.triggers.created.includes("needs_client_addr"), JSON.stringify(report.auth));
+          assert.deepEqual(report.auth.signup, { ran: true, ok: true });
+        } finally {
+          await sql(admin, "drop trigger needs_client_addr on auth.users; drop function public.needs_client_addr()");
+        }
+      });
+
+      await t.test("--keep keeps a reachable sandbox: the test sign-up is skipped, connString works as in 2.11.0", async () => {
+        const mem = await backup("default");
+        const report = await runDrill(config, { store: mem.store, appCheckCommand: "exit 1", keepSandboxOnFailure: true });
+        assert.ok(report.keptSandbox, "a failed drill with --keep leaves the sandbox");
+        const id = report.keptSandbox.containerId;
+        try {
+          assert.deepEqual(report.auth.signup, { ran: false, detail: "--keep leaves the sandbox connected so you can inspect it" });
+          assert.equal(report.pass, false, "the verdict comes from the app check, as before");
+          assert.ok((await networksOf(id)).length > 0, "never taken off the network");
+          const kept = await sql(report.keptSandbox.connString, "select count(*)::int as n from auth.users");
+          assert.equal(kept.rows[0].n, 4, "connString answers; no test user was ever inserted");
+          assert.equal(report.keptSandbox.inspect, `docker exec -it ${id.slice(0, 12)} psql -U postgres`);
+        } finally {
+          await x("docker", ["rm", "-f", "-v", id]).catch(() => {});
+        }
+        // --keep 但演练通过了:沙箱不会留下,模拟注册照常(断网)跑
+        const passed = await runDrill(config, { store: mem.store, keepSandboxOnFailure: true });
+        assert.equal(passed.pass, true);
+        assert.equal(passed.keptSandbox, undefined);
+        assert.deepEqual(passed.auth.signup, { ran: true, ok: true });
+      });
+
+      await t.test("an Auth check that times out during the offline sign-up: not checked, and the drill finishes", async () => {
+        await sql(admin, `
+          create function public.slow_signup() returns trigger language plpgsql security definer set search_path = '' as $$
+          begin perform pg_sleep(120); return new; end $$;
+          create trigger slow_signup after insert on auth.users for each row execute function public.slow_signup();`);
+        const previous = AUTH_DRILL_LIMITS.totalMs;
+        try {
+          const mem = await backup("default");
+          AUTH_DRILL_LIMITS.totalMs = 20_000;
+          const started = Date.now();
+          const report = await runDrill(config, { store: mem.store });
+          assert.equal(report.auth.status, "not_checked", report.auth.summary);
+          assert.deepEqual(verdict(report).pass, baseline.pass);
+          assert.ok(Date.now() - started < 90_000, `took ${Date.now() - started} ms`);
+        } finally {
+          AUTH_DRILL_LIMITS.totalMs = previous;
+          await sql(admin, "drop trigger slow_signup on auth.users; drop function public.slow_signup()");
+        }
+      });
+
+      await t.test("offline sandbox: cancelled first means no network is touched; a local timeout or a stop ends the sign-up inside", async () => {
+        await startPostgres(ids);
+        const id = ids.at(-1);
+        const sandbox = { containerId: id, offline: false };
+        const offline = offlineSandbox(sandbox);
+        const marker = () => randomUUID().replace(/-/g, "").slice(0, 16);
+        const sleepy = (m) => `select 'm${m}', pg_sleep(120);\n`;
+        const leftovers = async (m) => ({
+          sessions: await inContainer(id, `select count(*) from pg_stat_activity where query like '%m${m}%' and pid <> pg_backend_pid()`),
+          psql: (await x("docker", ["exec", id, "sh", "-c", "cat /proc/[0-9]*/comm 2>/dev/null | grep -c '^psql$' || true"])).stdout.trim(),
+        });
+
+        // 叫停在先:一个网络都不摘,沙箱照样在线
+        const early = new AbortController();
+        early.abort();
+        await assert.rejects(offline.runOffline(sleepy(marker()), marker(), early.signal), /stopped/);
+        assert.equal(sandbox.offline, false);
+        assert.ok((await networksOf(id)).length > 0);
+
+        // 本地的 docker exec 等到点被杀:容器里的那次注册也被停掉,才交出结果
+        const previous = OFFLINE_SIGNUP_LIMITS.psqlMs;
+        OFFLINE_SIGNUP_LIMITS.psqlMs = 3000;
+        try {
+          const m = marker();
+          const result = await offline.runOffline(sleepy(m), m);
+          assert.equal(result.code, null, "killed at the local timeout");
+          assert.equal(sandbox.offline, true);
+          assert.deepEqual(await networksOf(id), []);
+          assert.deepEqual(await leftovers(m), { sessions: "0", psql: "0" });
+        } finally {
+          OFFLINE_SIGNUP_LIMITS.psqlMs = previous;
+        }
+
+        // 最坏的时序:启动脚本看过取消标记、还没 exec psql 时就被叫停(测试钩子在这两步之间停 3 秒)。
+        // 收尾之后等它本来该醒来的时间过去,psql 也不能再起来
+        OFFLINE_SIGNUP_LIMITS.launchPauseSeconds = 3;
+        try {
+          const late = marker();
+          const stopEarly = new AbortController();
+          setTimeout(() => stopEarly.abort(), 1000);
+          const result = await offline.runOffline(sleepy(late), late, stopEarly.signal);
+          assert.equal(result.code, null);
+          await new Promise((r) => setTimeout(r, 4000));
+          assert.deepEqual(await leftovers(late), { sessions: "0", psql: "0" });
+        } finally {
+          OFFLINE_SIGNUP_LIMITS.launchPauseSeconds = 0;
+        }
+
+        // 运行中被叫停:同样停掉容器里的注册。演练那边的收尾(stopOfflineSessions)同时也来,
+        // 两边等的是同一次收尾,整体在时限(15 秒)之内结束
+        const m = marker();
+        const stop = new AbortController();
+        let stopsBoth;
+        setTimeout(() => {
+          stop.abort();
+          stopsBoth = offline.stopOfflineSessions();
+        }, 1500);
+        const stoppedAt = Date.now();
+        const result = await offline.runOffline(sleepy(m), m, stop.signal);
+        await stopsBoth;
+        assert.ok(Date.now() - stoppedAt < 1500 + 16_000, `took ${Date.now() - stoppedAt} ms`);
+        assert.equal(result.code, null);
+        assert.deepEqual(await leftovers(m), { sessions: "0", psql: "0" });
+        assert.deepEqual(await networksOf(id), [], "and still never put back on the network");
       });
 
       await t.test("a backed-up row count that doesn't match is a problem, the verdict doesn't move", async () => {

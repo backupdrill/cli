@@ -1,13 +1,15 @@
 import pg from "pg";
 import { attachPgErrorGuard, pgConnectOptions } from "./supabase-ca.js";
 import type { AuthSection, AuthTriggerInfo, AuthPolicyInfo } from "./manifest.js";
+import { PENDING_AUTH_COPY_VALUES } from "./auth-archive.js";
 
 /**
  * Supabase Auth 用户(auth.users + auth.identities)的备份。
  *
  * 只备这两张表:用户 ID、邮箱、密码哈希、metadata、登录方式。sessions、refresh token、MFA 因子、
  * SSO 配置一律不备——恢复到新项目后用户重新登录一次即可,MFA 因子可能用旧项目的密钥加密过,
- * 带过去反而可能把用户锁在外面。
+ * 带过去反而可能把用户锁在外面。2.11.1 起 auth.users 里待处理的找回密码、邮箱确认等 token 在上传前就抹掉
+ * (见 auth-archive.ts),pg_dump 的参数不变。
  *
  * 不打扰现有备份是硬约束:
  *  - "off"(库调用的默认值)时,备份命令、上传的文件、manifest 与没有这个功能时逐字节一致。
@@ -201,6 +203,8 @@ export type AuthInspection =
       triggers: AuthTriggerInfo[];
       policies: AuthPolicyInfo[];
       grants: Array<{ table: string; grantee: string; privilege: string }>;
+      /** auth.users 上第一个不是 Supabase 自带的、可能拒收抹过的值的对象(见 firstNonStockObject);null = 可以抹 */
+      nonStockObject: string | null;
     };
 
 // Supabase 平台自己的 schema。触发器函数或策略引用的函数在这些 schema 里时算平台对象
@@ -330,9 +334,16 @@ export async function inspectAuth(
         order by 1, 2, 3`
     );
 
+    // 比对的是 pg_get_*def 打印出来的原文:让它和白名单记下时的打印方式一样,不受角色/库级设置影响
+    // (quote_all_identifiers 会给每个名字加引号;search_path 决定名字前带不带 schema)
+    await client.query("set local quote_all_identifiers = off");
+    await client.query("set local search_path = ''");
+    const nonStockObject = await firstNonStockObject(client);
+
     await client.query("commit");
     return {
       readable: true,
+      nonStockObject,
       grants: grants.rows,
       users: Number(c.users),
       identities: Number(c.identities),
@@ -362,6 +373,141 @@ export async function inspectAuth(
   } finally {
     await client.end().catch(() => {});
   }
+}
+
+/**
+ * 把系统目录里的名字(约束名、索引名、列名)写进日志、manifest 和 RECOVERY.md 之前用:加双引号,
+ * 反斜杠、引号和所有控制字符(C0、DEL、C1、U+2028/2029)都转义成可见的文字。名字可以含换行,
+ * 原样写进终端就能伪造一行日志
+ */
+export function quotedName(name: string): string {
+  return `"${name.replace(/[\\"\u0000-\u001f\u007f-\u009f\u2028\u2029]/g, (ch) => {
+    if (ch === "\\" || ch === '"') return `\\${ch}`;
+    if (ch === "\n") return "\\n";
+    if (ch === "\r") return "\\r";
+    if (ch === "\t") return "\\t";
+    return `\\u${ch.charCodeAt(0).toString(16).padStart(4, "0")}`;
+  })}"`;
+}
+
+/**
+ * Supabase(GoTrue)自带的 auth.users:2026-11-21 在 supabase/postgres 17.6 上跑完 GoTrue v2.186.0 的全部迁移后
+ * 从系统目录读出来的原文(pg_get_constraintdef / pg_get_indexdef / pg_get_expr;PG16、PG17 输出一致)。
+ * 索引去掉名字只比定义,名字改过不算不同
+ */
+const STOCK_AUTH_USERS = {
+  /** CHECK / FOREIGN KEY / EXCLUDE 约束;自带的只有这一条 CHECK,没有外键和排他约束 */
+  constraints: ["CHECK (((email_change_confirm_status >= 0) AND (email_change_confirm_status <= 2)))"],
+  /** 索引:唯一索引(含主键、UNIQUE 约束背后的索引),以及带表达式的普通索引 */
+  indexes: [
+    "CREATE UNIQUE INDEX ON auth.users USING btree (id)",
+    "CREATE UNIQUE INDEX ON auth.users USING btree (phone)",
+    "CREATE UNIQUE INDEX ON auth.users USING btree (email) WHERE (is_sso_user = false)",
+    ...["confirmation_token", "recovery_token", "email_change_token_current", "email_change_token_new", "reauthentication_token"].map(
+      (column) => `CREATE UNIQUE INDEX ON auth.users USING btree (${column}) WHERE ((${column})::text !~ '^[0-9 ]*$'::text)`
+    ),
+    "CREATE INDEX ON auth.users USING btree (instance_id, lower((email)::text))",
+  ],
+  /** 生成列 → 表达式 */
+  generated: new Map([["confirmed_at", "LEAST(email_confirmed_at, phone_confirmed_at)"]]),
+};
+
+/** pg_get_indexdef 的结果去掉索引名:"CREATE [UNIQUE] INDEX <名字> ON ..." → "CREATE [UNIQUE] INDEX ON ..." */
+function indexDefWithoutName(def: string): string {
+  return def.replace(/^(CREATE (?:UNIQUE )?INDEX )(?:"(?:[^"]|"")*"|\S+) ON /, "$1ON ");
+}
+
+/**
+ * 2.11.1 起 auth.dump 里待处理的 token 被抹成空串、发送时间成 NULL、确认状态成 0(见 auth-archive.ts)。
+ * 用户自己在 auth.users 上加的约束可能不接受这些值(例如 CHECK (recovery_token <> '')、token 列上不带条件的
+ * 唯一索引、从 token 算出来的生成列再加 CHECK):原样的归档恢复得了、抹过的却恢复不了,这比不抹更糟。
+ *
+ * 规则:**可能碰到被抹的列**的东西,必须和 Supabase 自带的一模一样,否则不写 auth.dump、Auth 这一节记失败并点名
+ * 第一个对不上的对象。碰不到的(UNIQUE (email)、新加的非 token 列上的唯一索引、instance_id 上的外键)一律放过——
+ * 不然和 token 无关的改动、或者 GoTrue 以后新加的索引,都会让 Auth 备份悄悄停掉。"可能碰到"按系统目录判断:
+ *  - 约束的 conkey、索引的键列里有被抹的列(CHECK 的 conkey 就是它引用的全部列,0 = 整行);
+ *  - 索引的表达式和 WHERE 条件、生成列的表达式:读系统目录里存的表达式树(indexprs / indpred / adbin 的文本),
+ *    里面每个列引用都是 ":varattno N",0 = 整行。不用 pg_depend:全是表达式的索引在那里总记着对整张表(列号 0)
+ *    的依赖,分不出 lower(email) 和真的整行引用;
+ *  - 排他约束按它背后的索引判断;
+ *  - 生成列的表达式引用了被抹的列:它本身要和自带的一样,用到它的约束、索引也算可能碰到;
+ *  - 外键:只看 conkey;
+ *  - 被抹成 NULL 的列不能是 NOT NULL,被抹的列不能是域类型。
+ * 要比对的对象类型:CHECK、外键、排他约束(pg_get_constraintdef 原文),唯一索引和排他约束背后的索引
+ * (去掉名字的 pg_get_indexdef 原文),带表达式或 WHERE 条件的普通索引(恢复时重建要算它们;只按列建的普通索引
+ * 重建不会失败,不管),生成列(列名和表达式原文)。和 pg_dump 一样只看有效的索引。
+ *
+ * **只读系统目录,不执行任何用户定义的东西**:约束表达式里可以调用用户函数,不能拿备份角色的权限在生产库上跑。
+ * 跑在 inspectAuth 已经开着的 REPEATABLE READ READ ONLY 事务里,不另开连接。返回第一个对不上的对象(没有就是 null)
+ */
+async function firstNonStockObject(client: pg.Client): Promise<string | null> {
+  const blanked = new Map(PENDING_AUTH_COPY_VALUES);
+  const columns = await client.query<{ attnum: number; name: string; notnull: boolean; domain: boolean }>(
+    `select a.attnum, a.attname as name, a.attnotnull as notnull, t.typtype = 'd' as domain
+       from pg_attribute a join pg_type t on t.oid = a.atttypid
+      where a.attrelid = 'auth.users'::regclass and a.attnum > 0 and not a.attisdropped
+      order by a.attnum`
+  );
+  // 被抹的列,加上从它们算出来的生成列:碰到这些列的东西才要比对
+  const touched = new Set<number>();
+  for (const c of columns.rows) {
+    if (!blanked.has(c.name)) continue;
+    touched.add(c.attnum);
+    if (c.domain) return `a domain-typed column ${quotedName(c.name)}`;
+    if (blanked.get(c.name) === "\\N" && c.notnull) return `a NOT NULL column ${quotedName(c.name)}`;
+  }
+  // 列号 0 = 整行,什么列都可能碰到
+  const mayTouch = (referenced: number[]) => referenced.some((n) => n === 0 || touched.has(n));
+  /** 表达式树(pg_node_tree 的文本)里引用的列号;表达式里的常量是按字节存的,不会被误认成列引用 */
+  const columnsIn = (...trees: Array<string | null>) =>
+    trees.flatMap((tree) => [...(tree ?? "").matchAll(/:varattno (-?\d+)/g)].map((m) => Number(m[1])));
+
+  const generated = await client.query<{ attnum: number; name: string; expr: string; tree: string }>(
+    `select a.attnum, a.attname as name, pg_get_expr(d.adbin, d.adrelid) as expr, d.adbin::text as tree
+       from pg_attribute a join pg_attrdef d on d.adrelid = a.attrelid and d.adnum = a.attnum
+      where a.attrelid = 'auth.users'::regclass and a.attgenerated <> '' and not a.attisdropped
+      order by a.attnum`
+  );
+  for (const g of generated.rows) {
+    if (!mayTouch(columnsIn(g.tree))) continue;
+    if (STOCK_AUTH_USERS.generated.get(g.name) !== g.expr) return `a custom generated column ${quotedName(g.name)}`;
+    touched.add(g.attnum);
+  }
+
+  // CHECK 的 conkey 是它引用的全部列;外键只有自己的列。排他约束在下面按它背后的索引判断
+  const constraints = await client.query<{ name: string; type: string; def: string; keys: number[] }>(
+    `select conname as name, contype::text as type, pg_get_constraintdef(oid) as def, coalesce(conkey::int[], '{}') as keys
+       from pg_constraint
+      where conrelid = 'auth.users'::regclass and contype in ('c', 'f')
+      order by conname`
+  );
+  for (const k of constraints.rows) {
+    const could = k.type === "f" ? k.keys.some((n) => touched.has(n)) : mayTouch(k.keys);
+    if (!could || STOCK_AUTH_USERS.constraints.includes(k.def)) continue;
+    return `a custom ${k.type === "c" ? "check constraint" : "foreign key"} ${quotedName(k.name)}`;
+  }
+
+  // pg_dump 导出的索引(和它一样只要 indisvalid、indisready 的:CONCURRENTLY 建失败留下的无效索引不进归档)。
+  // 恢复时每个索引都要在抹过的数据上重建:唯一索引、排他约束会因重复值失败;普通索引只要有表达式或 WHERE
+  // 条件,也会在重建时算它们(例如 1 / length(recovery_token) 碰到 '' 就除零)。只按列建的普通索引重建不会失败,不管
+  const indexes = await client.query<{
+    name: string; def: string; keys: number[]; exprs: string | null; pred: string | null; unique: boolean; exclusion: boolean;
+  }>(
+    `select c.relname as name, pg_get_indexdef(i.indexrelid) as def, i.indkey::int2[] as keys,
+            i.indexprs::text as exprs, i.indpred::text as pred, i.indisunique as unique, i.indisexclusion as exclusion
+       from pg_index i join pg_class c on c.oid = i.indexrelid
+      where i.indrelid = 'auth.users'::regclass and i.indisvalid and i.indisready
+      order by c.relname`
+  );
+  for (const ix of indexes.rows) {
+    if (!ix.unique && !ix.exclusion && ix.exprs === null && ix.pred === null) continue;
+    // 键列里的 0 是"这一列是表达式"的占位,表达式用到的列从表达式树里读
+    const referenced = [...ix.keys.filter((n) => n !== 0), ...columnsIn(ix.exprs, ix.pred)];
+    if (!mayTouch(referenced) || STOCK_AUTH_USERS.indexes.includes(indexDefWithoutName(ix.def))) continue;
+    const kind = ix.exclusion ? "exclusion constraint" : ix.unique ? "unique index" : "index";
+    return `a custom ${kind} ${quotedName(ix.name)}`;
+  }
+  return null;
 }
 
 /**
