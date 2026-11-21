@@ -52,7 +52,7 @@ export interface AuthDumpForDrill {
  */
 export interface OfflineSandbox {
   /**
-   * 断开沙箱容器的全部网络,用容器里的 psql(走 unix socket)跑 script。marker 是这次注册的随机标记
+   * 断开沙箱容器的全部网络,用容器里的 psql(连容器自己的 127.0.0.1)跑 script。marker 是这次注册的随机标记
    * (也是 script 里 DO 块的引号标签),被叫停或超时时靠它找到并停掉容器里那次注册。**之后再也不接回网络**:
    * 只确认 SQL 会话都退出了,不能证明触发器没有留下别的东西(还没起来的 docker exec、后台进程),
    * 接回去它们就又能连出去。所以模拟注册是这个沙箱上做的最后一件事。断不开就抛错,一句 SQL 都不跑
@@ -178,8 +178,9 @@ async function insertStatement(client: Client, table: "users" | "identities"): P
 }
 
 /**
- * 模拟注册的 SQL,交给容器里的 psql 跑。注册放在 DO 块的子事务里:出错时接住,只把 SQLSTATE 和
- * 出错位置(错误上下文)写进两个会话变量;最后一行输出由我们自己的 select 拼出来——触发器的 NOTICE
+ * 模拟注册的 SQL,交给容器里的 psql 跑。注册放在 DO 块的子事务里:出错时接住,把 SQLSTATE、出错位置
+ * (错误上下文)和错误消息写进三个会话变量(消息只用来判断是不是连不上,不进报告);
+ * 最后一行输出由我们自己的 select 拼出来——触发器的 NOTICE
  * 只进 stderr,改不了这一行。成功路径最后覆盖写一遍,触发器事先写进去的值不算数。整个事务最后回滚。
  * 美元引号的标签每次随机:插入语句里的列名来自归档,不能让它把 DO 块提前截断
  */
@@ -193,6 +194,7 @@ export function signupScript(userInsert: string, identityInsert: string, marker:
     "declare",
     "  state text;",
     "  context text;",
+    "  message text;",
     "begin",
     "  begin",
     "    set local role supabase_auth_admin;",
@@ -201,17 +203,20 @@ export function signupScript(userInsert: string, identityInsert: string, marker:
     // 延迟检查的约束和约束触发器平时在提交时才跑:这里立刻跑完,才算这次注册真的能成
     "    set constraints all immediate;",
     "  exception when others then",
-    "    get stacked diagnostics state = returned_sqlstate, context = pg_exception_context;",
+    "    get stacked diagnostics state = returned_sqlstate, context = pg_exception_context, message = message_text;",
     "    perform set_config('backupdrill.signup_state', state, true);",
     "    perform set_config('backupdrill.signup_context', context, true);",
+    "    perform set_config('backupdrill.signup_message', message, true);",
     "    return;",
     "  end;",
     "  perform set_config('backupdrill.signup_state', 'ok', true);",
     "  perform set_config('backupdrill.signup_context', '', true);",
+    "  perform set_config('backupdrill.signup_message', '', true);",
     "end",
     `${tag};`,
     "select 'backupdrill-signup ' || current_setting('backupdrill.signup_state') || ' ' ||",
-    "       encode(convert_to(current_setting('backupdrill.signup_context'), 'UTF8'), 'hex');",
+    "       encode(convert_to(current_setting('backupdrill.signup_context'), 'UTF8'), 'hex') || ' ' ||",
+    "       encode(convert_to(current_setting('backupdrill.signup_message'), 'UTF8'), 'hex');",
     "rollback;",
     "",
   ].join("\n");
@@ -223,39 +228,46 @@ export function signupScript(userInsert: string, identityInsert: string, marker:
  * 认不出就按真失败报——宁可报一次需要人看的失败,也不把真问题藏成"没测成"
  */
 /**
- * 不管出错在哪个调用上都是真问题的 SQLSTATE:没权限、函数/对象/schema/表/列不存在。先认它们,
- * 再看是不是网络:dblink_connect 因为权限失败(42501),或者 dblink 根本没装(42883),都不是"没网"
+ * "没测成、可能是因为断网"只认有连不上的证据的情况,其余一律按真的注册失败报(23xxx、P0001、42xxx 等都是真问题):
+ *  - SQLSTATE 08 类(连接异常:dblink、postgres_fdw 连不上就是 08001);
+ *  - 出错的那条语句(错误上下文的第一行)本身就是联网调用,而错误是它报的连接/解析失败
+ *    (http 扩展的 libcurl 错误这类,错误码是通用的 XX000);
+ *  - 出错的就是 COPY ... PROGRAM,程序失败(38000)。
+ * 错误原文只在这里用来判断,不进报告(见 safeError)
  */
-const REAL_FAILURES = ["42501", "42883", "42704", "3F000", "42P01", "42703"];
+const NETWORK_CALL = /\b(dblink\w*|http(_\w+)?|net\.http_\w+)\s*\(/i;
+const CONNECTION_FAILURE =
+  /could not (establish connection|connect)|couldn't (connect|resolve)|could not resolve|resolve host|connection (refused|timed out)|network is unreachable|no route to host|timeout was reached|name or service not known|temporary failure in name resolution/i;
 
-const NETWORK_CALL = /\b(dblink\w*|http(_\w+)?|net\.http_\w+)\s*\(|\bforeign table\b|\bremote SQL command\b|\b(to|from)\s+program\b/i;
+function failedForLackOfNetwork(state: string, innermost: string, message: string): boolean {
+  if (state.startsWith("08")) return true;
+  if (state === "XX000" && NETWORK_CALL.test(innermost) && CONNECTION_FAILURE.test(message)) return true;
+  return state === "38000" && /\b(to|from)\s+program\b/i.test(innermost);
+}
 
 /** psql 的输出 → 报告里的 signup。只用 SQLSTATE 和"错在不在触发器里",错误原文不进报告(见 safeError) */
 export function signupOutcome(result: { code: number | null; stdout: string }): NonNullable<AuthDrillReport["signup"]> {
-  const line = /^backupdrill-signup (\S+) ([0-9a-f]*)$/m.exec(result.stdout);
+  const line = /^backupdrill-signup (\S+) ([0-9a-f]*) ([0-9a-f]*)$/m.exec(result.stdout);
   if (result.code !== 0 || !line) {
     // 超时(57014 接不住)或 psql 本身出错:没模拟成
-    return { ran: false, detail: "couldn't simulate a sign-up: it didn't finish" };
+    return { ran: false, detail: "psql returned no usable sign-up test result" };
   }
-  const [, state, contextHex] = line;
+  const [, state, contextHex, messageHex] = line;
   if (state === "ok") return { ran: true, ok: true };
-  // 去掉我们自己那层 DO 块的上下文,剩下的才是表结构或用户的函数
+  // 去掉我们自己那层 DO 块的上下文,剩下的才是表结构或用户的函数;第一行是真正出错的那条语句
   const where = Buffer.from(contextHex, "hex")
     .toString("utf8")
     .split("\n")
     .filter((l) => !/inline_code_block/.test(l))
     .join("\n");
+  const message = Buffer.from(messageHex, "hex").toString("utf8");
   const triggerPath =
     /PL\/pgSQL function|SQL function|trigger/i.test(where) ||
     ["23503", "23505", "42501", "42883", "42P01", "42703", "3F000", "P0001"].includes(state);
-  // 沙箱断着网:只有失败本身是连不出去造成的(连接类 SQLSTATE,或者出错的正是一个要联网的调用),
-  // 才算"没测成";光是装着 dblink 之类的扩展不改结论——那样会把 42501 这种真问题也藏起来
-  if (triggerPath && !REAL_FAILURES.includes(state) && (state.startsWith("08") || NETWORK_CALL.test(where))) {
+  if (triggerPath && failedForLackOfNetwork(state, where.split("\n")[0] ?? "", message)) {
     return {
       ran: false,
-      detail:
-        `a trigger needed the network (${describeSqlstate(state)}); the test sign-up runs with the sandbox ` +
-        `cut off from the network, so it can't write to your other systems`,
+      detail: `the test sign-up hit an error in the offline sandbox (${describeSqlstate(state)}). The failing operation may need network access`,
     };
   }
   return triggerPath
@@ -453,7 +465,7 @@ export async function runAuthDrill(
       } else if (skipSignup) {
         signup = { ran: false, detail: skipSignup };
       } else if (!sandbox) {
-        signup = { ran: false, detail: "the sandbox couldn't be cut off from the network, so no test sign-up was run" };
+        signup = { ran: false, detail: "offline testing is unavailable for this sandbox" };
       } else {
         // 断网之后这条 TCP 连接就断了:先关掉,后面不再用它
         await client.end().catch(() => {});
@@ -464,7 +476,7 @@ export async function runAuthDrill(
           const marker = randomBytes(8).toString("hex");
           result = await sandbox.runOffline(signupScript(userInsert, identityInsert, marker), marker, signal);
         } catch {
-          signup = { ran: false, detail: "the sandbox couldn't be cut off from the network, so no test sign-up was run" };
+          signup = { ran: false, detail: "couldn't get a result from the offline sign-up test" };
         }
         if (result) signup = signupOutcome(result);
       }

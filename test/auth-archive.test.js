@@ -15,7 +15,17 @@ import { CLEAR_PENDING_AUTH_SQL } from "../dist/auth-restore.js";
 
 const x = promisify(execFile);
 const pgRestore = process.env.BACKUPDRILL_PG_RESTORE || "pg_restore";
-const havePgRestore = await x(pgRestore, ["--version"]).then(() => true, () => false);
+const pgRestoreVersion = await x(pgRestore, ["--version"]).then((r) => r.stdout, () => null);
+const pgRestoreMajor = pgRestoreVersion ? Number(/(\d+)(?:\.\d+)?/.exec(pgRestoreVersion)?.[1]) : null;
+// 每个归档版本最早能读它的 pg_restore(pg_backup_archiver.h:1.14 = 12,1.15 = 16,1.16 = 17;1.12 早于 10)
+const READABLE_FROM = { 12: 10, 14: 12, 15: 16, 16: 17 };
+/** 本机 pg_restore 读不了这个版本的归档时跳过,并说清楚原因 */
+const needsPgRestoreFor = (minor) =>
+  pgRestoreMajor === null
+    ? "requires pg_restore"
+    : pgRestoreMajor < READABLE_FROM[minor]
+      ? `pg_restore ${pgRestoreMajor} can't read archive version 1.${minor} (needs ${READABLE_FROM[minor]} or newer)`
+      : false;
 
 const USER_COLUMNS = [
   "id", "email", "encrypted_password", "raw_user_meta_data", "confirmation_token", "recovery_token",
@@ -146,7 +156,7 @@ test("the columns blanked in the archive are exactly the ones the restore clears
 });
 
 for (const [minor, compression] of [[16, "gzip"], [16, "none"], [15, "gzip"], [14, "gzip"], [14, "none"], [12, "gzip"]]) {
-  test(`archive 1.${minor} (${compression}): pending tokens are blanked, everything else reads back the same`, { skip: havePgRestore ? false : "requires pg_restore" }, async () => {
+  test(`archive 1.${minor} (${compression}): pending tokens are blanked, everything else reads back the same`, { skip: needsPgRestoreFor(minor) }, async () => {
     const original = buildArchive({ minor, compression, users: 500 });
     const scrubbed = await scrub(original);
     const before = await restoredUsers(original);
@@ -191,7 +201,7 @@ test("a truncated archive, recorded data offsets or a row that doesn't match the
   await assert.rejects(scrub(newer), /archive version 1\.17/);
 });
 
-test("an empty auth.users and a gzip archive split into one-byte pieces still come out readable", { skip: havePgRestore ? false : "requires pg_restore" }, async () => {
+test("an empty auth.users and a gzip archive split into one-byte pieces still come out readable", { skip: needsPgRestoreFor(16) }, async () => {
   const empty = await scrub(buildArchive({ users: 0 }), 1);
   assert.deepEqual(await restoredUsers(empty), []);
   const tiny = await scrub(buildArchive({ users: 20, chunkSize: 3 }), 1);

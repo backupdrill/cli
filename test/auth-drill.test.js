@@ -403,7 +403,7 @@ id" uuid references auth.users (id) on delete set null)`);
           assert.equal(report.checks.find((c) => c.name === "app checks")?.pass, true, "the online control call ran");
           assert.ok(report.auth.triggers.created.includes("tell_crm"), JSON.stringify(report.auth));
           assert.equal(report.auth.signup.ran, false, JSON.stringify(report.auth.signup));
-          assert.match(report.auth.signup.detail, /needed the network/);
+          assert.match(report.auth.signup.detail, /The failing operation may need network access$/);
           const leaks = await sql(admin, "select count(*)::int as n from public.leaks");
           assert.equal(leaks.rows[0].n, 1, "only the online control wrote a row; the offline test sign-up wrote nothing");
 
@@ -427,13 +427,30 @@ id" uuid references auth.users (id) on delete set null)`);
       const inContainer = async (id, query) =>
         (await x("docker", ["exec", id, "psql", "-U", "postgres", "-X", "-tA", "-c", query])).stdout.trim();
 
+      await t.test("the offline test sign-up arrives over TCP like a real one: a trigger that needs the client address works", async () => {
+        await sql(admin, `
+          create function public.needs_client_addr() returns trigger language plpgsql security definer set search_path = '' as $$
+          begin
+            if pg_catalog.inet_client_addr() is null then raise exception 'no client address'; end if;
+            return new;
+          end $$;
+          create trigger needs_client_addr after insert on auth.users for each row execute function public.needs_client_addr();`);
+        try {
+          const report = await runDrill(config, { store: (await backup("default")).store });
+          assert.ok(report.auth.triggers.created.includes("needs_client_addr"), JSON.stringify(report.auth));
+          assert.deepEqual(report.auth.signup, { ran: true, ok: true });
+        } finally {
+          await sql(admin, "drop trigger needs_client_addr on auth.users; drop function public.needs_client_addr()");
+        }
+      });
+
       await t.test("--keep keeps a reachable sandbox: the test sign-up is skipped, connString works as in 2.11.0", async () => {
         const mem = await backup("default");
         const report = await runDrill(config, { store: mem.store, appCheckCommand: "exit 1", keepSandboxOnFailure: true });
         assert.ok(report.keptSandbox, "a failed drill with --keep leaves the sandbox");
         const id = report.keptSandbox.containerId;
         try {
-          assert.deepEqual(report.auth.signup, { ran: false, detail: "skipped because --keep keeps the sandbox reachable" });
+          assert.deepEqual(report.auth.signup, { ran: false, detail: "skipped: --keep leaves the sandbox reachable for inspection" });
           assert.equal(report.pass, false, "the verdict comes from the app check, as before");
           assert.ok((await networksOf(id)).length > 0, "never taken off the network");
           const kept = await sql(report.keptSandbox.connString, "select count(*)::int as n from auth.users");
@@ -500,6 +517,21 @@ id" uuid references auth.users (id) on delete set null)`);
           assert.deepEqual(await leftovers(m), { sessions: "0", psql: "0" });
         } finally {
           OFFLINE_SIGNUP_LIMITS.psqlMs = previous;
+        }
+
+        // 最坏的时序:启动脚本看过取消标记、还没 exec psql 时就被叫停(测试钩子在这两步之间停 3 秒)。
+        // 收尾之后等它本来该醒来的时间过去,psql 也不能再起来
+        OFFLINE_SIGNUP_LIMITS.launchPauseSeconds = 3;
+        try {
+          const late = marker();
+          const stopEarly = new AbortController();
+          setTimeout(() => stopEarly.abort(), 1000);
+          const result = await offline.runOffline(sleepy(late), late, stopEarly.signal);
+          assert.equal(result.code, null);
+          await new Promise((r) => setTimeout(r, 4000));
+          assert.deepEqual(await leftovers(late), { sessions: "0", psql: "0" });
+        } finally {
+          OFFLINE_SIGNUP_LIMITS.launchPauseSeconds = 0;
         }
 
         // 运行中被叫停:同样停掉容器里的注册

@@ -5,7 +5,7 @@ import assert from "node:assert/strict";
 import { signupOutcome, signupScript } from "../dist/auth-drill.js";
 
 const hex = (s) => Buffer.from(s, "utf8").toString("hex");
-const out = (state, context = "") => ({ code: 0, stdout: `backupdrill-signup ${state} ${hex(context)}\n` });
+const out = (state, context = "", message = "") => ({ code: 0, stdout: `backupdrill-signup ${state} ${hex(context)} ${hex(message)}\n` });
 const OWN_BLOCK = 'SQL statement "insert into auth.users (id) values (1)"\nPL/pgSQL function inline_code_block line 9 at SQL statement';
 
 test("signupScript: rolls back, runs as supabase_auth_admin, and quotes the block with this sign-up's random marker", () => {
@@ -32,48 +32,45 @@ test("signupOutcome: ok, a trigger that fails, and a test row that doesn't fit t
   });
 });
 
-test("signupOutcome: only a failure caused by the missing network is 'not tested'; anything else is a real sign-up failure", () => {
-  const dblinkCall =
-    `SQL statement "SELECT public.dblink_exec('host=10.0.0.1', 'insert into t default values')"\n` +
-    `PL/pgSQL function public.tell_crm() line 2 at PERFORM\n${OWN_BLOCK}`;
-  // dblink 连不上:SQLSTATE 08001,出错的就是 dblink 调用
-  const connecting = signupOutcome(out("08001", dblinkCall));
-  assert.equal(connecting.ran, false);
-  assert.match(connecting.detail, /needed the network \(a connection couldn't be made \(SQLSTATE 08001\)\)/);
-  assert.match(connecting.detail, /cut off from the network/);
-  // 不是连接类的错,但出错的正是要联网的调用(http 扩展、pg_net、COPY ... PROGRAM、外部表)
-  for (const statement of [
-    `SQL statement "SELECT http_post('https://crm.example/hook', '{}', 'application/json')"`,
-    `SQL statement "SELECT net.http_post(url := 'https://crm.example/hook')"`,
-    `SQL statement "copy (select 1) to program 'wget -q https://crm.example/hook'"`,
-    "remote SQL command: INSERT INTO public.signups(id) VALUES ($1)",
-  ]) {
-    const r = signupOutcome(out("XX000", `${statement}\nPL/pgSQL function public.tell_crm() line 2 at PERFORM\n${OWN_BLOCK}`));
-    assert.equal(r.ran, false, statement);
-  }
-  // 出错的就是 dblink 调用,但原因是权限(42501)或者 dblink 根本没装(42883):都是真问题,不算"没网"
-  const deniedDblink = signupOutcome(out("42501", dblinkCall));
-  assert.equal(deniedDblink.ok, false, JSON.stringify(deniedDblink));
-  assert.match(deniedDblink.detail, /^a new sign-up would fail: permission denied \(SQLSTATE 42501\)/);
-  const missingDblink = signupOutcome(out("42883", dblinkCall));
-  assert.equal(missingDblink.ok, false, JSON.stringify(missingDblink));
-  assert.match(missingDblink.detail, /^a new sign-up would fail: a function doesn't exist \(SQLSTATE 42883\)/);
-  // 沙箱里装着 dblink,但触发器是因为权限失败的:照实报成注册会失败,不藏成"没测成"
-  const denied = signupOutcome(
-    out("42501", `SQL statement "insert into private.audit values (new.id)"\nPL/pgSQL function public.tell_crm() line 4 at SQL statement\n${OWN_BLOCK}`)
+test("signupOutcome: 'may need network access' only with evidence of a connection failure; anything else is a real sign-up failure", () => {
+  const inTrigger = (statement) => `${statement}\nPL/pgSQL function public.tell_crm() line 2 at PERFORM\n${OWN_BLOCK}`;
+  const dblinkCall = inTrigger(`SQL statement "SELECT public.dblink_exec('host=10.0.0.1', 'insert into t default values')"`);
+  const httpCall = inTrigger(`SQL statement "SELECT http_post('https://crm.example/hook', '{}', 'application/json')"`);
+  const notTested = (r) => {
+    assert.equal(r.ran, false, JSON.stringify(r));
+    assert.match(r.detail, /^the test sign-up hit an error in the offline sandbox \(.+\)\. The failing operation may need network access$/);
+  };
+  // 连接类 SQLSTATE(dblink、postgres_fdw 连不上)
+  notTested(signupOutcome(out("08001", dblinkCall, "could not establish connection")));
+  // 联网调用自己报的连接/解析失败(http 扩展的 libcurl 错误是 XX000)
+  notTested(signupOutcome(out("XX000", httpCall, "Couldn't resolve host name")));
+  // COPY ... PROGRAM 的程序失败
+  notTested(signupOutcome(out("38000", inTrigger(`SQL statement "copy (select 1) to program 'wget -q https://crm.example/hook'"`), 'program "wget" failed')));
+
+  const failed = (r, sqlstate) =>
+    assert.deepEqual(r, {
+      ran: true,
+      ok: false,
+      detail: `a new sign-up would fail: ${sqlstate} (tested as an email sign-up with no user metadata)`,
+    });
+  // 出错的语句里也调了 net.http_post,但失败的是检查约束(审查复现的情况):真问题
+  failed(
+    signupOutcome(out("23514", inTrigger(`SQL statement "insert into public.hooks (r) values (net.http_post(url := 'https://crm.example'))"`), "new row violates check constraint")),
+    "a check constraint was violated (SQLSTATE 23514)"
   );
-  assert.deepEqual(denied, {
-    ran: true,
-    ok: false,
-    detail: "a new sign-up would fail: permission denied (SQLSTATE 42501) (tested as an email sign-up with no user metadata)",
-  });
+  // dblink 调用本身报权限不够(42501)、dblink 没装(42883):真问题
+  failed(signupOutcome(out("42501", dblinkCall, "permission denied for function dblink_exec")), "permission denied (SQLSTATE 42501)");
+  failed(signupOutcome(out("42883", dblinkCall, "function public.dblink_exec(unknown, unknown) does not exist")), "a function doesn't exist (SQLSTATE 42883)");
+  // http 调用报的不是连接问题,或者触发器自己 RAISE:真问题
+  failed(signupOutcome(out("XX000", httpCall, "invalid content type")), "an error (SQLSTATE XX000)");
+  failed(signupOutcome(out("P0001", httpCall, "could not connect")), "an exception was raised (SQLSTATE P0001)");
 });
 
 test("signupOutcome: psql that didn't finish (timeout, killed) or printed no result line means no sign-up was simulated", () => {
-  assert.deepEqual(signupOutcome({ code: 3, stdout: "" }), { ran: false, detail: "couldn't simulate a sign-up: it didn't finish" });
-  assert.deepEqual(signupOutcome({ code: null, stdout: "backupdrill-signup ok \n" }), {
+  assert.deepEqual(signupOutcome({ code: 3, stdout: "" }), { ran: false, detail: "psql returned no usable sign-up test result" });
+  assert.deepEqual(signupOutcome({ code: null, stdout: "backupdrill-signup ok  \n" }), {
     ran: false,
-    detail: "couldn't simulate a sign-up: it didn't finish",
+    detail: "psql returned no usable sign-up test result",
   });
   assert.equal(signupOutcome({ code: 0, stdout: "something else\n" }).ran, false);
 });

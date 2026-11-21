@@ -82,7 +82,7 @@ export interface DrillReport {
   restoredRowTotal: number;
   /** --keep 且演练失败时:被保留的沙箱(供排查/脚本消费);其余情况不存在 */
   /** inspect(2.11.1 起):进沙箱的 docker exec 命令 */
-  keptSandbox?: { containerId: string; connString: string; inspect: string };
+  keptSandbox?: { containerId: string; connString: string; inspect?: string };
   /** 源库自带孤儿行的外键:演练和真实恢复都把它们建成 NOT VALID,不算失败。没有时不出现 */
   orphanedForeignKeys?: OrphanedForeignKey[];
   /**
@@ -441,7 +441,7 @@ function containerExec(
   });
 }
 
-/** 容器里用 psql 跑 SQL(走 unix socket,不经网络)。官方镜像对本地 socket 是 trust */
+/** 容器里用 psql 跑 SQL(默认走 unix socket,不经网络)。官方镜像对本地 socket 和 127.0.0.1 都是 trust */
 const PSQL = ["psql", "-X", "-q", "-tA", "-v", "ON_ERROR_STOP=1", "-U", "postgres", "-d", "postgres"];
 
 /** 模拟注册在容器里的几样痕迹,都带同一个随机标记:取消标记文件、psql 的 pid 文件、会话的 application_name */
@@ -454,34 +454,58 @@ function signupTraces(marker: string) {
   };
 }
 
-/** 模拟注册本地那一侧(docker exec 客户端)最多等多久;导出供测试调短,产品里不改 */
-export const OFFLINE_SIGNUP_LIMITS = { psqlMs: 6 * 60 * 1000 };
+/**
+ * 模拟注册本地那一侧(docker exec 客户端)最多等多久;导出供测试调短,产品里不改。
+ * launchPauseSeconds 只给测试用:在启动脚本"看过取消标记"和"exec psql"之间停一会儿,复现最坏的时序
+ */
+export const OFFLINE_SIGNUP_LIMITS = { psqlMs: 6 * 60 * 1000, launchPauseSeconds: 0 };
+
+/**
+ * 容器里启动模拟注册的脚本。和 stopSignup 的约定:**先占位、再看取消**。
+ *  - 启动脚本先独占创建 pid 文件(set -C),写进自己的 pid,然后才看取消标记,有就退出;
+ *  - stopSignup 先建取消标记,然后才看 pid 文件。
+ * 所以 stopSignup 没看到 pid 文件,启动脚本之后一定会看到取消标记而退出;看到了,就按 pid 杀掉它——
+ * 不管它还是 sh(停在 exec 之前)还是已经 exec 成了 psql,pid 都是同一个。
+ *
+ * psql 经 127.0.0.1 连(断网后 loopback 还在):走 unix socket 时 inet_client_addr() 是 NULL,
+ * 真实注册经 TCP 进来,要客户端地址的触发器会被误判成坏的。官方镜像 loopback 是 trust;
+ * 万一不是,用容器自己的 POSTGRES_PASSWORD
+ */
+function signupLauncher(marker: string): string {
+  const { cancelFile, pidFile } = signupTraces(marker);
+  const pause = Math.max(0, Math.floor(OFFLINE_SIGNUP_LIMITS.launchPauseSeconds));
+  return (
+    `set -C; echo $$ > ${pidFile} || exit 99; [ -e ${cancelFile} ] && exit 99; ` +
+    (pause ? `sleep ${pause}; ` : "") +
+    `PGPASSWORD="$POSTGRES_PASSWORD" exec ${PSQL.join(" ")} -h 127.0.0.1`
+  );
+}
 
 /**
  * 停掉一次没有正常结束的模拟注册,并等到它在容器里确实没了(最多约 15 秒)。本地的 docker exec 客户端被杀掉
- * (超时、叫停)时,容器里的 psql 和它的会话照样在跑,甚至可能还没起来,所以三步一起做、反复做:
- *  1. 写取消标记:还没起来的那次 exec 看到它就不再启动 psql;
- *  2. 杀掉容器里那个 psql(按 pid 文件,并确认那个 pid 还是 psql,不误杀别的进程);
- *  3. 终止它的会话(按 application_name,或者语句里带着这次的随机标记——触发器能改 application_name)。
- * 连着两轮都干净才算停下来了:pid 文件可能在第一轮之后才写出来
+ * (超时、叫停)时,容器里的那次启动照样在跑,甚至可能还没起来。按 signupLauncher 的约定:
+ *  1. 先建取消标记,再看 pid 文件:没有 pid 文件 = 它以后也不会启动;有 = 那个进程(sh 或 psql)还活着就杀掉;
+ *  2. 终止它的会话(按 application_name,或者语句里带着这次的随机标记——触发器能改 application_name)。
+ * 进程没了、会话也没了才算停下来
  */
 async function stopSignup(containerId: string, marker: string): Promise<boolean> {
   const { cancelFile, pidFile, appName } = signupTraces(marker);
-  const killPsql =
-    `touch ${cancelFile}; if [ -f ${pidFile} ]; then p=$(cat ${pidFile}); ` +
-    `if [ "$(cat /proc/$p/comm 2>/dev/null)" = psql ]; then kill -9 "$p"; echo alive; fi; fi; true`;
+  // 输出 "alive":还有进程(刚杀掉,或者 pid 文件刚建、还没写进 pid),下一轮再看
+  const killLauncher =
+    `touch ${cancelFile}; if [ -e ${pidFile} ]; then p=$(cat ${pidFile}); ` +
+    `if [ -z "$p" ]; then echo alive; ` +
+    `else c=$(cat /proc/$p/comm 2>/dev/null); if [ "$c" = sh ] || [ "$c" = psql ]; then kill -9 "$p"; echo alive; fi; fi; fi; true`;
   const sessions =
     `select count(pg_terminate_backend(pid)) from pg_stat_activity where pid <> pg_backend_pid() ` +
     `and (application_name = '${appName}' or query like '%${marker}%')`;
-  let clean = 0;
-  for (let i = 0; i < 30 && clean < 2; i++) {
-    const killed = await containerExec(containerId, ["sh", "-c", killPsql], { timeoutMs: 10_000 });
+  for (let i = 0; i < 30; i++) {
+    const killed = await containerExec(containerId, ["sh", "-c", killLauncher], { timeoutMs: 10_000 });
     const left = await containerExec(containerId, [...PSQL, "-c", sessions], { timeoutMs: 10_000 });
     if (killed.code !== 0 || left.code !== 0) return false;
-    clean = killed.stdout.trim() === "" && left.stdout.trim() === "0" ? clean + 1 : 0;
-    if (clean < 2) await new Promise((resolve) => setTimeout(resolve, 500));
+    if (killed.stdout.trim() === "" && left.stdout.trim() === "0") return true;
+    await new Promise((resolve) => setTimeout(resolve, 500));
   }
-  return clean >= 2;
+  return false;
 }
 
 /**
@@ -489,7 +513,7 @@ async function stopSignup(containerId: string, marker: string): Promise<boolean>
  *
  * 为什么是临时断网,而不是一开始就不给沙箱联网:CLI 和 pg_restore 都从主机经发布的端口连沙箱,
  * --network none 和 --internal 网络都发布不了端口。所以恢复、校验照旧,只在最后的模拟注册之前把容器从所有
- * 网络上摘下来(只剩 loopback),经 docker exec 里的 psql 走 unix socket 跑。
+ * 网络上摘下来(只剩 loopback),经 docker exec 里的 psql 连 127.0.0.1 跑(见 signupLauncher)。
  *
  * **断了就不再接回**:能确认的只有会话和那个 psql 都没了,确认不了触发器有没有留下别的东西(后台进程等),
  * 一接回它们就又能连出去。所以模拟注册是这个沙箱上的最后一件事,跑完沙箱就销毁。--keep 要留下沙箱时
@@ -505,7 +529,7 @@ export function offlineSandbox(pg: { containerId: string; offline: boolean }): O
       if (running) await waitAtMost(stopSignup(pg.containerId, running), 20_000);
     },
     async runOffline(script, marker, signal) {
-      const { pidFile, cancelFile, appName } = signupTraces(marker);
+      const { appName } = signupTraces(marker);
       const stopped = () => {
         if (signal?.aborted) throw new Error("stopped");
       };
@@ -524,7 +548,7 @@ export function offlineSandbox(pg: { containerId: string; offline: boolean }): O
       running = marker;
       const result = await containerExec(
         pg.containerId,
-        ["sh", "-c", `[ -e ${cancelFile} ] && exit 99; echo $$ > ${pidFile}; exec ${PSQL.join(" ")}`],
+        ["sh", "-c", signupLauncher(marker)],
         { input: script, timeoutMs: OFFLINE_SIGNUP_LIMITS.psqlMs, signal, env: [`PGAPPNAME=${appName}`] }
       );
       // 本地超时或被叫停:容器里的那次模拟注册可能还在跑,先确实停掉它,再交出结果(之后沙箱才会被销毁)
@@ -1088,7 +1112,7 @@ export async function drillDump(
       sandbox: offlineSandbox(pg),
       // --keep 要留下这个沙箱时不跑模拟注册:断了网就不能再接回,留下的沙箱就连不上了(脚本靠 keptSandbox.connString)。
       // 结论(pass)这时已经定了,只有真的会留沙箱(演练没通过)才跳过
-      skipSignup: opts.keepSandboxOnFailure && !pass ? "skipped because --keep keeps the sandbox reachable" : undefined,
+      skipSignup: opts.keepSandboxOnFailure && !pass ? "skipped: --keep leaves the sandbox reachable for inspection" : undefined,
     });
     if (authSection) {
       report.auth = authSection;
