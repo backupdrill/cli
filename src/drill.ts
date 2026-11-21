@@ -565,7 +565,13 @@ export function offlineSandbox(pg: { containerId: string; offline: boolean }): O
       );
       // 本地超时或被叫停:容器里的那次模拟注册可能还在跑,先确实停掉它,再交出结果(之后沙箱才会被销毁)
       if (result.killed || signal?.aborted) {
-        if (!(await stopOnce(marker))) {
+        // 超时收尾时演练可能正同时销毁沙箱:容器已经停了(或没了),里面的注册也就跟着没了,不必提示
+        const stillThere = () =>
+          execFileAsync("docker", ["inspect", "-f", "{{.State.Running}}", pg.containerId], { timeout: 10_000 }).then(
+            (r) => r.stdout.trim() === "true",
+            () => false
+          );
+        if (!(await stopOnce(marker)) && (await stillThere())) {
           log.warn("Couldn't confirm the stopped test sign-up ended inside the drill sandbox; it stays off the network until it is removed.");
         }
       }
