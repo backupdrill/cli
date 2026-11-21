@@ -203,8 +203,8 @@ export type AuthInspection =
       triggers: AuthTriggerInfo[];
       policies: AuthPolicyInfo[];
       grants: Array<{ table: string; grantee: string; privilege: string }>;
-      /** 抹掉待处理 token 之后会被 auth.users 上的约束拒绝的地方(见 pendingTokenConflicts);空 = 可以抹 */
-      scrubConflicts: string[];
+      /** auth.users 上第一个不是 Supabase 自带的、可能拒收抹过的值的对象(见 firstNonStockObject);null = 可以抹 */
+      nonStockObject: string | null;
     };
 
 // Supabase 平台自己的 schema。触发器函数或策略引用的函数在这些 schema 里时算平台对象
@@ -334,12 +334,12 @@ export async function inspectAuth(
         order by 1, 2, 3`
     );
 
-    const scrubConflicts = await pendingTokenConflicts(client);
+    const nonStockObject = await firstNonStockObject(client);
 
     await client.query("commit");
     return {
       readable: true,
-      scrubConflicts,
+      nonStockObject,
       grants: grants.rows,
       users: Number(c.users),
       identities: Number(c.identities),
@@ -371,75 +371,101 @@ export async function inspectAuth(
   }
 }
 
-/** Supabase(GoTrue)自带、抹过的值一定过得了的 CHECK:pg_get_constraintdef 的原文,逐字比较(PG16/17 实测一致) */
-const STOCK_CHECKS = ["CHECK (((email_change_confirm_status >= 0) AND (email_change_confirm_status <= 2)))"];
+/**
+ * 把系统目录里的名字(约束名、索引名、列名)写进日志、manifest 和 RECOVERY.md 之前用:加双引号,
+ * 反斜杠、引号和所有控制字符(C0、DEL、C1、U+2028/2029)都转义成可见的文字。名字可以含换行,
+ * 原样写进终端就能伪造一行日志
+ */
+export function quotedName(name: string): string {
+  return `"${name.replace(/[\\"\u0000-\u001f\u007f-\u009f\u2028\u2029]/g, (ch) => {
+    if (ch === "\\" || ch === '"') return `\\${ch}`;
+    if (ch === "\n") return "\\n";
+    if (ch === "\r") return "\\r";
+    if (ch === "\t") return "\\t";
+    return `\\u${ch.charCodeAt(0).toString(16).padStart(4, "0")}`;
+  })}"`;
+}
 
 /**
- * Supabase 自带的 token 唯一索引的 WHERE 条件(pg_get_expr 的原文):数字和空格组成的值不进索引,
- * 抹成的空串因此也不进。varchar 列带 ::text,text 列不带
+ * Supabase(GoTrue)自带的 auth.users:2026-11-21 在 supabase/postgres 17.6 上跑完 GoTrue v2.186.0 的全部迁移后
+ * 从系统目录读出来的原文(pg_get_constraintdef / pg_get_indexdef / pg_get_expr;PG16、PG17 输出一致)。
+ * 索引去掉名字只比定义,名字改过不算不同
  */
-const stockTokenPredicates = (column: string) => [`((${column})::text !~ '^[0-9 ]*$'::text)`, `(${column} !~ '^[0-9 ]*$'::text)`];
+const STOCK_AUTH_USERS = {
+  /** CHECK / FOREIGN KEY / EXCLUDE 约束;自带的只有这一条 CHECK,没有外键和排他约束 */
+  constraints: ["CHECK (((email_change_confirm_status >= 0) AND (email_change_confirm_status <= 2)))"],
+  /** 唯一索引(含主键、UNIQUE 约束背后的索引) */
+  uniqueIndexes: [
+    "CREATE UNIQUE INDEX ON auth.users USING btree (id)",
+    "CREATE UNIQUE INDEX ON auth.users USING btree (phone)",
+    "CREATE UNIQUE INDEX ON auth.users USING btree (email) WHERE (is_sso_user = false)",
+    ...["confirmation_token", "recovery_token", "email_change_token_current", "email_change_token_new", "reauthentication_token"].map(
+      (column) => `CREATE UNIQUE INDEX ON auth.users USING btree (${column}) WHERE ((${column})::text !~ '^[0-9 ]*$'::text)`
+    ),
+  ],
+  /** 生成列 → 表达式 */
+  generated: new Map([["confirmed_at", "LEAST(email_confirmed_at, phone_confirmed_at)"]]),
+};
+
+/** pg_get_indexdef 的结果去掉索引名:"CREATE [UNIQUE] INDEX <名字> ON ..." → "CREATE [UNIQUE] INDEX ON ..." */
+function indexDefWithoutName(def: string): string {
+  return def.replace(/^(CREATE (?:UNIQUE )?INDEX )(?:"(?:[^"]|"")*"|\S+) ON /, "$1ON ");
+}
 
 /**
  * 2.11.1 起 auth.dump 里待处理的 token 被抹成空串、发送时间成 NULL、确认状态成 0(见 auth-archive.ts)。
- * 用户自己在 auth.users 上加的约束可能不接受这些值:例如 CHECK (recovery_token <> '')、发送时间 NOT NULL、
- * token 列上不带条件的唯一索引(所有行都成了 '',撞在一起)。原样的归档恢复得了、抹过的却恢复不了,
- * 这比不抹更糟,所以备份时先查,有可能被拒就不写 auth.dump,Auth 这一节记失败、写明是哪条约束。
+ * 用户自己在 auth.users 上加的约束可能不接受这些值(例如 CHECK (recovery_token <> '')、token 列上不带条件的
+ * 唯一索引、从 token 算出来的生成列再加 CHECK):原样的归档恢复得了、抹过的却恢复不了,这比不抹更糟。
  *
- * **只读系统目录,不执行任何用户定义的东西**:约束表达式里可以调用用户函数(dblink、http、很慢或有副作用的),
- * 不能拿备份角色的权限在生产库上跑它们。所以按定义的原文静态判断,而且偏保守:
- *  - 被抹成 NULL 的列是 NOT NULL,或者被抹的列是域类型 → 冲突;
- *  - 用到被抹的列的 CHECK,除非和 Supabase 自带的那条逐字相同 → 冲突;
- *  - 用到被抹的列的唯一索引(键、表达式或 WHERE 条件里),除非正是 Supabase 自带的样子
- *    (单个 token 列,WHERE 是 !~ '^[0-9 ]*$')→ 冲突;
- *  - 用到被抹的列的外键、排他约束 → 冲突。
- * 跑在 inspectAuth 已经开着的 REPEATABLE READ READ ONLY 事务里,不另开连接
+ * 所以用严格的白名单:只有 auth.users 上所有会在 COPY 时起作用的东西都和 Supabase 自带的一模一样,才写 auth.dump,
+ * 否则不写、Auth 这一节记失败并点名第一个对不上的对象。逐条分析"这条约束会不会拒绝抹过的值"靠不住
+ * (生成列、表达式排他约束都会漏),白名单不会漏。要比对的:
+ *  - 所有 CHECK、外键、排他约束(按 pg_get_constraintdef 原文);
+ *  - 所有唯一索引和排他约束背后的索引(按去掉名字的 pg_get_indexdef 原文;普通索引拒绝不了 COPY,不管);
+ *  - 所有生成列(按列名和表达式原文);
+ *  - 被抹成 NULL 的列不能是 NOT NULL,被抹的列不能是域类型。
+ *
+ * **只读系统目录,不执行任何用户定义的东西**:约束表达式里可以调用用户函数,不能拿备份角色的权限在生产库上跑。
+ * 跑在 inspectAuth 已经开着的 REPEATABLE READ READ ONLY 事务里,不另开连接。返回第一个对不上的对象(没有就是 null)
  */
-async function pendingTokenConflicts(client: pg.Client): Promise<string[]> {
-  const columns = await client.query<{ attnum: number; name: string; notnull: boolean; domain: boolean }>(
-    `select a.attnum, a.attname as name, a.attnotnull as notnull, t.typtype = 'd' as domain
-       from pg_attribute a join pg_type t on t.oid = a.atttypid
+async function firstNonStockObject(client: pg.Client): Promise<string | null> {
+  const blanked = new Map(PENDING_AUTH_COPY_VALUES);
+  const columns = await client.query<{ name: string; notnull: boolean; domain: boolean; generated: boolean; expr: string | null }>(
+    `select a.attname as name, a.attnotnull as notnull, t.typtype = 'd' as domain,
+            a.attgenerated <> '' as generated,
+            case when a.attgenerated <> '' then pg_get_expr(d.adbin, d.adrelid) end as expr
+       from pg_attribute a
+       join pg_type t on t.oid = a.atttypid
+       left join pg_attrdef d on d.adrelid = a.attrelid and d.adnum = a.attnum
       where a.attrelid = 'auth.users'::regclass and a.attnum > 0 and not a.attisdropped
       order by a.attnum`
   );
-  const blanked = new Map(PENDING_AUTH_COPY_VALUES);
-  const touched = columns.rows.filter((c) => blanked.has(c.name));
-  if (!touched.length) return [];
-  const conflicts: string[] = [];
-  for (const c of touched) {
-    if (c.domain) conflicts.push(`column ${c.name}, which has a domain type`);
-    if (c.notnull && blanked.get(c.name) === "\\N") conflicts.push(`NOT NULL column ${c.name}`);
+  for (const c of columns.rows) {
+    if (blanked.has(c.name) && c.domain) return `a domain-typed column ${quotedName(c.name)}`;
+    if (blanked.get(c.name) === "\\N" && c.notnull) return `a NOT NULL column ${quotedName(c.name)}`;
+    if (c.generated && STOCK_AUTH_USERS.generated.get(c.name) !== c.expr) return `a custom generated column ${quotedName(c.name)}`;
   }
-  const attnums = touched.map((c) => c.attnum);
   const constraints = await client.query<{ name: string; type: string; def: string }>(
     `select conname as name, contype::text as type, pg_get_constraintdef(oid) as def
        from pg_constraint
-      where conrelid = 'auth.users'::regclass and conkey && $1::int2[] and contype in ('c', 'f', 'x')
-      order by 1`,
-    [attnums]
+      where conrelid = 'auth.users'::regclass and contype in ('c', 'f', 'x')
+      order by conname`
   );
   for (const k of constraints.rows) {
-    if (k.type === "c" && STOCK_CHECKS.includes(k.def)) continue;
-    conflicts.push(`${k.type === "c" ? "check constraint" : k.type === "f" ? "foreign key" : "exclusion constraint"} ${k.name}`);
+    if (STOCK_AUTH_USERS.constraints.includes(k.def)) continue;
+    const kind = k.type === "c" ? "check constraint" : k.type === "f" ? "foreign key" : "exclusion constraint";
+    return `a custom ${kind} ${quotedName(k.name)}`;
   }
-  const indexes = await client.query<{ name: string; keys: number[]; pred: string | null }>(
-    `select c.relname as name, i.indkey::int2[] as keys, pg_get_expr(i.indpred, i.indrelid) as pred
+  const indexes = await client.query<{ name: string; def: string }>(
+    `select c.relname as name, pg_get_indexdef(i.indexrelid) as def
        from pg_index i join pg_class c on c.oid = i.indexrelid
-      where i.indrelid = 'auth.users'::regclass and i.indisunique
-        and (i.indkey::int2[] && $1::int2[]
-             or exists (select 1 from pg_depend d
-                         where d.classid = 'pg_class'::regclass and d.objid = i.indexrelid
-                           and d.refobjid = i.indrelid and d.refobjsubid = any($1::int2[])))
-      order by 1`,
-    [attnums]
+      where i.indrelid = 'auth.users'::regclass and (i.indisunique or i.indisexclusion)
+      order by c.relname`
   );
   for (const ix of indexes.rows) {
-    // Supabase 自带的样子:只有一个键,是被抹成空串的那一列本身(不是表达式),WHERE 正是那一句
-    const column = ix.keys.length === 1 ? touched.find((c) => c.attnum === ix.keys[0]) : undefined;
-    const stock = column && blanked.get(column.name) === "" && ix.pred !== null && stockTokenPredicates(column.name).includes(ix.pred);
-    if (!stock) conflicts.push(`unique index ${ix.name}`);
+    if (!STOCK_AUTH_USERS.uniqueIndexes.includes(indexDefWithoutName(ix.def))) return `a custom unique index ${quotedName(ix.name)}`;
   }
-  return conflicts;
+  return null;
 }
 
 /**

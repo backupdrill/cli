@@ -11,6 +11,16 @@ import { recoveryGrantsSql } from "./grants.js";
 import { plainSchemaName, restorableAuthObjects } from "./auth-backup.js";
 import { authRestoreNotes, CLEAR_PENDING_AUTH_SQL } from "./auth-restore.js";
 
+/**
+ * 原样写进 RECOVERY.md 的一段文字(例如 Auth 失败的原因,里面有从系统目录读来的约束名、索引名):
+ * 控制字符换成可见的转义,Markdown 会解释的字符前加反斜杠,名字里写的链接、强调、HTML 都只显示成文字
+ */
+export function markdownText(text: string): string {
+  return text
+    .replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029]/g, (ch) => `\\u${ch.charCodeAt(0).toString(16).padStart(4, "0")}`)
+    .replace(/[\\`*_{}\[\]()<>#!|~]/g, (ch) => `\\${ch}`);
+}
+
 /** 生成手册所需的非秘密快照坐标。刻意不收连接串/密钥类型——签名即防线。 */
 export interface RecoveryDocContext {
   snapshot: string; // 快照时间戳目录名
@@ -75,7 +85,7 @@ export function authRecoveryText(manifest: Manifest, place: RecoveryDocPlace): A
   (pg_dump custom format, ${mb(auth.dump!.bytes)} MB, sha256 \`${auth.dump!.sha256}\`) — ${auth.rows!.users.toLocaleString("en-US")} users, ${auth.rows!.identities.toLocaleString("en-US")} sign-in identities
 `
     : manifest.auth
-      ? `- **Supabase Auth users**: not in this snapshot (${AUTH_NOT_INCLUDED_TEXT[manifest.auth.reason ?? ""] ?? manifest.auth.reason ?? "not captured"})
+      ? `- **Supabase Auth users**: not in this snapshot (${AUTH_NOT_INCLUDED_TEXT[manifest.auth.reason ?? ""] ?? markdownText(manifest.auth.reason ?? "not captured")})
 `
       : "";
   // 空目标检查用的 schema 列表(SQL 字符串字面量,单引号按 SQL 规则加倍)

@@ -423,15 +423,14 @@ async function prepareAuthDump(
     await shared.release();
     return { kind: "settled", section: authNotDone(mode, inspection.reason) };
   }
-  // 抹掉待处理 token 后会被用户自己的约束拒绝:这样的 auth.dump 恢复不了,不写(见 pendingTokenConflicts)
-  if (inspection.scrubConflicts.length) {
+  // auth.users 上有不是 Supabase 自带的约束、唯一索引或生成列:抹过的 auth.dump 可能恢复不了,不写(见 firstNonStockObject)
+  if (inspection.nonStockObject) {
     await shared.release();
-    const listed = inspection.scrubConflicts.slice(0, 3).join("; ") + (inspection.scrubConflicts.length > 3 ? "; …" : "");
     return {
       kind: "settled",
       section: {
         status: "failed",
-        reason: `Could not write auth.dump. Clearing pending Auth tokens could conflict with ${listed} on auth.users.`,
+        reason: `Could not write auth.dump. auth.users has ${inspection.nonStockObject} that clearing pending Auth tokens could conflict with.`,
       },
     };
   }

@@ -427,6 +427,23 @@ id" uuid references auth.users (id) on delete set null)`);
       const inContainer = async (id, query) =>
         (await x("docker", ["exec", id, "psql", "-U", "postgres", "-X", "-tA", "-c", query])).stdout.trim();
 
+      await t.test("a trigger whose ASSERT fails is reported as a failing sign-up (WHEN OTHERS doesn't catch it)", async () => {
+        await sql(admin, `
+          create function public.assert_signup() returns trigger language plpgsql security definer set search_path = '' as $$
+          begin assert new.email like '%@example.com', 'only example.com'; return new; end $$;
+          create trigger assert_signup after insert on auth.users for each row execute function public.assert_signup();`);
+        try {
+          const report = await runDrill(config, { store: (await backup("default")).store });
+          assert.deepEqual(report.auth.signup, {
+            ran: true,
+            ok: false,
+            detail: "a new sign-up would fail: an assertion failed (SQLSTATE P0004) (tested as an email sign-up with no user metadata)",
+          });
+        } finally {
+          await sql(admin, "drop trigger assert_signup on auth.users; drop function public.assert_signup()");
+        }
+      });
+
       await t.test("the offline test sign-up arrives over TCP like a real one: a trigger that needs the client address works", async () => {
         await sql(admin, `
           create function public.needs_client_addr() returns trigger language plpgsql security definer set search_path = '' as $$

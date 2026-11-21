@@ -12,9 +12,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import pg from "pg";
 import { runBackup, mainDumpArgs, AUTH_TIMEOUTS } from "../dist/backup.js";
-import { schemasMayIncludeAuth, restorableAuthObjects, manualAuthObjects, redactValues } from "../dist/auth-backup.js";
+import { schemasMayIncludeAuth, restorableAuthObjects, manualAuthObjects, redactValues, quotedName } from "../dist/auth-backup.js";
 import { parseManifest } from "../dist/manifest.js";
-import { authRecoveryText, renderRecoveryDoc } from "../dist/recovery-doc.js";
+import { authRecoveryText, markdownText, renderRecoveryDoc } from "../dist/recovery-doc.js";
 import { AUTH_DDL, SETUP, sql, startPostgres } from "./auth-fixtures.js";
 
 const x = promisify(execFile);
@@ -95,6 +95,15 @@ test("RECOVERY.md never puts an object name into a shell command unless it is a 
   assert.ok(doc.includes("backupdrill restore \\"), "the CLI restore recipe is there");
   assert.match(doc, /backupdrill restore --status/);
   assert.match(doc, /backupdrill restore --finish --confirm-target <target-ref>/);
+});
+
+test("names from the catalog are shown safely: control characters escaped, Markdown never interpreted", () => {
+  assert.equal(quotedName("plain"), '"plain"');
+  assert.equal(quotedName('a"b\\c'), '"a\\"b\\\\c"');
+  assert.equal(quotedName("x\ny\rz\tw\u0007\u009b\u2028"), '"x\\ny\\rz\\tw\\u0007\\u009b\\u2028"');
+  const shown = markdownText(`has ${quotedName("evil\n[click](https://example.com) <b>*x*</b> `code`")}`);
+  assert.equal(shown.includes("\n"), false);
+  assert.equal(shown, 'has "evil\\\\n\\[click\\]\\(https://example.com\\) \\<b\\>\\*x\\*\\</b\\> \\`code\\`"');
 });
 
 test("redactValues: values that may be user data go, identifiers stay", () => {
@@ -493,65 +502,72 @@ test(
         assert.equal(r.manifest.dump.bytes, r.files.get("dump.pgcustom").length);
       });
 
-      await t.test("constraints that wouldn't take the cleared tokens: no auth.dump, Auth failed with the reason, database backed up", async () => {
-        // 每个用户都有 recovery_token,下面的 CHECK 和不带条件的唯一索引才建得出来;抹成 '' 之后两者都不接受
+      await t.test("anything on auth.users beyond Supabase's own: no auth.dump, Auth failed naming it, database backed up", async () => {
+        const reasonFor = (what) => `Could not write auth.dump. auth.users has ${what} that clearing pending Auth tokens could conflict with.`;
+        const expectRefused = async (name, what) => {
+          const r = await run(name, { databaseUrl: okUrl, auth: "default" });
+          assert.equal(r.manifest.auth.status, "failed", JSON.stringify(r.manifest.auth));
+          assert.equal(r.manifest.auth.reason, reasonFor(what));
+          assert.equal(r.files.has("auth.dump"), false);
+          assert.ok(r.files.get("dump.pgcustom").length > 0);
+          assert.equal(r.manifest.dump.bytes, r.files.get("dump.pgcustom").length);
+          return r;
+        };
+        // 每个用户都有 recovery_token,下面这些约束和索引才建得出来;抹成 '' 之后它们可能不接受
         await sql(admin, "update auth.users set recovery_token = 'r-' || id where recovery_token = ''");
-        try {
-          await sql(admin, "alter table auth.users add constraint recovery_token_set check (recovery_token <> '')");
-          let r = await run("scrub-check", { databaseUrl: okUrl, auth: "default" });
-          assert.equal(r.manifest.auth.status, "failed");
-          assert.equal(
-            r.manifest.auth.reason,
-            "Could not write auth.dump. Clearing pending Auth tokens could conflict with check constraint recovery_token_set on auth.users."
-          );
-          assert.equal(r.files.has("auth.dump"), false);
-          assert.ok(r.files.get("dump.pgcustom").length > 0);
-
+        const cases = [
+          ["custom-check", "alter table auth.users add constraint recovery_token_set check (recovery_token <> '')",
+            'a custom check constraint "recovery_token_set"', "alter table auth.users drop constraint recovery_token_set"],
           // 约束里调用了用户函数:备份只读系统目录里的定义,绝不在源库上执行它。函数一旦被调用就抛错,
-          // 那样这里就会变成"检查 Auth 表失败",而不是写明是哪条约束
-          await sql(admin, `alter table auth.users drop constraint recovery_token_set;
-            create function public.never_call_me(t text) returns boolean language plpgsql as $$
-            begin raise exception 'called on the source database'; end $$;
-            alter table auth.users add constraint token_checked_by_function check (public.never_call_me(recovery_token)) not valid`);
-          r = await run("scrub-function", { databaseUrl: okUrl, auth: "default" });
-          assert.equal(r.manifest.auth.status, "failed");
-          assert.equal(
-            r.manifest.auth.reason,
-            "Could not write auth.dump. Clearing pending Auth tokens could conflict with check constraint token_checked_by_function on auth.users."
-          );
-          assert.equal(r.files.has("auth.dump"), false);
-          assert.ok(r.files.get("dump.pgcustom").length > 0);
-
+          // 那样这里就会变成"检查 Auth 表失败",而不是点名这条约束
+          ["function-check", `create function public.never_call_me(t text) returns boolean language plpgsql as $$
+              begin raise exception 'called on the source database'; end $$;
+              alter table auth.users add constraint token_checked_by_function check (public.never_call_me(recovery_token)) not valid`,
+            'a custom check constraint "token_checked_by_function"',
+            "alter table auth.users drop constraint token_checked_by_function; drop function public.never_call_me(text)"],
           // 被抹成 NULL 的发送时间列是 NOT NULL
-          await sql(admin, `alter table auth.users drop constraint token_checked_by_function;
-            update auth.users set reauthentication_sent_at = now() where reauthentication_sent_at is null;
-            alter table auth.users alter column reauthentication_sent_at set not null`);
-          r = await run("scrub-notnull", { databaseUrl: okUrl, auth: "default" });
-          assert.equal(
-            r.manifest.auth.reason,
-            "Could not write auth.dump. Clearing pending Auth tokens could conflict with NOT NULL column reauthentication_sent_at on auth.users."
-          );
-          assert.equal(r.files.has("auth.dump"), false);
-          await sql(admin, "alter table auth.users alter column reauthentication_sent_at drop not null; update auth.users set reauthentication_sent_at = null");
-
-          await sql(admin, "create unique index recovery_token_unique on auth.users (recovery_token)");
-          r = await run("scrub-unique", { databaseUrl: okUrl, auth: "default" });
-          assert.equal(r.manifest.auth.status, "failed");
-          assert.equal(
-            r.manifest.auth.reason,
-            "Could not write auth.dump. Clearing pending Auth tokens could conflict with unique index recovery_token_unique on auth.users."
-          );
-          assert.equal(r.files.has("auth.dump"), false);
-          assert.ok(r.files.get("dump.pgcustom").length > 0);
+          ["not-null", `update auth.users set reauthentication_sent_at = now() where reauthentication_sent_at is null;
+              alter table auth.users alter column reauthentication_sent_at set not null`,
+            'a NOT NULL column "reauthentication_sent_at"',
+            "alter table auth.users alter column reauthentication_sent_at drop not null; update auth.users set reauthentication_sent_at = null"],
+          // token 列上不带条件的唯一索引:抹过之后所有行都是 '',撞在一起
+          ["unique", "create unique index recovery_token_unique on auth.users (recovery_token)",
+            'a custom unique index "recovery_token_unique"', "drop index auth.recovery_token_unique"],
+          // 从 token 算出来的生成列,再在生成列上加 CHECK(约束本身不提 token 列)
+          ["generated", `alter table auth.users add column token_length int generated always as (length(recovery_token)) stored;
+              alter table auth.users add constraint token_length_positive check (token_length > 0)`,
+            'a custom generated column "token_length"', "alter table auth.users drop column token_length"],
+          // 表达式上的排他约束(conkey 是 {0},按列号对不出来)
+          ["exclusion", "alter table auth.users add constraint token_exclusive exclude using btree (lower(recovery_token) with =)",
+            'a custom exclusion constraint "token_exclusive"', "alter table auth.users drop constraint token_exclusive"],
+        ];
+        try {
+          for (const [name, add, what, drop] of cases) {
+            await sql(admin, add);
+            try {
+              await expectRefused(`scrub-${name}`, what);
+            } finally {
+              await sql(admin, drop);
+            }
+          }
+          // 名字里带换行和 Markdown 链接:日志、manifest 里转义成可见的文字,RECOVERY.md 里不会变成链接或多出一行
+          const evil = 'evil\n[click](https://example.com)';
+          await sql(admin, `alter table auth.users add constraint "${evil.replace(/"/g, '""')}" check (true)`);
+          try {
+            const r = await expectRefused("scrub-evil-name", 'a custom check constraint "evil\\n[click](https://example.com)"');
+            assert.equal(r.manifest.auth.reason.includes("\n"), false, "no raw newline in the reason");
+            const doc = renderRecoveryDoc(r.manifest, { snapshot: "s", bucket: "b", prefix: "p", projectName: "p" });
+            const line = doc.split("\n").find((l) => l.startsWith("- **Supabase Auth users**: not in this snapshot"));
+            assert.ok(line, doc);
+            assert.ok(line.includes("evil\\\\n\\[click\\]\\(https://example.com\\)"), line);
+            assert.equal(doc.includes("[click](https://example.com)"), false, "the name never becomes a Markdown link");
+          } finally {
+            await sql(admin, `alter table auth.users drop constraint "${evil.replace(/"/g, '""')}"`);
+          }
         } finally {
-          await sql(admin, `drop index if exists auth.recovery_token_unique;
-            alter table auth.users drop constraint if exists recovery_token_set;
-            alter table auth.users drop constraint if exists token_checked_by_function;
-            drop function if exists public.never_call_me(text);
-            alter table auth.users alter column reauthentication_sent_at drop not null;
-            update auth.users set recovery_token = '' where recovery_token like 'r-%'`);
+          await sql(admin, "update auth.users set recovery_token = '' where recovery_token like 'r-%'");
         }
-        // 去掉之后照常:Supabase 自带的那些(fixture 里有)不挡
+        // 都去掉之后照常:Supabase 自带的那些(fixture 里有)不挡
         const ok = await run("scrub-stock", { databaseUrl: okUrl, auth: "default" });
         assert.equal(ok.manifest.auth.status, "included", JSON.stringify(ok.manifest.auth));
       });

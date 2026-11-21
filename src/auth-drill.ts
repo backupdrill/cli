@@ -83,6 +83,7 @@ const SQLSTATE_TEXT: Record<string, string> = {
   "57014": "a statement timed out or was cancelled",
   "40P01": "a deadlock",
   P0001: "an exception was raised",
+  P0004: "an assertion failed",
   "08001": "a connection couldn't be made",
   "08006": "a connection failed",
 };
@@ -179,7 +180,7 @@ async function insertStatement(client: Client, table: "users" | "identities"): P
 
 /**
  * 模拟注册的 SQL,交给容器里的 psql 跑。注册放在 DO 块的子事务里:出错时接住,把 SQLSTATE、出错位置
- * (错误上下文)和错误消息写进三个会话变量(消息只用来判断是不是连不上,不进报告);
+ * (错误上下文)、错误消息和 DETAIL 写进四个会话变量(消息和 DETAIL 只用来判断是不是连不上,不进报告);
  * 最后一行输出由我们自己的 select 拼出来——触发器的 NOTICE
  * 只进 stderr,改不了这一行。成功路径最后覆盖写一遍,触发器事先写进去的值不算数。整个事务最后回滚。
  * 美元引号的标签每次随机:插入语句里的列名来自归档,不能让它把 DO 块提前截断
@@ -195,6 +196,7 @@ export function signupScript(userInsert: string, identityInsert: string, marker:
     "  state text;",
     "  context text;",
     "  message text;",
+    "  detail text;",
     "begin",
     "  begin",
     "    set local role supabase_auth_admin;",
@@ -202,52 +204,64 @@ export function signupScript(userInsert: string, identityInsert: string, marker:
     `    ${identityInsert};`,
     // 延迟检查的约束和约束触发器平时在提交时才跑:这里立刻跑完,才算这次注册真的能成
     "    set constraints all immediate;",
-    "  exception when others then",
-    "    get stacked diagnostics state = returned_sqlstate, context = pg_exception_context, message = message_text;",
-    "    perform set_config('backupdrill.signup_state', state, true);",
-    "    perform set_config('backupdrill.signup_context', context, true);",
-    "    perform set_config('backupdrill.signup_message', message, true);",
-    "    return;",
+    // WHEN OTHERS 接不住 ASSERT 失败(P0004),单独接;两个分支做同一件事
+    "  exception",
+    ...["assert_failure", "others"].flatMap((condition) => [
+      `    when ${condition} then`,
+      "      get stacked diagnostics state = returned_sqlstate, context = pg_exception_context,",
+      "                              message = message_text, detail = pg_exception_detail;",
+      "      perform set_config('backupdrill.signup_state', state, true);",
+      "      perform set_config('backupdrill.signup_context', context, true);",
+      "      perform set_config('backupdrill.signup_message', message, true);",
+      "      perform set_config('backupdrill.signup_detail', detail, true);",
+      "      return;",
+    ]),
     "  end;",
     "  perform set_config('backupdrill.signup_state', 'ok', true);",
     "  perform set_config('backupdrill.signup_context', '', true);",
     "  perform set_config('backupdrill.signup_message', '', true);",
+    "  perform set_config('backupdrill.signup_detail', '', true);",
     "end",
     `${tag};`,
     "select 'backupdrill-signup ' || current_setting('backupdrill.signup_state') || ' ' ||",
     "       encode(convert_to(current_setting('backupdrill.signup_context'), 'UTF8'), 'hex') || ' ' ||",
-    "       encode(convert_to(current_setting('backupdrill.signup_message'), 'UTF8'), 'hex');",
+    "       encode(convert_to(current_setting('backupdrill.signup_message'), 'UTF8'), 'hex') || ' ' ||",
+    "       encode(convert_to(current_setting('backupdrill.signup_detail'), 'UTF8'), 'hex');",
     "rollback;",
     "",
   ].join("\n");
 }
 
 /**
- * "没测成、可能是因为断网"只认有连不上的证据的情况,其余一律按真的注册失败报(23xxx、P0001、42xxx 等都是真问题):
- *  - SQLSTATE 08 类(连接异常:dblink、postgres_fdw 连不上就是 08001);
- *  - 出错的那条语句(错误上下文的第一行)本身是联网调用(dblink、http 扩展、pg_net)或 COPY ... PROGRAM,
- *    而且错误消息就是连不上、解析不了地址(http 扩展的 libcurl 错误码是通用的 XX000,程序失败是 38000)。
- *    COPY ... PROGRAM 的消息通常只说"程序失败",看不出原因,这时也按真失败报。
+ * "没测成、可能是因为断网"只认有连不上的证据的情况,其余一律按真的注册失败报(23xxx、P0001、42xxx 等都是真问题)。
+ * 证据要在错误消息或 DETAIL 里:解析不了主机名、网络不可达、没有路由、连接被拒、连接超时这类
+ * (libc 的措辞不同:glibc 写 "Network is unreachable",musl 写 "Network unreachable",两种都认)。然后:
+ *  - SQLSTATE 08 类(dblink、postgres_fdw 连不上);同样是 08 类的认证、配置失败(密码不对、没有 pg_hba
+ *    条目)没有这类证据,按真失败报;
+ *  - 或者出错的那条语句(错误上下文的第一行)本身是联网调用(dblink、http 扩展、pg_net)或 COPY ... PROGRAM
+ *    (http 扩展的 libcurl 错误码是通用的 XX000,程序失败是 38000)。COPY ... PROGRAM 的消息通常只说
+ *    "程序失败",看不出原因,这时也按真失败报。
  * 上下文是用户函数里出错那条语句的原文,写成别的样子(动态 SQL 等)就认不出,同样按真失败报——宁可报一次
  * 需要人看的失败,也不把真问题藏成"没测成"。错误原文只在这里用来判断,不进报告(见 safeError)
  */
 const NETWORK_CALL = /\b(dblink\w*|http(_\w+)?|net\.http_\w+)\s*\(|\b(to|from)\s+program\b/i;
 const CONNECTION_FAILURE =
-  /could not (establish connection|connect)|couldn't (connect|resolve)|could not resolve|resolve host|bad address|connection (refused|timed out)|network is unreachable|no route to host|timeout was reached|name or service not known|temporary failure in name resolution/i;
+  /could not translate host name|could not resolve|couldn't resolve|resolve host|bad address|name or service not known|temporary failure in name resolution|network (is )?unreachable|host (is )?unreachable|no route to host|connection refused|connection timed out|timeout expired|timeout was reached|couldn't connect to server/i;
 
-function failedForLackOfNetwork(state: string, innermost: string, message: string): boolean {
+function failedForLackOfNetwork(state: string, innermost: string, evidence: string): boolean {
+  if (!CONNECTION_FAILURE.test(evidence)) return false;
   if (state.startsWith("08")) return true;
-  return (state === "XX000" || state === "38000") && NETWORK_CALL.test(innermost) && CONNECTION_FAILURE.test(message);
+  return (state === "XX000" || state === "38000") && NETWORK_CALL.test(innermost);
 }
 
 /** psql 的输出 → 报告里的 signup。只用 SQLSTATE 和"错在不在触发器里",错误原文不进报告(见 safeError) */
 export function signupOutcome(result: { code: number | null; stdout: string }): NonNullable<AuthDrillReport["signup"]> {
-  const line = /^backupdrill-signup (\S+) ([0-9a-f]*) ([0-9a-f]*)$/m.exec(result.stdout);
+  const line = /^backupdrill-signup (\S+) ([0-9a-f]*) ([0-9a-f]*) ([0-9a-f]*)$/m.exec(result.stdout);
   if (result.code !== 0 || !line) {
     // 超时(57014 接不住)或 psql 本身出错:没模拟成
     return { ran: false, detail: "psql did not confirm a sign-up result" };
   }
-  const [, state, contextHex, messageHex] = line;
+  const [, state, contextHex, messageHex, detailHex] = line;
   if (state === "ok") return { ran: true, ok: true };
   // 去掉我们自己那层 DO 块的上下文,剩下的才是表结构或用户的函数;第一行是真正出错的那条语句
   const where = Buffer.from(contextHex, "hex")
@@ -255,11 +269,12 @@ export function signupOutcome(result: { code: number | null; stdout: string }): 
     .split("\n")
     .filter((l) => !/inline_code_block/.test(l))
     .join("\n");
-  const message = Buffer.from(messageHex, "hex").toString("utf8");
+  // 消息和 DETAIL 只用来判断是不是连不上,不进报告
+  const evidence = `${Buffer.from(messageHex, "hex").toString("utf8")}\n${Buffer.from(detailHex, "hex").toString("utf8")}`;
   const triggerPath =
     /PL\/pgSQL function|SQL function|trigger/i.test(where) ||
-    ["23503", "23505", "42501", "42883", "42P01", "42703", "3F000", "P0001"].includes(state);
-  if (triggerPath && failedForLackOfNetwork(state, where.split("\n")[0] ?? "", message)) {
+    ["23503", "23505", "42501", "42883", "42P01", "42703", "3F000", "P0001", "P0004"].includes(state);
+  if (triggerPath && failedForLackOfNetwork(state, where.split("\n")[0] ?? "", evidence)) {
     return {
       ran: false,
       detail: `a database operation failed to connect while the sandbox was offline (SQLSTATE ${state})`,
