@@ -51,6 +51,7 @@ const K_VERS_1_16 = archiveVersion(1, 16, 0);
 const K_VERS_MAX_KNOWN = archiveVersion(1, 16, 255);
 const ARCH_CUSTOM = 1;
 const BLK_DATA = 1;
+const K_OFFSET_POS_NOT_SET = 1;
 const K_OFFSET_POS_SET = 2;
 // pg_compress_algorithm(1.15 起头部里存算法;之前存压缩级别,0 = 不压缩,其余都是 zlib)
 const COMPRESSION_NONE = 0;
@@ -151,74 +152,84 @@ export function copyColumns(copyStmt: string): string[] {
 }
 
 /**
- * 逐行改写 COPY 文本:按制表符拆字段,把要抹的那几列换掉。COPY 文本格式里数据中的制表符和换行
- * 都转义成 \t、\n,所以按原始字节 0x09 / 0x0A 拆是安全的(服务端编码都兼容 ASCII)。
- * 字段数和列数对不上就报错,不猜。
+ * 逐字段改写 COPY 文本:按制表符和换行切字段,要抹的那几列换掉,其余字节原样往下传。COPY 文本格式里数据中的
+ * 制表符和换行都转义成 \t、\n,所以按原始字节 0x09 / 0x0A 切是安全的(服务端编码都兼容 ASCII)。
+ *
+ * 不按整行缓冲:一行可以非常大(metadata 很长、又压缩得很好时,解压出来的一行能远超内存)。逐块扫一遍,
+ * 要抹的字段直接丢、其余直接写出,占用的内存只和一块输入一样大,和行多长无关。
+ * 字段数和列数对不上就报错,不猜(已经写出去的半行随这次上传一起作废)。
  */
 function copyLineScrubber(columns: string[], replace: Map<number, Buffer>): Transform {
-  let rest: Buffer = Buffer.alloc(0);
+  // 第一列要抹的话就认不出 "\." 结束标记(它的字节被丢了);auth.users 的第一列从来不是 token
+  if (replace.has(0)) throw new ArchiveError("the first column of auth.users is unexpectedly one to clear");
+  let field = 0; // 当前行里的第几个字段
+  let skipping = false; // 当前字段要抹:它的字节不写出
+  let lineLength = 0; // 当前行到目前为止的字节数(只用来认结束标记,到 3 就不再数)
+  let lineHead = 0; // 当前行的头两个字节
   // pg_dump 在数据末尾写 "\." 再跟几个空行;结束标记之后不是数据,原样照抄
   let afterEndMarker = false;
-  const scrubLine = (line: Buffer): Buffer => {
-    if (afterEndMarker) return line;
-    if (line.length === 2 && line[0] === 0x5c && line[1] === 0x2e) {
-      afterEndMarker = true;
-      return line;
-    }
-    const fields: Buffer[] = [];
-    let start = 0;
-    for (let i = 0; i <= line.length; i++) {
-      if (i === line.length || line[i] === 0x09) {
-        fields.push(line.subarray(start, i));
+  const fieldCountError = (fields: number) =>
+    new ArchiveError(`a row of auth.users has ${fields} fields, but the COPY statement lists ${columns.length} columns`);
+  const scan = (chunk: Buffer, out: Buffer[]): void => {
+    let start = 0; // 下一个还没写出的字节
+    for (let i = 0; i < chunk.length; i++) {
+      const b = chunk[i];
+      if (b !== 0x09 && b !== 0x0a) {
+        if (lineLength < 3) {
+          if (lineLength < 2) lineHead = lineHead * 256 + b;
+          lineLength++;
+        }
+        continue;
+      }
+      if (skipping) {
+        out.push(replace.get(field)!);
+        start = i; // 分隔符本身照常写出
+        skipping = false;
+      }
+      if (b === 0x09) {
+        field++;
+        lineLength = 3; // 有制表符就不可能是结束标记
+        if (field >= columns.length) throw fieldCountError(field + 1);
+      } else {
+        const endMarker = field === 0 && lineLength === 2 && lineHead === 0x5c2e;
+        if (!endMarker && field !== columns.length - 1) throw fieldCountError(field + 1);
+        field = 0;
+        lineLength = 0;
+        lineHead = 0;
+        if (endMarker) {
+          afterEndMarker = true;
+          out.push(chunk.subarray(start));
+          return;
+        }
+      }
+      if (replace.has(field)) {
+        out.push(chunk.subarray(start, i + 1));
         start = i + 1;
+        skipping = true;
       }
     }
-    if (fields.length !== columns.length) {
-      throw new ArchiveError(`a row of auth.users has ${fields.length} fields, but the COPY statement lists ${columns.length} columns`);
-    }
-    for (const [index, value] of replace) fields[index] = value;
-    return joinFields(fields);
-  };
-  const scrubComplete = (data: Buffer): Buffer[] => {
-    const out: Buffer[] = [];
-    let start = 0;
-    for (let i = data.indexOf(0x0a); i !== -1; i = data.indexOf(0x0a, start)) {
-      out.push(scrubLine(data.subarray(start, i)), NEWLINE);
-      start = i + 1;
-    }
-    rest = Buffer.from(data.subarray(start));
-    return out;
+    if (!skipping) out.push(chunk.subarray(start));
   };
   return new Transform({
     transform(chunk: Buffer, _encoding, callback) {
+      if (afterEndMarker) return callback(null, chunk);
       try {
-        const data = rest.length ? Buffer.concat([rest, chunk]) : chunk;
-        const out = scrubComplete(data);
-        callback(null, out.length ? Buffer.concat(out) : undefined);
+        const out: Buffer[] = [];
+        scan(chunk, out);
+        callback(null, out.length === 1 ? out[0] : Buffer.concat(out));
       } catch (error) {
         callback(error as Error);
       }
     },
     flush(callback) {
-      try {
-        callback(null, rest.length ? scrubLine(rest) : undefined);
-      } catch (error) {
-        callback(error as Error);
+      // 最后一行没有换行结尾(pg_dump 不会这样写):照样核对字段数、补上要抹的值
+      if (!afterEndMarker && (lineLength > 0 || field > 0)) {
+        if (field !== columns.length - 1) return callback(fieldCountError(field + 1));
+        if (skipping) return callback(null, replace.get(field));
       }
+      callback();
     },
   });
-}
-
-const NEWLINE = Buffer.from("\n");
-const TAB = Buffer.from("\t");
-
-function joinFields(fields: Buffer[]): Buffer {
-  const parts: Buffer[] = [];
-  fields.forEach((field, i) => {
-    if (i) parts.push(TAB);
-    parts.push(field);
-  });
-  return Buffer.concat(parts);
 }
 
 /**
@@ -280,6 +291,8 @@ export function scrubPendingAuthTokens(input: Readable): Readable {
     await readStr(); // pg_dump 版本
 
     const tocCount = await readInt();
+    // 目录里声明了有数据的条目:每一条都要在后面见到它的数据段,少一段就是归档不完整
+    const withData = new Set<number>();
     let target: { dumpId: number; columns: string[] } | null = null;
     for (let i = 0; i < tocCount; i++) {
       const dumpId = await readInt();
@@ -301,6 +314,7 @@ export function scrubPendingAuthTokens(input: Readable): Readable {
       while ((await readStr()) !== null); // 依赖,以 NULL 结尾
       const offsetFlag = (await take(1))[0];
       await take(offSize);
+      if (offsetFlag === K_OFFSET_POS_NOT_SET) withData.add(dumpId);
       // 改写会改变数据段的长度:目录里记着数据偏移的归档(写进可寻址文件的)不能这样改。管道上写出的不会记
       if (offsetFlag === K_OFFSET_POS_SET) throw new ArchiveError("the Auth archive records data offsets, which this CLI can't rewrite");
       if (desc === "TABLE DATA" && namespace === "auth" && tag === "users") {
@@ -320,6 +334,7 @@ export function scrubPendingAuthTokens(input: Readable): Readable {
     while (!(await reader.atEnd())) {
       if ((await take(1))[0] !== BLK_DATA) throw new ArchiveError("the Auth archive has a data block of an unexpected type");
       const dumpId = await readInt();
+      if (!withData.delete(dumpId)) throw new ArchiveError("the Auth archive has a data block the TOC doesn't declare, or one twice");
       if (dumpId !== target.dumpId) {
         for (let length = await readInt(); length !== 0; length = await readInt()) {
           if (length < 0) throw new ArchiveError("the archive has a malformed data chunk");
@@ -359,6 +374,7 @@ export function scrubPendingAuthTokens(input: Readable): Readable {
       await write(encodeInt(0, intSize));
     }
     if (!scrubbed) throw new ArchiveError("the Auth archive has no data block for auth.users");
+    if (withData.size) throw new ArchiveError("the Auth archive ended before all of its data blocks");
     out.end();
   })().catch((error: unknown) => {
     out.destroy(error instanceof Error ? error : new Error(String(error)));

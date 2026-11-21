@@ -9,7 +9,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Readable } from "node:stream";
 import { promisify } from "node:util";
-import { deflateSync } from "node:zlib";
+import { createDeflate, deflateSync } from "node:zlib";
 import { PENDING_AUTH_COPY_VALUES, copyColumns, scrubPendingAuthTokens } from "../dist/auth-archive.js";
 import { CLEAR_PENDING_AUTH_SQL } from "../dist/auth-restore.js";
 
@@ -37,7 +37,9 @@ function userRow(i) {
 const SCRUBBED_EXPECT = new Map(PENDING_AUTH_COPY_VALUES);
 
 /** 拼一份 custom 格式归档:auth.users、auth.identities 两张表的结构和数据,offset 一律"未记录"(管道输出就是这样) */
-function buildArchive({ minor = 16, compression = "gzip", users = 3, chunkSize = 1000, offsetFlag = 1 } = {}) {
+function buildArchive({
+  minor = 16, compression = "gzip", users = 3, chunkSize = 1000, offsetFlag = 1, identitiesBlock = true, usersPayload = null,
+} = {}) {
   const intSize = 4;
   const parts = [];
   const byte = (b) => parts.push(Buffer.from([b]));
@@ -84,9 +86,9 @@ function buildArchive({ minor = 16, compression = "gzip", users = 3, chunkSize =
     byte(e.dumper ? offsetFlag : 3);
     parts.push(Buffer.alloc(8));
   }
-  const dataBlock = (id, text) => {
+  const dataBlock = (id, text, ready = null) => {
     byte(1), int(id);
-    const payload = compression === "gzip" ? deflateSync(Buffer.from(text)) : Buffer.from(text);
+    const payload = ready ?? (compression === "gzip" ? deflateSync(Buffer.from(text)) : Buffer.from(text));
     // 和 pg_dump 一样分成若干块;块边界会落在行中间
     for (let at = 0; at < payload.length; at += chunkSize) {
       const piece = payload.subarray(at, at + chunkSize);
@@ -96,8 +98,8 @@ function buildArchive({ minor = 16, compression = "gzip", users = 3, chunkSize =
     int(0);
   };
   const rows = Array.from({ length: users }, (_, i) => userRow(i + 1));
-  dataBlock(4, rows.map((r) => `${r}\n`).join("") + "\\.\n\n\n");
-  dataBlock(5, Array.from({ length: users }, (_, i) => `u${i}\temail\n`).join("") + "\\.\n\n\n");
+  dataBlock(4, rows.map((r) => `${r}\n`).join("") + "\\.\n\n\n", usersPayload);
+  if (identitiesBlock) dataBlock(5, Array.from({ length: users }, (_, i) => `u${i}\temail\n`).join("") + "\\.\n\n\n");
   return Buffer.concat(parts);
 }
 
@@ -194,4 +196,36 @@ test("an empty auth.users and a gzip archive split into one-byte pieces still co
   assert.deepEqual(await restoredUsers(empty), []);
   const tiny = await scrub(buildArchive({ users: 20, chunkSize: 3 }), 1);
   assert.equal((await restoredUsers(tiny)).length, 20);
+});
+
+test("an archive whose TOC declares data that never comes (auth.identities cut off) is an error, not an upload", async () => {
+  await assert.rejects(scrub(buildArchive({ identitiesBlock: false })), /ended before all of its data blocks/);
+});
+
+test("one huge, highly compressible row streams through in bounded memory and linear time", async () => {
+  // 一行 256 MiB 的 metadata,压缩后只有几百 KB:整行缓冲的写法会在这里吃掉几百 MB 内存、反复拷贝
+  const fieldMiB = 256;
+  const deflate = createDeflate();
+  const compressed = [];
+  deflate.on("data", (c) => compressed.push(c));
+  const done = new Promise((resolve) => deflate.on("end", resolve));
+  const fields = userRow(1).split("\t");
+  const metadataAt = USER_COLUMNS.indexOf("raw_user_meta_data");
+  deflate.write(Buffer.from(fields.slice(0, metadataAt).join("\t") + "\t"));
+  const block = Buffer.alloc(1024 * 1024, "a");
+  for (let i = 0; i < fieldMiB; i++) deflate.write(block);
+  deflate.end(Buffer.from("\t" + fields.slice(metadataAt + 1).join("\t") + "\n\\.\n"));
+  await done;
+  const archive = buildArchive({ users: 1, usersPayload: Buffer.concat(compressed), chunkSize: 16 * 1024 });
+  const before = process.memoryUsage();
+  let peakArrayBuffers = 0;
+  let bytes = 0;
+  const started = Date.now();
+  for await (const chunk of scrubPendingAuthTokens(Readable.from([archive]))) {
+    bytes += chunk.length;
+    peakArrayBuffers = Math.max(peakArrayBuffers, process.memoryUsage().arrayBuffers - before.arrayBuffers);
+  }
+  assert.ok(bytes > 0);
+  assert.ok(peakArrayBuffers < 64 * 1024 * 1024, `buffered ${Math.round(peakArrayBuffers / 1024 / 1024)} MiB for a ${fieldMiB} MiB row`);
+  assert.ok(Date.now() - started < 30_000, `took ${Date.now() - started} ms`);
 });
