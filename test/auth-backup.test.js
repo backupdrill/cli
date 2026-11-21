@@ -186,7 +186,10 @@ for a in "$@"; do
 done
 echo "$args" >> "${log}"
 case "$args" in
-  *--table=auth.users*) if [ -n "$BD_TEST_FAIL_AUTH" ]; then echo "pg_dump: error: injected auth failure" >&2; exit 1; fi ;;
+  *--table=auth.users*)
+    if [ -n "$BD_TEST_FAIL_AUTH" ]; then echo "pg_dump: error: injected auth failure" >&2; exit 1; fi
+    # 0 退出却只写出半份归档
+    if [ -n "$BD_TEST_MALFORMED_AUTH" ]; then "${realPgDump}" "$@" | head -c 300; exit 0; fi ;;
   *--snapshot=*--schema=*) if [ -n "$BD_TEST_FAIL_MAIN_SNAPSHOT" ]; then echo "pg_dump: error: query failed: ERROR:  invalid snapshot identifier" >&2; exit 1; fi ;;
 esac
 case "$args" in
@@ -479,6 +482,48 @@ test(
         assert.match(r.manifest.auth.reason, /^Auth archive not written: pg_dump exited with code 1/);
         assert.ok(r.files.get("dump.pgcustom").length > 0);
         assert.equal(r.files.has("auth.dump"), false);
+      });
+
+      await t.test("pg_dump exits 0 but writes a broken Auth archive: no auth.dump, Auth failed, database backed up", async () => {
+        const r = await run("auth-malformed", { databaseUrl: okUrl, auth: "default" }, { env: { BD_TEST_MALFORMED_AUTH: "1" } });
+        assert.equal(r.manifest.auth.status, "failed");
+        assert.match(r.manifest.auth.reason, /^Auth archive not written: the archive ended early/);
+        assert.equal(r.files.has("auth.dump"), false);
+        assert.ok(r.files.get("dump.pgcustom").length > 0);
+        assert.equal(r.manifest.dump.bytes, r.files.get("dump.pgcustom").length);
+      });
+
+      await t.test("constraints that wouldn't take the cleared tokens: no auth.dump, Auth failed with the reason, database backed up", async () => {
+        // 每个用户都有 recovery_token,下面的 CHECK 和不带条件的唯一索引才建得出来;抹成 '' 之后两者都不接受
+        await sql(admin, "update auth.users set recovery_token = 'r-' || id where recovery_token = ''");
+        try {
+          await sql(admin, "alter table auth.users add constraint recovery_token_set check (recovery_token <> '')");
+          let r = await run("scrub-check", { databaseUrl: okUrl, auth: "default" });
+          assert.equal(r.manifest.auth.status, "failed");
+          assert.equal(
+            r.manifest.auth.reason,
+            "Auth archive not written: clearing the pending Auth tokens would break check constraint recovery_token_set on auth.users"
+          );
+          assert.equal(r.files.has("auth.dump"), false);
+          assert.ok(r.files.get("dump.pgcustom").length > 0);
+
+          await sql(admin, "alter table auth.users drop constraint recovery_token_set; create unique index recovery_token_unique on auth.users (recovery_token)");
+          r = await run("scrub-unique", { databaseUrl: okUrl, auth: "default" });
+          assert.equal(r.manifest.auth.status, "failed");
+          assert.equal(
+            r.manifest.auth.reason,
+            "Auth archive not written: clearing the pending Auth tokens would break unique index recovery_token_unique on auth.users"
+          );
+          assert.equal(r.files.has("auth.dump"), false);
+          assert.ok(r.files.get("dump.pgcustom").length > 0);
+        } finally {
+          await sql(admin, `drop index if exists auth.recovery_token_unique;
+            alter table auth.users drop constraint if exists recovery_token_set;
+            update auth.users set recovery_token = '' where recovery_token like 'r-%'`);
+        }
+        // 去掉之后照常:Supabase 自带的那些(fixture 里有)不挡
+        const ok = await run("scrub-stock", { databaseUrl: okUrl, auth: "default" });
+        assert.equal(ok.manifest.auth.status, "included", JSON.stringify(ok.manifest.auth));
       });
 
       await t.test("the main dump can't import the snapshot: it is redone the old way, Auth marked unavailable", async () => {

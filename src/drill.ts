@@ -482,13 +482,13 @@ function signupLauncher(marker: string): string {
 }
 
 /**
- * 停掉一次没有正常结束的模拟注册,并等到它在容器里确实没了(最多约 15 秒)。本地的 docker exec 客户端被杀掉
+ * 停掉一次没有正常结束的模拟注册,并等到它在容器里确实没了,到 deadline(时间戳)为止。本地的 docker exec 客户端被杀掉
  * (超时、叫停)时,容器里的那次启动照样在跑,甚至可能还没起来。按 signupLauncher 的约定:
  *  1. 先建取消标记,再看 pid 文件:没有 pid 文件 = 它以后也不会启动;有 = 那个进程(sh 或 psql)还活着就杀掉;
  *  2. 终止它的会话(按 application_name,或者语句里带着这次的随机标记——触发器能改 application_name)。
- * 进程没了、会话也没了才算停下来
+ * 进程没了、会话也没了才算停下来。每条 docker 命令的时限也截在 deadline 之内,整体不会超过它
  */
-async function stopSignup(containerId: string, marker: string): Promise<boolean> {
+async function stopSignup(containerId: string, marker: string, deadline: number): Promise<boolean> {
   const { cancelFile, pidFile, appName } = signupTraces(marker);
   // 输出 "alive":还有进程(刚杀掉,或者 pid 文件刚建、还没写进 pid),下一轮再看
   const killLauncher =
@@ -498,15 +498,20 @@ async function stopSignup(containerId: string, marker: string): Promise<boolean>
   const sessions =
     `select count(pg_terminate_backend(pid)) from pg_stat_activity where pid <> pg_backend_pid() ` +
     `and (application_name = '${appName}' or query like '%${marker}%')`;
-  for (let i = 0; i < 30; i++) {
-    const killed = await containerExec(containerId, ["sh", "-c", killLauncher], { timeoutMs: 10_000 });
-    const left = await containerExec(containerId, [...PSQL, "-c", sessions], { timeoutMs: 10_000 });
-    if (killed.code !== 0 || left.code !== 0) return false;
-    if (killed.stdout.trim() === "" && left.stdout.trim() === "0") return true;
-    await new Promise((resolve) => setTimeout(resolve, 500));
+  const left = () => deadline - Date.now();
+  while (left() > 0) {
+    const killed = await containerExec(containerId, ["sh", "-c", killLauncher], { timeoutMs: Math.max(1, left()) });
+    if (killed.code !== 0 || left() <= 0) return false;
+    const sessionsLeft = await containerExec(containerId, [...PSQL, "-c", sessions], { timeoutMs: Math.max(1, left()) });
+    if (sessionsLeft.code !== 0) return false;
+    if (killed.stdout.trim() === "" && sessionsLeft.stdout.trim() === "0") return true;
+    await new Promise((resolve) => setTimeout(resolve, Math.min(500, Math.max(0, left()))));
   }
   return false;
 }
+
+/** 停掉模拟注册最多等多久(整体,从开始停算起) */
+const STOP_SIGNUP_MS = 15_000;
 
 /**
  * 模拟注册用的"断网跑 SQL"(见 auth-drill.ts OfflineSandbox)。
@@ -523,10 +528,17 @@ async function stopSignup(containerId: string, marker: string): Promise<boolean>
 /** @internal 演练内部用;导出只为测试能直接对一个容器验证断网、叫停和超时收尾 */
 export function offlineSandbox(pg: { containerId: string; offline: boolean }): OfflineSandbox {
   let running: string | null = null;
+  // 同一次注册的收尾只做一次:本地超时、叫停、演练那边的 stopOfflineSessions 谁先来谁启动,其余的等同一个结果
+  const stopping = new Map<string, Promise<boolean>>();
+  const stopOnce = (marker: string) => {
+    let p = stopping.get(marker);
+    if (!p) stopping.set(marker, (p = stopSignup(pg.containerId, marker, Date.now() + STOP_SIGNUP_MS)));
+    return p;
+  };
   return {
     offline: () => pg.offline,
     async stopOfflineSessions() {
-      if (running) await waitAtMost(stopSignup(pg.containerId, running), 20_000);
+      if (running) await stopOnce(running);
     },
     async runOffline(script, marker, signal) {
       const { appName } = signupTraces(marker);
@@ -553,19 +565,13 @@ export function offlineSandbox(pg: { containerId: string; offline: boolean }): O
       );
       // 本地超时或被叫停:容器里的那次模拟注册可能还在跑,先确实停掉它,再交出结果(之后沙箱才会被销毁)
       if (result.killed || signal?.aborted) {
-        if (!(await stopSignup(pg.containerId, marker))) {
+        if (!(await stopOnce(marker))) {
           log.warn("Couldn't confirm the stopped test sign-up ended inside the drill sandbox; it stays off the network until it is removed.");
         }
       }
       return { code: result.killed ? null : result.code, stdout: result.stdout };
     },
   };
-}
-
-async function waitAtMost(p: Promise<unknown>, ms: number): Promise<void> {
-  let timer: NodeJS.Timeout | undefined;
-  await Promise.race([p.then(() => {}, () => {}), new Promise<void>((resolve) => (timer = setTimeout(resolve, ms)))]);
-  clearTimeout(timer);
 }
 
 /** --keep 留下的沙箱:和 2.11.0 一样给连接串(留沙箱时不跑模拟注册,它一直连得上),另给一条进容器的命令 */

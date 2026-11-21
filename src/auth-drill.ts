@@ -223,26 +223,21 @@ export function signupScript(userInsert: string, identityInsert: string, marker:
 }
 
 /**
- * 错误上下文里能看出"出错的是一个要联网的调用":dblink、http 扩展、pg_net、外部表(postgres_fdw 等)、
- * COPY ... PROGRAM。上下文里是用户函数里出错的那条语句的原文,用户可以写成别的样子(动态 SQL 等),
- * 认不出就按真失败报——宁可报一次需要人看的失败,也不把真问题藏成"没测成"
- */
-/**
  * "没测成、可能是因为断网"只认有连不上的证据的情况,其余一律按真的注册失败报(23xxx、P0001、42xxx 等都是真问题):
  *  - SQLSTATE 08 类(连接异常:dblink、postgres_fdw 连不上就是 08001);
- *  - 出错的那条语句(错误上下文的第一行)本身就是联网调用,而错误是它报的连接/解析失败
- *    (http 扩展的 libcurl 错误这类,错误码是通用的 XX000);
- *  - 出错的就是 COPY ... PROGRAM,程序失败(38000)。
- * 错误原文只在这里用来判断,不进报告(见 safeError)
+ *  - 出错的那条语句(错误上下文的第一行)本身是联网调用(dblink、http 扩展、pg_net)或 COPY ... PROGRAM,
+ *    而且错误消息就是连不上、解析不了地址(http 扩展的 libcurl 错误码是通用的 XX000,程序失败是 38000)。
+ *    COPY ... PROGRAM 的消息通常只说"程序失败",看不出原因,这时也按真失败报。
+ * 上下文是用户函数里出错那条语句的原文,写成别的样子(动态 SQL 等)就认不出,同样按真失败报——宁可报一次
+ * 需要人看的失败,也不把真问题藏成"没测成"。错误原文只在这里用来判断,不进报告(见 safeError)
  */
-const NETWORK_CALL = /\b(dblink\w*|http(_\w+)?|net\.http_\w+)\s*\(/i;
+const NETWORK_CALL = /\b(dblink\w*|http(_\w+)?|net\.http_\w+)\s*\(|\b(to|from)\s+program\b/i;
 const CONNECTION_FAILURE =
-  /could not (establish connection|connect)|couldn't (connect|resolve)|could not resolve|resolve host|connection (refused|timed out)|network is unreachable|no route to host|timeout was reached|name or service not known|temporary failure in name resolution/i;
+  /could not (establish connection|connect)|couldn't (connect|resolve)|could not resolve|resolve host|bad address|connection (refused|timed out)|network is unreachable|no route to host|timeout was reached|name or service not known|temporary failure in name resolution/i;
 
 function failedForLackOfNetwork(state: string, innermost: string, message: string): boolean {
   if (state.startsWith("08")) return true;
-  if (state === "XX000" && NETWORK_CALL.test(innermost) && CONNECTION_FAILURE.test(message)) return true;
-  return state === "38000" && /\b(to|from)\s+program\b/i.test(innermost);
+  return (state === "XX000" || state === "38000") && NETWORK_CALL.test(innermost) && CONNECTION_FAILURE.test(message);
 }
 
 /** psql 的输出 → 报告里的 signup。只用 SQLSTATE 和"错在不在触发器里",错误原文不进报告(见 safeError) */

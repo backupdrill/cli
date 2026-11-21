@@ -423,6 +423,18 @@ async function prepareAuthDump(
     await shared.release();
     return { kind: "settled", section: authNotDone(mode, inspection.reason) };
   }
+  // 抹掉待处理 token 后会被用户自己的约束拒绝:这样的 auth.dump 恢复不了,不写(见 pendingTokenConflicts)
+  if (inspection.scrubConflicts.length) {
+    await shared.release();
+    const listed = inspection.scrubConflicts.slice(0, 3).join("; ") + (inspection.scrubConflicts.length > 3 ? "; …" : "");
+    return {
+      kind: "settled",
+      section: {
+        status: "failed",
+        reason: `Auth archive not written: clearing the pending Auth tokens would break ${listed} on auth.users`,
+      },
+    };
+  }
   const uploadAuthDump = writer.uploadAuthDump!.bind(writer);
   return { kind: "dump", shared, inspection, key: writer.authDumpKey!, upload: (body) => uploadAuthDump(body) };
 }

@@ -44,8 +44,9 @@ test("signupOutcome: 'may need network access' only with evidence of a connectio
   notTested(signupOutcome(out("08001", dblinkCall, "could not establish connection")));
   // 联网调用自己报的连接/解析失败(http 扩展的 libcurl 错误是 XX000)
   notTested(signupOutcome(out("XX000", httpCall, "Couldn't resolve host name")));
-  // COPY ... PROGRAM 的程序失败
-  notTested(signupOutcome(out("38000", inTrigger(`SQL statement "copy (select 1) to program 'wget -q https://crm.example/hook'"`), 'program "wget" failed')));
+  // COPY ... PROGRAM:消息里有连不上的证据才算
+  const copyProgram = inTrigger(`SQL statement "copy (select 1) to program 'wget -q https://crm.example/hook'"`);
+  notTested(signupOutcome(out("38000", copyProgram, "wget: bad address 'crm.example'")));
 
   const failed = (r, sqlstate) =>
     assert.deepEqual(r, {
@@ -61,6 +62,8 @@ test("signupOutcome: 'may need network access' only with evidence of a connectio
   // dblink 调用本身报权限不够(42501)、dblink 没装(42883):真问题
   failed(signupOutcome(out("42501", dblinkCall, "permission denied for function dblink_exec")), "permission denied (SQLSTATE 42501)");
   failed(signupOutcome(out("42883", dblinkCall, "function public.dblink_exec(unknown, unknown) does not exist")), "a function doesn't exist (SQLSTATE 42883)");
+  // COPY ... PROGRAM 只说程序失败、看不出原因:真问题
+  failed(signupOutcome(out("38000", copyProgram, 'program "wget -q https://crm.example/hook" failed')), "an error (SQLSTATE 38000)");
   // http 调用报的不是连接问题,或者触发器自己 RAISE:真问题
   failed(signupOutcome(out("XX000", httpCall, "invalid content type")), "an error (SQLSTATE XX000)");
   failed(signupOutcome(out("P0001", httpCall, "could not connect")), "an exception was raised (SQLSTATE P0001)");

@@ -534,11 +534,19 @@ id" uuid references auth.users (id) on delete set null)`);
           OFFLINE_SIGNUP_LIMITS.launchPauseSeconds = 0;
         }
 
-        // 运行中被叫停:同样停掉容器里的注册
+        // 运行中被叫停:同样停掉容器里的注册。演练那边的收尾(stopOfflineSessions)同时也来,
+        // 两边等的是同一次收尾,整体在时限(15 秒)之内结束
         const m = marker();
         const stop = new AbortController();
-        setTimeout(() => stop.abort(), 1500);
+        let stopsBoth;
+        setTimeout(() => {
+          stop.abort();
+          stopsBoth = offline.stopOfflineSessions();
+        }, 1500);
+        const stoppedAt = Date.now();
         const result = await offline.runOffline(sleepy(m), m, stop.signal);
+        await stopsBoth;
+        assert.ok(Date.now() - stoppedAt < 1500 + 16_000, `took ${Date.now() - stoppedAt} ms`);
         assert.equal(result.code, null);
         assert.deepEqual(await leftovers(m), { sessions: "0", psql: "0" });
         assert.deepEqual(await networksOf(id), [], "and still never put back on the network");
