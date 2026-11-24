@@ -149,8 +149,8 @@ test("restoreFailureAdvice:目标库早于 2026-11 安全更新、拒绝 pg_attv
     'pg_restore: error: could not execute query: ERROR:  unrecognized parameter "pg_attver"\n' +
       "Command was: CREATE TABLE public.t (id bigint NOT NULL);\nALTER TABLE ONLY public.t ALTER COLUMN id SET (pg_attver=171396040);\n"
   );
-  assert.match(restoreFailureAdvice([failure]), /November 2026 PostgreSQL security release/);
-  assert.match(restoreFailureAdvice([failure]), /latest minor version/);
+  assert.match(restoreFailureAdvice([failure]), /November 2026 PostgreSQL security fix/);
+  assert.match(restoreFailureAdvice([failure]), /latest minor release/);
   // 带 Auth 的恢复:失败说明带阶段前缀,去掉前缀后才是主错误
   assert.match(
     restoreFailureAdvice([primaryAuthRestoreError('restoring the database failed: unrecognized parameter "pg_attver"')]),

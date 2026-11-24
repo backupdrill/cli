@@ -353,7 +353,7 @@ for (const mode of ["pull-ok", "pull-fails", "pull-hangs"]) {
         assert.equal(code, 0, `exit code; stderr:\n${run.stderr()}`);
         assert.ok(existsSync(docker.marks.pull), "docker pull was run although the image was local");
         if (mode === "pull-hangs") {
-          assert.match(run.stderr(), /Could not refresh \S+; using the local copy \(no answer within 3s\)/);
+          assert.match(run.stderr(), /Could not refresh \S+; using the local copy \(docker pull timed out after 3s\)/);
           const [dockerPid, helperPid] = readFileSync(docker.marks.pull, "utf8").split(" ").map(Number);
           helper = helperPid;
           assert.equal(alive(dockerPid), false, "the hung docker pull was stopped");

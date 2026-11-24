@@ -267,7 +267,7 @@ async function ensureImage(image: string): Promise<void> {
   if (outcome === "ok") return;
   const reason =
     outcome === "timeout"
-      ? `no answer within ${Math.round(IMAGE_REFRESH_TIMEOUT_MS / 1000)}s`
+      ? `docker pull timed out after ${Math.round(IMAGE_REFRESH_TIMEOUT_MS / 1000)}s`
       : stderr.split("\n").map((line) => line.trim()).find(Boolean) ?? "docker pull failed";
   if (!present) throw new Error(`could not pull ${image}: ${reason}`);
   log.warn(`Could not refresh ${image}; using the local copy (${reason})`);
@@ -1113,10 +1113,10 @@ export async function drillDump(
       // MISSING_EXTENSION_ERROR,2026-11-24 的告警就被误指成了 supabase_vault
       if (error instanceof PreDataRestoreError && error.sandboxTooOld) {
         throw new Error(
-          `restore failed: the drill sandbox (${image}) predates the November 2026 PostgreSQL security ` +
-            `release and rejects the "SET (pg_attver=…)" lines that a pg_dump older than that release writes ` +
-            `when the source database already has it. Run "docker pull ${image}" and drill again; upgrading ` +
-            `pg_dump to the latest minor version keeps these lines out of new backups. All errors: ${message}`
+          `restore failed: the drill sandbox (${image}) rejected "SET (pg_attver=…)". The sandbox needs the ` +
+            `November 2026 PostgreSQL security fix. Run "docker pull ${image}" and rerun the drill. Older pg_dump ` +
+            `versions can write this line when the source already has the fix. Use the latest minor version of ` +
+            `pg_dump for new backups. All errors: ${message}`
         );
       }
       if (unavailable.length && MISSING_EXTENSION_ERROR.test(message)) {

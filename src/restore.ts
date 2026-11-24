@@ -563,9 +563,9 @@ export function restoreFailureAdvice(failures: string[]): string {
   // 只看开头:语句正文或 DETAIL 里出现这个词不算
   if (failures.some((failure) => /^unrecognized parameter "pg_attver"(?:\s|$)/.test(failure))) {
     return (
-      " The snapshot comes from a database on the November 2026 PostgreSQL security release, and the " +
-      "target is on an older minor version that rejects its \"SET (pg_attver=…)\" lines. Update the " +
-      "target to the latest minor version of its PostgreSQL release and retry."
+      ' The target rejected "SET (pg_attver=…)" from the snapshot. Older pg_dump versions can write this ' +
+      "line when the source has the November 2026 PostgreSQL security fix. Update the target to the latest " +
+      "minor release for its current PostgreSQL major version and retry."
     );
   }
   if (!failures.some((failure) => /max_locks_per_transaction/.test(failure))) return "";
