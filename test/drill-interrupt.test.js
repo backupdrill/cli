@@ -363,13 +363,14 @@ for (const mode of ["pull-ok", "pull-fails", "pull-hangs"]) {
           const [dockerPid, helperPid] = readFileSync(docker.marks.pull, "utf8").split(" ").map(Number);
           helper = helperPid;
           assert.equal(alive(dockerPid), false, "the hung docker pull was stopped");
+          assert.equal(alive(helperPid), false, "its credential helper was stopped too");
         }
         if (mode === "pull-fails") {
           assert.ok(run.stderr().includes(`Could not refresh ${sandbox}; using the local copy (Error response from daemon: toomanyrequests)`), run.stderr());
         }
         if (mode === "pull-ok") assert.doesNotMatch(run.stderr(), /Could not refresh/);
       } finally {
-        // 卡住的助手留在演练的进程组里,由叫停演练的一方按组结束(下一个测试);这里单独跑完要自己清
+        // 断言失败时别把助手留在机器上
         if (helper && alive(helper)) process.kill(helper, "SIGKILL");
         await s3.close();
         rmSync(tmp, { recursive: true, force: true });

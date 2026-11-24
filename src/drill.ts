@@ -1,4 +1,4 @@
-import { execFile, spawn } from "node:child_process";
+import { execFile, spawn, type ChildProcess } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -233,11 +233,36 @@ export function sandboxDataVolumeTarget(major: number): string {
  * 已有缓存时刷新失败(断网、仓库限流、超时)不算演练失败:退回本地镜像并提示。
  *
  * 收尾不等 stdio 关闭:docker 拉起的凭据助手可能还占着 stderr(交叉审查用卡住的助手复现)。
- * 只等 docker 本身退出,到点就 SIGKILL 它,然后把我们这头的管道关掉,CLI 才能照常退出。
+ * 只等 docker 本身退出;到点或被中断时,连同它的子孙进程(凭据助手)一起 SIGKILL,再把我们这头的
+ * 管道关掉,CLI 才能照常退出,也不会每次超时留下一个助手。
  * pull 留在演练所在的进程组里(不 detach):worker 叫停演练时按组结束,连助手一起带走。
  */
 // 测试用的环境变量只为把 5 分钟缩短到几秒;不对用户公开
 const IMAGE_REFRESH_TIMEOUT_MS = Number(process.env.BACKUPDRILL_TEST_IMAGE_REFRESH_TIMEOUT_MS) || 5 * 60_000;
+
+/** 子孙进程 pid(pgrep -P 逐层往下找);没有 pgrep(Windows)时返回空,只停进程本身 */
+async function descendantPids(pid: number): Promise<number[]> {
+  const children = await execFileAsync("pgrep", ["-P", String(pid)], { timeout: 5_000 }).then(
+    ({ stdout }) => stdout.split("\n").map(Number).filter((n) => n > 0),
+    () => [] as number[]
+  );
+  const deeper = await Promise.all(children.map(descendantPids));
+  return [...children, ...deeper.flat()];
+}
+
+/** 先记下子孙再停:父进程一死,子进程就被收养,pgrep -P 再也找不到它们 */
+async function killProcessTree(child: ChildProcess): Promise<void> {
+  if (!child.pid || child.exitCode !== null || child.signalCode !== null) return;
+  const descendants = await descendantPids(child.pid);
+  child.kill("SIGKILL");
+  for (const pid of descendants) {
+    try {
+      process.kill(pid, "SIGKILL");
+    } catch {
+      // 已经退出
+    }
+  }
+}
 
 async function ensureImage(image: string): Promise<void> {
   const present = await execFileAsync("docker", ["image", "inspect", "--format", "{{.Id}}", image]).then(
@@ -247,7 +272,7 @@ async function ensureImage(image: string): Promise<void> {
   throwIfInterrupted();
   log.step(present ? `Checking ${image} for updates…` : `Pulling ${image}…`);
   const pull = spawn("docker", ["pull", "--quiet", image], { stdio: ["ignore", "ignore", "pipe"] });
-  const forget = stopOnInterrupt(pull);
+  const forget = onInterrupt(() => killProcessTree(pull));
   // 只留开头一段用来说明失败原因,其余照样读掉,别让吵闹的 docker 把内存撑大
   let stderr = "";
   pull.stderr?.on("data", (chunk) => {
@@ -263,7 +288,7 @@ async function ensureImage(image: string): Promise<void> {
     if (present) timer = setTimeout(() => resolve("timeout"), IMAGE_REFRESH_TIMEOUT_MS);
   });
   clearTimeout(timer);
-  if (outcome === "timeout") pull.kill("SIGKILL");
+  if (outcome === "timeout") await killProcessTree(pull);
   pull.stderr?.destroy();
   forget();
   throwIfInterrupted();
