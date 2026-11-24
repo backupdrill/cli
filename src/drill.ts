@@ -248,8 +248,11 @@ async function ensureImage(image: string): Promise<void> {
   log.step(present ? `Checking ${image} for updates…` : `Pulling ${image}…`);
   const pull = spawn("docker", ["pull", "--quiet", image], { stdio: ["ignore", "ignore", "pipe"] });
   const forget = stopOnInterrupt(pull);
+  // 只留开头一段用来说明失败原因,其余照样读掉,别让吵闹的 docker 把内存撑大
   let stderr = "";
-  pull.stderr?.on("data", (chunk) => (stderr += chunk.toString()));
+  pull.stderr?.on("data", (chunk) => {
+    if (stderr.length < 4096) stderr += chunk.toString();
+  });
   let timer: NodeJS.Timeout | undefined;
   const outcome = await new Promise<"ok" | "failed" | "timeout">((resolve) => {
     pull.on("error", (error) => {
@@ -643,6 +646,11 @@ const MISSING_EXTENSION_ERROR =
 const PG_ATTVER_REJECTED =
   /^pg_restore: error: could not execute query: ERROR:\s+unrecognized parameter "pg_attver"\s+Command was:/;
 
+/** pre-data 失败里有没有"沙箱不认 pg_attver"这一条(导出给测试) */
+export function sandboxRejectsAttver(preDataFailures: string[]): boolean {
+  return preDataFailures.some((failure) => PG_ATTVER_REJECTED.test(failure));
+}
+
 /** pre-data 硬失败;sandboxTooOld = 至少一段失败的主错误是沙箱不认 pg_attver */
 class PreDataRestoreError extends Error {
   constructor(message: string, readonly sandboxTooOld: boolean) {
@@ -686,7 +694,7 @@ async function pgRestore(
   if (result.preData.failures.length) {
     throw new PreDataRestoreError(
       `pg_restore failed: ${result.preData.failures.join(" | ")}`,
-      result.preData.failures.some((failure) => PG_ATTVER_REJECTED.test(failure))
+      sandboxRejectsAttver(result.preData.failures)
     );
   }
   return {
