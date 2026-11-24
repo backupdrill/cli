@@ -36,7 +36,7 @@ import { orphanedForeignKeysCheck, type OrphanedForeignKey } from "./orphaned-fo
 import { grantsCheck } from "./grants.js";
 import { localPgRestoreMajor, restoreToolTargetBlocker } from "./pgbin.js";
 import { describeTarget, restoreRecordKey, type RestorePhase, type RestoreRecord, type RestoreRecordStore } from "./restore-record.js";
-import {
+import { primaryAuthRestoreError,
   AUTH_TABLE_KEYS,
   authRestoreFailureMessage,
   authRestoreNotes,
@@ -556,8 +556,19 @@ async function dryRunPreflight(
  * 900 张表能过、1200 张表报 out of shared memory(2026-10-23,PG 17)。分区多的库会撞上。
  * Supabase 只能用 CLI 调这个参数(会重启数据库),照官方文档的命令给出来。
  */
-export function restoreFailureAdvice(failure: string): string {
-  if (!/max_locks_per_transaction/.test(failure)) return "";
+export function restoreFailureAdvice(failures: string[]): string {
+  // 2026-11 安全更新(CVE-2026-6460)后:更新前的 pg_dump 导出已更新的源库,会写出
+  // `SET (pg_attver=…)`;已更新的目标会忽略它,没更新的目标直接拒绝。
+  // 传进来的每一项都以服务端主错误开头(firstRestoreError / 去掉阶段前缀的 psql 错误),
+  // 只看开头:语句正文或 DETAIL 里出现这个词不算
+  if (failures.some((failure) => /^unrecognized parameter "pg_attver"(?:\s|$)/.test(failure))) {
+    return (
+      ' The target rejected "SET (pg_attver=…)" from the snapshot. Older pg_dump versions can write this ' +
+      "line when the source has the November 2026 PostgreSQL security fix. Update the target to the latest " +
+      "minor release for its current PostgreSQL major version and retry."
+    );
+  }
+  if (!failures.some((failure) => /max_locks_per_transaction/.test(failure))) return "";
   return (
     " The target ran out of lock slots: a single-transaction restore holds a lock on every table, index " +
     "and sequence until it commits. Raise max_locks_per_transaction on the target and retry. On Supabase " +
@@ -1048,7 +1059,7 @@ export async function runRestore(
         if (run.transaction === "committed" && run.afterCommit!.pass.failures.length === 0) await advance("done");
         if (run.transaction !== "committed") {
           // 结果由事务本身说了算(没写 COMMIT,或 pg_xact_status 的回答),不再数 schema 里的对象去推断
-          throw new Error(authRestoreFailureMessage(run) + restoreFailureAdvice(run.failure ?? ""));
+          throw new Error(authRestoreFailureMessage(run) + restoreFailureAdvice(run.failure ? [primaryAuthRestoreError(run.failure)] : []));
         }
         const committed = run.transaction === "committed";
         const pass = committed ? run.afterCommit!.pass : { expectedSkips: 0, failures: [run.failure!] };
@@ -1094,7 +1105,7 @@ export async function runRestore(
                 " Check the target before doing anything else; restore won't write into it again while those " +
                 "objects are there."
               : await targetStateAfterFailure(targetUrl, manifest.database.schemas)) +
-            restoreFailureAdvice(failures.join(" "))
+            restoreFailureAdvice(failures)
         );
       }
       result.restoredToDatabase = true;

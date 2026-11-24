@@ -1,4 +1,4 @@
-import { execFile, spawn } from "node:child_process";
+import { execFile, spawn, type ChildProcess } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -225,21 +225,80 @@ export function sandboxDataVolumeTarget(major: number): string {
  * 停掉命令也说不准守护进程之后还会不会把容器建出来(交叉审查)。拆开之后,慢的那一步(第一次拉镜像
  * 可能好几分钟)什么都不建,中断时直接停掉;docker run 只剩建容器和启动。
  */
+/**
+ * 本地已有镜像也要每次 pull:标签(postgres:17-alpine)跟着小版本走,只拉一次就会永远停在当时的小版本。
+ * 2026-11-24 事故:worker 上的沙箱停在 17.10,源库被 Supabase 升到带 CVE-2026-6460 补丁的新小版本,
+ * 旧 pg_dump 导出的 `ALTER COLUMN ... SET (pg_attver=…)` 在 17.10 上报 unrecognized parameter,
+ * 整个演练失败;17.12 会接受并忽略这句。镜像没变时 pull 只比一次清单,很快。
+ * 已有缓存时刷新失败(断网、仓库限流、超时)不算演练失败:退回本地镜像并提示。
+ *
+ * 收尾不等 stdio 关闭:docker 拉起的凭据助手可能还占着 stderr(交叉审查用卡住的助手复现)。
+ * 只等 docker 本身退出;到点或被中断时,连同它的子孙进程(凭据助手)一起 SIGKILL,再把我们这头的
+ * 管道关掉,CLI 才能照常退出,也不会每次超时留下一个助手。
+ * pull 留在演练所在的进程组里(不 detach):worker 叫停演练时按组结束,连助手一起带走。
+ */
+// 测试用的环境变量只为把 5 分钟缩短到几秒;不对用户公开
+const IMAGE_REFRESH_TIMEOUT_MS = Number(process.env.BACKUPDRILL_TEST_IMAGE_REFRESH_TIMEOUT_MS) || 5 * 60_000;
+
+/** 子孙进程 pid(pgrep -P 逐层往下找);没有 pgrep(Windows)时返回空,只停进程本身 */
+async function descendantPids(pid: number): Promise<number[]> {
+  const children = await execFileAsync("pgrep", ["-P", String(pid)], { timeout: 5_000 }).then(
+    ({ stdout }) => stdout.split("\n").map(Number).filter((n) => n > 0),
+    () => [] as number[]
+  );
+  const deeper = await Promise.all(children.map(descendantPids));
+  return [...children, ...deeper.flat()];
+}
+
+/** 先记下子孙再停:父进程一死,子进程就被收养,pgrep -P 再也找不到它们 */
+async function killProcessTree(child: ChildProcess): Promise<void> {
+  if (!child.pid || child.exitCode !== null || child.signalCode !== null) return;
+  const descendants = await descendantPids(child.pid);
+  child.kill("SIGKILL");
+  for (const pid of descendants) {
+    try {
+      process.kill(pid, "SIGKILL");
+    } catch {
+      // 已经退出
+    }
+  }
+}
+
 async function ensureImage(image: string): Promise<void> {
   const present = await execFileAsync("docker", ["image", "inspect", "--format", "{{.Id}}", image]).then(
     () => true,
     () => false
   );
-  if (present) return;
   throwIfInterrupted();
-  log.step(`Pulling ${image}…`);
-  const pull = execFileAsync("docker", ["pull", "--quiet", image]);
-  const forget = pull.child ? stopOnInterrupt(pull.child) : () => {};
-  try {
-    await pull;
-  } finally {
-    forget();
-  }
+  log.step(present ? `Checking ${image} for updates…` : `Pulling ${image}…`);
+  const pull = spawn("docker", ["pull", "--quiet", image], { stdio: ["ignore", "ignore", "pipe"] });
+  const forget = onInterrupt(() => killProcessTree(pull));
+  // 只留开头一段用来说明失败原因,其余照样读掉,别让吵闹的 docker 把内存撑大
+  let stderr = "";
+  pull.stderr?.on("data", (chunk) => {
+    if (stderr.length < 4096) stderr += chunk.toString();
+  });
+  let timer: NodeJS.Timeout | undefined;
+  const outcome = await new Promise<"ok" | "failed" | "timeout">((resolve) => {
+    pull.on("error", (error) => {
+      stderr ||= error.message;
+      resolve("failed");
+    });
+    pull.on("exit", (code) => resolve(code === 0 ? "ok" : "failed"));
+    if (present) timer = setTimeout(() => resolve("timeout"), IMAGE_REFRESH_TIMEOUT_MS);
+  });
+  clearTimeout(timer);
+  if (outcome === "timeout") await killProcessTree(pull);
+  pull.stderr?.destroy();
+  forget();
+  throwIfInterrupted();
+  if (outcome === "ok") return;
+  const reason =
+    outcome === "timeout"
+      ? `docker pull timed out after ${Math.round(IMAGE_REFRESH_TIMEOUT_MS / 1000)}s`
+      : stderr.split("\n").map((line) => line.trim()).find(Boolean) ?? "docker pull failed";
+  if (!present) throw new Error(`could not pull ${image}: ${reason}`);
+  log.warn(`Could not refresh ${image}; using the local copy (${reason})`);
 }
 
 async function startEphemeralPostgres(image: string, major: number, resourceName?: string): Promise<Ephemeral> {
@@ -276,6 +335,8 @@ async function startEphemeralPostgres(image: string, major: number, resourceName
       "POSTGRES_DB=postgres",
       "-p",
       "127.0.0.1:0:5432", // 随机主机端口,避免撞端口
+      // 拉镜像只在 ensureImage 里做(有超时、可中断);缓存恰好在刷新时被清掉的话,这里报错而不是悄悄再拉一次
+      "--pull=never",
       `--shm-size=${tuning.shmSize}`,
       image,
       "postgres",
@@ -604,6 +665,24 @@ interface PostDataResult {
 const MISSING_EXTENSION_ERROR =
   /type "[^"]+" does not exist|schema "[^"]+" does not exist|extension "[^"]+" is not available/i;
 
+// 沙箱小版本早于 2026-11 安全更新(CVE-2026-6460):不认识旧 pg_dump 从已更新的源库导出的列参数。
+// 逐段看 pre-data 失败:主错误(段首 ERROR: 之后、Command was: 之前)整句就是这一条才算,
+// 语句正文或 DETAIL 里出现这个词不算
+const PG_ATTVER_REJECTED =
+  /^pg_restore: error: could not execute query: ERROR:\s+unrecognized parameter "pg_attver"\s+Command was:/;
+
+/** pre-data 失败里有没有"沙箱不认 pg_attver"这一条(导出给测试) */
+export function sandboxRejectsAttver(preDataFailures: string[]): boolean {
+  return preDataFailures.some((failure) => PG_ATTVER_REJECTED.test(failure));
+}
+
+/** pre-data 硬失败;sandboxTooOld = 至少一段失败的主错误是沙箱不认 pg_attver */
+class PreDataRestoreError extends Error {
+  constructor(message: string, readonly sandboxTooOld: boolean) {
+    super(message);
+  }
+}
+
 /** 兼容层:历史签名保留,分类逻辑的单一权威在统一引擎(restore-engine.ts)。 */
 export function classifyPostDataErrors(stderr: string): PostDataResult {
   const classified = classifyBlocks(stderr, SANDBOX_MANAGED_ERROR);
@@ -638,7 +717,10 @@ async function pgRestore(
     grants: { schemas: dumpedSchemas, recorded: grants },
   });
   if (result.preData.failures.length) {
-    throw new Error(`pg_restore failed: ${result.preData.failures.join(" | ")}`);
+    throw new PreDataRestoreError(
+      `pg_restore failed: ${result.preData.failures.join(" | ")}`,
+      sandboxRejectsAttver(result.preData.failures)
+    );
   }
   return {
     supabaseSkipped: result.postData.expectedSkips,
@@ -1003,7 +1085,8 @@ export async function drillDump(
   const sourceMajor = parseInt(manifest.database.serverVersion, 10);
   const toolMajor = await localPgRestoreMajor();
   const sandboxMajor = sandboxMajorFor(sourceMajor, toolMajor);
-  const pg = await startEphemeralPostgres(sandboxImage(manifest, sandboxMajor), sandboxMajor, opts.supervision?.resourceName);
+  const image = sandboxImage(manifest, sandboxMajor);
+  const pg = await startEphemeralPostgres(image, sandboxMajor, opts.supervision?.resourceName);
   let pass = false; // 异常路径视为失败,供 finally 决定 --keep 是否保留沙箱
   try {
     if (sandboxMajor !== sourceMajor) {
@@ -1059,6 +1142,16 @@ export async function drillDump(
       // 沙箱装不上扩展 + 错误特征命中"缺类型/schema/扩展" → 假设式归因到沙箱环境
       // (不对备份健康下断言);其余失败与扩展无关,必须原样抛出
       const message = (error as Error).message;
+      // 必须排在缺扩展归因前面:这类失败的连带错误(type "…" does not exist)也会命中
+      // MISSING_EXTENSION_ERROR,2026-11-24 的告警就被误指成了 supabase_vault
+      if (error instanceof PreDataRestoreError && error.sandboxTooOld) {
+        throw new Error(
+          `restore failed: the drill sandbox (${image}) rejected "SET (pg_attver=…)". The sandbox needs the ` +
+            `November 2026 PostgreSQL security fix. Run "docker pull ${image}" and rerun the drill. Older pg_dump ` +
+            `versions can write this line when the source already has the fix. Use the latest minor version of ` +
+            `pg_dump for new backups. All errors: ${message}`
+        );
+      }
       if (unavailable.length && MISSING_EXTENSION_ERROR.test(message)) {
         throw new Error(
           `restore failed; likely because the drill sandbox cannot install ` +

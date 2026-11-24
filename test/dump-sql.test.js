@@ -14,6 +14,8 @@ import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { restoreFailureAdvice } from "../dist/restore.js";
+import { primaryAuthRestoreError } from "../dist/auth-restore.js";
+import { sandboxRejectsAttver } from "../dist/drill.js";
 
 // 夹具:pg_restore 17.11 对 supabase/postgres:17.6.1.084 源库转储(--schema=public)的原样输出
 // (`pg_restore -f - -L <FK CONSTRAINT + TABLE ATTACH + SCHEMA 条目>`,注释和 SET 行去掉了)
@@ -139,8 +141,44 @@ test("restoreFailureAdvice:锁槽用完时告诉用户怎么调 max_locks_per_tr
       "Command was: CREATE TABLE public.t1015 (id bigint NOT NULL);\n"
   );
   assert.match(lockFailure, /out of shared memory HINT: You might need to increase "max_locks_per_transaction"\./);
-  assert.match(restoreFailureAdvice(lockFailure), /supabase postgres-config update --config max_locks_per_transaction=256/);
-  assert.equal(restoreFailureAdvice('schema "private" does not exist'), "");
+  assert.match(restoreFailureAdvice([lockFailure]), /supabase postgres-config update --config max_locks_per_transaction=256/);
+  assert.equal(restoreFailureAdvice(['schema "private" does not exist']), "");
+});
+
+test("restoreFailureAdvice:目标库早于 2026-11 安全更新、拒绝 pg_attver 时说清楚要升级目标", () => {
+  const failure = firstRestoreError(
+    'pg_restore: error: could not execute query: ERROR:  unrecognized parameter "pg_attver"\n' +
+      "Command was: CREATE TABLE public.t (id bigint NOT NULL);\nALTER TABLE ONLY public.t ALTER COLUMN id SET (pg_attver=171396040);\n"
+  );
+  assert.match(restoreFailureAdvice([failure]), /November 2026 PostgreSQL security fix/);
+  assert.match(restoreFailureAdvice([failure]), /latest minor release/);
+  // 带 Auth 的恢复:失败说明带阶段前缀,去掉前缀后才是主错误
+  assert.match(
+    restoreFailureAdvice([primaryAuthRestoreError('restoring the database failed: unrecognized parameter "pg_attver"')]),
+    /November 2026/
+  );
+  assert.equal(
+    restoreFailureAdvice([primaryAuthRestoreError('restoring the database failed: relation "x" does not exist DETAIL: failed: unrecognized parameter "pg_attver"')]),
+    ""
+  );
+  // 词只出现在语句正文里、主错误是别的:不能叫用户去升级 PostgreSQL
+  const unrelated = firstRestoreError(
+    'pg_restore: error: could not execute query: ERROR:  relation "public.x" does not exist\n' +
+      "Command was: COMMENT ON TABLE public.t IS 'unrecognized parameter \"pg_attver\"';\n"
+  );
+  assert.equal(restoreFailureAdvice([unrelated]), "");
+});
+
+test("sandboxRejectsAttver:2026-11-24 告警那种 pre-data 失败(pg_attver 加连带的缺类型)认得出;词只在语句里不算", () => {
+  const attver =
+    'pg_restore: error: could not execute query: ERROR: unrecognized parameter "pg_attver" Command was: CREATE TABLE public.t ( id uuid NOT NULL ); ALTER TABLE ONLY public.t ALTER COLUMN id SET (pg_attver=171396040);';
+  const cascade =
+    'pg_restore: error: could not execute query: ERROR: type "public.t" does not exist Command was: CREATE FUNCTION public.f() RETURNS SETOF public.t LANGUAGE sql AS $$ select * from public.t $$;';
+  assert.equal(sandboxRejectsAttver([attver, cascade]), true);
+  assert.equal(sandboxRejectsAttver([cascade]), false);
+  const quoted =
+    "pg_restore: error: could not execute query: ERROR: relation \"public.x\" does not exist Command was: COMMENT ON TABLE public.t IS 'ERROR: unrecognized parameter \"pg_attver\" Command was:';";
+  assert.equal(sandboxRejectsAttver([quoted]), false);
 });
 
 test("parseTableColumns:pg_dump 建表语句里的列类型(修饰符、COLLATE、DEFAULT、生成列、CHECK 行、跨行的名字)", () => {

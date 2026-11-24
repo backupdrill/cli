@@ -11,6 +11,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { startFakeS3 } from "./fake-s3.js";
+import { parsePgDumpMajor, sandboxMajorFor } from "../dist/pgbin.js";
 
 const x = promisify(execFile);
 const pgDump = process.env.BACKUPDRILL_PG_DUMP || "pg_dump";
@@ -125,6 +126,19 @@ function startDrill(s3, tmp, args, { ownGroup = false, env = {} } = {}) {
     child.on("exit", (code, signal) => setTimeout(() => resolve({ code, signal }), 200))
   );
   return { child, exited, stderr: () => stderr };
+}
+
+/** 和 drill 选沙箱的规则一致:主版本取 max(源库 17, 本机 pg_restore 主版本),没有向量扩展就是 alpine 镜像 */
+async function sandboxImageForTest() {
+  const pgRestore = process.env.BACKUPDRILL_PG_RESTORE || "pg_restore";
+  const toolMajor = parsePgDumpMajor((await x(pgRestore, ["--version"])).stdout.trim());
+  return `postgres:${sandboxMajorFor(17, toolMajor)}-alpine`;
+}
+
+/** 本地没有才拉:离线或被限流的机器上,只要镜像已在本地,回退路径照样测得了 */
+async function ensureLocalImage(image) {
+  const present = await x("docker", ["image", "inspect", image]).then(() => true, () => false);
+  if (!present) await x("docker", ["pull", "--quiet", image]);
 }
 
 const leftovers = (tmp) => readdirSync(tmp).filter((name) => name.startsWith("backupdrill-"));
@@ -252,7 +266,10 @@ test(
 /**
  * 假的 docker:放在 PATH 最前面,别的子命令照转真 docker。
  * mode "slow-pull":image inspect 说镜像不在,pull 挂 10 分钟(模拟第一次拉镜像);
- * mode "late-create":run 先等 4 秒再真的去建容器(模拟守护进程晚一点才把容器建出来)。
+ * mode "late-create":run 先等 4 秒再真的去建容器(模拟守护进程晚一点才把容器建出来);
+ * mode "pull-fails":镜像在本地(真 image inspect),pull 直接失败(模拟断网、仓库限流);
+ * mode "pull-ok":pull 记下标记后成功退出,不真的去拉;
+ * mode "pull-hangs":pull 拉起一个占着 stderr 的子进程(模拟卡住的凭据助手),自己也不理 SIGTERM、一直不退出。
  * 每次 pull / run 把自己的 pid 和容器名写进 mark 文件。
  */
 async function fakeDocker(tmp, mode) {
@@ -269,9 +286,17 @@ const args = process.argv.slice(2);
 const real = () => process.exit(spawnSync(${JSON.stringify(realDocker)}, args, { stdio: "inherit" }).status ?? 1);
 const mode = ${JSON.stringify(mode)};
 if (mode === "slow-pull" && args[0] === "image" && args[1] === "inspect") process.exit(1);
-if (mode === "slow-pull" && args[0] === "pull") {
+if (args[0] === "pull" && mode !== "late-create") {
   fs.writeFileSync(${JSON.stringify(marks.pull)}, String(process.pid));
-  setTimeout(() => process.exit(0), 600000);
+  if (mode === "slow-pull") setTimeout(() => process.exit(0), 600000);
+  else if (mode === "pull-fails") { console.error("Error response from daemon: toomanyrequests"); process.exit(1); }
+  else if (mode === "pull-hangs") {
+    const helper = require("child_process").spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: ["ignore", "ignore", "inherit"] });
+    fs.writeFileSync(${JSON.stringify(marks.pull)}, process.pid + " " + helper.pid);
+    process.on("SIGTERM", () => {});
+    setInterval(() => {}, 1000);
+  }
+  else process.exit(0);
 } else if (args[0] === "run") {
   fs.writeFileSync(${JSON.stringify(marks.run)}, process.pid + " " + args[args.indexOf("--name") + 1]);
   if (mode === "late-create") setTimeout(real, 4000); else real();
@@ -305,6 +330,76 @@ test(
       assert.deepEqual(leftovers(tmp), [], "temporary files removed");
     } finally {
       if (pullPid && alive(pullPid)) process.kill(pullPid, "SIGKILL");
+      await s3.close();
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  }
+);
+
+// 2026-11-24:worker 上的沙箱镜像拉过一次就再没更新,停在 17.10,恢复不了 Supabase 升到 2026-11
+// 安全更新之后导出的 dump。本地已有镜像也要去刷新;刷新失败退回本地镜像,演练照常
+for (const mode of ["pull-ok", "pull-fails", "pull-hangs"]) {
+  test(
+    `drill: with the sandbox image already local, it still checks for a newer one (${mode})`,
+    { skip: canRun ? false : "requires Docker + pg_dump", timeout: 180_000 },
+    async () => {
+      const tmp = mkdtempSync(join(tmpdir(), "bd-sig-test-"));
+      const s3 = await startFakeS3({ bucket: "backups" });
+      let helper = null;
+      try {
+        await seedBucket(s3, await makeDump(tmp));
+        // 沙箱用哪个镜像跟着本机 pg_restore 的主版本走(18+ 就是 postgres:18-alpine),先确保它在本地
+        const sandbox = await sandboxImageForTest();
+        await ensureLocalImage(sandbox);
+        const docker = await fakeDocker(tmp, mode);
+        const run = startDrill(s3, tmp, [], {
+          env: { PATH: docker.PATH, ...(mode === "pull-hangs" ? { BACKUPDRILL_TEST_IMAGE_REFRESH_TIMEOUT_MS: "3000" } : {}) },
+        });
+        const { code } = await run.exited;
+        assert.equal(code, 0, `exit code; stderr:\n${run.stderr()}`);
+        assert.ok(existsSync(docker.marks.pull), "docker pull was run although the image was local");
+        if (mode === "pull-hangs") {
+          assert.match(run.stderr(), /Could not refresh \S+; using the local copy \(docker pull timed out after 3s\)/);
+          const [dockerPid, helperPid] = readFileSync(docker.marks.pull, "utf8").split(" ").map(Number);
+          helper = helperPid;
+          assert.equal(alive(dockerPid), false, "the hung docker pull was stopped");
+          assert.equal(alive(helperPid), false, "its credential helper was stopped too");
+        }
+        if (mode === "pull-fails") {
+          assert.ok(run.stderr().includes(`Could not refresh ${sandbox}; using the local copy (Error response from daemon: toomanyrequests)`), run.stderr());
+        }
+        if (mode === "pull-ok") assert.doesNotMatch(run.stderr(), /Could not refresh/);
+      } finally {
+        // 断言失败时别把助手留在机器上
+        if (helper && alive(helper)) process.kill(helper, "SIGKILL");
+        await s3.close();
+        rmSync(tmp, { recursive: true, force: true });
+      }
+    }
+  );
+}
+
+// worker 叫停演练是给整个进程组发 SIGKILL(killDrillProcessGroup):卡住的 pull 和它拉起的助手
+// 必须在这个组里,不能自成一组漏掉
+test(
+  "drill: killing the drill's process group also ends a hung image refresh and its helper",
+  { skip: canRun ? false : "requires Docker + pg_dump", timeout: 120_000 },
+  async () => {
+    const tmp = mkdtempSync(join(tmpdir(), "bd-sig-test-"));
+    const s3 = await startFakeS3({ bucket: "backups" });
+    let pids = [];
+    try {
+      await seedBucket(s3, await makeDump(tmp));
+      await ensureLocalImage(await sandboxImageForTest());
+      const docker = await fakeDocker(tmp, "pull-hangs");
+      const run = startDrill(s3, tmp, [], { ownGroup: true, env: { PATH: docker.PATH } });
+      await waitFor("docker pull to start", () => existsSync(docker.marks.pull) && readFileSync(docker.marks.pull, "utf8").includes(" "), 120_000);
+      pids = readFileSync(docker.marks.pull, "utf8").split(" ").map(Number);
+      process.kill(-run.child.pid, "SIGKILL");
+      await run.exited;
+      await waitFor("pull and helper to exit", () => pids.every((pid) => !alive(pid)), 10_000);
+    } finally {
+      for (const pid of pids) if (alive(pid)) process.kill(pid, "SIGKILL");
       await s3.close();
       rmSync(tmp, { recursive: true, force: true });
     }
