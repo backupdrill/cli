@@ -1,6 +1,6 @@
 {
   "name": "backupdrill",
-  "version": "2.11.1",
+  "version": "2.11.2",
   "description": "Open-source CLI to back up a Supabase project to your own S3/R2/B2 bucket (the Postgres database, Auth users when your role can read them, and Storage files once you add the project's Storage S3 keys), then run a restore drill that proves the backup restores.",
   "type": "module",
   "bin": {

@@ -557,6 +557,15 @@ async function dryRunPreflight(
  * Supabase 只能用 CLI 调这个参数(会重启数据库),照官方文档的命令给出来。
  */
 export function restoreFailureAdvice(failure: string): string {
+  // 2026-11 安全更新(CVE-2026-6460)后:更新前的 pg_dump 导出已更新的源库,会写出
+  // `SET (pg_attver=…)`;已更新的目标会忽略它,没更新的目标直接拒绝
+  if (/unrecognized parameter "pg_attver"/.test(failure)) {
+    return (
+      " The snapshot comes from a database on the November 2026 PostgreSQL security release, and the " +
+      "target is on an older minor version that rejects its \"SET (pg_attver=…)\" lines. Update the " +
+      "target to the latest minor version of its PostgreSQL release and retry."
+    );
+  }
   if (!/max_locks_per_transaction/.test(failure)) return "";
   return (
     " The target ran out of lock slots: a single-transaction restore holds a lock on every table, index " +

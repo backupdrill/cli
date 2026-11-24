@@ -225,18 +225,30 @@ export function sandboxDataVolumeTarget(major: number): string {
  * 停掉命令也说不准守护进程之后还会不会把容器建出来(交叉审查)。拆开之后,慢的那一步(第一次拉镜像
  * 可能好几分钟)什么都不建,中断时直接停掉;docker run 只剩建容器和启动。
  */
+/**
+ * 本地已有镜像也要每次 pull:标签(postgres:17-alpine)跟着小版本走,只拉一次就会永远停在当时的小版本。
+ * 2026-11-24 事故:worker 上的沙箱停在 17.10,源库被 Supabase 升到带 CVE-2026-6460 补丁的新小版本,
+ * 旧 pg_dump 导出的 `ALTER COLUMN ... SET (pg_attver=…)` 在 17.10 上报 unrecognized parameter,
+ * 整个演练失败;17.12 会接受并忽略这句。镜像没变时 pull 只比一次清单,很快。
+ * 已有缓存时刷新失败(断网、仓库限流)不算演练失败:退回本地镜像并提示,真不兼容时恢复那一步会说清楚。
+ */
+const IMAGE_REFRESH_TIMEOUT_MS = 5 * 60_000;
+
 async function ensureImage(image: string): Promise<void> {
   const present = await execFileAsync("docker", ["image", "inspect", "--format", "{{.Id}}", image]).then(
     () => true,
     () => false
   );
-  if (present) return;
   throwIfInterrupted();
-  log.step(`Pulling ${image}…`);
-  const pull = execFileAsync("docker", ["pull", "--quiet", image]);
+  log.step(present ? `Checking ${image} for updates…` : `Pulling ${image}…`);
+  const pull = execFileAsync("docker", ["pull", "--quiet", image], present ? { timeout: IMAGE_REFRESH_TIMEOUT_MS } : {});
   const forget = pull.child ? stopOnInterrupt(pull.child) : () => {};
   try {
     await pull;
+  } catch (error) {
+    throwIfInterrupted();
+    if (!present) throw error;
+    log.warn(`Could not refresh ${image}; using the local copy (${(error as Error).message.split("\n")[0]})`);
   } finally {
     forget();
   }
@@ -603,6 +615,9 @@ interface PostDataResult {
 // 若不按特征过滤,任何硬失败(归档损坏、OOM…)都会被误归因到沙箱。
 const MISSING_EXTENSION_ERROR =
   /type "[^"]+" does not exist|schema "[^"]+" does not exist|extension "[^"]+" is not available/i;
+
+// 沙箱小版本早于 2026-11 安全更新(CVE-2026-6460):不认识旧 pg_dump 从已更新的源库导出的列参数
+const PG_ATTVER_REJECTED = /unrecognized parameter "pg_attver"/;
 
 /** 兼容层:历史签名保留,分类逻辑的单一权威在统一引擎(restore-engine.ts)。 */
 export function classifyPostDataErrors(stderr: string): PostDataResult {
@@ -1003,7 +1018,8 @@ export async function drillDump(
   const sourceMajor = parseInt(manifest.database.serverVersion, 10);
   const toolMajor = await localPgRestoreMajor();
   const sandboxMajor = sandboxMajorFor(sourceMajor, toolMajor);
-  const pg = await startEphemeralPostgres(sandboxImage(manifest, sandboxMajor), sandboxMajor, opts.supervision?.resourceName);
+  const image = sandboxImage(manifest, sandboxMajor);
+  const pg = await startEphemeralPostgres(image, sandboxMajor, opts.supervision?.resourceName);
   let pass = false; // 异常路径视为失败,供 finally 决定 --keep 是否保留沙箱
   try {
     if (sandboxMajor !== sourceMajor) {
@@ -1059,6 +1075,17 @@ export async function drillDump(
       // 沙箱装不上扩展 + 错误特征命中"缺类型/schema/扩展" → 假设式归因到沙箱环境
       // (不对备份健康下断言);其余失败与扩展无关,必须原样抛出
       const message = (error as Error).message;
+      // 必须排在缺扩展归因前面:这类失败的连带错误(type "…" does not exist)也会命中
+      // MISSING_EXTENSION_ERROR,2026-11-24 的告警就被误指成了 supabase_vault
+      if (PG_ATTVER_REJECTED.test(message)) {
+        throw new Error(
+          `restore failed because the drill sandbox (${image}) predates the November 2026 PostgreSQL ` +
+            `security release. The source database is already on that release, and the pg_dump that made ` +
+            `this backup is older, so the dump contains "SET (pg_attver=…)" lines the sandbox rejects. ` +
+            `The backup is fine: run "docker pull ${image}" and drill again. Upgrading pg_dump to the ` +
+            `latest minor version keeps these lines out of new backups. Original error: ${message}`
+        );
+      }
       if (unavailable.length && MISSING_EXTENSION_ERROR.test(message)) {
         throw new Error(
           `restore failed; likely because the drill sandbox cannot install ` +

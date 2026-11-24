@@ -143,6 +143,15 @@ test("restoreFailureAdvice:锁槽用完时告诉用户怎么调 max_locks_per_tr
   assert.equal(restoreFailureAdvice('schema "private" does not exist'), "");
 });
 
+test("restoreFailureAdvice:目标库早于 2026-11 安全更新、拒绝 pg_attver 时说清楚要升级目标", () => {
+  const failure = firstRestoreError(
+    'pg_restore: error: could not execute query: ERROR:  unrecognized parameter "pg_attver"\n' +
+      "Command was: CREATE TABLE public.t (id bigint NOT NULL);\nALTER TABLE ONLY public.t ALTER COLUMN id SET (pg_attver=171396040);\n"
+  );
+  assert.match(restoreFailureAdvice(failure), /November 2026 PostgreSQL security release/);
+  assert.match(restoreFailureAdvice(failure), /latest minor version/);
+});
+
 test("parseTableColumns:pg_dump 建表语句里的列类型(修饰符、COLLATE、DEFAULT、生成列、CHECK 行、跨行的名字)", () => {
   const sql = [
     "CREATE TABLE public.orders (",

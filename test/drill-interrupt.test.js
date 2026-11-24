@@ -252,7 +252,9 @@ test(
 /**
  * 假的 docker:放在 PATH 最前面,别的子命令照转真 docker。
  * mode "slow-pull":image inspect 说镜像不在,pull 挂 10 分钟(模拟第一次拉镜像);
- * mode "late-create":run 先等 4 秒再真的去建容器(模拟守护进程晚一点才把容器建出来)。
+ * mode "late-create":run 先等 4 秒再真的去建容器(模拟守护进程晚一点才把容器建出来);
+ * mode "pull-fails":镜像在本地(真 image inspect),pull 直接失败(模拟断网、仓库限流);
+ * mode "pull-ok":pull 记下标记后成功退出,不真的去拉。
  * 每次 pull / run 把自己的 pid 和容器名写进 mark 文件。
  */
 async function fakeDocker(tmp, mode) {
@@ -269,9 +271,11 @@ const args = process.argv.slice(2);
 const real = () => process.exit(spawnSync(${JSON.stringify(realDocker)}, args, { stdio: "inherit" }).status ?? 1);
 const mode = ${JSON.stringify(mode)};
 if (mode === "slow-pull" && args[0] === "image" && args[1] === "inspect") process.exit(1);
-if (mode === "slow-pull" && args[0] === "pull") {
+if (args[0] === "pull" && mode !== "late-create") {
   fs.writeFileSync(${JSON.stringify(marks.pull)}, String(process.pid));
-  setTimeout(() => process.exit(0), 600000);
+  if (mode === "slow-pull") setTimeout(() => process.exit(0), 600000);
+  else if (mode === "pull-fails") { console.error("Error response from daemon: toomanyrequests"); process.exit(1); }
+  else process.exit(0);
 } else if (args[0] === "run") {
   fs.writeFileSync(${JSON.stringify(marks.run)}, process.pid + " " + args[args.indexOf("--name") + 1]);
   if (mode === "late-create") setTimeout(real, 4000); else real();
@@ -310,6 +314,32 @@ test(
     }
   }
 );
+
+// 2026-11-24:worker 上的沙箱镜像拉过一次就再没更新,停在 17.10,恢复不了 Supabase 升到 2026-11
+// 安全更新之后导出的 dump。本地已有镜像也要去刷新;刷新失败退回本地镜像,演练照常
+for (const mode of ["pull-ok", "pull-fails"]) {
+  test(
+    `drill: with the sandbox image already local, it still checks for a newer one (${mode})`,
+    { skip: canRun ? false : "requires Docker + pg_dump", timeout: 180_000 },
+    async () => {
+      const tmp = mkdtempSync(join(tmpdir(), "bd-sig-test-"));
+      const s3 = await startFakeS3({ bucket: "backups" });
+      try {
+        await seedBucket(s3, await makeDump(tmp)); // makeDump 用的就是 postgres:17-alpine,镜像一定已在本地
+        const docker = await fakeDocker(tmp, mode);
+        const run = startDrill(s3, tmp, [], { env: { PATH: docker.PATH } });
+        const { code } = await run.exited;
+        assert.equal(code, 0, `exit code; stderr:\n${run.stderr()}`);
+        assert.ok(existsSync(docker.marks.pull), "docker pull was run although the image was local");
+        if (mode === "pull-fails") assert.match(run.stderr(), /Could not refresh postgres:17-alpine; using the local copy/);
+        else assert.doesNotMatch(run.stderr(), /Could not refresh/);
+      } finally {
+        await s3.close();
+        rmSync(tmp, { recursive: true, force: true });
+      }
+    }
+  );
+}
 
 test(
   "drill: SIGINT while docker run is still creating the sandbox waits for it, then removes it",
