@@ -558,8 +558,10 @@ async function dryRunPreflight(
  */
 export function restoreFailureAdvice(failure: string): string {
   // 2026-11 安全更新(CVE-2026-6460)后:更新前的 pg_dump 导出已更新的源库,会写出
-  // `SET (pg_attver=…)`;已更新的目标会忽略它,没更新的目标直接拒绝
-  if (/unrecognized parameter "pg_attver"/.test(failure)) {
+  // `SET (pg_attver=…)`;已更新的目标会忽略它,没更新的目标直接拒绝。
+  // 只认服务端主错误所在的位置:单事务恢复每行一段失败、行首就是主错误(firstRestoreError);
+  // 带 Auth 的恢复是 "<阶段> failed: <主错误>"(auth-restore.ts)。语句正文里出现这个词不算
+  if (/(?:^|failed: )unrecognized parameter "pg_attver"/m.test(failure)) {
     return (
       " The snapshot comes from a database on the November 2026 PostgreSQL security release, and the " +
       "target is on an older minor version that rejects its \"SET (pg_attver=…)\" lines. Update the " +
@@ -1103,7 +1105,7 @@ export async function runRestore(
                 " Check the target before doing anything else; restore won't write into it again while those " +
                 "objects are there."
               : await targetStateAfterFailure(targetUrl, manifest.database.schemas)) +
-            restoreFailureAdvice(failures.join(" "))
+            restoreFailureAdvice(failures.join("\n"))
         );
       }
       result.restoredToDatabase = true;

@@ -230,9 +230,13 @@ export function sandboxDataVolumeTarget(major: number): string {
  * 2026-11-24 事故:worker 上的沙箱停在 17.10,源库被 Supabase 升到带 CVE-2026-6460 补丁的新小版本,
  * 旧 pg_dump 导出的 `ALTER COLUMN ... SET (pg_attver=…)` 在 17.10 上报 unrecognized parameter,
  * 整个演练失败;17.12 会接受并忽略这句。镜像没变时 pull 只比一次清单,很快。
- * 已有缓存时刷新失败(断网、仓库限流)不算演练失败:退回本地镜像并提示,真不兼容时恢复那一步会说清楚。
+ * 已有缓存时刷新失败(断网、仓库限流、超时)不算演练失败:退回本地镜像并提示。
+ *
+ * pull 自成进程组:docker 会拉起凭据助手,超时时只停 docker 的话,助手可能还占着管道、拖住收尾
+ * (交叉审查用卡住的助手复现),所以到点按组 SIGKILL,也不等 stdio 关闭,只等 docker 本身退出。
  */
-const IMAGE_REFRESH_TIMEOUT_MS = 5 * 60_000;
+// 测试用的环境变量只为把 5 分钟缩短到几秒,验证卡住的 pull 会被整组停掉;不对用户公开
+const IMAGE_REFRESH_TIMEOUT_MS = Number(process.env.BACKUPDRILL_TEST_IMAGE_REFRESH_TIMEOUT_MS) || 5 * 60_000;
 
 async function ensureImage(image: string): Promise<void> {
   const present = await execFileAsync("docker", ["image", "inspect", "--format", "{{.Id}}", image]).then(
@@ -241,17 +245,38 @@ async function ensureImage(image: string): Promise<void> {
   );
   throwIfInterrupted();
   log.step(present ? `Checking ${image} for updates…` : `Pulling ${image}…`);
-  const pull = execFileAsync("docker", ["pull", "--quiet", image], present ? { timeout: IMAGE_REFRESH_TIMEOUT_MS } : {});
-  const forget = pull.child ? stopOnInterrupt(pull.child) : () => {};
-  try {
-    await pull;
-  } catch (error) {
-    throwIfInterrupted();
-    if (!present) throw error;
-    log.warn(`Could not refresh ${image}; using the local copy (${(error as Error).message.split("\n")[0]})`);
-  } finally {
-    forget();
+  const ownGroup = process.platform !== "win32";
+  const pull = spawn("docker", ["pull", "--quiet", image], { stdio: ["ignore", "ignore", "pipe"], detached: ownGroup });
+  const forget = stopOnInterrupt(pull, { group: true });
+  let stderr = "";
+  pull.stderr?.on("data", (chunk) => (stderr += chunk.toString()));
+  let timer: NodeJS.Timeout | undefined;
+  const outcome = await new Promise<"ok" | "failed" | "timeout">((resolve) => {
+    pull.on("error", (error) => {
+      stderr ||= error.message;
+      resolve("failed");
+    });
+    pull.on("exit", (code) => resolve(code === 0 ? "ok" : "failed"));
+    if (present) timer = setTimeout(() => resolve("timeout"), IMAGE_REFRESH_TIMEOUT_MS);
+  });
+  clearTimeout(timer);
+  if (outcome === "timeout") {
+    try {
+      if (ownGroup && pull.pid) process.kill(-pull.pid, "SIGKILL");
+      else pull.kill("SIGKILL");
+    } catch {
+      // 已经退出
+    }
   }
+  forget();
+  throwIfInterrupted();
+  if (outcome === "ok") return;
+  const reason =
+    outcome === "timeout"
+      ? `no answer within ${Math.round(IMAGE_REFRESH_TIMEOUT_MS / 1000)}s`
+      : stderr.split("\n").map((line) => line.trim()).find(Boolean) ?? "docker pull failed";
+  if (!present) throw new Error(`could not pull ${image}: ${reason}`);
+  log.warn(`Could not refresh ${image}; using the local copy (${reason})`);
 }
 
 async function startEphemeralPostgres(image: string, major: number, resourceName?: string): Promise<Ephemeral> {
@@ -288,6 +313,8 @@ async function startEphemeralPostgres(image: string, major: number, resourceName
       "POSTGRES_DB=postgres",
       "-p",
       "127.0.0.1:0:5432", // 随机主机端口,避免撞端口
+      // 拉镜像只在 ensureImage 里做(有超时、可中断);缓存恰好在刷新时被清掉的话,这里报错而不是悄悄再拉一次
+      "--pull=never",
       `--shm-size=${tuning.shmSize}`,
       image,
       "postgres",
@@ -616,8 +643,10 @@ interface PostDataResult {
 const MISSING_EXTENSION_ERROR =
   /type "[^"]+" does not exist|schema "[^"]+" does not exist|extension "[^"]+" is not available/i;
 
-// 沙箱小版本早于 2026-11 安全更新(CVE-2026-6460):不认识旧 pg_dump 从已更新的源库导出的列参数
-const PG_ATTVER_REJECTED = /unrecognized parameter "pg_attver"/;
+// 沙箱小版本早于 2026-11 安全更新(CVE-2026-6460):不认识旧 pg_dump 从已更新的源库导出的列参数。
+// 只认 pg_restore 报出来的那条服务端主错误(每段失败的开头),语句正文或 DETAIL 里出现这个词不算
+const PG_ATTVER_REJECTED =
+  /(?:^pg_restore failed: |\| )pg_restore: error: could not execute query: ERROR:\s+unrecognized parameter "pg_attver"/;
 
 /** 兼容层:历史签名保留,分类逻辑的单一权威在统一引擎(restore-engine.ts)。 */
 export function classifyPostDataErrors(stderr: string): PostDataResult {
@@ -1079,11 +1108,10 @@ export async function drillDump(
       // MISSING_EXTENSION_ERROR,2026-11-24 的告警就被误指成了 supabase_vault
       if (PG_ATTVER_REJECTED.test(message)) {
         throw new Error(
-          `restore failed because the drill sandbox (${image}) predates the November 2026 PostgreSQL ` +
-            `security release. The source database is already on that release, and the pg_dump that made ` +
-            `this backup is older, so the dump contains "SET (pg_attver=…)" lines the sandbox rejects. ` +
-            `The backup is fine: run "docker pull ${image}" and drill again. Upgrading pg_dump to the ` +
-            `latest minor version keeps these lines out of new backups. Original error: ${message}`
+          `restore failed: the drill sandbox (${image}) predates the November 2026 PostgreSQL security ` +
+            `release and rejects the "SET (pg_attver=…)" lines that a pg_dump older than that release writes ` +
+            `when the source database already has it. Run "docker pull ${image}" and drill again; upgrading ` +
+            `pg_dump to the latest minor version keeps these lines out of new backups. All errors: ${message}`
         );
       }
       if (unavailable.length && MISSING_EXTENSION_ERROR.test(message)) {

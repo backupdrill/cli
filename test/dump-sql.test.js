@@ -150,6 +150,13 @@ test("restoreFailureAdvice:目标库早于 2026-11 安全更新、拒绝 pg_attv
   );
   assert.match(restoreFailureAdvice(failure), /November 2026 PostgreSQL security release/);
   assert.match(restoreFailureAdvice(failure), /latest minor version/);
+  assert.match(restoreFailureAdvice('restoring the database failed: unrecognized parameter "pg_attver"'), /November 2026/);
+  // 词只出现在语句正文里、主错误是别的:不能叫用户去升级 PostgreSQL
+  const unrelated = firstRestoreError(
+    'pg_restore: error: could not execute query: ERROR:  relation "public.x" does not exist\n' +
+      "Command was: COMMENT ON TABLE public.t IS 'unrecognized parameter \"pg_attver\"';\n"
+  );
+  assert.equal(restoreFailureAdvice(unrelated), "");
 });
 
 test("parseTableColumns:pg_dump 建表语句里的列类型(修饰符、COLLATE、DEFAULT、生成列、CHECK 行、跨行的名字)", () => {
