@@ -135,6 +135,12 @@ async function sandboxImageForTest() {
   return `postgres:${sandboxMajorFor(17, toolMajor)}-alpine`;
 }
 
+/** 本地没有才拉:离线或被限流的机器上,只要镜像已在本地,回退路径照样测得了 */
+async function ensureLocalImage(image) {
+  const present = await x("docker", ["image", "inspect", image]).then(() => true, () => false);
+  if (!present) await x("docker", ["pull", "--quiet", image]);
+}
+
 const leftovers = (tmp) => readdirSync(tmp).filter((name) => name.startsWith("backupdrill-"));
 
 // target "process":只发给 CLI(`kill <pid>`、systemd 的 SIGTERM),子进程收不到;
@@ -344,7 +350,7 @@ for (const mode of ["pull-ok", "pull-fails", "pull-hangs"]) {
         await seedBucket(s3, await makeDump(tmp));
         // 沙箱用哪个镜像跟着本机 pg_restore 的主版本走(18+ 就是 postgres:18-alpine),先确保它在本地
         const sandbox = await sandboxImageForTest();
-        await x("docker", ["pull", "--quiet", sandbox]);
+        await ensureLocalImage(sandbox);
         const docker = await fakeDocker(tmp, mode);
         const run = startDrill(s3, tmp, [], {
           env: { PATH: docker.PATH, ...(mode === "pull-hangs" ? { BACKUPDRILL_TEST_IMAGE_REFRESH_TIMEOUT_MS: "3000" } : {}) },
@@ -383,7 +389,7 @@ test(
     let pids = [];
     try {
       await seedBucket(s3, await makeDump(tmp));
-      await x("docker", ["pull", "--quiet", await sandboxImageForTest()]);
+      await ensureLocalImage(await sandboxImageForTest());
       const docker = await fakeDocker(tmp, "pull-hangs");
       const run = startDrill(s3, tmp, [], { ownGroup: true, env: { PATH: docker.PATH } });
       await waitFor("docker pull to start", () => existsSync(docker.marks.pull) && readFileSync(docker.marks.pull, "utf8").includes(" "), 120_000);
