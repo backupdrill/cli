@@ -245,6 +245,17 @@ const STAGE_TEXT: Record<Stage, string> = {
   committed: "committing",
 };
 
+/**
+ * 失败说明 "<阶段> failed: <主错误>" 里的主错误(按已知阶段前缀去掉);别的形状的失败原样返回。
+ * 给 restoreFailureAdvice 用:它只看主错误开头,语句正文里碰巧出现的字不能触发建议
+ */
+export function primaryAuthRestoreError(failure: string): string {
+  for (const text of [...Object.values(STAGE_TEXT), "connecting to the target"]) {
+    if (failure.startsWith(`${text} failed: `)) return failure.slice(text.length + " failed: ".length);
+  }
+  return failure;
+}
+
 const STAGE_MARK = "backupdrill-stage:";
 const XID_MARK = "backupdrill-xid:";
 

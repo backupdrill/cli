@@ -232,10 +232,11 @@ export function sandboxDataVolumeTarget(major: number): string {
  * 整个演练失败;17.12 会接受并忽略这句。镜像没变时 pull 只比一次清单,很快。
  * 已有缓存时刷新失败(断网、仓库限流、超时)不算演练失败:退回本地镜像并提示。
  *
- * pull 自成进程组:docker 会拉起凭据助手,超时时只停 docker 的话,助手可能还占着管道、拖住收尾
- * (交叉审查用卡住的助手复现),所以到点按组 SIGKILL,也不等 stdio 关闭,只等 docker 本身退出。
+ * 收尾不等 stdio 关闭:docker 拉起的凭据助手可能还占着 stderr(交叉审查用卡住的助手复现)。
+ * 只等 docker 本身退出,到点就 SIGKILL 它,然后把我们这头的管道关掉,CLI 才能照常退出。
+ * pull 留在演练所在的进程组里(不 detach):worker 叫停演练时按组结束,连助手一起带走。
  */
-// 测试用的环境变量只为把 5 分钟缩短到几秒,验证卡住的 pull 会被整组停掉;不对用户公开
+// 测试用的环境变量只为把 5 分钟缩短到几秒;不对用户公开
 const IMAGE_REFRESH_TIMEOUT_MS = Number(process.env.BACKUPDRILL_TEST_IMAGE_REFRESH_TIMEOUT_MS) || 5 * 60_000;
 
 async function ensureImage(image: string): Promise<void> {
@@ -245,9 +246,8 @@ async function ensureImage(image: string): Promise<void> {
   );
   throwIfInterrupted();
   log.step(present ? `Checking ${image} for updates…` : `Pulling ${image}…`);
-  const ownGroup = process.platform !== "win32";
-  const pull = spawn("docker", ["pull", "--quiet", image], { stdio: ["ignore", "ignore", "pipe"], detached: ownGroup });
-  const forget = stopOnInterrupt(pull, { group: true });
+  const pull = spawn("docker", ["pull", "--quiet", image], { stdio: ["ignore", "ignore", "pipe"] });
+  const forget = stopOnInterrupt(pull);
   let stderr = "";
   pull.stderr?.on("data", (chunk) => (stderr += chunk.toString()));
   let timer: NodeJS.Timeout | undefined;
@@ -260,14 +260,8 @@ async function ensureImage(image: string): Promise<void> {
     if (present) timer = setTimeout(() => resolve("timeout"), IMAGE_REFRESH_TIMEOUT_MS);
   });
   clearTimeout(timer);
-  if (outcome === "timeout") {
-    try {
-      if (ownGroup && pull.pid) process.kill(-pull.pid, "SIGKILL");
-      else pull.kill("SIGKILL");
-    } catch {
-      // 已经退出
-    }
-  }
+  if (outcome === "timeout") pull.kill("SIGKILL");
+  pull.stderr?.destroy();
   forget();
   throwIfInterrupted();
   if (outcome === "ok") return;
@@ -644,9 +638,17 @@ const MISSING_EXTENSION_ERROR =
   /type "[^"]+" does not exist|schema "[^"]+" does not exist|extension "[^"]+" is not available/i;
 
 // 沙箱小版本早于 2026-11 安全更新(CVE-2026-6460):不认识旧 pg_dump 从已更新的源库导出的列参数。
-// 只认 pg_restore 报出来的那条服务端主错误(每段失败的开头),语句正文或 DETAIL 里出现这个词不算
+// 逐段看 pre-data 失败:主错误(段首 ERROR: 之后、Command was: 之前)整句就是这一条才算,
+// 语句正文或 DETAIL 里出现这个词不算
 const PG_ATTVER_REJECTED =
-  /(?:^pg_restore failed: |\| )pg_restore: error: could not execute query: ERROR:\s+unrecognized parameter "pg_attver"/;
+  /^pg_restore: error: could not execute query: ERROR:\s+unrecognized parameter "pg_attver"\s+Command was:/;
+
+/** pre-data 硬失败;sandboxTooOld = 至少一段失败的主错误是沙箱不认 pg_attver */
+class PreDataRestoreError extends Error {
+  constructor(message: string, readonly sandboxTooOld: boolean) {
+    super(message);
+  }
+}
 
 /** 兼容层:历史签名保留,分类逻辑的单一权威在统一引擎(restore-engine.ts)。 */
 export function classifyPostDataErrors(stderr: string): PostDataResult {
@@ -682,7 +684,10 @@ async function pgRestore(
     grants: { schemas: dumpedSchemas, recorded: grants },
   });
   if (result.preData.failures.length) {
-    throw new Error(`pg_restore failed: ${result.preData.failures.join(" | ")}`);
+    throw new PreDataRestoreError(
+      `pg_restore failed: ${result.preData.failures.join(" | ")}`,
+      result.preData.failures.some((failure) => PG_ATTVER_REJECTED.test(failure))
+    );
   }
   return {
     supabaseSkipped: result.postData.expectedSkips,
@@ -1106,7 +1111,7 @@ export async function drillDump(
       const message = (error as Error).message;
       // 必须排在缺扩展归因前面:这类失败的连带错误(type "…" does not exist)也会命中
       // MISSING_EXTENSION_ERROR,2026-11-24 的告警就被误指成了 supabase_vault
-      if (PG_ATTVER_REJECTED.test(message)) {
+      if (error instanceof PreDataRestoreError && error.sandboxTooOld) {
         throw new Error(
           `restore failed: the drill sandbox (${image}) predates the November 2026 PostgreSQL security ` +
             `release and rejects the "SET (pg_attver=…)" lines that a pg_dump older than that release writes ` +

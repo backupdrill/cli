@@ -339,6 +339,7 @@ for (const mode of ["pull-ok", "pull-fails", "pull-hangs"]) {
     async () => {
       const tmp = mkdtempSync(join(tmpdir(), "bd-sig-test-"));
       const s3 = await startFakeS3({ bucket: "backups" });
+      let helper = null;
       try {
         await seedBucket(s3, await makeDump(tmp));
         // 沙箱用哪个镜像跟着本机 pg_restore 的主版本走(18+ 就是 postgres:18-alpine),先确保它在本地
@@ -353,21 +354,50 @@ for (const mode of ["pull-ok", "pull-fails", "pull-hangs"]) {
         assert.ok(existsSync(docker.marks.pull), "docker pull was run although the image was local");
         if (mode === "pull-hangs") {
           assert.match(run.stderr(), /Could not refresh \S+; using the local copy \(no answer within 3s\)/);
-          for (const pid of readFileSync(docker.marks.pull, "utf8").split(" ").map(Number)) {
-            assert.equal(alive(pid), false, `pull process ${pid} (docker or its helper) was stopped`);
-          }
+          const [dockerPid, helperPid] = readFileSync(docker.marks.pull, "utf8").split(" ").map(Number);
+          helper = helperPid;
+          assert.equal(alive(dockerPid), false, "the hung docker pull was stopped");
         }
         if (mode === "pull-fails") {
           assert.ok(run.stderr().includes(`Could not refresh ${sandbox}; using the local copy (Error response from daemon: toomanyrequests)`), run.stderr());
         }
         if (mode === "pull-ok") assert.doesNotMatch(run.stderr(), /Could not refresh/);
       } finally {
+        // 卡住的助手留在演练的进程组里,由叫停演练的一方按组结束(下一个测试);这里单独跑完要自己清
+        if (helper && alive(helper)) process.kill(helper, "SIGKILL");
         await s3.close();
         rmSync(tmp, { recursive: true, force: true });
       }
     }
   );
 }
+
+// worker 叫停演练是给整个进程组发 SIGKILL(killDrillProcessGroup):卡住的 pull 和它拉起的助手
+// 必须在这个组里,不能自成一组漏掉
+test(
+  "drill: killing the drill's process group also ends a hung image refresh and its helper",
+  { skip: canRun ? false : "requires Docker + pg_dump", timeout: 120_000 },
+  async () => {
+    const tmp = mkdtempSync(join(tmpdir(), "bd-sig-test-"));
+    const s3 = await startFakeS3({ bucket: "backups" });
+    let pids = [];
+    try {
+      await seedBucket(s3, await makeDump(tmp));
+      await x("docker", ["pull", "--quiet", await sandboxImageForTest()]);
+      const docker = await fakeDocker(tmp, "pull-hangs");
+      const run = startDrill(s3, tmp, [], { ownGroup: true, env: { PATH: docker.PATH } });
+      await waitFor("docker pull to start", () => existsSync(docker.marks.pull) && readFileSync(docker.marks.pull, "utf8").includes(" "), 120_000);
+      pids = readFileSync(docker.marks.pull, "utf8").split(" ").map(Number);
+      process.kill(-run.child.pid, "SIGKILL");
+      await run.exited;
+      await waitFor("pull and helper to exit", () => pids.every((pid) => !alive(pid)), 10_000);
+    } finally {
+      for (const pid of pids) if (alive(pid)) process.kill(pid, "SIGKILL");
+      await s3.close();
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  }
+);
 
 test(
   "drill: SIGINT while docker run is still creating the sandbox waits for it, then removes it",
