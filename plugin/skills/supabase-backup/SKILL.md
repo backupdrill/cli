@@ -98,7 +98,7 @@ report="$(mktemp "${TMPDIR:-/tmp}/backupdrill-backup.XXXXXX")" || exit 1; echo "
   npx -y backupdrill@2.11.2 drill )
 ```
 
-- It reads the latest snapshot from the bucket, restores it into a throwaway Postgres container, runs its checks and removes the container. It doesn't connect to the Supabase project. Each run pulls the Postgres image from Docker Hub first (the full download only happens the first time), and uses the copy it already has if Docker Hub is unreachable.
+- It reads the latest snapshot from the bucket, restores it into a throwaway Postgres container, runs its checks and removes the container. It doesn't connect to the Supabase project. Before starting Postgres, `drill` checks Docker Hub and downloads any missing image layers. If the pull fails and a local image is available, `drill` uses it.
 - `--snapshot <timestamp>` picks an older snapshot. `--verify-all-files` checksums every Storage file instead of a sample.
 - `--check-cmd "<command>"` runs the user's own test against the restored copy, with its connection string in `BACKUPDRILL_SANDBOX_URL`. It connects as a superuser, so it can check data and business rules but not row-level security.
 - stdout ends with `{"ok":...,"report":{...}}`. Go through the check lines. If the drill fails, quote the failing check as printed and don't guess at a cause it doesn't state.
