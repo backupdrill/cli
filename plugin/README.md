@@ -56,7 +56,7 @@ Everything runs on your machine:
 
 - `npx` downloads the `backupdrill` package from the npm registry the first time.
 - The CLI connects to your Supabase project's database, to its Storage if you add Storage S3 keys, and to your bucket. `restore` also connects to the target project you name.
-- `drill` starts a temporary Postgres container in Docker. The first time, Docker downloads the Postgres image from Docker Hub.
+- `drill` starts a temporary Postgres container in Docker. Before each drill, Docker checks Docker Hub and downloads any missing image layers. If that fails and a local image is available, `drill` uses it.
 - Nothing goes to BackupDrill. There is no account, telemetry or license check.
 
 What the agent reads while it works, such as command output with table names, row counts and file names, goes to your model provider like the rest of your conversation. The CLI itself never deletes objects in your bucket.
