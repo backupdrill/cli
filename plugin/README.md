@@ -7,7 +7,7 @@ Back up a Supabase project to a bucket you own and prove the backup restores, by
 - `drill` restores a snapshot into a throwaway Postgres in Docker, checks that the tables and their data came back, and checksums a sample of the Storage files.
 - `restore` puts a snapshot into a new, empty Supabase project, after a dry run and only once you confirm the target.
 
-The agent runs every command as `npx -y backupdrill@2.11.0`, so the CLI version stays fixed.
+The agent runs every command as `npx -y backupdrill@2.11.2`, so the CLI version stays fixed.
 
 ## What you need
 
@@ -56,7 +56,7 @@ Everything runs on your machine:
 
 - `npx` downloads the `backupdrill` package from the npm registry the first time.
 - The CLI connects to your Supabase project's database, to its Storage if you add Storage S3 keys, and to your bucket. `restore` also connects to the target project you name.
-- `drill` starts a temporary Postgres container in Docker. The first time, Docker downloads the Postgres image from Docker Hub.
+- `drill` starts a temporary Postgres container in Docker. Before each drill, Docker checks Docker Hub and downloads any missing image layers. If that fails and a local image is available, `drill` uses it.
 - Nothing goes to BackupDrill. There is no account, telemetry or license check.
 
 What the agent reads while it works, such as command output with table names, row counts and file names, goes to your model provider like the rest of your conversation. The CLI itself never deletes objects in your bucket.
