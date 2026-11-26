@@ -19,17 +19,17 @@
     <summary>Back up a Supabase project to your own S3, R2 or B2 bucket. Run a restore drill in Docker to check that the database backup loads.</summary>
     <description><![CDATA[backupdrill is an open-source (MIT) command-line tool that backs up a Supabase project to a bucket you own: Amazon S3, Cloudflare R2 or Backblaze B2.
 
-- `backupdrill backup` dumps the Postgres database and, once you add the project's Storage S3 keys, copies your Storage files. Each backup writes a `manifest.json` with checksums for the backup files.
+- `backupdrill backup` dumps the Postgres `public` schema by default. Add your project's Storage S3 keys to copy Storage files too. Each backup writes a `manifest.json` with checksums for the backup files.
 - By default, `backupdrill drill` restores the latest database snapshot into a throwaway Postgres in Docker and checks restored row counts against the dump.
 - `backupdrill restore` restores a snapshot into a Supabase project.
 
 Data goes from your machine straight to your bucket.
 
-This package installs the npm release with the same version number into the package folder and adds a `backupdrill` command, so it depends on Node.js. It doesn't touch packages you installed with `npm install -g`.
+This package depends on Node.js LTS and adds a `backupdrill` command. It installs the npm release matching the first three parts of the Chocolatey version into its own folder. Global npm installs stay untouched.
 
 ## Also needed
 
-- PostgreSQL client tools. For backups, use `pg_dump` from the same PostgreSQL major version as your Supabase database (15 to 17) or newer. For drills and database restores, use a `pg_restore` that can read the dump. To restore Supabase Auth users, install `pg_restore` and `psql` from the same PostgreSQL client package: 15.14, 16.10, 17.6 or a later release in one of those series, or PostgreSQL 18 or newer. Add the PostgreSQL `bin` folder to `PATH` or set `BACKUPDRILL_PG_DUMP`, `BACKUPDRILL_PG_RESTORE` and `BACKUPDRILL_PSQL`.
+- PostgreSQL client tools. For backups, use `pg_dump` from the same PostgreSQL major version as your Supabase database (15 to 17) or newer. For drills and database restores, use a `pg_restore` that can read the dump. If you use `pg_restore` 17 or newer for a database restore, the target must run PostgreSQL 17 or newer. To restore Supabase Auth users, install `pg_restore` and `psql` from the same PostgreSQL client package: 15.14, 16.10, 17.6 or a later release in one of those series, or PostgreSQL 18 or newer. Add the PostgreSQL `bin` folder to `PATH` or set `BACKUPDRILL_PG_DUMP`, `BACKUPDRILL_PG_RESTORE` and `BACKUPDRILL_PSQL`.
 - Docker, for `backupdrill drill`.
 
 Setup, environment variables and examples: https://github.com/backupdrill/cli#readme

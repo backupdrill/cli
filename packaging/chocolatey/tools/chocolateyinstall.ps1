@@ -6,22 +6,19 @@ $toolsDir = Split-Path -Parent $MyInvocation.MyCommand.Definition
 # npm only knows the first three.
 $npmVersion = ($env:ChocolateyPackageVersion -split '\.')[0..2] -join '.'
 
-# nodejs-lts may have been installed in this same choco run, so PATH in this
-# session can still be missing it; try its default folder first.
+# Use the machine-wide Node.js that nodejs-lts installs, and run its bundled
+# npm-cli.js directly: npm.cmd would prefer an npm from the user's own global
+# folder, which the installing admin shouldn't run.
 $nodeDir = Join-Path $env:ProgramFiles 'nodejs'
-if (-not (Test-Path (Join-Path $nodeDir 'npm.cmd'))) {
-  $found = Get-Command node.exe -ErrorAction SilentlyContinue
-  if ($found) { $nodeDir = Split-Path -Parent $found.Source }
-}
 $node = Join-Path $nodeDir 'node.exe'
-$npm = Join-Path $nodeDir 'npm.cmd'
-if (-not (Test-Path $npm)) { throw "npm not found next to node.exe ($nodeDir). Install the nodejs-lts package first." }
+$npmCli = Join-Path $nodeDir 'node_modules\npm\bin\npm-cli.js'
+if (-not ((Test-Path $node) -and (Test-Path $npmCli))) { throw "Node.js not found in $nodeDir. Install the nodejs-lts package first." }
 
 # Install into the package folder instead of npm's global folder, so the command
 # works for every user and never replaces a copy someone installed with npm -g.
 # Pin the public registry; no dependency needs install scripts, so turn them off.
 $appDir = Join-Path $toolsDir 'app'
-& $npm install --prefix $appDir --registry https://registry.npmjs.org/ --ignore-scripts --omit=dev --no-audit --no-fund "backupdrill@$npmVersion"
+& $node $npmCli install --prefix $appDir --registry https://registry.npmjs.org/ --ignore-scripts --omit=dev --no-audit --no-fund "backupdrill@$npmVersion"
 if ($LASTEXITCODE -ne 0) { throw "npm install backupdrill@$npmVersion failed with exit code $LASTEXITCODE" }
 
 $entry = Join-Path $appDir 'node_modules\backupdrill\dist\index.js'
