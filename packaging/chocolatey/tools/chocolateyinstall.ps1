@@ -27,14 +27,20 @@ $emptyNpmrc = Join-Path $toolsDir 'empty.npmrc'
 Set-Content -Path $emptyNpmrc -Value '' -Encoding Ascii
 $env:NPM_CONFIG_USERCONFIG = $emptyNpmrc
 $env:NPM_CONFIG_GLOBALCONFIG = $emptyNpmrc
+# NODE_OPTIONS could preload a module into npm before --ignore-scripts applies.
+Remove-Item Env:NODE_OPTIONS -ErrorAction SilentlyContinue
 & $node $npmCli install --prefix $appDir --registry https://registry.npmjs.org/ --ignore-scripts --omit=dev --no-audit --no-fund "backupdrill@$npmVersion"
 if ($LASTEXITCODE -ne 0) { throw "npm install backupdrill@$npmVersion failed with exit code $LASTEXITCODE" }
 
 $entry = Join-Path $appDir 'node_modules\backupdrill\dist\index.js'
 if (-not (Test-Path $entry)) { throw "backupdrill entry point not found at $entry" }
 
-# An .exe shim in Chocolatey's bin folder (on the machine PATH) that starts
-# node.exe with the entry point. A .cmd launcher would let cmd.exe treat & in an
-# unquoted argument, such as a database URL with several query parameters, as a
-# command separator.
-Install-BinFile -Name 'backupdrill' -Path $node -Command "`"$entry`""
+# A .cmd launcher in Chocolatey's bin folder (on the machine PATH), the same
+# kind of launcher npm itself writes on Windows. Its marker line lets install
+# and uninstall tell it apart from a backupdrill.cmd that came from elsewhere.
+$launcher = Join-Path $env:ChocolateyInstall 'bin\backupdrill.cmd'
+$marker = 'rem backupdrill Chocolatey package launcher'
+if ((Test-Path $launcher) -and -not ((Get-Content $launcher -TotalCount 2) -contains $marker)) {
+  throw "A launcher already exists at $launcher. To use this package's launcher, move the existing file aside and retry."
+}
+Set-Content -Path $launcher -Encoding Ascii -Value @('@echo off', $marker, "`"$node`" `"$entry`" %*")
