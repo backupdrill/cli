@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="utf-8"?>
+<package xmlns="http://schemas.microsoft.com/packaging/2015/06/nuspec.xsd">
+  <metadata>
+    <id>backupdrill</id>
+    <version>2.11.2</version>
+    <packageSourceUrl>https://github.com/backupdrill/cli/tree/main/packaging/chocolatey</packageSourceUrl>
+    <owners>backupdrill</owners>
+    <title>backupdrill (Supabase backup CLI)</title>
+    <authors>BackupDrill</authors>
+    <projectUrl>https://backupdrill.com</projectUrl>
+    <iconUrl>https://raw.githubusercontent.com/backupdrill/cli/main/plugin/assets/icon.png</iconUrl>
+    <copyright>BackupDrill</copyright>
+    <licenseUrl>https://github.com/backupdrill/cli/blob/main/LICENSE</licenseUrl>
+    <requireLicenseAcceptance>false</requireLicenseAcceptance>
+    <projectSourceUrl>https://github.com/backupdrill/cli</projectSourceUrl>
+    <docsUrl>https://github.com/backupdrill/cli#readme</docsUrl>
+    <bugTrackerUrl>https://github.com/backupdrill/cli/issues</bugTrackerUrl>
+    <tags>supabase postgres postgresql backup restore pg-dump s3 r2 b2 cli foss</tags>
+    <summary>Back up a Supabase project to your own S3, R2 or B2 bucket, then restore-drill it to check the backup restores.</summary>
+    <description><![CDATA[backupdrill is an open-source (MIT) command-line tool that backs up a Supabase project to a bucket you own: Amazon S3, Cloudflare R2 or Backblaze B2.
+
+- `backupdrill backup` dumps the Postgres database and, once you add the project's Storage S3 keys, copies your Storage files. Each backup writes a checksummed `manifest.json`.
+- `backupdrill drill` restores the latest snapshot into a throwaway Postgres in Docker and compares the row count of every table with the backup.
+- `backupdrill restore` restores a snapshot into a Supabase project.
+
+Data goes from your machine straight to your bucket.
+
+This package installs the npm package `backupdrill` globally with npm, so it depends on Node.js.
+
+## Also needed
+
+- `pg_dump` (and `pg_restore` for drills and restores) whose major version is at least your Supabase Postgres version (Supabase runs PostgreSQL 15 to 17). Put the PostgreSQL bin folder on `PATH`, or set `BACKUPDRILL_PG_DUMP` and `BACKUPDRILL_PG_RESTORE` to the executables.
+- Docker, for `backupdrill drill`.
+
+Setup, environment variables and examples: https://github.com/backupdrill/cli#readme
+]]></description>
+    <releaseNotes>https://github.com/backupdrill/cli/releases</releaseNotes>
+    <dependencies>
+      <dependency id="nodejs-lts" version="20.0.0" />
+    </dependencies>
+  </metadata>
+  <files>
+    <file src="tools\**" target="tools" />
+  </files>
+</package>
