@@ -1,7 +1,6 @@
 $ErrorActionPreference = 'Stop'
 
-$npm = Join-Path $env:ProgramFiles 'nodejs\npm.cmd'
-if (-not (Test-Path $npm)) { $npm = 'npm.cmd' }
-
-& $npm uninstall --global backupdrill
-if ($LASTEXITCODE -ne 0) { throw "npm uninstall --global backupdrill failed with exit code $LASTEXITCODE" }
+# The npm install lives in this package's tools folder, which Chocolatey deletes
+# on uninstall; only the launcher outside it needs removing.
+$launcher = Join-Path $env:ChocolateyInstall 'bin\backupdrill.cmd'
+if (Test-Path $launcher) { Remove-Item $launcher -Force }

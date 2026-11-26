@@ -1,10 +1,7 @@
 # Chocolatey package
 
-Source of the [`backupdrill` Chocolatey package](https://community.chocolatey.org/packages/backupdrill). It installs the npm release with the same version number (`npm install --global backupdrill@<version>`), so it depends on `nodejs-lts`.
+Source of the [`backupdrill` Chocolatey package](https://community.chocolatey.org/packages/backupdrill). The install script runs `npm install backupdrill@<version>` into the package folder (public registry, install scripts off) and writes a `backupdrill.cmd` launcher into Chocolatey's `bin` folder, so it depends on `nodejs-lts`.
 
-To release a new version, set `<version>` in `backupdrill.nuspec` to the npm version, then:
+To release a new version, set `<version>` in `backupdrill.nuspec` to the npm version, pack it with `choco pack`, and push it to https://push.chocolatey.org/. A fix that changes only this package uses a fourth version segment (`2.11.2.20261201`); the install script drops it when it calls npm.
 
-```bash
-choco pack packaging/chocolatey/backupdrill.nuspec
-choco push backupdrill.<version>.nupkg --source https://push.chocolatey.org/
-```
+The community repository's automated verifier installs and uninstalls every submitted version on a clean Windows machine. We haven't run the package on Windows ourselves, so check its verifier result before approving a release.
