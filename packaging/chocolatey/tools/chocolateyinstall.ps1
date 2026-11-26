@@ -20,13 +20,18 @@ if (-not (Test-Path $npmCli)) { throw "This package needs the npm that comes wit
 
 # Install into the package folder instead of npm's global folder, so the command
 # works for every user and never replaces a copy someone installed with npm -g.
-# Point npm at empty user and global config files so an admin's .npmrc can't
-# send any package to another registry; no dependency needs install scripts.
+# Drop inherited npm_config_* settings and point npm at empty user and global
+# config files, so an admin's .npmrc or environment can't send any package to
+# another registry; no dependency needs install scripts.
 $appDir = Join-Path $toolsDir 'app'
-$emptyNpmrc = Join-Path $toolsDir 'empty.npmrc'
-Set-Content -Path $emptyNpmrc -Value '' -Encoding Ascii
-$env:NPM_CONFIG_USERCONFIG = $emptyNpmrc
-$env:NPM_CONFIG_GLOBALCONFIG = $emptyNpmrc
+Get-ChildItem Env: | Where-Object { $_.Name -like 'npm_config_*' } | ForEach-Object { Remove-Item "Env:$($_.Name)" }
+# npm refuses one file for both, so use two.
+$emptyUserNpmrc = Join-Path $toolsDir 'empty-user.npmrc'
+$emptyGlobalNpmrc = Join-Path $toolsDir 'empty-global.npmrc'
+Set-Content -Path $emptyUserNpmrc -Value '' -Encoding Ascii
+Set-Content -Path $emptyGlobalNpmrc -Value '' -Encoding Ascii
+$env:NPM_CONFIG_USERCONFIG = $emptyUserNpmrc
+$env:NPM_CONFIG_GLOBALCONFIG = $emptyGlobalNpmrc
 # NODE_OPTIONS could preload a module into npm before --ignore-scripts applies.
 Remove-Item Env:NODE_OPTIONS -ErrorAction SilentlyContinue
 & $node $npmCli install --prefix $appDir --registry https://registry.npmjs.org/ --ignore-scripts --omit=dev --no-audit --no-fund "backupdrill@$npmVersion"
