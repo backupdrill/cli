@@ -34,8 +34,15 @@ $env:NPM_CONFIG_USERCONFIG = $emptyUserNpmrc
 $env:NPM_CONFIG_GLOBALCONFIG = $emptyGlobalNpmrc
 # NODE_OPTIONS could preload a module into npm before --ignore-scripts applies.
 Remove-Item Env:NODE_OPTIONS -ErrorAction SilentlyContinue
-& $node $npmCli install --prefix $appDir --registry https://registry.npmjs.org/ --ignore-scripts --omit=dev --no-audit --no-fund "backupdrill@$npmVersion"
-if ($LASTEXITCODE -ne 0) { throw "npm install backupdrill@$npmVersion failed with exit code $LASTEXITCODE" }
+# npm prints notices on stderr even when it succeeds. With ErrorActionPreference
+# set to Stop, Chocolatey's PowerShell host turns that output into a terminating
+# error, so relax it for this one call and judge the result by the exit code.
+$previousErrorAction = $ErrorActionPreference
+$ErrorActionPreference = 'Continue'
+& $node $npmCli install --prefix $appDir --registry https://registry.npmjs.org/ --ignore-scripts --omit=dev --no-audit --no-fund --loglevel=error --update-notifier=false "backupdrill@$npmVersion"
+$npmExitCode = $LASTEXITCODE
+$ErrorActionPreference = $previousErrorAction
+if ($npmExitCode -ne 0) { throw "npm install backupdrill@$npmVersion failed with exit code $npmExitCode" }
 
 $entry = Join-Path $appDir 'node_modules\backupdrill\dist\index.js'
 if (-not (Test-Path $entry)) { throw "backupdrill entry point not found at $entry" }
